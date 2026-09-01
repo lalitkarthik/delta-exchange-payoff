@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Tests never reach the network; httpx (above) also backs FastAPI's TestClient.
+pytest>=8.0
+ruff>=0.6
