@@ -1,0 +1,410 @@
+/* One screen, one table. Plain CSS, no framework — the whole app is a ladder. */
+
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --ink: #14171c;
+  --ink-dim: #5b6472;
+  --ink-faint: #9aa3b0;
+  --line: #dfe3ea;
+  --line-strong: #c3cad6;
+  --call: #0f6b4f;
+  --call-tint: rgba(15, 107, 79, 0.06);
+  --put: #9a2f3a;
+  --put-tint: rgba(154, 47, 58, 0.06);
+  --atm: #b4741a;
+  --atm-tint: rgba(180, 116, 26, 0.13);
+  --warn-bg: #fff6e5;
+  --warn-ink: #7a5411;
+  --err-bg: #fdecec;
+  --err-ink: #8f2020;
+  --accent: #2b5fd9;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1116;
+    --panel: #151a21;
+    --ink: #e6eaf0;
+    --ink-dim: #98a3b3;
+    --ink-faint: #5c6675;
+    --line: #232b36;
+    --line-strong: #333d4b;
+    --call: #4fd1a0;
+    --call-tint: rgba(79, 209, 160, 0.07);
+    --put: #f2848f;
+    --put-tint: rgba(242, 132, 143, 0.07);
+    --atm: #f0b459;
+    --atm-tint: rgba(240, 180, 89, 0.14);
+    --warn-bg: #2b2314;
+    --warn-ink: #f0cd8d;
+    --err-bg: #2e1719;
+    --err-ink: #f2a6a6;
+    --accent: #6f9bff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+main {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 28px 20px 56px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ---- header ---- */
+
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-end;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.sub {
+  margin: 4px 0 0;
+  color: var(--ink-dim);
+  font-size: 13px;
+  max-width: 52ch;
+}
+
+.controls {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel);
+}
+
+.seg button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-dim);
+  font: inherit;
+  font-weight: 600;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+.seg button + button {
+  border-left: 1px solid var(--line);
+}
+
+.seg button.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+.seg button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field span {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+}
+
+.field select {
+  font: inherit;
+  font-family: var(--mono);
+  padding: 7px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.refresh {
+  appearance: none;
+  font: inherit;
+  font-weight: 600;
+  padding: 8px 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.refresh:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.refresh:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+/* ---- summary strip ---- */
+
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+
+.fact {
+  background: var(--panel);
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.fact .k {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+}
+
+.fact .v {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.fact.wide {
+  grid-column: span 2;
+}
+
+.badge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+}
+
+.badge.engine {
+  color: var(--call);
+}
+
+.badge.fixture {
+  color: var(--atm);
+}
+
+/* ---- notices ---- */
+
+.notice {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--ink-dim);
+  font-size: 13px;
+}
+
+.notice code {
+  font-family: var(--mono);
+}
+
+.notice.warn {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  border-color: transparent;
+}
+
+.notice.error {
+  background: var(--err-bg);
+  color: var(--err-ink);
+  border-color: transparent;
+}
+
+/* ---- the ladder ---- */
+
+/* The scroll container is what makes `position: sticky` on the header work while a
+   long ladder scrolls: the thead sticks to the top of this box, not the document. */
+.ladder-scroll {
+  max-height: 72vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+table.ladder {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.ladder thead th {
+  position: sticky;
+  background: var(--panel);
+  z-index: 2;
+  font-weight: 600;
+  text-align: right;
+  padding: 7px 12px;
+}
+
+.ladder tr.group-row th {
+  top: 0;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  text-align: center;
+  border-bottom: 1px solid var(--line);
+}
+
+.ladder tr.col-row th {
+  top: 30px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.ladder th.group.call,
+.ladder th.call {
+  color: var(--call);
+}
+
+.ladder th.group.put,
+.ladder th.put {
+  color: var(--put);
+}
+
+.ladder th.strike-group {
+  color: var(--ink-dim);
+  text-align: center;
+  border-left: 1px solid var(--line-strong);
+  border-right: 1px solid var(--line-strong);
+}
+
+.ladder td.num {
+  text-align: right;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+}
+
+/* In the money: a whisper of the side's colour, the conventional chain shading. */
+.ladder td.num.itm.call {
+  background: var(--call-tint);
+}
+
+.ladder td.num.itm.put {
+  background: var(--put-tint);
+}
+
+/* An absent value. Deliberately quiet and unmistakably not a number — the dash must
+   never be confused with a real 0.00, which renders in full ink. */
+.ladder td.num.empty,
+.ladder td.num.absent {
+  color: var(--ink-faint);
+}
+
+/* A side that is not listed at all gets a faint diagonal wash, so a whole missing
+   call or put reads as structurally absent rather than as five empty quotes. */
+.ladder td.num.absent {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent 0 5px,
+    var(--line) 5px 6px
+  );
+}
+
+.ladder th.strike {
+  font-weight: 600;
+  text-align: center;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--line);
+  border-left: 1px solid var(--line-strong);
+  border-right: 1px solid var(--line-strong);
+  background: var(--panel);
+  color: var(--ink);
+}
+
+/* ---- the ATM row ---- */
+
+.ladder tr.atm td.num,
+.ladder tr.atm th.strike {
+  background: var(--atm-tint);
+  border-top: 1px solid var(--atm);
+  border-bottom: 1px solid var(--atm);
+}
+
+.ladder tr.atm th.strike {
+  color: var(--atm);
+}
+
+.atm-badge {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--atm);
+  color: var(--panel);
+  vertical-align: 1px;
+}
+
+.foot {
+  margin-top: 14px;
+  color: var(--ink-faint);
+  font-size: 12px;
+  max-width: 76ch;
+}
