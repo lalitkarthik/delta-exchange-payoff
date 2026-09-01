@@ -1,23 +1,34 @@
 /**
  * Display formatting. The only place in the app where a number is turned into text.
  *
- * Two rules from `docs/chain-contract.md` live here:
+ * Three rules live here, and each of them is a correctness rule wearing a formatting hat:
  *
- *   1. `null` renders as an em dash, never as `0` or `0.00`. A null bid means nobody
- *      is bidding; `0.00` would claim somebody bid zero. Around 40% of listed strikes
- *      are illiquid, so this is on screen constantly and has to be unmistakable.
- *   2. IV arrives as a decimal fraction and is shown as a percentage. `0.3730` is
+ *   1. **A `null` field inside a quote renders as nothing at all** — an empty cell.
+ *      Never `0`, never `0.00`, and no longer a dash: a dash sits in the column where
+ *      prices sit and at a glance reads as one. This follows the sibling chain, which
+ *      renders `""` for a null delta. A *whole missing side* is a different statement
+ *      and gets a different treatment — `td.blank`, hatched, in `ChainLadder.tsx`.
+ *   2. **A zero is a zero.** Open interest of exactly `0` is a measured fact on this
+ *      venue and prints as `0`. Empty and zero mean opposite things and must not look
+ *      alike.
+ *   3. IV arrives as a decimal fraction and is shown as a percentage. `0.3730` is
  *      `37.30%`. The engine never multiplies by 100; this is the web app's job.
  *
  * Nothing here parses a string into a number. Every input is already `number | null`.
  */
 
-/** U+2014. The single marker for "no data", used for every absent value. */
+/**
+ * What an absent value looks like: nothing. Exported so the rule is nameable and so a
+ * tooltip, which has no cell to leave empty, can say `formatIv(x) || DASH` on purpose.
+ */
+export const EMPTY = "";
+
+/** U+2014. Only for prose and tooltips, never for a cell in the ladder. */
 export const DASH = "—";
 
 /** Prices, in USD. Grouped thousands, two decimals — a real zero shows as `0.00`. */
 export function formatPrice(value: number | null): string {
-  if (value === null) return DASH;
+  if (value === null) return EMPTY;
   return value.toLocaleString("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
@@ -51,7 +62,7 @@ export function formatSpot(value: number): string {
  * to stay visibly nonzero — `0.000005` renders as `0.0005%`.
  */
 export function formatIv(value: number | null): string {
-  if (value === null) return DASH;
+  if (value === null) return EMPTY;
   const pct = value * 100;
   if (pct !== 0 && Math.abs(pct) < 0.01) return `${pct.toPrecision(1)}%`;
   return `${pct.toFixed(2)}%`;
@@ -59,7 +70,7 @@ export function formatIv(value: number | null): string {
 
 /** Delta, signed, three places. Puts are negative and shown that way. */
 export function formatDelta(value: number | null): string {
-  if (value === null) return DASH;
+  if (value === null) return EMPTY;
   return value.toFixed(3);
 }
 
@@ -67,11 +78,11 @@ export function formatDelta(value: number | null): string {
  * Open interest, in contracts.
  *
  * This is the one column where a zero is routine and genuine — a listed strike that
- * nobody holds. It renders as `0`, not as a dash, because zero open interest is a
- * measured fact rather than missing data. The contrast with the dash is the point.
+ * nobody holds. It renders as `0`, not as an empty cell, because zero open interest is
+ * a measured fact rather than missing data. The contrast is the point.
  */
 export function formatOi(value: number | null): string {
-  if (value === null) return DASH;
+  if (value === null) return EMPTY;
   return value.toLocaleString("en-US", {
     minimumFractionDigits: 0,
     maximumFractionDigits: 1,
@@ -92,4 +103,11 @@ export function formatFetchedAt(iso: string): string {
     `${d.getUTCFullYear()}-${PAD(d.getUTCMonth() + 1)}-${PAD(d.getUTCDate())} ` +
     `${PAD(d.getUTCHours())}:${PAD(d.getUTCMinutes())}:${PAD(d.getUTCSeconds())} UTC`
   );
+}
+
+/** The clock part alone, for the header, where the date is already elsewhere. */
+export function formatFetchedClock(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return `${PAD(d.getUTCHours())}:${PAD(d.getUTCMinutes())}:${PAD(d.getUTCSeconds())}`;
 }

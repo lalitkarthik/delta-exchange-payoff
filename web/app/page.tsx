@@ -3,14 +3,27 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ChainLadder } from "@/components/ChainLadder";
+import ThemeToggle from "@/components/ThemeToggle";
 import { UNDERLYINGS, type ChainResponse, type Underlying } from "@/lib/contract";
 import { ENGINE_URL, loadChain, loadExpiries, type Source } from "@/lib/engine";
-import { formatFetchedAt, formatSpot } from "@/lib/format";
+import { formatFetchedAt, formatFetchedClock, formatSpot } from "@/lib/format";
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * One header row of figures, then the ladder, in the sibling chain screen's shell.
+ *
+ * The header holds what belongs to the *minute*: which series, spot, the strike the
+ * star is on, when the numbers were taken, and where they came from. The Underlying and
+ * Expiry dropdowns are shaped as figures rather than as controls, so they sit in that
+ * row without pulling the eye off it — see `.picker` in `globals.css`.
+ *
+ * Nothing invented. There is no forward, no basis and no session IV, because Delta
+ * publishes none and `docs/chain-contract.md` exposes none; the sibling shows all three
+ * because it fits them from the option prices, which this project does not do.
+ */
 export default function Page() {
   const [underlying, setUnderlying] = useState<Underlying>("BTC");
   const [expiries, setExpiries] = useState<string[]>([]);
@@ -95,113 +108,123 @@ export default function Page() {
   };
 
   return (
-    <main>
-      <header className="head">
-        <div className="head-title">
-          <h1>Option chain</h1>
-          <p className="sub">
-            Delta Exchange · quotes and Greeks as the venue publishes them. No calculation of our
-            own.
-          </p>
-        </div>
+    <div className="shell">
+      <header className="header">
+        <div className="brand">DELTA</div>
 
-        <div className="controls">
-          <div className="seg" role="group" aria-label="Underlying">
-            {UNDERLYINGS.map((u) => (
-              <button
-                key={u}
-                type="button"
-                className={u === underlying ? "on" : undefined}
-                aria-pressed={u === underlying}
-                onClick={() => onUnderlying(u)}
-                disabled={busy}
-              >
-                {u}
-              </button>
-            ))}
-          </div>
-
-          <label className="field">
-            <span>Expiry</span>
-            <select
-              value={expiry}
-              onChange={(e) => onExpiry(e.target.value)}
-              disabled={busy || expiries.length === 0}
-            >
-              {expiries.length === 0 ? <option value="">—</option> : null}
-              {expiries.map((e) => (
-                <option key={e} value={e}>
-                  {e}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <button
-            type="button"
-            className="refresh"
-            onClick={() => void load(underlying, expiry || null)}
+        <label className="picker">
+          <span className="stat-label">Underlying</span>
+          <select
+            className="picker-select"
+            value={underlying}
+            onChange={(e) => onUnderlying(e.target.value as Underlying)}
             disabled={busy}
           >
-            {busy ? "Refreshing…" : "Refresh"}
-          </button>
-        </div>
-      </header>
+            {UNDERLYINGS.map((u) => (
+              <option key={u} value={u}>
+                {u}
+              </option>
+            ))}
+          </select>
+        </label>
 
-      <section className="facts" aria-label="Chain summary">
-        <div className="fact">
-          <span className="k">Underlying</span>
-          <span className="v">{chain ? chain.underlying : underlying}</span>
+        <label className="picker">
+          <span className="stat-label">Expiry</span>
+          <select
+            className="picker-select"
+            value={expiry}
+            onChange={(e) => onExpiry(e.target.value)}
+            disabled={busy || expiries.length === 0}
+          >
+            {expiries.length === 0 ? <option value="">—</option> : null}
+            {expiries.map((e) => (
+              <option key={e} value={e}>
+                {e}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="stat">
+          <span className="stat-label">Spot</span>
+          <span className="stat-value">{chain ? formatSpot(chain.spot) : "—"}</span>
         </div>
-        <div className="fact">
-          <span className="k">Expiry</span>
-          <span className="v">{chain ? chain.expiry : expiry || "—"}</span>
-        </div>
-        <div className="fact">
-          <span className="k">Spot</span>
-          <span className="v">{chain ? formatSpot(chain.spot) : "—"}</span>
-        </div>
-        <div className="fact">
-          <span className="k">ATM strike</span>
-          <span className="v">{chain ? formatSpot(chain.atm_strike) : "—"}</span>
-        </div>
-        <div className="fact wide">
-          <span className="k">Fetched at</span>
-          <span className="v">{chain ? formatFetchedAt(chain.fetched_at) : "—"}</span>
-        </div>
-        <div className="fact">
-          <span className="k">Source</span>
-          <span className="v">
-            {source === null ? (
-              "—"
-            ) : (
-              <span className={`badge ${source}`}>{source === "engine" ? "engine" : "fixture"}</span>
-            )}
+
+        <div className="stat">
+          <span className="stat-label">ATM strike</span>
+          <span className="stat-value">
+            {chain ? formatSpot(chain.atm_strike) : "—"}{" "}
+            <span className="stat-note">(★)</span>
           </span>
         </div>
-      </section>
 
-      {fallbackReason ? (
-        <p className="notice warn">
-          {fallbackReason} Showing the committed fixture instead. Engine base URL is{" "}
-          <code>{ENGINE_URL}</code>.
+        <div className="stat">
+          <span className="stat-label">Fetched</span>
+          <span
+            className="stat-value"
+            title={chain ? formatFetchedAt(chain.fetched_at) : undefined}
+          >
+            {chain ? formatFetchedClock(chain.fetched_at) : "—"}{" "}
+            <span className="stat-note">UTC</span>
+          </span>
+        </div>
+
+        {/* Always on screen, whichever way it reads: a fixture must never be mistaken
+            for live market data, and the only way to guarantee that is to name the
+            source every time rather than only when it is the surprising one. */}
+        <span
+          className="chip"
+          title={
+            source === "fixture"
+              ? "The committed fixture, not the venue. Start the engine for live quotes."
+              : `Live from the engine at ${ENGINE_URL}.`
+          }
+        >
+          source · {source ?? "—"}
+        </span>
+
+        <button
+          type="button"
+          className="refresh"
+          onClick={() => void load(underlying, expiry || null)}
+          disabled={busy}
+        >
+          {busy ? "Refreshing…" : "Refresh"}
+        </button>
+
+        {/* Last, and pushed right by `margin-left: auto`: it changes how the figures look
+            and never what they say, so it must not sit among them competing for the eye. */}
+        <ThemeToggle />
+      </header>
+
+      <main className="main">
+        {fallbackReason ? (
+          <p className="notice warn">
+            {fallbackReason} Showing the committed fixture instead. Engine base URL is{" "}
+            <code>{ENGINE_URL}</code>.
+          </p>
+        ) : null}
+
+        {error ? <p className="notice error">{error}</p> : null}
+
+        {chain ? (
+          // Re-keyed per series: a different underlying or expiry is a different ladder
+          // and earns a fresh centring on the money. A Refresh keeps the key, so the
+          // view stays where the reader left it.
+          <ChainLadder key={`${chain.underlying}:${chain.expiry}`} chain={chain} />
+        ) : error ? null : (
+          <p className="notice">Loading the chain…</p>
+        )}
+
+        <p className="note">
+          A hatched half means that side is not listed at this strike. An empty cell means the
+          venue did not price that field of a contract that does exist. A printed <code>0</code>{" "}
+          is a real zero — open interest of exactly zero is common and is shown as such. The IV
+          column is the mark IV, per side, because Delta prices the call and the put separately;
+          hovering any cell gives the mark price and bid, mark and ask IV. The in-the-money half
+          is washed, measured against spot. Data changes only on load and on Refresh.
         </p>
-      ) : null}
-
-      {error ? <p className="notice error">{error}</p> : null}
-
-      {chain ? (
-        <ChainLadder chain={chain} />
-      ) : error ? null : (
-        <p className="notice">Loading the chain…</p>
-      )}
-
-      <footer className="foot">
-        An em dash (—) means no data, and is never a zero. A printed <code>0</code> is a real
-        zero — open interest of exactly zero is common and is shown as such. IV is the mark IV,
-        shown as a percentage; the engine sends it as a decimal fraction, and hovering a cell
-        gives bid, mark and ask IV. Data changes only on load and on Refresh.
-      </footer>
-    </main>
+      </main>
+    </div>
   );
 }

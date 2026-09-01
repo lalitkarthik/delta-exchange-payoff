@@ -74,12 +74,14 @@ ETH), so the control still works.
 
 These are the ones that matter, and the ones a rewrite is most likely to get wrong.
 
-**`null` is an em dash `—`, never `0`.** A null bid means nobody is bidding; printing
-`0.00` would claim someone bid zero. All the dash logic lives in `lib/format.ts`.
+**`null` is an empty cell, never `0` and never a dash.** A null bid means nobody is
+bidding; printing `0.00` would claim someone bid zero, and a dash sitting in the column
+where prices sit reads as one at a glance. All of it lives in `lib/format.ts`. This
+follows the sibling chain in `payoff-project`, which renders `""` for a null Greek.
 
 **A zero is a zero.** Open interest of exactly `0` is routine on this venue and is printed
-as `0`. The dash and the zero must stay visually distinct, because they mean opposite
-things. The fixture contains both next to each other on purpose.
+as `0`. The empty cell and the zero must stay visually distinct, because they mean
+opposite things. The fixture contains both next to each other on purpose.
 
 **IV is a decimal fraction on the wire and a percentage on screen.** `0.3730` renders as
 `37.30%`. The engine never multiplies by 100.
@@ -89,36 +91,64 @@ ever sends one as a string, `lib/engine.ts` raises a `ContractViolationError` na
 offending fields instead of parsing them — the breach gets reported, not worked around.
 
 **Either side of a row may be `null`.** The row still renders, with its strike, and the
-absent side shown as dashes over a faint hatched background. Rows are never dropped.
+absent side is **hatched** — five cells of 45° stripes with no text at all. Absence has
+to look deliberate, and it must never look like a price. Rows are never dropped. This is
+a different statement from a null field inside a quote, and gets a different mark.
 
 **Data moves only on load and on Refresh.** There is no polling, no websocket, no
 revalidation and no auto-refresh anywhere in this app.
 
 ## Layout notes
 
-Calls left, strike centre, puts right. Both sides read in the same column order —
-`Bid · Ask · Mark · IV · Δ · OI` — rather than mirroring the call side. Mirroring is
-conventional on some terminals, but it makes the two sides hard to compare at a glance,
-and everything here is read left to right.
+The appearance is **ported from the sibling chain screen** at
+`payoff-project/web` — its palette, its density, its column geometry and most of its
+stylesheet comments. The two projects are meant to look like one product, so a change
+here that is not also a change there is a divergence, not an improvement.
 
-- IV is the **mark** IV. Hovering a cell gives bid, mark and ask IV. Deep in-the-money
-  calls report a floored `bid_iv` of `0.000005`, which shows there as `0.0005%` — a real
-  value the venue publishes, not a rendering fault.
-- The ATM row (`atm_strike`) is tinted, ruled top and bottom, and badged `ATM`.
-- In-the-money cells carry a faint tint of their side's colour.
-- The table header stays put while the ladder scrolls: `position: sticky` inside the
-  `.ladder-scroll` box, which is what the header sticks to.
+Calls read outward-in from the left, puts inward-out to the right, so the tradeable
+prices sit nearest the strike and the position-sized figures sit at the edges:
+
+```
+OI  Δ  IV  Bid  Ask  |  STRIKE  |  Ask  Bid  IV  Δ  OI
+```
+
+- **IV is per side, and that is the one deliberate difference from the sibling.** The
+  sibling has a single shared IV column because it *solves* one volatility per strike.
+  Delta publishes `mark_iv` for the call and the put separately and they genuinely
+  differ — 28.19% against 27.58% on the at-the-money strike of a live BTC chain — so
+  collapsing them would invent a number the venue never sent. `ChainLadder.tsx` says so.
+- **Mark price is not a column.** It is in the cell tooltip with all three IVs, because
+  a trader deals at the bid and the ask. Deep in-the-money calls report a floored
+  `bid_iv` of `0.000005`, which shows there as `0.0005%` — a real value the venue
+  publishes, not a rendering fault.
+- The ATM row (`atm_strike`) carries the yellow `--atm` wash, an `--atm-line` inset ring
+  and a **★** on the strike. The table scrolls it into view on mount, once — not on
+  Refresh, which would yank the view out from under someone reading a wing.
+- The in-the-money half carries the `--itm` wash, measured against **spot**. The sibling
+  measures against its fitted Forward and says so; Delta publishes no forward and the
+  contract exposes none, so spot is the only honest reference here — and it is the same
+  one `atm_strike` uses, so the star and the wash agree.
+- Light is the default. The theme toggle cycles Auto → Light → Dark and stores the choice
+  under the same key the sibling uses, so a trader who sets it on one screen finds the
+  other already wearing it. **Auto is the absence of `data-theme`**, not
+  `data-theme="auto"` — the dark palette hangs off
+  `@media (prefers-color-scheme: dark) :root:not([data-theme="light"])`, so any attribute
+  left in place would override the system instead of deferring to it.
+- The table header stays put while the ladder scrolls: two sticky rows inside `.main`,
+  which is the scroll box the shell grid creates.
 
 ## Files
 
 ```
-app/page.tsx             the page: controls, header facts, load and refresh
-app/layout.tsx           document shell
-app/globals.css          all styling, plain CSS, no framework
+app/page.tsx             the page: header figures, pickers, load and refresh
+app/layout.tsx           document shell, and the anti-flash theme script
+app/globals.css          all styling, plain CSS, no framework — ported from the sibling
 components/ChainLadder.tsx   the ladder table
+components/ThemeToggle.tsx   Auto / Light / Dark, ported from the sibling
 lib/contract.ts          types mirroring docs/chain-contract.md
 lib/engine.ts            the only place that talks to the engine
 lib/format.ts            the only place a number becomes text
+lib/theme.ts             what a stored theme means; pure, no DOM
 lib/fixture.ts           fixture loading, and what it covers
 lib/fixture.chain.json   one committed /chain response
 ```

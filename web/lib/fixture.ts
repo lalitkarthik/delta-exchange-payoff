@@ -11,13 +11,13 @@
  *
  *   - 20 strikes, 70000 to 86000, spot 77543, ATM 77500. 39 legs, fully quoted but for:
  *   - `P-86000` is `null` — a whole side absent from the listing. The row still renders,
- *     with its strike, and five dashes. This is the case that breaks naive table code.
+ *     with its strike, and five hatched cells. This is the case that breaks naive table code.
  *   - `C-86000` and `P-70000` have a `null` bid and so a `null` bid_iv: the extreme wings.
  *   - `P-84000` has a `null` mark_iv and therefore `null` Greeks. Production did not show
  *     this, but the contract permits it and the table has to survive it.
  *   - `C-86000` and `P-70000` have `oi` of exactly **0** — not null. Zero open interest is
- *     a measured fact (18 of 316 live ETH tickers), and renders as `0`, never as a dash.
- *     This is the pair that proves dash and zero are not the same thing on screen.
+ *     a measured fact (18 of 316 live ETH tickers), and renders as `0`, never as blank.
+ *     This is the pair that proves empty and zero are not the same thing on screen.
  *   - `C-70000` and `C-71000` carry `bid_iv: 0.000005`, the floor the venue reports on
  *     deep in-the-money calls. It is a real value, so it renders — as `0.0005%` in the
  *     IV tooltip. Not a null, and not a bug.

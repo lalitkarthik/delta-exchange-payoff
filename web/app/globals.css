@@ -1,66 +1,132 @@
-/* One screen, one table. Plain CSS, no framework — the whole app is a ladder. */
+/*
+ * One stylesheet, plain CSS. No Tailwind, no UI library.
+ *
+ * Ported from `payoff-project/web/app/globals.css` so the two projects read as one
+ * product. Two things drive every choice here: the chain is a **dense numeric table**,
+ * so figures are tabular-aligned and the row height is tight; and a trader reads it for
+ * minutes at a time, so contrast is carried by weight and alignment rather than by
+ * colour.
+ *
+ * Only the rules this page uses are kept. The sibling's Legs, presets, payoff chart,
+ * tabs, time control and metrics panel have no counterpart here, so their rules are not
+ * carried over — a stylesheet describing screens that do not exist is a map of the wrong
+ * building.
+ */
+
+/*
+ * The palette is declared three times, and the order is load-bearing.
+ *
+ * `:root` carries the complete light palette. The `@media` block redefines only the
+ * colours, and only where the trader has not asked for light - so a system set to dark
+ * wins over the default but never over an explicit choice. The `[data-theme="dark"]`
+ * block repeats those colours last, so the toggle can reach dark from a light system
+ * too. A colour defined *only* inside one of the lower blocks would have no value in
+ * the other direction, which is why every token has a value here first.
+ *
+ * `auto` is spelled as the *absence* of `data-theme`, not as `data-theme="auto"`, so
+ * the media query is what governs. See `lib/theme.ts`.
+ */
 
 :root {
+  color-scheme: light;
+
   --bg: #f6f7f9;
-  --panel: #ffffff;
-  --ink: #14171c;
-  --ink-dim: #5b6472;
-  --ink-faint: #9aa3b0;
-  --line: #dfe3ea;
-  --line-strong: #c3cad6;
-  --call: #0f6b4f;
-  --call-tint: rgba(15, 107, 79, 0.06);
-  --put: #9a2f3a;
-  --put-tint: rgba(154, 47, 58, 0.06);
-  --atm: #b4741a;
-  --atm-tint: rgba(180, 116, 26, 0.13);
-  --warn-bg: #fff6e5;
-  --warn-ink: #7a5411;
-  --err-bg: #fdecec;
-  --err-ink: #8f2020;
-  --accent: #2b5fd9;
-  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+  --surface: #ffffff;
+  --line: #e3e6ea;
+  --line-strong: #cdd3da;
+  --ink: #16202b;
+  --ink-soft: #5b6773;
+  --ink-faint: #93a0ac;
+
+  --call: #1f6feb;
+  --put: #d1383a;
+  --accent: #4338ca;
+  --atm: #fff6d6;
+  --atm-line: #e0b400;
+  /* The in-the-money wash. A tint rather than an alpha, so it composes predictably with
+     the hatch on a blank cell and with the row hover that overrides it. */
+  --itm: #fbeff0;
+
+  /* Promoted out of the rules that used to hardcode them, because each is invisible
+     or wrong when the surface underneath it changes. */
+  --row-hover: #f0f4ff;
+  --hatch: #fafbfc;
+
+  --radius: 6px;
+  --pad: 12px;
+  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
 }
 
+/*
+ * Dark. Every semantic the light palette carries is preserved: `--surface` still sits
+ * *above* `--bg` rather than below it, calls stay blue, puts stay red. Blue and indigo
+ * are lifted, because #1f6feb and #4338ca are close to unreadable on a dark ground.
+ */
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0e1116;
-    --panel: #151a21;
-    --ink: #e6eaf0;
-    --ink-dim: #98a3b3;
-    --ink-faint: #5c6675;
-    --line: #232b36;
-    --line-strong: #333d4b;
-    --call: #4fd1a0;
-    --call-tint: rgba(79, 209, 160, 0.07);
-    --put: #f2848f;
-    --put-tint: rgba(242, 132, 143, 0.07);
-    --atm: #f0b459;
-    --atm-tint: rgba(240, 180, 89, 0.14);
-    --warn-bg: #2b2314;
-    --warn-ink: #f0cd8d;
-    --err-bg: #2e1719;
-    --err-ink: #f2a6a6;
-    --accent: #6f9bff;
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --bg: #0e1319;
+    --surface: #161d26;
+    --line: #232c38;
+    --line-strong: #33404f;
+    --ink: #e6edf3;
+    --ink-soft: #9aa7b4;
+    --ink-faint: #6b7885;
+
+    --call: #4d9bff;
+    --put: #ff6b6b;
+    --accent: #8b7cf6;
+    --atm: #3a3016;
+    --atm-line: #e0b400;
+    --itm: #241a1c;
+
+    --row-hover: #1d2733;
+    --hatch: #1b232d;
   }
 }
 
-* {
-  box-sizing: border-box;
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0e1319;
+  --surface: #161d26;
+  --line: #232c38;
+  --line-strong: #33404f;
+  --ink: #e6edf3;
+  --ink-soft: #9aa7b4;
+  --ink-faint: #6b7885;
+
+  --call: #4d9bff;
+  --put: #ff6b6b;
+  --accent: #8b7cf6;
+  --atm: #3a3016;
+  --atm-line: #e0b400;
+  --itm: #241a1c;
+
+  --row-hover: #1d2733;
+  --hatch: #1b232d;
 }
 
-body {
+* { box-sizing: border-box; }
+
+html, body {
   margin: 0;
+  padding: 0;
   background: var(--bg);
   color: var(--ink);
-  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  -webkit-font-smoothing: antialiased;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.45;
 }
 
-main {
-  max-width: 1180px;
-  margin: 0 auto;
-  padding: 28px 20px 56px;
+/* Every figure in this interface is compared against the one above it. */
+.num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .sr-only {
@@ -72,339 +138,218 @@ main {
   white-space: nowrap;
 }
 
-/* ---- header ---- */
+/* ---------------------------------------------------------------- shell */
 
-.head {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-  align-items: flex-end;
-  justify-content: space-between;
-  margin-bottom: 18px;
-}
-
-h1 {
-  margin: 0;
-  font-size: 22px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
-}
-
-.sub {
-  margin: 4px 0 0;
-  color: var(--ink-dim);
-  font-size: 13px;
-  max-width: 52ch;
-}
-
-.controls {
-  display: flex;
-  gap: 10px;
-  align-items: flex-end;
-  flex-wrap: wrap;
-}
-
-.seg {
-  display: inline-flex;
-  border: 1px solid var(--line-strong);
-  border-radius: 8px;
-  overflow: hidden;
-  background: var(--panel);
-}
-
-.seg button {
-  appearance: none;
-  border: 0;
-  background: transparent;
-  color: var(--ink-dim);
-  font: inherit;
-  font-weight: 600;
-  padding: 8px 16px;
-  cursor: pointer;
-}
-
-.seg button + button {
-  border-left: 1px solid var(--line);
-}
-
-.seg button.on {
-  background: var(--accent);
-  color: #fff;
-}
-
-.seg button:disabled {
-  cursor: not-allowed;
-  opacity: 0.65;
-}
-
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.field span {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--ink-faint);
-}
-
-.field select {
-  font: inherit;
-  font-family: var(--mono);
-  padding: 7px 10px;
-  border: 1px solid var(--line-strong);
-  border-radius: 8px;
-  background: var(--panel);
-  color: var(--ink);
-}
-
-.refresh {
-  appearance: none;
-  font: inherit;
-  font-weight: 600;
-  padding: 8px 16px;
-  border: 1px solid var(--line-strong);
-  border-radius: 8px;
-  background: var(--panel);
-  color: var(--ink);
-  cursor: pointer;
-}
-
-.refresh:hover:not(:disabled) {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-.refresh:disabled {
-  cursor: not-allowed;
-  opacity: 0.65;
-}
-
-/* ---- summary strip ---- */
-
-.facts {
+.shell {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 1px;
-  background: var(--line);
-  border: 1px solid var(--line);
-  border-radius: 10px;
+  grid-template-rows: auto 1fr;
+  height: 100vh;
   overflow: hidden;
-  margin-bottom: 14px;
 }
 
-.fact {
-  background: var(--panel);
-  padding: 10px 14px;
+/* The scroll box. It is what `position: sticky` on the two header rows sticks to, and
+   what `scrollIntoView` moves when the table opens on the money. `min-height: 0` is
+   load-bearing: a grid item's default `min-height: auto` grows to fit its content, so
+   the `1fr` row would silently become "as tall as the ladder" and this pane would never
+   get a scrollbar - the shell's `overflow: hidden` would just cut the bottom off. */
+.main { overflow-y: auto; min-height: 0; }
+
+/* --------------------------------------------------------------- header */
+
+.header {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
 }
 
-.fact .k {
+.brand { font-weight: 700; font-size: 15px; letter-spacing: 0.02em; }
+
+.stat { display: flex; flex-direction: column; line-height: 1.25; }
+.stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-faint); }
+.stat-value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 600; }
+.stat-note { font-size: 11px; color: var(--ink-soft); }
+
+.chip {
   font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--ink-faint);
-}
-
-.fact .v {
-  font-family: var(--mono);
-  font-size: 15px;
-  font-variant-numeric: tabular-nums;
-}
-
-.fact.wide {
-  grid-column: span 2;
-}
-
-.badge {
-  display: inline-block;
-  font-family: var(--mono);
-  font-size: 12px;
-  padding: 1px 8px;
+  padding: 1px 7px;
   border-radius: 999px;
-  border: 1px solid currentColor;
-}
-
-.badge.engine {
-  color: var(--call);
-}
-
-.badge.fixture {
-  color: var(--atm);
-}
-
-/* ---- notices ---- */
-
-.notice {
-  margin: 0 0 14px;
-  padding: 10px 14px;
-  border-radius: 10px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  color: var(--ink-dim);
-  font-size: 13px;
-}
-
-.notice code {
-  font-family: var(--mono);
-}
-
-.notice.warn {
-  background: var(--warn-bg);
-  color: var(--warn-ink);
-  border-color: transparent;
-}
-
-.notice.error {
-  background: var(--err-bg);
-  color: var(--err-ink);
-  border-color: transparent;
-}
-
-/* ---- the ladder ---- */
-
-/* The scroll container is what makes `position: sticky` on the header work while a
-   long ladder scrolls: the thead sticks to the top of this box, not the document. */
-.ladder-scroll {
-  max-height: 72vh;
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--panel);
-}
-
-table.ladder {
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  font-family: var(--mono);
-  font-variant-numeric: tabular-nums;
-  font-size: 13px;
+  border: 1px solid var(--line-strong);
+  color: var(--ink-soft);
+  background: var(--bg);
   white-space: nowrap;
 }
 
-.ladder thead th {
-  position: sticky;
-  background: var(--panel);
-  z-index: 2;
+/* ------------------------------------------------------------- pickers */
+
+/* The Underlying and Expiry dropdowns. Shaped as a `.stat` deliberately: they sit in the
+   row that reads Spot, ATM, Fetched, and a control that looked like a control would
+   pull the eye off the figures. The label above and the value below are the same two
+   lines, and only the caret says one of them can be changed. */
+.picker { display: flex; flex-direction: column; line-height: 1.25; }
+
+.picker-select {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
   font-weight: 600;
-  text-align: right;
-  padding: 7px 12px;
+  font-size: 13px;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 0 2px;
+  margin: -1px -3px;
+  cursor: pointer;
 }
+.picker-select:hover { border-color: var(--line-strong); background: var(--bg); }
+.picker-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-.ladder tr.group-row th {
-  top: 0;
-  font-size: 11px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  text-align: center;
-  border-bottom: 1px solid var(--line);
-}
+/* Disabled while a fetch is in flight, rather than hidden: a control that vanished for
+   the second it was busy would move every figure beside it. */
+.picker-select:disabled { color: var(--ink-soft); cursor: default; }
+.picker-select:disabled:hover { border-color: transparent; background: transparent; }
 
-.ladder tr.col-row th {
-  top: 30px;
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--ink-dim);
-  border-bottom: 1px solid var(--line-strong);
-}
-
-.ladder th.group.call,
-.ladder th.call {
-  color: var(--call);
-}
-
-.ladder th.group.put,
-.ladder th.put {
-  color: var(--put);
-}
-
-.ladder th.strike-group {
-  color: var(--ink-dim);
-  text-align: center;
-  border-left: 1px solid var(--line-strong);
-  border-right: 1px solid var(--line-strong);
-}
-
-.ladder td.num {
-  text-align: right;
+/* The one button on this page that fetches. Shaped like the sibling's `.back` link,
+   because it is the same thing: a secondary action that must not out-shout a figure. */
+.refresh {
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--ink);
+  border-radius: var(--radius);
   padding: 6px 12px;
-  border-bottom: 1px solid var(--line);
-  color: var(--ink);
-}
-
-/* In the money: a whisper of the side's colour, the conventional chain shading. */
-.ladder td.num.itm.call {
-  background: var(--call-tint);
-}
-
-.ladder td.num.itm.put {
-  background: var(--put-tint);
-}
-
-/* An absent value. Deliberately quiet and unmistakably not a number — the dash must
-   never be confused with a real 0.00, which renders in full ink. */
-.ladder td.num.empty,
-.ladder td.num.absent {
-  color: var(--ink-faint);
-}
-
-/* A side that is not listed at all gets a faint diagonal wash, so a whole missing
-   call or put reads as structurally absent rather than as five empty quotes. */
-.ladder td.num.absent {
-  background-image: repeating-linear-gradient(
-    -45deg,
-    transparent 0 5px,
-    var(--line) 5px 6px
-  );
-}
-
-.ladder th.strike {
+  font-family: inherit;
+  font-size: 12px;
   font-weight: 600;
+  cursor: pointer;
+}
+.refresh:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.refresh:disabled { opacity: 0.35; cursor: default; }
+
+/* ---------------------------------------------------------- chain table */
+
+.chain-wrap { padding: 0 0 40px; }
+
+table.chain {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+/* Two header rows, so each needs its own offset - a single `top: 0` stacks them and the
+   CALLS / PUTS banner scrolls away under the column names. */
+table.chain thead tr:first-child th { top: 0; }
+table.chain thead tr:nth-child(2) th { top: 21px; }
+
+table.chain thead th {
+  position: sticky;
+  z-index: 2;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line-strong);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-faint);
+  font-weight: 600;
+  padding: 6px 6px;
+  text-align: right;
+}
+
+table.chain thead th.side-head {
   text-align: center;
-  padding: 6px 14px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  padding-bottom: 2px;
+}
+/*
+ * Calls blue, puts red.
+ *
+ * Qualified with `table.chain thead th` rather than left as the sibling's bare
+ * `.side-call` / `.side-put`. The block above sets `color` on `table.chain thead th`,
+ * which is specificity (0,1,3) against a bare class's (0,1,0), so the bare rule loses
+ * whatever the source order and the banner renders in `--ink-faint` — measured, in
+ * both projects. Same tokens, same intent; this is the sibling's rule made to take
+ * effect, not a change of design. Worth carrying back there.
+ */
+table.chain thead th.side-call { color: var(--call); }
+table.chain thead th.side-put { color: var(--put); }
+
+table.chain tbody td {
+  padding: 3px 6px;
   border-bottom: 1px solid var(--line);
+}
+
+/*
+ * The in-the-money half, washed red.
+ *
+ * Before the hover rule on purpose: hovering a row has to win, or the pointer would
+ * stop telling you which row it is on for half the table. `td.strike` is never washed,
+ * because a strike is not on one side or the other.
+ */
+table.chain tbody td.itm { background: var(--itm); }
+
+table.chain tbody tr:hover td { background: var(--row-hover); }
+
+td.strike {
+  text-align: center;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  background: var(--bg);
   border-left: 1px solid var(--line-strong);
   border-right: 1px solid var(--line-strong);
-  background: var(--panel);
-  color: var(--ink);
+  width: 104px;
 }
 
-/* ---- the ATM row ---- */
+tr.at-the-money td.strike { background: var(--atm); box-shadow: inset 0 0 0 1px var(--atm-line); }
 
-.ladder tr.atm td.num,
-.ladder tr.atm th.strike {
-  background: var(--atm-tint);
-  border-top: 1px solid var(--atm);
-  border-bottom: 1px solid var(--atm);
-}
+/* An unquoted side renders empty. Never a zero, never a dash that reads as a price. */
+td.blank { background: repeating-linear-gradient(45deg, transparent, transparent 6px, var(--hatch) 6px, var(--hatch) 12px); }
 
-.ladder tr.atm th.strike {
-  color: var(--atm);
-}
+/* -------------------------------------------------------------- notices */
 
-.atm-badge {
-  display: inline-block;
-  margin-left: 8px;
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  padding: 1px 5px;
-  border-radius: 3px;
-  background: var(--atm);
-  color: var(--panel);
-  vertical-align: 1px;
-}
-
-.foot {
-  margin-top: 14px;
-  color: var(--ink-faint);
+.notice {
+  margin: var(--pad) var(--pad) 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink-soft);
   font-size: 12px;
-  max-width: 76ch;
 }
+
+.notice code { font-family: var(--mono); }
+
+/* The fixture banner. Amber, because the figures on screen are real but not live. */
+.notice.warn { background: var(--atm); border-color: var(--atm-line); color: var(--ink); }
+
+/* The engine's refusal - a 400, 404 or 502 with its `detail`. Same recipe as the
+   sibling's `.refusal`: put-red rule over the in-the-money wash. */
+.notice.error { background: var(--itm); border-color: var(--put); color: var(--ink); }
+
+.note { font-size: 11px; color: var(--ink-faint); margin: 10px var(--pad) 0; }
+
+/* ---------------------------------------------------------------- theme */
+
+/* Pushed to the right end of the header. It changes how every figure looks and none of
+   what they say, so it sits apart from them rather than among them. */
+.theme {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--ink-soft);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.theme:hover { border-color: var(--accent); color: var(--accent); }
+.theme:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
