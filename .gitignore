@@ -1,0 +1,19 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# node
+node_modules/
+.next/
+*.tsbuildinfo
+
+# secrets — never commit an API key
+.env
+.env.local
+tools/.env
+
+# probe output
+tools/out/
