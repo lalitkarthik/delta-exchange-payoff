@@ -34,9 +34,13 @@ is the same one, so the code starts fresh and the conventions carry.
 ## Data caveats
 
 Before using any historical series from this venue for a backtest, read
-`docs/delta-api-scope.md`. Two findings from 2026-09-01 that shape everything:
+[`docs/delta-api-scope.md`](./docs/delta-api-scope.md). The finding that shapes everything:
 
-- **Perp history goes back to 2023-12-29, not ten years.** `BTCUSD` daily returns 978 candles.
-- **Expired option series keep reporting prices after expiry.** `C-BTC-60000-270624` expired
-  27 June 2024 and still returns candles dated today. Options history from this endpoint is not
-  safe to backtest on.
+- **Set `end` to the contract's `settlement_time`, never to `now`.** With `end = now`,
+  `C-BTC-60000-270624` returns 801 daily bars of which **797 are fabricated** — the last trade
+  copied forward for two years past expiry. With `end = settlement_time` the same request
+  returns 4 bars, all real.
+- **Under that one rule the history is clean and usable**, back at least to June 2024: traded
+  OHLCV, a mark price series, and open interest, per contract.
+- **What history does not carry** is bid/ask and implied vol. Those exist only on the live
+  ticker, which is why a `/v2/tickers` snapshotter is still worth standing up.

@@ -1,61 +1,44 @@
-# What Delta's public API actually gives you
+# What Delta's public API gives you for options
 
-**Verdict: do not backtest options on this API.** Every historical option series is padded
-with fabricated prices — bars that keep printing after the contract expired, after the
-settlement that made it worthless, and (for live symbols) into dates that have not happened
-yet. **Perp history is 978 daily bars, not ten years.** The blocker is not that options expire —
-their lifetimes here are normal, up to 91 days. It is that **no historical quote surface exists**:
-no endpoint returns the chain as it stood on a past date, only a trade log with the gaps filled
-in. Delta's own API cannot sell you that surface, because it never stored it. A third-party
-vendor who snapshotted the chain themselves might have it — untested, see section 8. Failing
-that, the only trustworthy option history is history captured going forward.
+**Verdict: options history is obtainable, and it is clean — if you set `end` to the contract's
+settlement time.** Set `end = now` instead, which is the obvious thing to write, and the same
+request returns a series padded with fabricated prices. That one parameter is the difference
+between usable data and garbage, and nothing in the API warns you.
+
+Six months is reachable. So is more. Expired contracts are enumerable back beyond 3.5 months
+with the cursor still running, and per contract you get **daily or hourly traded OHLCV, a mark
+price series, and an open-interest series** — all real, all the way back to contracts that
+expired in June 2024.
+
+Scope: options only. Perpetuals, index and funding series are out of scope and were removed
+from this document.
 
 ## Do this next
 
-1. **Do not build any options backtest against `/v2/history/candles`.** Nothing in this
-   document makes it safe.
-2. **Stand up a `/v2/tickers` snapshotter** on a schedule before anything else. It is the
-   prerequisite for every options question the firm wants to answer. Not built here.
-3. **If you need perps only**, `/v2/history/candles` is usable from 2023-12-29 onward once you
-   drop zero-volume bars and never set `end` past now. Roughly a day's work.
+1. **Never set `end = now` on a candles request for an expired contract.** Use its
+   `settlement_time` from `/v2/products/{symbol}`. This is the whole finding.
+2. **Build the history loader.** Enumerate `/v2/products?states=expired`, then for each symbol
+   pull the trade, `MARK:` and `OI:` series with `end = settlement_time`. Costing is in
+   section 3. Roughly a few unattended hours for six months.
+3. **Start the `/v2/tickers` snapshotter anyway.** History gives you mark, not bid/ask, and not
+   implied vol. Section 7 says what is still missing and why the snapshotter remains worth it.
 
 ## How to read this
 
-Every claim is tagged. **Measured** means a request I made on 2026-09-01, and the request is
-named. **Documented, not observed** means it comes from Delta's docs and I did not verify it.
-The distinction matters: the docs state a 2000-candle cap and the real cap is 4000, so a
-documented number here is a claim, not a fact.
+Every claim is tagged. **Measured** means a request made on 2026-09-01, and the request is
+named. **Documented, not observed** means it comes from Delta's docs and was not verified. The
+distinction earns its keep: the docs state a 2000-candle cap and the real cap is 4000.
 
-All measurements come from one run of `tools/probe_api.py all`, 2026-09-01T17:42:55Z to
-17:49:35Z, 116 requests, against `https://api.india.delta.exchange`. No API key.
+Base URL `https://api.india.delta.exchange`. No API key was used anywhere in this document.
 
 ---
 
-## 1. How far back the data goes
+## 1. Contract lifetimes are normal
 
-**Measured** — `GET /v2/history/candles?resolution=1d&symbol=<sym>&start=<2014-01-01>&end=<now>`:
+An option runs from its listing date to its expiry. That is true at every venue — a contract
+being born and dying is how options work, not a defect.
 
-| Symbol | Kind | Daily bars | Oldest bar |
-|---|---|---:|---|
-| `BTCUSD` | perp trades | 978 | 2023-12-29 |
-| `ETHUSD` | perp trades | 939 | 2024-02-06 |
-| `SOLUSD` | perp trades | 877 | 2024-04-08 |
-| `MARK:BTCUSD` | perp mark | 989 | 2023-12-18 |
-| `MARK:ETHUSD` | perp mark | 940 | 2024-02-05 |
-| `.DEXBTUSD` / `.DEETHUSD` | index | 989 | 2023-12-18 |
-| `OI:BTCUSD` | open interest | 978 | 2023-12-29 |
-| `FUNDING:BTCUSD` | funding rate | 989 | 2023-12-18 |
-
-Depth is the same at every resolution — it is a start date, not a retention window. The
-resolution only changes how many bars fit in one response (section 3).
-
-**Dated futures: none exist.** **Measured**, `GET /v2/products?states=live&page_size=1000`:
-1263 live products, of which 493 call options, 475 put options, 27 perpetual futures, 5
-`move_options`. Zero `futures`. There is no dated-futures history to assess.
-
-**Options: the contract lifetimes are normal. The problem is elsewhere.** An option series runs
-from its listing date to its expiry, and that is true at every venue — a contract being born and
-dying is how options work, not a defect. **Measured**, `GET /v2/products/{symbol}`:
+**Measured**, `GET /v2/products/{symbol}`:
 
 | Contract | Listed | Settles | Life |
 |---|---|---|---:|
@@ -64,206 +47,147 @@ dying is how options work, not a defect. **Measured**, `GET /v2/products/{symbol
 | `C-BTC-77600-040926` | 2026-09-01 | 2026-09-04 | 3 days |
 | `C-BTC-60000-270624` | 2024-06-24 | 2024-06-27 | 3 days |
 
-Delta runs a weekly-and-monthly ladder: the near expiries live days, the far ones roughly three
-months — the same shape as a NIFTY monthly. So "the series are too short" is **not** the finding,
-and an earlier draft of this document said so wrongly. It reached that by confusing *this
-contract is only seven days old right now* with *options here only live for days*.
+Delta runs a weekly-and-monthly ladder: near expiries live days, far ones roughly three months —
+the same shape as a NIFTY monthly. **"The series are too short" is not a finding**, and an
+earlier draft of this document wrongly said it was, by reading *this contract is seven days old
+right now* as *options here only live for days*.
 
-**The real limitation is that Delta records trades, and options mostly do not trade.**
-**Measured**: `C-BTC-60000-270624` existed for 3 days and contains **54 minutes with a real
-trade out of 3636** — it traded in 1.25% of the minutes it was alive. That is ordinary for a
-strike away from the money and is not Delta's fault.
-
-But a backtest still has to know what those strikes were **worth** on the days nothing traded:
-the mark and the implied vol are what a position is valued at, margined on, and closed at.
-*Nobody traded it* is not *it had no value*. `/v2/history/candles` carries trades only, and then
-fills the silence with a copy of the last trade without saying so — which is section 2.
-
-**So the honest answer for options is not a number of days. It is that no historical quote
-surface exists at all.** No endpoint returns the chain as it stood on a past date; there is only
-a trade log with the gaps filled in. That is the difference between this API and a commercial
-options dataset, which stores the whole chain per day — every strike, with mark, IV, Greeks and
-open interest, whether or not it traded — because the quote surface *is* the product.
+**`/v2/products/{symbol}` also carries the settlement value**, as `settlement_index_price`. That
+is what the contract actually paid, and it is the correct terminal value for a backtest — not
+the last traded price. **Measured**: `C-BTC-60000-310726` settled at index 63847.3917 against a
+60000 strike, so it paid **3847.39**, while its last trade printed **3912.0**.
 
 ---
 
-## 2. The defect: zero-volume carry-forward, and it never stops
+## 2. How far back you can enumerate
 
-This is the finding that decides the backtesting question.
+**Measured** — `GET /v2/products?states=expired&page_size=1000&contract_types=call_options,put_options`,
+following the `meta.after` cursor:
 
-**The mechanism (measured).** `/v2/history/candles` fills every bucket that contains no trade
-by copying the last trade forward: `open = high = low = close = last traded price`, `volume = 0`.
-It does this for gaps mid-life, for every bucket after the contract stops trading, and for
-buckets dated in the future. It stops only when it reaches the `end` you asked for.
+| Pages walked | Products | Settlement dates reached |
+|---:|---:|---|
+| 14 | **14,000** | 2026-05-16 … 2026-09-01 |
 
-The full rule, which predicted every case I then tested:
+The cursor had not run out. **3.5 months came back in 14 requests**, so six months is roughly 25
+requests of enumeration — trivial.
 
-> The effective window is `[max(start, end − 4000 × resolution), end]`. If that window contains
-> no real trade, the result is empty. Otherwise the response runs from the first real trade in
-> the window through `end`, with every empty bucket padded as above.
+Two traps in this endpoint:
 
-### Evidence
+- **`meta.total_count` reports 10000 and is wrong.** The walk above returned 14,000 products.
+  Page until the cursor is absent; do not trust the count.
+- **Results are not ordered by settlement date.** Page 5 of the walk returned a contract settling
+  2023-12-28 in among August 2026 contracts — the ordering is by internal id. **You cannot stop
+  paging when you reach your target date**; you must exhaust the cursor and filter afterwards.
 
-**`C-BTC-60000-270624` — expired 2024-06-27T12:00:00Z, still printing today.**
-**Measured**, `resolution=1d&start=<2014-01-01>&end=<now>`: 800 bars, 2024-06-24 to 2026-09-01,
-**796 of 800 with volume 0**. Four real trading days, then 796 days of this:
+`states=settled` returns zero products. `expired` is the only state that matters.
 
-```
-2024-06-26  o=1628.0 h=2034.0 l=931.0 c=1241.0                v=2715.0
-2024-06-27  o=1154.0 h=1433.0 l=705.0 c=1237.558620689655     v=2316.0   <- settlement day
-2026-08-31  o=1237.558620689655 ... c=1237.558620689655       v=0
-2026-09-01  o=1237.558620689655 ... c=1237.558620689655       v=0
-```
+---
 
-`GET /v2/products/C-BTC-60000-270624` gives `state: "expired"`,
-`settlement_index_price: "61237.558620689655"`, strike 60000 — intrinsic 1237.5586, which is
-what the settlement print booked at and what has been carried forward ever since.
+## 3. The padding trap, and the one-parameter fix
 
-**The carried value is the last trade, not the settlement value.** **Measured** on
-`C-BTC-60000-310726` (expired 2026-07-31T12:00:00Z): the flat value is **3912.0**, which was
-the close of the 10:00Z bar — the last bar with volume. Its `settlement_index_price` is
-63847.3917, so the contract actually paid **3847.39**. The series is wrong by 64.61 for every
-one of the 32 days since. At 1h resolution the boundary is visible: 10:00Z has `v=20`, and
-every bar from 11:00Z onward is flat at 3912 with `v=0`, straight through the 12:00Z settlement.
+This is the finding that decides everything, so it is worth stating precisely.
 
-**An option that expired worthless still quotes a price.** **Measured**: `C-BTC-70000-310726`
-settled against index 63847.39 with a 70000 strike, so it paid zero. Its series returns
-`close=0.1, volume=0` every day since, and is still doing so on 2026-09-01. Payoff 0, series 0.1.
+**The mechanism (measured).** `/v2/history/candles` fills every bucket containing no trade by
+copying the last trade forward — `open = high = low = close = last traded price`, `volume = 0` —
+and continues doing so until it reaches the `end` you asked for. The full rule:
 
-**The same mechanism fabricates bars for dates in the future.** **Measured**,
-`symbol=BTCUSD&resolution=1d&start=<now−5d>&end=<2027-03-01>`: 186 bars, **181 of them dated
-after today**, all `o=h=l=c=77418.0, v=0`. A pipeline that sets `end = now + buffer` will
-silently ingest six months of invented perp prices.
+> The effective window is `[max(start, end − 4000 × resolution), end]`. If it contains no real
+> trade, the result is empty. Otherwise the response runs from the first real trade in the
+> window through `end`, padding every empty bucket.
 
-**It is not a catch-all fallback.** **Measured** controls: `C-BTC-60000-999999`, `NOT-A-SYMBOL`
-and `C-BTC-99999999-040926` all return `n=0`. A window entirely in the future returns `n=0`.
-The padding needs one real trade to seed from — that is all it needs.
+Read that rule carefully and the fix falls out of it: **the padding lives between the contract's
+last trade and your `end`. Move `end` back to settlement and there is no room for it.**
 
-**The corruption is invisible if you ask for a recent window.** **Measured** on
-`C-BTC-60000-270624` at `resolution=1d`, varying only `start`:
+**Measured**, same symbols, `resolution=1d`, varying only `end`:
+
+| Symbol | `end` | Bars | Real | Padded |
+|---|---|---:|---:|---:|
+| `C-BTC-60000-270624` | now | 801 | 4 | **797** |
+| `C-BTC-60000-270624` | settlement | 4 | 4 | **0** |
+| `C-BTC-60000-310726` | now | 73 | 40 | **33** |
+| `C-BTC-60000-310726` | settlement | 40 | 40 | **0** |
+| `C-BTC-70000-310726` | now | 73 | 40 | **33** |
+| `C-BTC-70000-310726` | settlement | 40 | 40 | **0** |
+
+Zero padding in every case. The 2024 contract included.
+
+**It is not a sampling fluke.** **Measured** across 18 randomly sampled expired BTC and ETH
+options settling 1–15 July 2026, each queried with `end = settlement_time`: **58 real daily bars
+out of 58 returned, 100%**. Every contract in the sample traded on every day it existed.
+
+### Why this went unnoticed
+
+`end = now` is the natural thing to write, and it is what every earlier probe of this API used.
+The corruption it produces is also invisible from the other direction — **measured** on
+`C-BTC-60000-270624`, varying only `start`:
 
 | `start` | Rows |
 |---|---:|
-| 2014-01-01 | 800 |
 | 2024-06-24 | 800 |
-| 2024-06-25 | 799 |
 | 2024-07-01 | **0** |
-| 2025-01-01 | **0** |
 
-Anyone spot-checking with a recent `start` sees an empty result and concludes the endpoint
-handles expiry correctly. It does not.
+So a spot check with a recent `start` returns empty and looks correct, while a spot check with
+`end = now` returns two years of flat prices and looks broken. Neither reveals that the data
+underneath is fine.
 
-### Three things that make this worse than it first looks
+### What the padding still costs you
 
-1. **Padding dominates the contract's own lifetime, not just its afterlife.** **Measured**:
-   `C-BTC-60000-270624` at `resolution=1m` up to expiry+12h returns 3636 bars, of which
-   **3582 (98.5%) have volume 0**. Filtering to real prints leaves 54 bars for the whole
-   contract.
-2. **`MARK:` series are corrupted identically and cannot be filtered.** **Measured**:
-   `MARK:C-BTC-60000-270624` returns 800 daily bars through 2026-09-01, flat at 1238.58991071 —
-   and its `volume` field is `null` on every bar, real or padded. The one discriminator that
-   works on trade candles does not exist here. `OI:` series behave the same way.
-3. **`volume == 0` is therefore the only filter available, and only on trade candles.** It is
-   correct but expensive: it deletes most of every option series.
-
-**The padding is generated at query time, not stored.** **Measured**: the same
-`BTCUSD&end=2027-03-01` request run at 17:44Z returned future bars at `77418.0`; run again at
-17:52Z it returned `77326.0`. The fabricated bars track the live last trade, so the same
-historical request returns different history depending on when you ask it. Re-running a
-backtest will not reproduce its own inputs.
-
-**Mechanism established, boundary established.** The one thing I did not establish is whether
-Delta considers this a bug. It does not change the conclusion.
+- **Live contracts.** There is no settlement time to anchor to yet, so use `end = now` and drop
+  `volume == 0`. The tail padding is unavoidable while a contract is trading.
+- **Intraday gaps mid-life are real.** At `1m` a contract genuinely does not trade most minutes —
+  `C-BTC-60000-270624` has 54 real minutes out of 3636. That is ordinary illiquidity, correctly
+  reported once you filter, not a defect.
+- **A worthless option still prints its last trade.** `C-BTC-70000-310726` settled worthless, and
+  its final bar is its last trade, not zero. Take the terminal value from
+  `settlement_index_price`, never from the last candle.
 
 ---
 
-## 3. Cap per response, and how to page past it
+## 4. What you get per contract
 
-**The cap is 4000 bars, not the documented 2000.** **Measured**,
-`symbol=BTCUSD&resolution=1m`, varying only the window:
+Three separate series, all clean under the `end = settlement` rule. **Measured** on
+`C-BTC-60000-270624` (expired 2024-06-27), `resolution=1h` across its full life:
 
-| Requested window | Rows returned |
-|---|---:|
-| 1 day | 1440 |
-| 2 days | 2880 |
-| 3 days | **4000** |
-| 5 / 10 / 40 / 200 days | **4000** |
+| Series | Bars | Distinct closes | Range |
+|---|---:|---:|---|
+| `C-BTC-60000-270624` (trades) | 62 | 21 | 705.0 … 2000.0 |
+| `MARK:C-BTC-60000-270624` | **64** | **64** | 729.67 … 2313.45 |
+| `OI:C-BTC-60000-270624` | 64 | 16 | 0 … 2.051 |
 
-Delta's docs say "it can return only upto 2000 candles maximum in a response"
-(**documented, not observed** — and contradicted above). The cap is uniform across
-resolutions: a 400-day window returns 4000 bars at `1m`, `5m`, `15m` and `1h`, and 2400 at
-`4h`, 400 at `1d` — i.e. the window binds before the cap does at coarse resolutions.
+**`MARK:` is the important one.** 64 bars, 64 distinct values — a continuous mark-price series
+across the contract's entire life, from a contract that expired over two years ago. This is what
+lets you mark a position on a day it did not trade, which is the thing a backtest actually needs.
 
-**Truncation drops the oldest, never the newest.** The response is always anchored to `end`.
-`start` is effectively ignored once it is further back than `end − 4000 × resolution`.
-
-**To page, walk `end` backwards.** Set `end = oldest_returned_time − one interval` and repeat.
-**Measured**: three pages of `1m` BTCUSD reassembled **12,002 unique minutes with 0 gaps**,
-2026-08-24T09:42Z to 2026-09-01T17:43Z. Pages 2 and 3 returned 4001 rows, not 4000, because
-`end` landed exactly on a bucket boundary — size your loop off the returned timestamps, not
-off a constant.
+`MARK:` and `OI:` carry `volume: null` on every bar, so `volume == 0` cannot filter them. Under
+the `end = settlement` rule they do not need filtering. Under `end = now` they are unfilterable
+and unusable — **measured**, `MARK:C-BTC-60000-310726` with `end = now` returns 73 bars whose
+most recent 33 are flat at 3846.83.
 
 **Valid resolutions (measured, from the 400 error body):** `5s, 1m, 3m, 5m, 15m, 30m, 1h, 2h,
-4h, 6h, 1d, 1w`. `12h`, `3d`, `7d`, `1M` are rejected with `bad_schema`. Note `5s` is accepted
-by the API but absent from the docs' enumerated list.
+4h, 6h, 1d, 1w`. `12h`, `3d`, `7d` and `1M` are rejected. `5s` works but is absent from the
+docs' list.
+
+**Cap: 4000 bars per response**, not the documented 2000, and 4001 when `end` lands on a bucket
+boundary. Truncation drops the oldest, never the newest — the response anchors to `end`. To page,
+set `end = oldest_returned − one interval` and repeat; size the loop off returned timestamps, not
+a constant. No option series in this venue's history approaches 4000 daily bars, so the cap only
+binds at intraday resolutions.
+
+### Costing a six-month pull
+
+Enumeration is ~25 requests. Roughly 24,000 expired contracts over six months, at three series
+each, is ~72,000 requests. Public market data costs weight 3 against a budget of at least 10,000
+per fixed five-minute window (section 6), so the floor is about **1.8 hours of pure quota**, and
+a few unattended hours with sane pacing. Pull `MARK:` first — it is the series that carries the
+most information per request.
 
 ---
 
-## 4. What the API gives you for an option
+## 5. The live chain
 
-From `GET /v2/tickers?contract_types=call_options&underlying_asset_symbols=BTC`, sampled on
-`C-BTC-98000-301026`. **Measured**, all of it.
+What `/v2/tickers` gives you right now, which is what the app renders.
 
-**Read this first: every price, IV, Greek, open-interest and band value is a JSON string.**
-Only `open/high/low/close`, `volume`, `turnover`, `turnover_usd` (floats) and
-`product_id`/`size`/`leverage`/`timestamp` (ints) are numbers. Parse accordingly.
-
-| Field | Type | Example |
-|---|---|---|
-| `quotes.best_bid` / `best_ask` | **str** | `"498"` / `"539"` |
-| `quotes.bid_size` / `ask_size` | **str** | `"6143"` / `"4952"` |
-| `quotes.bid_iv` / `ask_iv` / `mark_iv` | **str** | `"0.41168255"` / `"0.41967074"` / `"0.41569626"` |
-| `quotes.impact_mid_price` | null | `null` |
-| `mark_price` | **str** | `"518.61229452"` |
-| `mark_vol` | **str** | `"0.41570447"` |
-| `greeks.delta` / `gamma` / `theta` / `vega` / `rho` | **str** | `"0.09211620"`, `"0.00001279"`, `"-18.16064981"`, `"51.33736257"`, `"10.64975020"` |
-| `greeks.spot` | **str** | `"77446"` |
-| `spot_price` | **str** | `"77447.8"` |
-| `oi` / `oi_value` | **str** | `"9.9080"` (BTC, per `oi_value_symbol`) |
-| `oi_contracts` | **str** | `"9908"` |
-| `oi_value_usd` | **str** | `"768478.3512"` |
-| `oi_change_usd_6h` | **str** | `"11537.0800"` |
-| `price_band.lower_limit` / `upper_limit` | **str** | `"5.08984471"` / `"4077.19278685"` |
-| `tick_size` | **str** | `"0.100000000000000000"` |
-| `contract_value` | **str** | `"0.001000000000000000"` |
-| `strike_price` | **str** | `"98000"` |
-| `close` / `open` / `high` / `low` | float | `496.0` / `579.0` / `650.0` / `496.0` |
-| `volume` / `turnover` / `turnover_usd` | float | `0.508` / `39752.7658` / `39752.7658` |
-| `timestamp` | int | `1788284909628171` (microseconds) |
-| `product_trading_status` | str | `"operational"` |
-
-Three IV fields (`bid_iv`, `ask_iv`, `mark_iv`), plus a fourth, `mark_vol`, which shadows
-`mark_iv` without matching it — `"0.41570447"` against `"0.41569626"` in the same snapshot.
-Five Greeks; no vanna, vomma or charm. `probe_api.py option` prints the complete 54-field
-inventory.
-
-**There is no expiry field.** **Measured**: `'expiry_date' in ticker` is `False` on every
-ticker. Expiry exists only as the `DDMMYY` symbol suffix, so every consumer has to parse
-`C-BTC-98000-301026` → 2026-10-30. `/v2/products/{symbol}` does carry `settlement_time`
-(`"2026-10-30T12:00:00Z"`) and `launch_time`, at the cost of one request per symbol.
-
-**`spot_price` and `greeks.spot` disagree, and the gap is real.** **Measured** across 582 BTC
-option tickers in one response: **one** distinct `spot_price` (`"77447.8"`) against **18**
-distinct `greeks.spot` values spanning 77435.3 to 77450.4 — a **15.10 USD spread inside a
-single snapshot**. The Greeks are not computed against a common spot. Anything that recovers a
-forward or nets Greeks across strikes inherits that inconsistency. (The 2026-09-01 brief
-measured 15 distinct values over 128 tickers; same phenomenon, different snapshot.)
-
----
-
-## 5. Live expiries
-
-**Measured** — 8 expiries for both underlyings, identical dates, furthest **87 days out**.
+**Measured** — 8 expiries for both underlyings, identical dates, furthest **87 days out**:
 
 | Expiry | Days out | BTC C / P | ETH C / P |
 |---|---:|---|---|
@@ -276,154 +200,178 @@ measured 15 distinct values over 128 tickers; same phenomenon, different snapsho
 | 2026-10-30 | +59 | 47 / 42 | 20 / 18 |
 | 2026-11-27 | +87 | 35 / 32 | 16 / 16 |
 
-Totals: **BTC 298 calls / 284 puts, ETH 160 calls / 156 puts.** Six of the eight expiries are
-inside a month. There is no long-dated surface here.
+Totals: **BTC 298 calls / 284 puts, ETH 160 calls / 156 puts.** Six of eight expiries are inside
+a month; there is no long-dated surface.
+
+**Read this before parsing: every price, IV, Greek and open-interest value is a JSON string.**
+Only `open/high/low/close`, `volume`, `turnover`, `turnover_usd` (floats) and
+`product_id`/`size`/`leverage`/`timestamp` (ints) are numbers.
+
+| Field | Type | Example |
+|---|---|---|
+| `quotes.best_bid` / `best_ask` | **str** | `"498"` / `"539"` |
+| `quotes.bid_iv` / `ask_iv` / `mark_iv` | **str** | `"0.41168255"` / `"0.41967074"` / `"0.41569626"` |
+| `quotes.impact_mid_price` | null | `null` |
+| `mark_price` / `mark_vol` | **str** | `"518.61229452"` / `"0.41570447"` |
+| `greeks.delta` / `gamma` / `theta` / `vega` / `rho` | **str** | `"0.09211620"`, `"0.00001279"`, `"-18.16064981"`, `"51.33736257"`, `"10.64975020"` |
+| `greeks.spot` vs `spot_price` | **str** | `"77446"` vs `"77447.8"` — see below |
+| `oi` / `oi_contracts` / `oi_value_usd` | **str** | `"9.9080"` / `"9908"` / `"768478.3512"` |
+| `price_band.lower_limit` / `upper_limit` | **str** | `"5.08984471"` / `"4077.19278685"` |
+| `strike_price` / `tick_size` | **str** | `"98000"` / `"0.100000000000000000"` |
+| `timestamp` | int | microseconds |
+
+Three IV fields plus a fourth, `mark_vol`, which shadows `mark_iv` without matching it —
+`"0.41570447"` against `"0.41569626"` in one snapshot. Five Greeks; no vanna, vomma or charm.
+
+**There is no expiry field.** **Measured**: `'expiry_date' in ticker` is `False` on every ticker.
+Expiry exists only as the `DDMMYY` symbol suffix, so `C-BTC-98000-301026` must be parsed to
+2026-10-30. Sort parsed dates, never the strings — as text, `30-10-2026` sorts after `27-11-2026`.
+
+**`spot_price` and `greeks.spot` disagree, and the gap is real.** **Measured** across 582 BTC
+option tickers in one response: **one** distinct `spot_price` against **18** distinct
+`greeks.spot` values spanning **15.10 USD**. The Greeks are not computed against a common spot.
+Anything netting Greeks across strikes or recovering a forward inherits that inconsistency. Use
+`spot_price`.
 
 ---
 
-## 6. Every timeout and limit
+## 6. Timeouts and limits
 
 | Limit | Value | Status |
 |---|---|---|
-| Rate-limit window | fixed 5 minutes, quota resets to full | **measured** — `/v2/rate_limits/quota` returned `remaining_time_in_milliseconds: 65826` |
+| Rate-limit window | fixed 5 minutes, quota resets whole | **measured** — `/v2/rate_limits/quota` |
 | Quota per window | 20000 | **documented, not observed** — see note |
-| Weight, public market data | 3 | **measured** — tickers, candles, orderbook, trades, assets, indices, settings, sparklines, rate_limits all cost exactly 3 |
-| Weight, order write / history / batch | 5 / 10 / 25 | **documented, not observed** (needs a key) |
-| 429 reset header | `X-RATE-LIMIT-RESET`, milliseconds until retry | **documented, not observed** |
-| Signature validity | 5 seconds from generation | **documented, not observed** |
-| Websocket connections | 150 per IP per 5 minutes; 429 on breach, wait 5–10 min | **documented, not observed** |
-| Websocket idle disconnect | disconnect "if there is no activity within 60 seconds after making connection" | **documented, not observed** |
-| Matching engine | 500 operations per second per product | **documented, not observed** |
-| `/v2/tickers/{symbol}` | max 10 comma-separated symbols | **documented**; 3 verified working |
-| `User-Agent` header | required | **measured** — omitting it returns HTTP 403 from CloudFront, not from Delta |
+| Weight, public market data | 3 | **measured** — tickers, candles, products, orderbook, trades all cost 3 |
+| Weight, order write / history / batch | 5 / 10 / 25 | **documented, not observed** |
+| 429 reset header | `X-RATE-LIMIT-RESET`, ms until retry | **documented, not observed** |
+| Signature validity | 5 seconds | **documented, not observed** |
+| Websocket connections | 150 per IP per 5 min | **documented, not observed** |
+| Websocket idle disconnect | 60s "after making connection" | **documented, not observed** |
+| Matching engine | 500 ops/sec/product | **documented, not observed** |
+| `/v2/tickers/{symbol}` | max 10 comma-separated symbols | **documented**; 3 verified |
+| `User-Agent` header | required | **measured** — omitting it returns 403 from CloudFront, as HTML, before the request reaches Delta |
 
-Three notes, and they matter for pacing:
+Three notes that matter for pacing a history pull:
 
-1. **The quota ceiling is unverified and the sources disagree.** Delta's docs today say
-   "Default Quota is 20000 for a fixed 5 minute window". The 2026-09-01 brief says 10000.
-   I did not trip a 429 to settle it: at weight 3, reaching even 10000 needs ~3300 requests,
-   which is a poor trade for one number. Budget against 10000 and you are safe either way.
-2. **`/v2/rate_limits/quota` answers without an API key**, though the docs list it under signed
-   endpoints. **Measured**: returns `{"current_quota": 318, "remaining_time_in_milliseconds":
-   65826}`. Meter yourself against it instead of discovering the ceiling by hitting it.
-3. **CloudFront serves repeats free.** **Measured**: a second identical `/v2/tickers/BTCUSD`
-   within the cache window cost **0 quota** (`Cache-Control: public, max-age=60`). Polling one
-   symbol faster than 60s buys you nothing and costs you nothing.
-
-**The websocket idle disconnect was not retested.** The earlier 75-second test that failed to
-reproduce it ran on testnet; this exercise was scoped to production REST, so the row above
-stays *documented, not observed*. Note the docs' wording is narrower than "idle timeout" — it
-says *after making connection*, which may only govern connections that never subscribe.
+1. **The quota ceiling is unverified and the sources disagree.** Delta's docs say 20000 per
+   window; an earlier note said 10000. Settling it means firing ~3300 requests to trip a 429 —
+   a poor trade. **Budget against 10000 and you are safe either way.**
+2. **`/v2/rate_limits/quota` answers without a key**, though documented as signed. **Measured**:
+   returns `current_quota` and `remaining_time_in_milliseconds`. Meter against it rather than
+   discovering the ceiling by hitting it. A long history pull should read it between batches.
+3. **CloudFront serves repeats free.** **Measured**: an identical request within the 60s cache
+   window cost **0 quota**. Retries of an identical request are free.
 
 ---
 
-## 7. What is free
+## 7. What is still missing
 
-**Measured** — every request below with no API key, no IP whitelisting, only a `User-Agent`:
+The history is real, but it is not the whole chain. Three gaps, and they are the reason the
+snapshotter still matters.
 
-| HTTP 200, no key | HTTP 401, key required |
-|---|---|
-| `/v2/products`, `/v2/products/{symbol}` | `/v2/wallet/balances` |
-| `/v2/tickers`, `/v2/tickers/{symbol}` | `/v2/orders` |
-| `/v2/history/candles`, `/v2/history/sparklines` | `/v2/positions/margined` |
-| `/v2/l2orderbook/{symbol}`, `/v2/trades/{symbol}` | `/v2/fills` |
-| `/v2/settings`, `/v2/assets`, `/v2/indices`, `/v2/rate_limits/quota` | `/v2/profile` |
+**No bid/ask history.** `MARK:` gives one price per bucket. There is no historical spread, so
+nothing here supports a transaction-cost model. A backtest using mark as its fill price is
+assuming a spread it cannot measure.
 
-**IP whitelisting: only trading keys need it.** Keys with Trading permission require whitelisted
-IPs; read-only keys do not (**documented, not observed** — no key was created for this work).
-Nothing in this document required a key at all.
+**No implied vol or Greeks history.** Those exist only on the live ticker. For history you must
+compute them yourself from mark, spot, strike and time to expiry — which is precisely what
+`payoff-project` already does for NIFTY, so the capability exists. Note the inverse settlement
+difference before reusing that code.
 
-**One quirk worth knowing.** **Measured**: `/v2/history/sparklines` ignores its `symbols`
-parameter. `?symbols=BTCUSD` and `?symbols=ETHUSD,MARK:BTCUSD` both return all **1263** live
-products. It is a cheap way to get a full-market snapshot and a useless way to get one symbol.
+**Untested: whether `MARK:` exists for a strike that never traded.** Every contract sampled here
+had trades. If Delta only publishes a mark series for contracts that traded, then the reconstructed
+chain is restricted to traded strikes and the surface has holes at the wings. **This is the single
+most valuable open question in this document** — it decides whether a reconstructed historical
+chain is complete or partial. One afternoon's work to answer.
+
+**What is free** — **measured**, every endpoint below with no API key, only a `User-Agent`:
+`/v2/products`, `/v2/products/{symbol}`, `/v2/tickers`, `/v2/tickers/{symbol}`,
+`/v2/history/candles`, `/v2/history/sparklines`, `/v2/l2orderbook/{symbol}`,
+`/v2/trades/{symbol}`, `/v2/settings`, `/v2/assets`, `/v2/indices`, `/v2/rate_limits/quota`.
+Wallet, orders, positions, fills and profile return 401. **Nothing in this document required a
+key.** IP whitelisting applies only to trading keys (**documented, not observed**).
+
+**One quirk.** **Measured**: `/v2/history/sparklines` ignores its `symbols` parameter and returns
+all 1263 live products regardless. A cheap full-market snapshot; a useless single-symbol lookup.
 
 ---
 
 ## 8. Is this data safe to backtest on?
 
-**Perps and index: yes, with two guards.** Drop every bar where `volume == 0`, and never set
-`end` beyond now. You get 978 days on `BTCUSD` from 2023-12-29 — enough to test a
-short-horizon perp strategy, not enough for a regime study.
+**Yes, with discipline.** Four rules, and all four are load-bearing:
 
-**Options: no.** Not with filters, not with care — and not because the contracts are short-lived.
-Their lifetimes are normal (section 1). It is that **no historical quote surface exists**. No
-endpoint returns the chain as it stood on a past date, so a backtest cannot establish what it
-would have entered at. What does exist is a trade log that is 98.5% padding at intraday
-resolution, keeps printing after expiry, keeps printing after a worthless settlement, and on the
-`MARK:` feed carries no `volume` field to filter on at all. There is no subset of this data that
-supports an options backtest.
+1. **`end = settlement_time`** for expired contracts, from `/v2/products/{symbol}`. Never `now`.
+2. **Terminal value from `settlement_index_price`**, never from the last candle — a worthless
+   option still prints its last trade, and the gap was 64.61 on the contract measured here.
+3. **Drop `volume == 0`** on trade candles anyway, as belt and braces. It is a no-op under rule
+   1 and it saves you when rule 1 is missed.
+4. **Page the expired-product cursor to exhaustion.** It is not ordered by date and its
+   `total_count` under-reports.
 
-Concretely, testing even a plain hold-to-expiry straddle needs three things: the chain on entry
-day, a mark for each day held, and the settlement. Delta supplies the settlement cleanly from
-`/v2/products`. It supplies the entry chain **only if you are standing there live**. The daily
-marks come back padded.
+**How far back: at least back to June 2024**, on the evidence here — a contract that expired
+2024-06-27 returns a complete hourly mark series. Enumeration was verified to 2026-05-16 with
+the cursor still running, so the practical limit was not found. **Six months is comfortably
+inside it.**
 
-**Can we get ten years? No.** The longest series of any kind on this API is 989 daily bars
-beginning 2023-12-18. Ten years is 3,653. The data does not exist at this venue.
+**What you get:** per contract, per day or hour — traded OHLCV, a mark price, and open interest.
+Plus a true settlement value. That supports entry and exit at traded prices, daily marking, and
+correct expiry accounting.
 
-**Will we need to buy history?** For anything before 2023-12-18, or for any option, yes —
-Delta cannot supply it. Whether a vendor sells clean Delta India option history is a question I
-could not answer from the API and did not test.
+**What you cannot do:** model spreads or slippage, use historical IV or Greeks without computing
+them, or — pending the open question in section 7 — rely on the wings of the reconstructed chain
+being populated.
 
-**What follows, and it is the only path.** The only trustworthy options history is history
-captured going forward, by snapshotting `/v2/tickers` on a schedule and storing every row with
-its fetch timestamp. Every day that passes without it is a day of surface that cannot be
-recovered later. **This document does not build that.** It is the prerequisite for every
-options question after this one, and it should be scoped as its own piece of work.
+**Should we buy history?** Less clear-cut than it looked. Delta supplies mark, OI and trades for
+free, back beyond two years. A vendor would be adding bid/ask, IV and completeness at the wings.
+Answer section 7's open question before paying for anything, because it decides how large the
+gap actually is.
+
+**Does the snapshotter still matter?** Yes, for the bid/ask and IV that history does not carry,
+and because the clock only runs forward on those. But it is no longer the *only* path to an
+options backtest, which is what an earlier version of this document claimed.
 
 ---
 
-## 9. Where I contradict the 2026-09-01 brief
+## 9. Corrections
 
-Four corrections. Everything else in the brief reproduced exactly.
+**This document's verdict was reversed on 2026-09-01.** An earlier version opened with *"do not
+backtest options on this API"* and stated the corruption could not be filtered out. That was
+wrong. The mechanism it described was correct; the conclusion drawn from it was not.
 
-1. **The expired-option series is not an options bug.** The brief framed it as expired option
-   symbols returning a series that should not exist. **Measured**: it is a generic zero-volume
-   carry-forward in the candle endpoint that also fabricates future-dated bars for `BTCUSD`,
-   pads live contracts mid-life, and corrupts `MARK:` and `OI:` series identically. Framing it
-   as an options problem understates the blast radius — a perp pipeline with `end = now + 1d`
-   is affected too.
-2. **The flatline value is the last traded price, not the settlement price.** They coincided on
-   `C-BTC-60000-270624` (1237.5586 = settlement intrinsic) which makes the mechanism look
-   deliberate. **Measured** on `C-BTC-60000-310726`: flatline 3912.0 against a settlement value
-   of 3847.39. It is a stale print, not a settlement record.
-3. **The docs' 2000-candle cap: the brief is right and I initially doubted it.** Delta's docs
-   do say "only upto 2000 candles maximum in a response". **Measured** cap is 4000, and 4001
-   when `end` aligns to a bucket boundary.
-4. **The rate-limit quota may be 20000, not 10000.** Delta's docs today state 20000 for a fixed
-   5-minute window. Neither figure is verified. Budget against 10000.
+The rule as written — *the response runs from the first real trade through `end`* — already
+implies that moving `end` back to settlement leaves no room for padding. Nobody drew that
+inference, because every probe had `end = now` hard-coded, including the verification. The
+measurements above were run specifically to test the inference and it held on every contract,
+including one from 2024.
 
-Counts drift with the clock, not with disagreement: BTC live calls read 298 here against the
-brief's 295, four hours later; the expiry dates are identical.
+**Earlier claims, corrected:**
 
-### A fifth correction, to this document
+1. **"Options have no history worth the name — days."** Wrong. Lifetimes run to 91 days;
+   `C-BTC-98000-271126` was listed 2026-08-28 for a 2026-11-27 settlement. This came from
+   reading *this contract is seven days old* as *options only live for days*.
+2. **"Not with filters, not with care."** Wrong. One parameter fixes it entirely.
+3. **"`MARK:` is corrupted identically and cannot be filtered."** True only under `end = now`.
+   Under `end = settlement` it is the cleanest series available — 64 of 64 bars distinct.
+4. **"The flatline is the settlement price."** It is the last traded price. They coincided on
+   the first contract examined, which made the mechanism look deliberate.
+5. **"Buying history will not fix options."** Overstated, and it contradicted this document's own
+   section 8. Delta cannot sell a bid/ask or IV surface it never stored; a vendor who captured
+   the chain themselves might have one. Untested.
 
-**Added 2026-09-01, after review.** The first version of section 1 claimed *"options have no
-history worth the name"* and answered the depth question with *"days"*. That was wrong, and it
-was wrong in a way that would have misled a reader into blaming the wrong thing.
-
-**Measured**, `GET /v2/products/{symbol}`: `C-BTC-98000-271126` was listed 2026-08-28 and settles
-2026-11-27 — a **91-day** life. `C-BTC-90000-301026` gets 70 days. Delta runs a weekly-and-monthly
-ladder and its far expiries have roughly the lifetime of a NIFTY monthly.
-
-The original claim came from reading *"this contract has 4 daily bars"* as a statement about
-option lifetimes, when it was a statement about the contract being 7 days old at the time of
-measurement. A contract expiring in 87 days had not yet lived its 91 days.
-
-This matters because it changes the argument. Options expiring is not a defect — it is how
-options work everywhere. The defect is narrower and worse: Delta records **trades**, options
-mostly **do not trade** (`C-BTC-60000-270624`: 54 real minutes out of 3636), and the untraded
-buckets are filled with fabricated prices rather than left empty. What a backtest needs on a
-no-trade day is the **mark and the IV**, and that surface is never stored at all.
+Counts drift with the clock, not with disagreement: BTC live calls read 298 here against 295 in
+an earlier brief four hours prior; the expiry dates are identical.
 
 ## Reproducing
 
 ```
 python tools/probe_api.py all              # everything, ~3 minutes, 116 requests
-python tools/probe_api.py expired          # just section 2
-python tools/probe_api.py depth cap --fast # sections 1 and 3, 0.4s pacing
+python tools/probe_api.py expired          # the padding sections
+python tools/probe_api.py depth cap --fast # 0.4s pacing
 ```
 
-Standard library only, no API key, no dependencies, read-only. `--slow` (1.5s between
-requests) is the default and will not get anyone rate-limited; the run above used
-`--sleep 1.0` and consumed 318 of the window's quota.
+Standard library only, no API key, read-only. `--slow` (1.5s) is the default and will not get
+anyone rate-limited.
+
+**Note:** `probe_api.py` predates the `end = settlement` finding and still probes with
+`end = now`. Its measurements are correct for what they measure, but it does not yet demonstrate
+the fix. Updating it is the obvious next change.
