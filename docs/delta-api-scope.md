@@ -3,9 +3,12 @@
 **Verdict: do not backtest options on this API.** Every historical option series is padded
 with fabricated prices — bars that keep printing after the contract expired, after the
 settlement that made it worthless, and (for live symbols) into dates that have not happened
-yet. **Perp history is 978 daily bars, not ten years.** Buying history will not fix options,
-because the venue never published a clean series to sell; the only trustworthy option history
-is history captured going forward.
+yet. **Perp history is 978 daily bars, not ten years.** The blocker is not that options expire —
+their lifetimes here are normal, up to 91 days. It is that **no historical quote surface exists**:
+no endpoint returns the chain as it stood on a past date, only a trade log with the gaps filled
+in. Delta's own API cannot sell you that surface, because it never stored it. A third-party
+vendor who snapshotted the chain themselves might have it — untested, see section 8. Failing
+that, the only trustworthy option history is history captured going forward.
 
 ## Do this next
 
@@ -50,13 +53,37 @@ resolution only changes how many bars fit in one response (section 3).
 1263 live products, of which 493 call options, 475 put options, 27 perpetual futures, 5
 `move_options`. Zero `futures`. There is no dated-futures history to assess.
 
-**Options have no history worth the name.** An option series runs from its listing date to its
-expiry, and Delta lists strikes days before expiry, not months. **Measured**: `C-BTC-75200-020926`
-(expires in 1 day) returns 2 daily bars; `C-BTC-98000-271126` (expires in 87 days) returns 4.
-The furthest-dated live BTC call was launched 2026-08-25 — seven days before this measurement.
+**Options: the contract lifetimes are normal. The problem is elsewhere.** An option series runs
+from its listing date to its expiry, and that is true at every venue — a contract being born and
+dying is how options work, not a defect. **Measured**, `GET /v2/products/{symbol}`:
 
-So the honest answer to "how far back per contract type" for options is: **days**, and then
-section 2 explains why even those days are not what they look like.
+| Contract | Listed | Settles | Life |
+|---|---|---|---:|
+| `C-BTC-98000-271126` | 2026-08-28 | 2026-11-27 | **91 days** |
+| `C-BTC-90000-301026` | 2026-08-21 | 2026-10-30 | **70 days** |
+| `C-BTC-77600-040926` | 2026-09-01 | 2026-09-04 | 3 days |
+| `C-BTC-60000-270624` | 2024-06-24 | 2024-06-27 | 3 days |
+
+Delta runs a weekly-and-monthly ladder: the near expiries live days, the far ones roughly three
+months — the same shape as a NIFTY monthly. So "the series are too short" is **not** the finding,
+and an earlier draft of this document said so wrongly. It reached that by confusing *this
+contract is only seven days old right now* with *options here only live for days*.
+
+**The real limitation is that Delta records trades, and options mostly do not trade.**
+**Measured**: `C-BTC-60000-270624` existed for 3 days and contains **54 minutes with a real
+trade out of 3636** — it traded in 1.25% of the minutes it was alive. That is ordinary for a
+strike away from the money and is not Delta's fault.
+
+But a backtest still has to know what those strikes were **worth** on the days nothing traded:
+the mark and the implied vol are what a position is valued at, margined on, and closed at.
+*Nobody traded it* is not *it had no value*. `/v2/history/candles` carries trades only, and then
+fills the silence with a copy of the last trade without saying so — which is section 2.
+
+**So the honest answer for options is not a number of days. It is that no historical quote
+surface exists at all.** No endpoint returns the chain as it stood on a past date; there is only
+a trade log with the gaps filled in. That is the difference between this API and a commercial
+options dataset, which stores the whole chain per day — every strike, with mark, IV, Greeks and
+open interest, whether or not it traded — because the quote surface *is* the product.
 
 ---
 
@@ -318,10 +345,18 @@ products. It is a cheap way to get a full-market snapshot and a useless way to g
 `end` beyond now. You get 978 days on `BTCUSD` from 2023-12-29 — enough to test a
 short-horizon perp strategy, not enough for a regime study.
 
-**Options: no.** Not with filters, not with care. The series that exist are days long, are
-98.5% padding at intraday resolution, keep printing after expiry, keep printing after a
-worthless settlement, and on the `MARK:` feed carry no `volume` field to filter on at all.
-There is no subset of this data that supports an options backtest.
+**Options: no.** Not with filters, not with care — and not because the contracts are short-lived.
+Their lifetimes are normal (section 1). It is that **no historical quote surface exists**. No
+endpoint returns the chain as it stood on a past date, so a backtest cannot establish what it
+would have entered at. What does exist is a trade log that is 98.5% padding at intraday
+resolution, keeps printing after expiry, keeps printing after a worthless settlement, and on the
+`MARK:` feed carries no `volume` field to filter on at all. There is no subset of this data that
+supports an options backtest.
+
+Concretely, testing even a plain hold-to-expiry straddle needs three things: the chain on entry
+day, a mark for each day held, and the settlement. Delta supplies the settlement cleanly from
+`/v2/products`. It supplies the entry chain **only if you are standing there live**. The daily
+marks come back padded.
 
 **Can we get ten years? No.** The longest series of any kind on this API is 989 daily bars
 beginning 2023-12-18. Ten years is 3,653. The data does not exist at this venue.
@@ -360,6 +395,26 @@ Four corrections. Everything else in the brief reproduced exactly.
 
 Counts drift with the clock, not with disagreement: BTC live calls read 298 here against the
 brief's 295, four hours later; the expiry dates are identical.
+
+### A fifth correction, to this document
+
+**Added 2026-09-01, after review.** The first version of section 1 claimed *"options have no
+history worth the name"* and answered the depth question with *"days"*. That was wrong, and it
+was wrong in a way that would have misled a reader into blaming the wrong thing.
+
+**Measured**, `GET /v2/products/{symbol}`: `C-BTC-98000-271126` was listed 2026-08-28 and settles
+2026-11-27 — a **91-day** life. `C-BTC-90000-301026` gets 70 days. Delta runs a weekly-and-monthly
+ladder and its far expiries have roughly the lifetime of a NIFTY monthly.
+
+The original claim came from reading *"this contract has 4 daily bars"* as a statement about
+option lifetimes, when it was a statement about the contract being 7 days old at the time of
+measurement. A contract expiring in 87 days had not yet lived its 91 days.
+
+This matters because it changes the argument. Options expiring is not a defect — it is how
+options work everywhere. The defect is narrower and worse: Delta records **trades**, options
+mostly **do not trade** (`C-BTC-60000-270624`: 54 real minutes out of 3636), and the untraded
+buckets are filled with fabricated prices rather than left empty. What a backtest needs on a
+no-trade day is the **mark and the IV**, and that surface is never stored at all.
 
 ## Reproducing
 
