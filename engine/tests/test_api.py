@@ -93,6 +93,12 @@ def test_chain_endpoint(make_client, chain_tickers) -> None:
     assert set(row["put"]) == {
         "symbol", "product_id", "bid", "ask", "mark", "bid_iv", "ask_iv", "mark_iv",
         "delta", "gamma", "theta", "vega", "rho", "oi", "oi_value_usd", "tick_size",
+        # Ours, added beside Delta's rather than replacing any of them. Every name
+        # above is still the venue's own figure.
+        "computed",
+    }
+    assert set(row["put"]["computed"]) == {
+        "iv", "iv_leg", "iv_reason", "delta", "gamma", "vega", "theta", "rho",
     }
 
 

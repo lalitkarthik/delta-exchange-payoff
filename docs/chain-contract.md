@@ -30,6 +30,10 @@ no reformatting anywhere in the stack.
   "spot": 77543.0,
   "atm_strike": 77500.0,
   "fetched_at": "2026-09-01T09:21:04Z",
+  "forward": 77609.4,
+  "discount": 0.99961,
+  "years_to_expiry": 0.008522,
+  "forward_method": "F1",
   "rows": [
     { "strike": 77000.0, "call": { }, "put": { } }
   ]
@@ -38,6 +42,17 @@ no reformatting anywhere in the stack.
 
 `rows` is ascending by strike. `atm_strike` is the listed strike closest to `spot` — a lookup,
 not a model. Either side of a row may be `null` when only one of the pair is listed.
+
+`forward` is **recovered from prices**, not assumed: an ordinary least-squares fit of `C - P`
+against `K` across every paired strike, whose slope is `-D` and whose zero crossing is `F`.
+`forward_method` names it — `F1` is that regression. `years_to_expiry` is ACT/365, and it is
+the clock both the volatility and the Greeks below are quoted on.
+
+**All four are `null` together when the fit is refused**, and then no leg carries a computed
+volatility either. A fit is refused below five paired strikes, or when the implied rate lands
+outside `(0%, 30%)` — a negative rate or an implausible one means the prices are not a parity
+line, and pricing a whole chain against a forward we do not believe would produce a ladder of
+plausible, uniformly wrong numbers with nothing to signal it.
 
 ### A leg
 
@@ -58,9 +73,54 @@ not a model. Either side of a row may be `null` when only one of the pair is lis
   "rho": 12.9,
   "oi": 148.0,
   "oi_value_usd": 1150400.0,
-  "tick_size": 0.5
+  "tick_size": 0.5,
+  "computed": {
+    "iv": 0.3712,
+    "iv_leg": "call",
+    "iv_reason": "",
+    "delta": 0.5231,
+    "gamma": 0.0000312,
+    "vega": 0.4118,
+    "theta": -66.58,
+    "rho": 0.1290
+  }
 }
 ```
+
+Everything outside `computed` is **Delta's own figure, passed through untouched**. Everything
+inside `computed` is ours. The two sit side by side on purpose: Delta republishes its
+volatility every 5,001 ms while the book beneath it moves every 508 ms, so ours is up to 9.8x
+fresher, and the comparison is only possible while both are present. **Ours are added, never
+substituted.**
+
+### `computed`
+
+`iv` is a property of the **strike**, not of the leg. Put-call parity gives both legs one
+volatility, and it is recovered by inverting the **out-of-the-money** leg's bid/ask midpoint —
+calls above the forward, puts below — because that leg holds no intrinsic value, so its whole
+price is time value and its vega is largest. The same number therefore appears on both legs of
+a row, and `iv_leg` names the side it came from so the repetition cannot be read as two
+independent solves.
+
+`iv_reason` is empty when solved and otherwise says why not. **`iv` is `null` and never `0`**,
+and a leg with no volatility carries no Greeks either: reporting Greeks at some default
+volatility would put five plausible numbers on screen that describe nothing.
+
+**The Greek conventions are not all textbook.** They are carried unchanged from the sibling
+project's implementation, which is graded against its platform's own Greeks to 2.2e-16 on delta:
+
+| `delta`, `gamma` | **undiscounted** — delta is bounded by `[0, 1]`, not `[0, D]` |
+| `vega`, `rho` | discounted, and quoted **per one percent** |
+| `theta` | a **one-calendar-day repricing**, not the analytic derivative |
+
+The asymmetry is the sibling platform's rather than ours, and it is kept so one implementation
+serves both projects. `delta` is with respect to the **forward**; Delta's own `delta` above is
+with respect to **spot**, so the two are recorded side by side and not graded against each
+other.
+
+**Theta is one calendar day.** The sibling runs a 252-trading-day year in which nothing decays
+at weekends, which is right for an index that closes and wrong here — crypto trades every day
+and this venue lists weekend expiries. Measured: a 1/252 step overstates theta by **1.456x**.
 
 ## Rules that are not negotiable
 

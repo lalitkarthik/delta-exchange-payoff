@@ -1,207 +1,307 @@
 {
   "underlying": "BTC",
   "expiry": "04-09-2026",
-  "spot": 77543,
-  "atm_strike": 77500,
+  "spot": 77543.0,
+  "atm_strike": 77500.0,
   "fetched_at": "2026-09-01T09:21:04Z",
   "rows": [
     {
-      "strike": 70000,
+      "strike": 70000.0,
       "call": {
         "symbol": "C-BTC-70000-040926",
         "product_id": 138700,
-        "bid": 7483,
-        "ask": 7665,
-        "mark": 7574,
-        "bid_iv": 0.000005,
+        "bid": 7483.0,
+        "ask": 7665.0,
+        "mark": 7574.0,
+        "bid_iv": 5e-06,
         "ask_iv": 0.5675,
         "mark_iv": 0.5615,
         "delta": 0.9791,
-        "gamma": 0.0000127,
-        "theta": -33,
+        "gamma": 1.27e-05,
+        "theta": -33.0,
         "vega": 3.53,
         "rho": 5.62,
         "oi": 6.1,
         "oi_value_usd": 46201.4,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-70000-040926",
         "product_id": 138701,
         "bid": null,
         "ask": 33.5,
-        "mark": 31,
+        "mark": 31.0,
         "bid_iv": null,
         "ask_iv": 0.5675,
         "mark_iv": 0.5615,
         "delta": -0.0209,
-        "gamma": 0.0000127,
-        "theta": -33,
+        "gamma": 1.27e-05,
+        "theta": -33.0,
         "vega": 3.53,
         "rho": -0.14,
-        "oi": 0,
-        "oi_value_usd": 0,
-        "tick_size": 0.5
+        "oi": 0.0,
+        "oi_value_usd": 0.0,
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 71000,
+      "strike": 71000.0,
       "call": {
         "symbol": "C-BTC-71000-040926",
         "product_id": 138702,
         "bid": 6507.5,
         "ask": 6665.5,
         "mark": 6586.5,
-        "bid_iv": 0.000005,
+        "bid_iv": 5e-06,
         "ask_iv": 0.5297,
         "mark_iv": 0.5237,
         "delta": 0.97,
-        "gamma": 0.0000185,
+        "gamma": 1.85e-05,
         "theta": -41.8,
         "vega": 4.79,
         "rho": 5.64,
         "oi": 6.7,
         "oi_value_usd": 44129.6,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-71000-040926",
         "product_id": 138703,
-        "bid": 41,
-        "ask": 46,
+        "bid": 41.0,
+        "ask": 46.0,
         "mark": 43.5,
         "bid_iv": 0.5177,
         "ask_iv": 0.5297,
         "mark_iv": 0.5237,
         "delta": -0.03,
-        "gamma": 0.0000185,
+        "gamma": 1.85e-05,
         "theta": -41.8,
         "vega": 4.79,
         "rho": -0.19,
         "oi": 6.7,
         "oi_value_usd": 291.4,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 72000,
+      "strike": 72000.0,
       "call": {
         "symbol": "C-BTC-72000-040926",
         "product_id": 138704,
-        "bid": 5541,
+        "bid": 5541.0,
         "ask": 5675.5,
         "mark": 5608.5,
         "bid_iv": 0.484,
         "ask_iv": 0.496,
         "mark_iv": 0.49,
         "delta": 0.9547,
-        "gamma": 0.0000277,
+        "gamma": 2.77e-05,
         "theta": -54.7,
         "vega": 6.7,
         "rho": 5.62,
         "oi": 10.7,
         "oi_value_usd": 60010.9,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-72000-040926",
         "product_id": 138705,
-        "bid": 63,
-        "ask": 68,
+        "bid": 63.0,
+        "ask": 68.0,
         "mark": 65.5,
         "bid_iv": 0.484,
         "ask_iv": 0.496,
         "mark_iv": 0.49,
         "delta": -0.0453,
-        "gamma": 0.0000277,
+        "gamma": 2.77e-05,
         "theta": -54.7,
         "vega": 6.7,
         "rho": -0.29,
         "oi": 10.7,
         "oi_value_usd": 700.8,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 73000,
+      "strike": 73000.0,
       "call": {
         "symbol": "C-BTC-73000-040926",
         "product_id": 138706,
-        "bid": 4591,
+        "bid": 4591.0,
         "ask": 4702.5,
         "mark": 4646.5,
         "bid_iv": 0.4542,
         "ask_iv": 0.4662,
         "mark_iv": 0.4602,
         "delta": 0.929,
-        "gamma": 0.000042,
+        "gamma": 4.2e-05,
         "theta": -73.2,
         "vega": 9.55,
         "rho": 5.54,
         "oi": 27.4,
         "oi_value_usd": 127314.1,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-73000-040926",
         "product_id": 138707,
-        "bid": 101,
-        "ask": 106,
+        "bid": 101.0,
+        "ask": 106.0,
         "mark": 103.5,
         "bid_iv": 0.4542,
         "ask_iv": 0.4662,
         "mark_iv": 0.4602,
         "delta": -0.071,
-        "gamma": 0.000042,
+        "gamma": 4.2e-05,
         "theta": -73.2,
         "vega": 9.55,
         "rho": -0.46,
         "oi": 27.4,
         "oi_value_usd": 2835.9,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 74000,
+      "strike": 74000.0,
       "call": {
         "symbol": "C-BTC-74000-040926",
         "product_id": 138708,
         "bid": 3669.5,
-        "ask": 3759,
+        "ask": 3759.0,
         "mark": 3714.5,
         "bid_iv": 0.4281,
         "ask_iv": 0.4401,
         "mark_iv": 0.4341,
         "delta": 0.8865,
-        "gamma": 0.000063,
+        "gamma": 6.3e-05,
         "theta": -97.8,
         "vega": 13.52,
         "rho": 5.34,
         "oi": 76.4,
         "oi_value_usd": 283787.8,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-74000-040926",
         "product_id": 138709,
-        "bid": 169,
-        "ask": 174,
+        "bid": 169.0,
+        "ask": 174.0,
         "mark": 171.5,
         "bid_iv": 0.4281,
         "ask_iv": 0.4401,
         "mark_iv": 0.4341,
         "delta": -0.1135,
-        "gamma": 0.000063,
+        "gamma": 6.3e-05,
         "theta": -97.8,
         "vega": 13.52,
         "rho": -0.74,
         "oi": 76.4,
         "oi_value_usd": 13102.6,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 75000,
+      "strike": 75000.0,
       "call": {
         "symbol": "C-BTC-75000-040926",
         "product_id": 138710,
@@ -212,35 +312,55 @@
         "ask_iv": 0.4177,
         "mark_iv": 0.4117,
         "delta": 0.8191,
-        "gamma": 0.0000909,
-        "theta": -127,
+        "gamma": 9.09e-05,
+        "theta": -127.0,
         "vega": 18.5,
         "rho": 4.99,
         "oi": 175.5,
         "oi_value_usd": 497103.8,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-75000-040926",
         "product_id": 138711,
-        "bid": 286,
-        "ask": 293,
+        "bid": 286.0,
+        "ask": 293.0,
         "mark": 289.5,
         "bid_iv": 0.4057,
         "ask_iv": 0.4177,
         "mark_iv": 0.4117,
         "delta": -0.1809,
-        "gamma": 0.0000909,
-        "theta": -127,
+        "gamma": 9.09e-05,
+        "theta": -127.0,
         "vega": 18.5,
         "rho": -1.18,
         "oi": 175.5,
         "oi_value_usd": 50807.3,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 75500,
+      "strike": 75500.0,
       "call": {
         "symbol": "C-BTC-75500-040926",
         "product_id": 138712,
@@ -257,13 +377,23 @@
         "rho": 4.73,
         "oi": 240.7,
         "oi_value_usd": 582373.7,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-75500-040926",
         "product_id": 138713,
-        "bid": 372,
-        "ask": 381,
+        "bid": 372.0,
+        "ask": 381.0,
         "mark": 376.5,
         "bid_iv": 0.3958,
         "ask_iv": 0.4078,
@@ -275,17 +405,27 @@
         "rho": -1.47,
         "oi": 240.7,
         "oi_value_usd": 90623.6,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 76000,
+      "strike": 76000.0,
       "call": {
         "symbol": "C-BTC-76000-040926",
         "product_id": 138714,
-        "bid": 2007,
+        "bid": 2007.0,
         "ask": 2055.5,
-        "mark": 2031,
+        "mark": 2031.0,
         "bid_iv": 0.3867,
         "ask_iv": 0.3987,
         "mark_iv": 0.3927,
@@ -294,16 +434,26 @@
         "theta": -154.9,
         "vega": 23.67,
         "rho": 4.42,
-        "oi": 308,
-        "oi_value_usd": 625548,
-        "tick_size": 0.5
+        "oi": 308.0,
+        "oi_value_usd": 625548.0,
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-76000-040926",
         "product_id": 138715,
         "bid": 482.5,
-        "ask": 494,
-        "mark": 488,
+        "ask": 494.0,
+        "mark": 488.0,
         "bid_iv": 0.3867,
         "ask_iv": 0.3987,
         "mark_iv": 0.3927,
@@ -312,13 +462,23 @@
         "theta": -154.9,
         "vega": 23.67,
         "rho": -1.83,
-        "oi": 308,
-        "oi_value_usd": 150304,
-        "tick_size": 0.5
+        "oi": 308.0,
+        "oi_value_usd": 150304.0,
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 76500,
+      "strike": 76500.0,
       "call": {
         "symbol": "C-BTC-76500-040926",
         "product_id": 138716,
@@ -334,14 +494,24 @@
         "vega": 25.83,
         "rho": 4.05,
         "oi": 367.6,
-        "oi_value_usd": 614811,
-        "tick_size": 0.5
+        "oi_value_usd": 614811.0,
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-76500-040926",
         "product_id": 138717,
-        "bid": 622,
-        "ask": 637,
+        "bid": 622.0,
+        "ask": 637.0,
         "mark": 629.5,
         "bid_iv": 0.3785,
         "ask_iv": 0.3905,
@@ -353,55 +523,85 @@
         "rho": -2.23,
         "oi": 367.6,
         "oi_value_usd": 231404.2,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 77000,
+      "strike": 77000.0,
       "call": {
         "symbol": "C-BTC-77000-040926",
         "product_id": 138718,
         "bid": 1331.5,
-        "ask": 1364,
+        "ask": 1364.0,
         "mark": 1347.5,
         "bid_iv": 0.3711,
         "ask_iv": 0.3831,
         "mark_iv": 0.3771,
         "delta": 0.5881,
         "gamma": 0.000147,
-        "theta": -172,
+        "theta": -172.0,
         "vega": 27.36,
         "rho": 3.64,
         "oi": 409.4,
         "oi_value_usd": 551666.5,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-77000-040926",
         "product_id": 138719,
-        "bid": 795,
-        "ask": 814,
+        "bid": 795.0,
+        "ask": 814.0,
         "mark": 804.5,
         "bid_iv": 0.3711,
         "ask_iv": 0.3831,
         "mark_iv": 0.3771,
         "delta": -0.4119,
         "gamma": 0.000147,
-        "theta": -172,
+        "theta": -172.0,
         "vega": 27.36,
         "rho": -2.69,
         "oi": 409.4,
         "oi_value_usd": 329362.3,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 77500,
+      "strike": 77500.0,
       "call": {
         "symbol": "C-BTC-77500-040926",
         "product_id": 138720,
-        "bid": 1048,
-        "ask": 1073,
+        "bid": 1048.0,
+        "ask": 1073.0,
         "mark": 1060.5,
         "bid_iv": 0.3645,
         "ask_iv": 0.3765,
@@ -413,7 +613,17 @@
         "rho": 3.18,
         "oi": 425.9,
         "oi_value_usd": 451666.9,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-77500-040926",
@@ -431,17 +641,27 @@
         "rho": -3.19,
         "oi": 425.9,
         "oi_value_usd": 433353.3,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 78000,
+      "strike": 78000.0,
       "call": {
         "symbol": "C-BTC-78000-040926",
         "product_id": 138722,
-        "bid": 828,
-        "ask": 848,
-        "mark": 838,
+        "bid": 828.0,
+        "ask": 848.0,
+        "mark": 838.0,
         "bid_iv": 0.3675,
         "ask_iv": 0.3795,
         "mark_iv": 0.3735,
@@ -452,14 +672,24 @@
         "rho": 2.72,
         "oi": 414.3,
         "oi_value_usd": 347183.4,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-78000-040926",
         "product_id": 138723,
         "bid": 1279.5,
         "ask": 1310.5,
-        "mark": 1295,
+        "mark": 1295.0,
         "bid_iv": 0.3675,
         "ask_iv": 0.3795,
         "mark_iv": 0.3735,
@@ -470,17 +700,27 @@
         "rho": -3.69,
         "oi": 414.3,
         "oi_value_usd": 536518.5,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 78500,
+      "strike": 78500.0,
       "call": {
         "symbol": "C-BTC-78500-040926",
         "product_id": 138724,
-        "bid": 648,
-        "ask": 664,
-        "mark": 656,
+        "bid": 648.0,
+        "ask": 664.0,
+        "mark": 656.0,
         "bid_iv": 0.3721,
         "ask_iv": 0.3841,
         "mark_iv": 0.3781,
@@ -490,15 +730,25 @@
         "vega": 26.46,
         "rho": 2.28,
         "oi": 377.5,
-        "oi_value_usd": 247640,
-        "tick_size": 0.5
+        "oi_value_usd": 247640.0,
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-78500-040926",
         "product_id": 138725,
         "bid": 1593.5,
         "ask": 1632.5,
-        "mark": 1613,
+        "mark": 1613.0,
         "bid_iv": 0.3721,
         "ask_iv": 0.3841,
         "mark_iv": 0.3781,
@@ -509,16 +759,26 @@
         "rho": -4.17,
         "oi": 377.5,
         "oi_value_usd": 608907.5,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 79000,
+      "strike": 79000.0,
       "call": {
         "symbol": "C-BTC-79000-040926",
         "product_id": 138726,
         "bid": 502.5,
-        "ask": 515,
+        "ask": 515.0,
         "mark": 508.5,
         "bid_iv": 0.3774,
         "ask_iv": 0.3894,
@@ -530,12 +790,22 @@
         "rho": 1.88,
         "oi": 322.5,
         "oi_value_usd": 163991.3,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-79000-040926",
         "product_id": 138727,
-        "bid": 1942,
+        "bid": 1942.0,
         "ask": 1989.5,
         "mark": 1965.5,
         "bid_iv": 0.3774,
@@ -548,17 +818,27 @@
         "rho": -4.61,
         "oi": 322.5,
         "oi_value_usd": 633873.8,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 79500,
+      "strike": 79500.0,
       "call": {
         "symbol": "C-BTC-79500-040926",
         "product_id": 138728,
-        "bid": 387,
+        "bid": 387.0,
         "ask": 396.5,
-        "mark": 392,
+        "mark": 392.0,
         "bid_iv": 0.3833,
         "ask_iv": 0.3953,
         "mark_iv": 0.3893,
@@ -569,14 +849,24 @@
         "rho": 1.53,
         "oi": 258.9,
         "oi_value_usd": 101488.8,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-79500-040926",
         "product_id": 138729,
         "bid": 2320.5,
-        "ask": 2377,
-        "mark": 2349,
+        "ask": 2377.0,
+        "mark": 2349.0,
         "bid_iv": 0.3833,
         "ask_iv": 0.3953,
         "mark_iv": 0.3893,
@@ -584,31 +874,51 @@
         "gamma": 0.000115,
         "theta": -143.6,
         "vega": 22.13,
-        "rho": -5,
+        "rho": -5.0,
         "oi": 258.9,
         "oi_value_usd": 608156.1,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 80000,
+      "strike": 80000.0,
       "call": {
         "symbol": "C-BTC-80000-040926",
         "product_id": 138730,
         "bid": 296.5,
-        "ask": 304,
+        "ask": 304.0,
         "mark": 300.5,
         "bid_iv": 0.3899,
         "ask_iv": 0.4019,
         "mark_iv": 0.3959,
         "delta": 0.1973,
-        "gamma": 0.0000998,
+        "gamma": 9.98e-05,
         "theta": -128.8,
         "vega": 19.52,
         "rho": 1.23,
         "oi": 195.8,
         "oi_value_usd": 58837.9,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-80000-040926",
@@ -620,119 +930,179 @@
         "ask_iv": 0.4019,
         "mark_iv": 0.3959,
         "delta": -0.8027,
-        "gamma": 0.0000998,
+        "gamma": 9.98e-05,
         "theta": -128.8,
         "vega": 19.52,
         "rho": -5.34,
         "oi": 195.8,
         "oi_value_usd": 539918.5,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 81000,
+      "strike": 81000.0,
       "call": {
         "symbol": "C-BTC-81000-040926",
         "product_id": 138732,
         "bid": 173.5,
         "ask": 178.5,
-        "mark": 176,
+        "mark": 176.0,
         "bid_iv": 0.4051,
         "ask_iv": 0.4171,
         "mark_iv": 0.4111,
         "delta": 0.1247,
-        "gamma": 0.0000711,
-        "theta": -99,
+        "gamma": 7.11e-05,
+        "theta": -99.0,
         "vega": 14.45,
         "rho": 0.78,
         "oi": 94.9,
         "oi_value_usd": 16702.4,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-81000-040926",
         "product_id": 138733,
         "bid": 3589.5,
         "ask": 3676.5,
-        "mark": 3633,
+        "mark": 3633.0,
         "bid_iv": 0.4051,
         "ask_iv": 0.4171,
         "mark_iv": 0.4111,
         "delta": -0.8753,
-        "gamma": 0.0000711,
-        "theta": -99,
+        "gamma": 7.11e-05,
+        "theta": -99.0,
         "vega": 14.45,
         "rho": -5.88,
         "oi": 94.9,
         "oi_value_usd": 344771.7,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 82000,
+      "strike": 82000.0,
       "call": {
         "symbol": "C-BTC-82000-040926",
         "product_id": 138734,
-        "bid": 102,
-        "ask": 107,
+        "bid": 102.0,
+        "ask": 107.0,
         "mark": 104.5,
         "bid_iv": 0.4228,
         "ask_iv": 0.4348,
         "mark_iv": 0.4288,
         "delta": 0.0781,
-        "gamma": 0.0000484,
+        "gamma": 4.84e-05,
         "theta": -73.3,
         "vega": 10.26,
         "rho": 0.49,
         "oi": 38.8,
         "oi_value_usd": 4054.6,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-82000-040926",
         "product_id": 138735,
-        "bid": 4507,
+        "bid": 4507.0,
         "ask": 4616.5,
         "mark": 4561.5,
         "bid_iv": 0.4228,
         "ask_iv": 0.4348,
         "mark_iv": 0.4288,
         "delta": -0.9219,
-        "gamma": 0.0000484,
+        "gamma": 4.84e-05,
         "theta": -73.3,
         "vega": 10.26,
         "rho": -6.25,
         "oi": 38.8,
         "oi_value_usd": 176986.2,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 84000,
+      "strike": 84000.0,
       "call": {
         "symbol": "C-BTC-84000-040926",
         "product_id": 138736,
         "bid": 38.5,
         "ask": 43.5,
-        "mark": 41,
+        "mark": 41.0,
         "bid_iv": 0.4656,
         "ask_iv": 0.4776,
         "mark_iv": 0.4716,
         "delta": 0.0322,
-        "gamma": 0.0000218,
+        "gamma": 2.18e-05,
         "theta": -39.9,
         "vega": 5.07,
         "rho": 0.2,
         "oi": 8.3,
         "oi_value_usd": 340.3,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": {
         "symbol": "P-BTC-84000-040926",
         "product_id": 138737,
-        "bid": 6420,
-        "ask": 6576,
-        "mark": 6498,
+        "bid": 6420.0,
+        "ask": 6576.0,
+        "mark": 6498.0,
         "bid_iv": null,
         "ask_iv": null,
         "mark_iv": null,
@@ -743,30 +1113,54 @@
         "rho": null,
         "oi": 8.3,
         "oi_value_usd": 53933.4,
-        "tick_size": 0.5
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       }
     },
     {
-      "strike": 86000,
+      "strike": 86000.0,
       "call": {
         "symbol": "C-BTC-86000-040926",
         "product_id": 138738,
         "bid": null,
         "ask": 22.5,
-        "mark": 20,
+        "mark": 20.0,
         "bid_iv": null,
         "ask_iv": 0.5294,
         "mark_iv": 0.5234,
         "delta": 0.0155,
-        "gamma": 0.0000106,
+        "gamma": 1.06e-05,
         "theta": -23.8,
         "vega": 2.73,
         "rho": 0.1,
-        "oi": 0,
-        "oi_value_usd": 0,
-        "tick_size": 0.5
+        "oi": 0.0,
+        "oi_value_usd": 0.0,
+        "tick_size": 0.5,
+        "computed": {
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "the forward could not be fitted from this chain",
+          "delta": null,
+          "gamma": null,
+          "vega": null,
+          "theta": null,
+          "rho": null
+        }
       },
       "put": null
     }
-  ]
+  ],
+  "forward": null,
+  "discount": null,
+  "years_to_expiry": 0.00852156265854896,
+  "forward_method": "F1"
 }

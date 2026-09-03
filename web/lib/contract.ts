@@ -31,6 +31,40 @@ export interface ExpiriesResponse {
 }
 
 /**
+ * What the engine computed for one leg, as opposed to what Delta published.
+ *
+ * Kept as its own object rather than as prefixed fields so the boundary between the
+ * venue's numbers and ours is visible in the payload. Nothing here replaces anything on
+ * `Leg`; every field there is still Delta's own figure.
+ *
+ * `iv` is a property of the **strike**, not of the leg. Put-call parity gives both sides
+ * one volatility and the engine recovers it from whichever side is out of the money, so
+ * the same number appears on both legs of a row. `iv_leg` names the side it came from,
+ * so that repetition cannot be misread as two independent solves.
+ *
+ * **The Greek conventions are not all textbook** and are documented in the engine's
+ * `greeks.py`: `delta` and `gamma` are undiscounted, `vega` and `rho` are discounted and
+ * quoted per one percent, and `theta` is a one-calendar-day repricing rather than the
+ * analytic derivative. They are carried unchanged from the sibling project's verified
+ * implementation rather than converted, because a convention the desk does not use is
+ * one that has to be undone at every boundary.
+ */
+export interface ComputedLeg {
+  /** Decimal fraction, as everywhere else. `null` when the strike could not be solved. */
+  iv: number | null;
+  /** `"call"` or `"put"` — the out-of-the-money side this strike's `iv` came from. */
+  iv_leg: string | null;
+  /** Empty when solved; otherwise the solver's own account of why it stopped. */
+  iv_reason: string;
+  /** With respect to the **forward**, not to spot. Delta's `delta` is a spot delta. */
+  delta: number | null;
+  gamma: number | null;
+  vega: number | null;
+  theta: number | null;
+  rho: number | null;
+}
+
+/**
  * One side of one strike — a call or a put.
  *
  * `symbol` and `product_id` always come through. Every quote, vol and Greek may be
@@ -56,6 +90,8 @@ export interface Leg {
   oi: number | null;
   oi_value_usd: number | null;
   tick_size: number | null;
+  /** Ours. `null` on a chain that has not been through the engine's enrichment. */
+  computed: ComputedLeg | null;
 }
 
 /**
@@ -80,6 +116,18 @@ export interface ChainResponse {
   fetched_at: string;
   /** Ascending by strike. */
   rows: ChainRow[];
+  /**
+   * The forward every `computed` figure on this chain was priced against, recovered by
+   * parity regression across all paired strikes — not spot, and not assumed. `null` when
+   * the chain could not be fitted, in which case no leg carries a volatility either.
+   */
+  forward: number | null;
+  /** The discount factor fitted alongside the forward. */
+  discount: number | null;
+  /** ACT/365. The clock the volatility and the Greeks are both quoted on. */
+  years_to_expiry: number | null;
+  /** Which method produced the forward. `"F1"` is the parity regression. */
+  forward_method: string | null;
 }
 
 /** FastAPI's default error shape. */

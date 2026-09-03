@@ -103,6 +103,13 @@ def test_the_payload_is_the_same_shape_the_rest_endpoint_returns(live_stream) ->
         "atm_strike",
         "fetched_at",
         "rows",
+        # The forward every computed figure below was priced against, and the clock it
+        # was priced on. Reported because a volatility whose forward is unknown cannot
+        # be checked by anyone reading the payload.
+        "forward",
+        "discount",
+        "years_to_expiry",
+        "forward_method",
     }
     assert isinstance(chain["spot"], float)
     assert isinstance(chain["rows"][0]["call"]["bid"], float)

@@ -4,6 +4,12 @@ import { useEffect, useRef } from "react";
 
 import type { ChainResponse, ChainRow, Leg } from "@/lib/contract";
 import {
+  directionOf,
+  priceMemoryOf,
+  type Direction,
+  type PriceMemory,
+} from "@/lib/direction";
+import {
   DASH,
   formatDelta,
   formatIv,
@@ -24,12 +30,24 @@ import {
  * position-sized figures sit out at the edges. Mark price is not a column; it is in the
  * cell tooltip beside all three IVs, because a trader deals at the bid and the ask.
  *
- * **One deliberate deviation from the sibling: IV is per side, not shared.** The sibling
- * carries a single centre IV column, because it *solves* one volatility per strike from
- * the out-of-the-money leg. This project solves nothing — Delta publishes `mark_iv`
- * separately for the call and the put, and the two genuinely differ: 28.19% against
- * 27.58% on the at-the-money strike of a live BTC chain. Collapsing them into one figure
- * would invent a number the venue never sent, so there are two IV columns.
+ * **The IV and Δ columns are ours, not Delta's.** They used to be the venue's published
+ * figures; since T8 the engine solves a volatility per strike from the out-of-the-money
+ * leg's midpoint and computes Greeks from it. Delta's own numbers have not gone
+ * anywhere — they are still in the payload and now read out in the cell tooltip, which
+ * is what makes the comparison between the two possible at a glance.
+ *
+ * Delta republishes its figures every 5,001 ms while the book underneath moves every
+ * 508 ms, so ours are up to **9.8x fresher**. Watching one against the other during a
+ * fast move is the point of the whole project: theirs steps, ours moves underneath it.
+ *
+ * There are still two IV columns rather than the sibling's single centre one, and the
+ * number in them is now the *same* on both sides — parity gives one volatility per
+ * strike. The tooltip names the leg it was actually solved from so that the repetition
+ * cannot be misread as two independent solves.
+ *
+ * **Bid and ask cells carry a direction arrow** — green up, red down — comparing this
+ * push against the previous one. See `lib/direction.ts` for what that does and does not
+ * mean; briefly, it samples the push and not the tick.
  *
  * Three rules this table must not break, and they are three different statements:
  *
@@ -64,11 +82,12 @@ function inTheMoney(strike: number, spot: number, side: "call" | "put"): boolean
  * and empty — computed before any moneyness, deliberately: shading an absence would be
  * a claim about a price that was never printed.
  */
-function QuoteCells({ leg, side, strike, spot }: {
+function QuoteCells({ leg, side, strike, spot, previous }: {
   leg: Leg | null;
   side: "call" | "put";
   strike: number;
   spot: number;
+  previous: PriceMemory | null;
 }) {
   if (leg === null) {
     const label = `No ${side} listed at this strike`;
@@ -84,16 +103,29 @@ function QuoteCells({ leg, side, strike, spot }: {
   }
 
   const itm = inTheMoney(strike, spot, side) ? "itm" : "";
+  const ours = leg.computed;
 
-  // Everything the columns had no room for. The venue's floored `bid_iv` of 0.000005 on
-  // deep in-the-money calls surfaces here as `0.0005%` — a real value it publishes, not
-  // a rendering fault. A null IV reads as a dash in prose, where there is no empty cell
-  // to leave blank.
+  // Everything the columns had no room for. Delta's three IVs and its own delta live
+  // here now that the columns carry ours — the two sitting side by side is the
+  // comparison this project exists to make, and it costs nothing to surface.
+  //
+  // The venue's floored `bid_iv` of 0.000005 on deep in-the-money calls surfaces here as
+  // `0.0005%` — a real value it publishes, not a rendering fault. A null IV reads as a
+  // dash in prose, where there is no empty cell to leave blank.
+  const solvedFrom = ours?.iv_leg
+    ? ` (solved on the ${ours.iv_leg})`
+    : "";
+  const whyNot = ours && ours.iv === null && ours.iv_reason
+    ? ` · not solved: ${ours.iv_reason}`
+    : "";
   const detail =
     `${leg.symbol} · mark ${formatPrice(leg.mark) || DASH}` +
-    ` · IV bid ${formatIv(leg.bid_iv) || DASH}` +
+    ` · ours IV ${formatIv(ours?.iv ?? null) || DASH}${solvedFrom}` +
+    ` · Delta IV bid ${formatIv(leg.bid_iv) || DASH}` +
     ` · mark ${formatIv(leg.mark_iv) || DASH}` +
-    ` · ask ${formatIv(leg.ask_iv) || DASH}`;
+    ` · ask ${formatIv(leg.ask_iv) || DASH}` +
+    ` · Delta Δ ${formatDelta(leg.delta) || DASH}` +
+    whyNot;
 
   const cell = (key: string, text: string) => (
     <td key={key} className={`num ${itm}`} title={detail}>
@@ -101,14 +133,36 @@ function QuoteCells({ leg, side, strike, spot }: {
     </td>
   );
 
+  /** A price cell, with an arrow when it moved since the previous push. */
+  const priced = (key: "bid" | "ask") => {
+    const moved: Direction = directionOf(previous, leg.symbol, key, leg[key]);
+    return (
+      <td
+        key={key}
+        className={`num ${itm} ${moved ? `moved-${moved}` : ""}`.trim()}
+        title={detail}
+      >
+        {formatPrice(leg[key])}
+        {moved && (
+          // `aria-hidden` because the arrow repeats no information a screen reader
+          // needs: it is a redundant encoding of a change the value itself carries,
+          // and announcing "up arrow" on every push would make the table unusable.
+          <span className={`arrow arrow-${moved}`} aria-hidden="true">
+            {moved === "up" ? "▲" : "▼"}
+          </span>
+        )}
+      </td>
+    );
+  };
+
   // Written outward-in once, then reversed for the put side, so the order can only be
   // wrong in one place.
   const outwardIn = [
     cell("oi", formatOi(leg.oi)),
-    cell("delta", formatDelta(leg.delta)),
-    cell("iv", formatIv(leg.mark_iv)),
-    cell("bid", formatPrice(leg.bid)),
-    cell("ask", formatPrice(leg.ask)),
+    cell("delta", formatDelta(ours?.delta ?? null)),
+    cell("iv", formatIv(ours?.iv ?? null)),
+    priced("bid"),
+    priced("ask"),
   ];
 
   return <>{side === "call" ? outwardIn : [...outwardIn].reverse()}</>;
@@ -116,6 +170,35 @@ function QuoteCells({ leg, side, strike, spot }: {
 
 export function ChainLadder({ chain }: { chain: ChainResponse }) {
   const money = useRef<HTMLTableRowElement>(null);
+
+  // The previous push's prices, so this one can be compared against them.
+  //
+  // **Keyed on the identity of `chain`, and that is load-bearing.** A naive
+  // read-then-overwrite of a ref during render is defeated by StrictMode, which
+  // double-invokes the render in development: the second pass reads back what the first
+  // pass wrote, so every cell compares against itself and no arrow ever appears — in the
+  // one environment where anyone would look at it. `reactStrictMode` is on in
+  // `next.config.ts`.
+  //
+  // Holding both snapshots and only rolling them forward when the chain object actually
+  // changes makes the render idempotent: run it twice on the same push and `previous`
+  // is still the *previous* push. A new push parses a new object, so identity is exactly
+  // the right trigger — and unlike `fetched_at` it cannot collide when two pushes land
+  // inside the same second.
+  const store = useRef<{
+    source: ChainResponse;
+    previous: PriceMemory | null;
+    current: PriceMemory;
+  } | null>(null);
+
+  if (store.current === null || store.current.source !== chain) {
+    store.current = {
+      source: chain,
+      previous: store.current?.current ?? null,
+      current: priceMemoryOf(chain),
+    };
+  }
+  const seen = store.current.previous;
 
   // Open on the money. A live BTC chain runs from far below spot to far above it and the
   // interesting strikes are in the middle, so a table scrolled to its top shows rows of
@@ -137,8 +220,10 @@ export function ChainLadder({ chain }: { chain: ChainResponse }) {
       <table className="chain">
         <caption className="sr-only">
           {chain.underlying} option chain expiring {chain.expiry}. Calls on the left, strikes in
-          the centre, puts on the right. A hatched cell means that side is not listed; an empty
-          cell means the venue did not price that field; a zero means zero.
+          the centre, puts on the right. The IV and delta columns are computed by this engine from
+          the order book; the venue’s own figures are in each cell’s tooltip. A hatched cell
+          means that side is not listed; an empty cell means the field could not be computed or
+          was not priced; a zero means zero.
         </caption>
         <thead>
           <tr>
@@ -170,12 +255,24 @@ export function ChainLadder({ chain }: { chain: ChainResponse }) {
             const atm = row.strike === chain.atm_strike;
             return (
               <tr key={row.strike} ref={atm ? money : undefined} className={atm ? "at-the-money" : ""}>
-                <QuoteCells leg={row.call} side="call" strike={row.strike} spot={chain.spot} />
+                <QuoteCells
+                  leg={row.call}
+                  side="call"
+                  strike={row.strike}
+                  spot={chain.spot}
+                  previous={seen}
+                />
                 <td className="strike">
                   {formatStrike(row.strike)}
                   {atm && " ★"}
                 </td>
-                <QuoteCells leg={row.put} side="put" strike={row.strike} spot={chain.spot} />
+                <QuoteCells
+                  leg={row.put}
+                  side="put"
+                  strike={row.strike}
+                  spot={chain.spot}
+                  previous={seen}
+                />
               </tr>
             );
           })}

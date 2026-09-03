@@ -231,10 +231,14 @@ export default function Page() {
           A hatched half means that side is not listed at this strike. An empty cell means the
           venue did not price that field of a contract that does exist. A printed <code>0</code>{" "}
           is a real zero — open interest of exactly zero is common and is shown as such. The IV
-          column is the mark IV, per side, because Delta prices the call and the put separately;
-          hovering any cell gives the mark price and bid, mark and ask IV. The in-the-money half
-          is washed, measured against spot. Figures update continuously from the venue; the
-          clock above is when the engine last rebuilt the ladder.
+          and Δ columns are <strong>computed here</strong>, not the venue&rsquo;s: the volatility is
+          solved from the out-of-the-money leg&rsquo;s midpoint against a forward recovered from
+          every paired strike, so both sides of a row share one figure. Hovering any cell gives
+          the mark price, our volatility and the leg it came from, and Delta&rsquo;s own bid, mark
+          and ask IV beside it. A bid or ask that moved since the last update carries a green or
+          red arrow — that compares one update to the previous one, not every trade in between.
+          The in-the-money half is washed, measured against spot. Figures update continuously
+          from the venue; the clock above is when the engine last rebuilt the ladder.
         </p>
       </main>
     </div>

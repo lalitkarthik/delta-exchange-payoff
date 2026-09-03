@@ -38,11 +38,12 @@ from .chain import (
     normalise_underlying,
     validate_expiry,
 )
+from .compute import enrich
 from .delta_client import DeltaClient, DeltaUnavailable
 from .fanout import FanOut
 from .feed import DeltaFeed
 from .models import ChainResponse, ExpiriesResponse
-from .stream import ChainStream
+from .stream import ChainStream, recompute_forever
 
 #: The Next.js dev server. Development only; production origins are a deploy concern.
 ALLOWED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
@@ -120,6 +121,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.tasks = [
                 asyncio.create_task(app.state.feed.run(), name="delta-feed"),
                 asyncio.create_task(app.state.stream.run(), name="chain-stream"),
+                asyncio.create_task(
+                    recompute_forever(app.state.stream), name="chain-recompute"
+                ),
             ]
             for task in app.state.tasks:
                 task.add_done_callback(_report_finished_task)
@@ -219,7 +223,10 @@ async def chain(
             status_code=404,
             detail=f"Delta lists no option contracts for {symbol} expiring {date}",
         )
-    return build_chain(symbol, date, tickers)
+    # Enriched here as well as on the live path, so the two transports return the
+    # same populated shape. A REST reader that got null Greeks where the websocket
+    # sends real ones would be reading a different contract.
+    return enrich(build_chain(symbol, date, tickers))
 
 
 def _validated(check: Callable[[str], str], value: str) -> str:
