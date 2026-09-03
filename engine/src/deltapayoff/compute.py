@@ -34,7 +34,7 @@ familiarity rather than accuracy.
 
 from __future__ import annotations
 
-from .forward import f1_parity_fit, mid, year_fraction
+from .forward import f1_parity_fit, f2_single_strike, mid, year_fraction
 from .greeks import report_greeks
 from .models import ChainResponse, ComputedLeg, Leg
 from .solvers import implied_vol_newton
@@ -101,11 +101,29 @@ def enrich(chain: ChainResponse) -> ChainResponse:
     fit = f1_parity_fit(chain)
     years = year_fraction(chain)
 
+    if not fit.trusted and years > 0.0:
+        # **F1 fits the discount as well as the forward, and near expiry it cannot.**
+        # Under a day out the true discount factor sits within a few parts per hundred
+        # thousand of 1, so the rate implied by it is quote noise — measured on the live
+        # 04-09-2026 chain, the fitted discount flapped between 0.99997892 and 1.00001939
+        # from one second to the next, taking the implied rate from +1.03% to -0.95% and
+        # back. `f1_parity_fit` will not trust a non-positive rate, quite rightly, but
+        # that makes a sign test on noise decide whether the whole chain prices.
+        #
+        # The forward is not what is in doubt: across those same ticks F1 and F2 agreed
+        # to four parts per million. So where the discount cannot be fitted we assume one
+        # instead of fitting it, which is precisely what F2 is for. `forward_method` on
+        # the response says which was used, so nobody has to guess afterwards.
+        fallback = f2_single_strike(chain)
+        if fallback.trusted and fallback.forward is not None:
+            fit = fallback
+
     if not fit.trusted or fit.forward is None or years <= 0.0:
         # No forward, or the contract has settled. Every strike gets the same honest
         # refusal rather than a volatility inverted against a guess.
         reason = (
-            "the forward could not be fitted from this chain"
+            "the forward could not be recovered from this chain, by parity "
+            "regression or from the money strike"
             if years > 0.0
             else "the contract has expired; Greeks are undefined"
         )

@@ -26,14 +26,20 @@ import {
  *
  * Calls read outward-in from the left and puts inward-out to the right:
  *
- *     OI  ρ  Θ  ν  Γ  Δ  IV  Bid  Ask  |  STRIKE  |  Ask  Bid  IV  Δ  Γ  ν  Θ  ρ  OI
+ *     OI  Rho  Theta  Vega  Gamma  Delta  IV  Bid  Ask  |  STRIKE  |  ...mirrored
  *
  * so the two columns either side of the strike are always the tradeable prices, and the
  * position-sized figures sit out at the edges. The Greeks read outward in order of how
  * often a desk looks at them: delta and the volatility nearest the prices, rho furthest
  * away. Nineteen columns is wide, and the wrapper scrolls horizontally rather than
  * shrinking the type — a dense numeric table that cannot be read is worse than one that
- * has to be scrolled. Mark price is not a column; it is in the
+ * has to be scrolled.
+ *
+ * **The Greeks are named, not lettered.** The obvious headers are the Greek letters, and
+ * they were - until rho and nu came back as "P" and "N". In this table's monospace face
+ * ρ is very nearly a Latin p and ν very nearly a v, so two of the five columns were
+ * unreadable and one reader asked what P and N meant. Θ and Δ survive the same test, but
+ * a row of headers where three are words and two are glyphs is worse than five words. Mark price is not a column; it is in the
  * cell tooltip beside all three IVs, because a trader deals at the bid and the ask.
  *
  * **The IV and Δ columns are ours, not Delta's.** They used to be the venue's published
@@ -251,11 +257,11 @@ export function ChainLadder({ chain }: { chain: ChainResponse }) {
           </tr>
           <tr>
             <th>OI</th>
-            <th title="Rho, per one percent. Computed here, not the venue's.">ρ</th>
-            <th title="Theta, one calendar day. Computed here, not the venue's.">Θ</th>
-            <th title="Vega, per volatility point. Computed here, not the venue's.">ν</th>
-            <th title="Gamma, scaled by 10,000 so it is readable. Computed here.">Γ ×10⁴</th>
-            <th title="Delta, with respect to the forward. Computed here.">Δ</th>
+            <th title="Rho, per one percent. Computed here, not the venue&rsquo;s.">Rho</th>
+            <th title="Theta, one calendar day. Computed here, not the venue&rsquo;s.">Theta</th>
+            <th title="Vega, per volatility point. Computed here, not the venue&rsquo;s.">Vega</th>
+            <th title="Gamma, scaled by 10,000 so it is readable. Computed here.">Gamma&nbsp;×10⁴</th>
+            <th title="Delta, with respect to the forward. Computed here.">Delta</th>
             <th title="Implied volatility, solved from the out-of-the-money leg.">IV</th>
             <th>Bid</th>
             <th>Ask</th>
@@ -263,11 +269,11 @@ export function ChainLadder({ chain }: { chain: ChainResponse }) {
             <th>Ask</th>
             <th>Bid</th>
             <th title="Implied volatility, solved from the out-of-the-money leg.">IV</th>
-            <th title="Delta, with respect to the forward. Computed here.">Δ</th>
-            <th title="Gamma, scaled by 10,000 so it is readable. Computed here.">Γ ×10⁴</th>
-            <th title="Vega, per volatility point. Computed here, not the venue's.">ν</th>
-            <th title="Theta, one calendar day. Computed here, not the venue's.">Θ</th>
-            <th title="Rho, per one percent. Computed here, not the venue's.">ρ</th>
+            <th title="Delta, with respect to the forward. Computed here.">Delta</th>
+            <th title="Gamma, scaled by 10,000 so it is readable. Computed here.">Gamma&nbsp;×10⁴</th>
+            <th title="Vega, per volatility point. Computed here, not the venue&rsquo;s.">Vega</th>
+            <th title="Theta, one calendar day. Computed here, not the venue&rsquo;s.">Theta</th>
+            <th title="Rho, per one percent. Computed here, not the venue&rsquo;s.">Rho</th>
             <th>OI</th>
           </tr>
         </thead>

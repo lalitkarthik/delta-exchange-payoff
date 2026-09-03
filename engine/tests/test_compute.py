@@ -36,6 +36,7 @@ def priced_chain(
     strikes: list[float],
     vol: float = PLANTED_VOL,
     quote: bool = True,
+    discount: float = PLANTED_DISCOUNT,
 ) -> ChainResponse:
     """A chain whose every leg is worth exactly what Black-76 says at `vol`.
 
@@ -47,8 +48,8 @@ def priced_chain(
     """
     rows = []
     for strike in strikes:
-        call = call_price(PLANTED_FORWARD, strike, PLANTED_YEARS, vol, PLANTED_DISCOUNT)
-        put = put_price(PLANTED_FORWARD, strike, PLANTED_YEARS, vol, PLANTED_DISCOUNT)
+        call = call_price(PLANTED_FORWARD, strike, PLANTED_YEARS, vol, discount)
+        put = put_price(PLANTED_FORWARD, strike, PLANTED_YEARS, vol, discount)
         rows.append(
             ChainRow(
                 strike=strike,
@@ -212,15 +213,21 @@ def test_an_empty_chain_is_returned_unchanged_rather_than_raising() -> None:
     assert enriched.forward is None
 
 
-def test_an_untrusted_forward_refuses_the_whole_chain() -> None:
-    """Too few pairs to fit means no volatility anywhere, and a reason on every leg.
+def test_a_chain_neither_method_can_price_refuses_the_whole_chain() -> None:
+    """When both the regression and the money strike fail, nothing gets a volatility.
 
-    `f1_parity_fit` will not call a fit trusted below `MIN_PAIRS` pairs. Pricing the
-    chain against an untrusted forward would produce a full ladder of plausible,
-    uniformly wrong volatilities with nothing to signal it — the exact failure this
-    project keeps refusing. Refusing is louder and cheaper.
+    Refusing matters. Pricing a chain against a forward nobody believes produces a full
+    ladder of plausible, uniformly wrong numbers with nothing to signal it — louder and
+    cheaper to say so.
+
+    Both routes have to be closed to reach this. Three strikes is below `MIN_PAIRS`, so
+    the parity regression will not be trusted; stripping the quotes from the money strike
+    closes F2, which needs both of its legs to invert.
     """
     thin = priced_chain([79_000.0, 80_000.0, 81_000.0])
+    money = next(r for r in thin.rows if r.strike == 80_000.0)
+    money.call.bid = money.call.ask = None
+    money.put.bid = money.put.ask = None
 
     enriched = enrich(thin)
 
@@ -228,3 +235,49 @@ def test_an_untrusted_forward_refuses_the_whole_chain() -> None:
     for row in enriched.rows:
         assert row.call.computed.iv is None
         assert "forward" in row.call.computed.iv_reason
+
+
+def test_a_thin_chain_still_prices_through_the_money_strike() -> None:
+    """Below `MIN_PAIRS` the regression has no line to fit, but parity still has a point.
+
+    F2 needs one strike quoting both sides, not five, so a sparse chain is priceable even
+    though the discount has to be assumed rather than fitted.
+    """
+    enriched = enrich(priced_chain([79_000.0, 80_000.0, 81_000.0]))
+
+    assert enriched.forward_method == "F2"
+    assert enriched.forward == pytest.approx(PLANTED_FORWARD, rel=1e-4)
+
+
+def test_a_flat_discount_falls_back_to_f2_rather_than_blanking() -> None:
+    """The front-expiry bug, pinned.
+
+    Under a day to expiry the true discount factor is within a few parts per hundred
+    thousand of exactly 1, so the rate implied by it is quote noise. `f1_parity_fit`
+    will not trust a fit whose implied rate is non-positive, which makes trusting the
+    forward a coin flip on the last digit of a quote — measured on the live 04-09-2026
+    chain, the fitted discount flapped between 0.99997892 and 1.00001939 and the rate
+    with it, between +1.03% and -0.95%, blanking every Greek on the screen each time it
+    went negative.
+
+    The forward itself is not in doubt: F1 and F2 agreed to four parts per million
+    across those same ticks. So a chain whose *discount* cannot be fitted falls back to
+    assuming one, which is exactly what F2 is for, rather than refusing to price at all.
+
+    A discount of exactly 1.0 reproduces the condition: the implied rate is 0, and
+    `trusted` requires it to be strictly positive.
+    """
+    chain = priced_chain(STRIKES, discount=1.0)
+
+    enriched = enrich(chain)
+
+    assert enriched.forward_method == "F2"
+    assert enriched.forward == pytest.approx(PLANTED_FORWARD, rel=1e-6)
+    assert all(row.call.computed.iv is not None for row in enriched.rows)
+
+
+def test_the_fallback_is_only_reached_when_f1_is_untrusted() -> None:
+    """A healthy chain still uses the parity regression, which fits the discount too."""
+    enriched = enrich(priced_chain(STRIKES))
+
+    assert enriched.forward_method == "F1"
