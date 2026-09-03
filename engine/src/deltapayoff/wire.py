@@ -147,10 +147,10 @@ def chain_from_frames(
     """A `ChainResponse` from websocket frames — the same type the REST path returns.
 
     `book_frames` **overrides** the ticker's quotes where present, and that override is
-    the whole reason to subscribe both channels. Measured by `tools/probe_ws.py`:
-    `ticker` republishes about every 6 s while `ob_l2` moves about every 940 ms, and they
-    carry the same top-of-book numbers. Taking the book's copy makes every price here
-    roughly six times fresher, and every implied volatility with it.
+    the whole reason to subscribe both channels. Measured by `tools/measure_feed.py` on a
+    live 136-symbol chain: `ticker` republishes every **5001 ms** while `ob_l2` moves
+    every **508 ms**, and they carry the same top-of-book numbers. Taking the book's copy
+    makes every price here **9.8x fresher**, and every implied volatility with it.
 
     `ticker` is still needed, but for nothing in the calculation — it carries spot, open
     interest, and Delta's own Greeks and implied vols, which travel as reference columns

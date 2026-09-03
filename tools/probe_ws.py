@@ -41,6 +41,13 @@ CHANNELS = ("ticker", "ob_l2")
 #: keep going past both so the actual ceiling shows rather than just "our number worked".
 SIZES = (1, 2, 10, 50, 136, 300, 600)
 
+#: **The per-symbol interval this probe reports is not the chain's interval.** It takes
+#: the first N symbols of the all-expiries list, which is mostly far-dated contracts that
+#: rarely change, and Delta publishes on change rather than on a metronome. That made 136
+#: symbols look like 940 ms per symbol. `tools/measure_feed.py` on a real single-expiry
+#: chain of the same size measures **508 ms**, matching #3's figure. Read the frame limit
+#: here; read the interval there.
+
 #: How long to wait for data after subscribing before calling a channel silent.
 LISTEN_SECONDS = 12.0
 
