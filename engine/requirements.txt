@@ -13,3 +13,13 @@ scipy>=1.14
 
 # The websocket client for T4's ingestion, and for tools/probe_ws.py.
 websockets>=15.0
+
+# T5's store. Writes and scans hive-partitioned Parquet; DuckDB reads the same files,
+# which is why the query engine stays a later decision.
+polars>=1.0
+
+# Reading the store back on Windows. Polars keeps a timestamp's time zone as a label
+# and asks `zoneinfo` for it when converting a value to a Python `datetime`; Windows
+# ships no tz database, so without this that call raises ZoneInfoNotFoundError from
+# inside Rust. The Parquet files are correct either way — this is the reader's problem.
+tzdata>=2024.1

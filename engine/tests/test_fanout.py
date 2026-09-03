@@ -182,3 +182,96 @@ def test_a_subscriber_needs_a_bounded_queue() -> None:
 
     with pytest.raises(ValueError):
         bus.subscribe("greedy", maxsize=0)
+
+
+def test_a_lossless_consumer_that_stops_reading_during_a_burst_loses_nothing() -> None:
+    """The inverse of the sabotage above, and #5's whole reason for existing.
+
+    Drop-oldest is right for a screen and wrong for a store, and not because a drop
+    leaves a hole — under one-minute bars a dropped tick perturbs a bar rather than
+    removing a record. The problem is that drops happen *under load*, load is when price
+    moves fastest, and so drop-oldest **systematically shaves the highs and lows**, which
+    are the only columns the bars exist to capture. A bias, not noise, and invisible in
+    the output.
+
+    So: a consumer that stops reading for the whole of a burst far larger than its
+    watermark must, on resuming, receive every message in order.
+    """
+
+    async def scenario():
+        bus = FanOut()
+        writer = bus.subscribe("writer", maxsize=5, lossless=True)
+        received: list[int] = []
+
+        reading = asyncio.Event()
+        reading.set()
+
+        async def read_while_allowed():
+            while True:
+                await reading.wait()
+                received.append(await writer.queue.get())
+
+        task = asyncio.create_task(read_while_allowed())
+        for n in range(10):
+            bus.publish(n)
+            await asyncio.sleep(0)
+
+        reading.clear()  # the consumer stalls for the whole burst
+        for n in range(10, 500):
+            bus.publish(n)
+        await asyncio.sleep(0)
+
+        reading.set()  # and resumes
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return received, writer.dropped, bus.stats()
+
+    received, dropped, stats = run(scenario())
+    assert received == list(range(500)), "a lossless consumer lost messages"
+    assert dropped == 0
+    assert stats["writer"]["dropped"] == 0
+
+
+def test_a_lossless_backlog_is_counted_rather_than_silently_absorbed() -> None:
+    """An unbounded queue is a memory leak with good manners *unless somebody counts*.
+
+    So `maxsize` does not stop a lossless consumer, it watermarks one: every offer made
+    while the queue is already at or above it is counted, and the deepest backlog is
+    kept. That turns "the writer is falling behind" from an out-of-memory an hour later
+    into a number available now.
+    """
+
+    async def scenario():
+        bus = FanOut()
+        writer = bus.subscribe("writer", maxsize=4, lossless=True)
+        for n in range(10):
+            bus.publish(n)
+        return writer, bus.stats()
+
+    writer, stats = run(scenario())
+    assert writer.dropped == 0
+    assert writer.queue.qsize() == 10, "nothing may be discarded"
+    # Offers 0..3 fit under the watermark; offers 4..9 were made with the queue already
+    # at or above it. Six, and it must not be ten — a watermark that trips on the first
+    # message would make the counter useless.
+    assert stats["writer"]["over_capacity"] == 6
+    assert stats["writer"]["backlog_peak"] == 10
+    assert stats["writer"]["lossless"] is True
+
+
+def test_drop_oldest_remains_the_default() -> None:
+    """The existing consumers must not silently change policy because #5 arrived."""
+
+    async def scenario():
+        bus = FanOut()
+        screen = bus.subscribe("screen", maxsize=3)
+        for n in range(6):
+            bus.publish(n)
+        drained = [screen.queue.get_nowait() for _ in range(3)]
+        return screen.lossless, screen.dropped, drained
+
+    lossless, dropped, drained = run(scenario())
+    assert lossless is False
+    assert dropped == 3
+    assert drained == [3, 4, 5]

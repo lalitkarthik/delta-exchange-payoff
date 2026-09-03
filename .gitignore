@@ -17,3 +17,8 @@ tools/.env
 
 # probe output
 tools/out/
+
+# the bar store. Market data is never committed: it is regenerable from the feed,
+# it is Delta's to publish rather than ours to redistribute, and at an estimated
+# 50-100 MB/day a year of it would be 20-35 GB in a git history.
+data/

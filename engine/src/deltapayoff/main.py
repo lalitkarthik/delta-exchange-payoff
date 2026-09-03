@@ -10,6 +10,13 @@ unchanged — the transport moved, the contract did not.
 Behind it: one `DeltaFeed` for the whole process, publishing to a `FanOut`, with a
 `ChainStream` holding the newest frame per contract. Sockets are per browser; the cache
 and the connection to Delta are shared. A second tab costs a queue, not a connection.
+
+The bus's second consumer is `BarWriter`, which aggregates the same stream into
+one-minute bars and writes hive-partitioned Parquet. It is **not** folded into
+`ChainStream`: that holds only the latest state per contract while the writer needs every
+state, and sharing one structure would make them fight. It subscribes losslessly, and its
+disk write runs in a worker thread — a flush on this event loop would stop the socket
+reader, fill the receive buffer and get us disconnected.
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ from .delta_client import DeltaClient, DeltaUnavailable
 from .fanout import FanOut
 from .feed import DeltaFeed
 from .models import ChainResponse, ExpiriesResponse
+from .store import BarStore, BarWriter
 from .stream import ChainStream, recompute_forever
 
 #: The Next.js dev server. Development only; production origins are a deploy concern.
@@ -107,6 +115,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.fanout = FanOut()
     app.state.stream = ChainStream()
     app.state.stream.attach(app.state.fanout)
+    # The writer is attached whether or not the feed runs, so `/health`-adjacent
+    # introspection and the tests can see the subscription exists and is lossless. With
+    # no feed nothing is published, so an undrained queue costs nothing.
+    app.state.writer = BarWriter(BarStore())
+    app.state.writer.attach(app.state.fanout)
     app.state.feed = DeltaFeed(app.state.fanout)
     app.state.tasks = []
 
@@ -124,6 +137,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 asyncio.create_task(
                     recompute_forever(app.state.stream), name="chain-recompute"
                 ),
+                asyncio.create_task(app.state.writer.run(), name="bar-writer"),
             ]
             for task in app.state.tasks:
                 task.add_done_callback(_report_finished_task)
@@ -140,6 +154,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             task.cancel()
         if app.state.tasks:
             await asyncio.gather(*app.state.tasks, return_exceptions=True)
+            # After the cancellations, not inside them. The open minute is a real
+            # observation and is written with its true tick counts rather than
+            # discarded for tidiness; doing it here rather than from inside the
+            # cancelled task means the flush is not itself racing a cancellation.
+            try:
+                await app.state.writer.aclose()
+            except Exception:
+                # A failed final flush costs the open minute and nothing else. It must
+                # not take the shutdown with it and leave the HTTP client unclosed.
+                logger.exception("the final bar flush failed")
         await client.aclose()
 
 

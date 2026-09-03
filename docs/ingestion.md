@@ -188,6 +188,10 @@ stale. Trust your own measurements over their constants, including the ones in t
   and still ten times faster than the data. One message cannot be answered alone anyway —
   the forward is fitted across every paired strike, so one quote moving changes every
   strike's implied volatility. This belongs in #6 with the live read path.
-- **A lossless subscription policy is not built.** #5's storage writer wants the opposite
-  of drop-oldest, because a gap there is a hole in the historical record rather than a
-  stale price nobody wanted.
+- ~~A lossless subscription policy is not built.~~ **Built, and the reason above was
+  wrong.** Under one-minute bars a dropped tick does not leave a hole — it perturbs a
+  bar, and the bar still exists. The real problem is worse because it is invisible: drops
+  happen under load, load is when price moves fastest, so drop-oldest systematically
+  shaves the highs and lows, which are the columns the bars exist to capture. That is a
+  bias, not noise. `FanOut.subscribe(..., lossless=True)` gives an unbounded queue where
+  `maxsize` becomes a watermark to count against. See `docs/storage.md`.
