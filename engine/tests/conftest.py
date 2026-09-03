@@ -44,6 +44,16 @@ def load_fixture(name: str) -> dict[str, Any]:
 
 
 @pytest.fixture(autouse=True)
+def no_live_feed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The app's start-up subscribes every live BTC option over a websocket. No test may.
+
+    Set before any `TestClient(app)` runs the lifespan, so the REST endpoints and
+    `/ws/chain` are exercised against a hand-fed `ChainStream` instead of Delta.
+    """
+    monkeypatch.setenv("DELTA_LIVE_FEED", "0")
+
+
+@pytest.fixture(autouse=True)
 def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hard stop: a test that opens a real client fails instead of dialling out."""
     from deltapayoff import delta_client

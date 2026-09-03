@@ -80,6 +80,11 @@ class Quote(BaseModel):
     bid: float | None = None
     ask: float | None = None
     received_at: float
+    #: The frame this came from, verbatim. Carried because the screen shows more than a
+    #: quote — mark, open interest, and Delta's Greeks and implied vols as reference
+    #: columns — and re-decoding downstream would duplicate `wire`'s array offsets in a
+    #: second place. Consumers that only want prices ignore it.
+    frame: dict[str, Any] | None = None
 
     @property
     def mid(self) -> float | None:
@@ -172,6 +177,7 @@ class DeltaFeed:
                 bid=leg.bid,
                 ask=leg.ask,
                 received_at=time.time(),
+                frame=message,
             )
         if kind == "ob_l2":
             symbol, bid, ask = decode_ob_l2(message)
@@ -181,6 +187,7 @@ class DeltaFeed:
                 bid=bid,
                 ask=ask,
                 received_at=time.time(),
+                frame=message,
             )
         # `subscriptions`, `error` and anything else is control traffic. Publishing it
         # would put a record with no prices on the bus.

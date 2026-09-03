@@ -5,12 +5,26 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChainLadder } from "@/components/ChainLadder";
 import ThemeToggle from "@/components/ThemeToggle";
 import { UNDERLYINGS, type ChainResponse, type Underlying } from "@/lib/contract";
-import { ENGINE_URL, loadChain, loadExpiries, type Source } from "@/lib/engine";
+import { ENGINE_URL, loadExpiries } from "@/lib/engine";
+import { subscribeChain, type LiveStatus } from "@/lib/live";
 import { formatFetchedAt, formatFetchedClock, formatSpot } from "@/lib/format";
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+/**
+ * What the chip says. `waiting` is distinct from `live` on purpose: an empty ladder and
+ * a ladder that has not arrived look identical, and only one of them means Delta lists
+ * nothing.
+ */
+const STATUS_LABEL: Record<LiveStatus, string> = {
+  connecting: "connecting…",
+  live: "live",
+  waiting: "waiting for quotes…",
+  closed: "reconnecting…",
+  error: "error",
+};
 
 /**
  * One header row of figures, then the ladder, in the sibling chain screen's shell.
@@ -23,6 +37,11 @@ function message(err: unknown): string {
  * Nothing invented. There is no forward, no basis and no session IV, because Delta
  * publishes none and `docs/chain-contract.md` exposes none; the sibling shows all three
  * because it fits them from the option prices, which this project does not do.
+ *
+ * **The chain arrives over a websocket and there is no Refresh button.** The engine holds
+ * one connection to Delta and pushes the complete chain once a second; this page never
+ * asks for it. `loadExpiries` is still a REST call, because the dropdown needs its list
+ * once and it does not change while you watch.
  */
 export default function Page() {
   const [underlying, setUnderlying] = useState<Underlying>("BTC");
@@ -30,22 +49,22 @@ export default function Page() {
   const [expiry, setExpiry] = useState<string>("");
 
   const [chain, setChain] = useState<ChainResponse | null>(null);
-  const [source, setSource] = useState<Source | null>(null);
-  const [fallbackReason, setFallbackReason] = useState<string | null>(null);
+  const [status, setStatus] = useState<LiveStatus>("connecting");
+  const [statusDetail, setStatusDetail] = useState<string | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Guards against a slow earlier request landing after a newer one.
+  // Guards against a slow earlier expiries request landing after a newer one.
   const requestId = useRef(0);
 
   /**
-   * One fetch pass: expiries, then the chain for the chosen expiry. Called on mount,
-   * when the underlying changes, when the expiry changes, and when Refresh is clicked.
-   * There is no interval, no websocket and no revalidation anywhere in this file —
-   * data moves only when the user asks for it.
+   * The expiry list, over REST. Called on mount and when the underlying changes.
+   *
+   * Only the list. The chain itself is not fetched anywhere in this file — the effect
+   * below subscribes to it, and data arrives without anyone asking.
    */
-  const load = useCallback(async (next: Underlying, wanted: string | null) => {
+  const loadExpiryList = useCallback(async (next: Underlying, wanted: string | null) => {
     const id = ++requestId.current;
     setBusy(true);
     setError(null);
@@ -57,9 +76,9 @@ export default function Page() {
       const available = list.data.expiries;
       setExpiries(available);
 
-      // Keep the user's expiry if the new underlying still lists it. Otherwise take the
-      // front expiry — except in fixture mode, where `preferredExpiry` names the one
-      // expiry a chain was actually captured for.
+      // Keep the user's expiry if the new underlying still lists it, otherwise take the
+      // front one. `preferredExpiry` names the expiry the committed fixture holds a
+      // chain for, and only ever appears when the engine was unreachable.
       const fallback =
         list.preferredExpiry && available.includes(list.preferredExpiry)
           ? list.preferredExpiry
@@ -67,45 +86,43 @@ export default function Page() {
       const chosen = wanted && available.includes(wanted) ? wanted : fallback;
       setExpiry(chosen);
 
-      if (!chosen) {
-        setChain(null);
-        setSource(list.source);
-        setFallbackReason(list.fallbackReason ?? null);
-        setError(`No expiries listed for ${next}.`);
-        return;
-      }
-
-      const res = await loadChain(next, chosen);
-      if (id !== requestId.current) return;
-
-      setChain(res.data);
-      setSource(res.source);
-      setFallbackReason(res.fallbackReason ?? list.fallbackReason ?? null);
+      if (!chosen) setError(`No expiries listed for ${next}.`);
     } catch (err) {
       if (id !== requestId.current) return;
-      setChain(null);
-      setSource(null);
-      setFallbackReason(null);
       setError(message(err));
     } finally {
       if (id === requestId.current) setBusy(false);
     }
   }, []);
 
-  // Load once on mount. The empty dependency list is the point: no polling.
+  // The expiry list, once per underlying.
   useEffect(() => {
-    void load("BTC", null);
-  }, [load]);
+    void loadExpiryList(underlying, expiry || null);
+    // Deliberately keyed on the underlying alone: re-running this when the expiry
+    // changes would refetch a list that cannot have changed and reset the dropdown.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [underlying, loadExpiryList]);
 
-  const onUnderlying = (next: Underlying) => {
-    setUnderlying(next);
-    void load(next, expiry || null);
-  };
+  /**
+   * One live subscription, torn down and rebuilt whenever the series changes.
+   *
+   * The cleanup is what makes switching expiry safe: without it, the old socket keeps
+   * pushing the old expiry's chain and the two interleave on screen.
+   */
+  useEffect(() => {
+    if (!expiry) return;
+    setChain(null);
+    return subscribeChain(underlying, expiry, {
+      onChain: setChain,
+      onStatus: (next, detail) => {
+        setStatus(next);
+        setStatusDetail(detail ?? null);
+      },
+    });
+  }, [underlying, expiry]);
 
-  const onExpiry = (next: string) => {
-    setExpiry(next);
-    void load(underlying, next);
-  };
+  const onUnderlying = (next: Underlying) => setUnderlying(next);
+  const onExpiry = (next: string) => setExpiry(next);
 
   return (
     <div className="shell">
@@ -169,28 +186,12 @@ export default function Page() {
           </span>
         </div>
 
-        {/* Always on screen, whichever way it reads: a fixture must never be mistaken
-            for live market data, and the only way to guarantee that is to name the
-            source every time rather than only when it is the surprising one. */}
-        <span
-          className="chip"
-          title={
-            source === "fixture"
-              ? "The committed fixture, not the venue. Start the engine for live quotes."
-              : `Live from the engine at ${ENGINE_URL}.`
-          }
-        >
-          source · {source ?? "—"}
+        {/* Always on screen. A stalled socket and a live one show the same numbers,
+            and the only difference is whether they are still moving — so the state of
+            the connection is named every time rather than only when it is bad. */}
+        <span className="chip" title={statusDetail ?? `Streaming from ${ENGINE_URL}.`}>
+          {STATUS_LABEL[status]}
         </span>
-
-        <button
-          type="button"
-          className="refresh"
-          onClick={() => void load(underlying, expiry || null)}
-          disabled={busy}
-        >
-          {busy ? "Refreshing…" : "Refresh"}
-        </button>
 
         {/* Last, and pushed right by `margin-left: auto`: it changes how the figures look
             and never what they say, so it must not sit among them competing for the eye. */}
@@ -198,10 +199,16 @@ export default function Page() {
       </header>
 
       <main className="main">
-        {fallbackReason ? (
+        {status === "error" ? (
+          <p className="notice error">
+            {statusDetail ?? "The live stream reported an error."}
+          </p>
+        ) : null}
+
+        {status === "closed" ? (
           <p className="notice warn">
-            {fallbackReason} Showing the committed fixture instead. Engine base URL is{" "}
-            <code>{ENGINE_URL}</code>.
+            Lost the connection to the engine at <code>{ENGINE_URL}</code>. Retrying — the
+            figures below are the last ones that arrived, and they are not moving.
           </p>
         ) : null}
 
@@ -209,11 +216,15 @@ export default function Page() {
 
         {chain ? (
           // Re-keyed per series: a different underlying or expiry is a different ladder
-          // and earns a fresh centring on the money. A Refresh keeps the key, so the
-          // view stays where the reader left it.
+          // and earns a fresh centring on the money. A push of new prices keeps the key,
+          // so the view stays where the reader left it while the numbers change under it.
           <ChainLadder key={`${chain.underlying}:${chain.expiry}`} chain={chain} />
-        ) : error ? null : (
-          <p className="notice">Loading the chain…</p>
+        ) : error || status === "error" ? null : (
+          <p className="notice">
+            {status === "waiting"
+              ? "Connected. Waiting for the first quotes on this expiry…"
+              : "Connecting to the engine…"}
+          </p>
         )}
 
         <p className="note">
@@ -222,7 +233,8 @@ export default function Page() {
           is a real zero — open interest of exactly zero is common and is shown as such. The IV
           column is the mark IV, per side, because Delta prices the call and the put separately;
           hovering any cell gives the mark price and bid, mark and ask IV. The in-the-money half
-          is washed, measured against spot. Data changes only on load and on Refresh.
+          is washed, measured against spot. Figures update continuously from the venue; the
+          clock above is when the engine last rebuilt the ladder.
         </p>
       </main>
     </div>

@@ -1,12 +1,34 @@
-"""The FastAPI app. Two endpoints, both fixed by `docs/chain-contract.md`."""
+"""The FastAPI app.
+
+Two REST endpoints fixed by `docs/chain-contract.md`, and one websocket that pushes the
+same `ChainResponse` live.
+
+`/ws/chain` exists so the screen updates without anyone pressing anything. It sends the
+identical object `/chain` returns, so `web/components/ChainLadder.tsx` renders it
+unchanged — the transport moved, the contract did not.
+
+Behind it: one `DeltaFeed` for the whole process, publishing to a `FanOut`, with a
+`ChainStream` holding the newest frame per contract. Sockets are per browser; the cache
+and the connection to Delta are shared. A second tab costs a queue, not a connection.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 
 from .chain import (
@@ -17,21 +39,103 @@ from .chain import (
     validate_expiry,
 )
 from .delta_client import DeltaClient, DeltaUnavailable
+from .fanout import FanOut
+from .feed import DeltaFeed
 from .models import ChainResponse, ExpiriesResponse
+from .stream import ChainStream
 
 #: The Next.js dev server. Development only; production origins are a deploy concern.
 ALLOWED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
+#: Note that CORS does **not** cover `/ws/chain`. A websocket handshake is not subject to
+#: it, so that route accepts any origin. The payload is public Delta market data, the
+#: server binds to loopback and no credentials are involved, so the exposure is small
+#: today — but it stops being small the moment this binds to a non-loopback interface or
+#: the payload carries anything user-specific, and neither needs a code change here.
+
+logger = logging.getLogger(__name__)
+
+#: How often a connected browser is sent the chain. One second is well under what anyone
+#: reads and far above what the eye needs, and it is one JSON push regardless of how many
+#: messages arrived underneath. **Measured**: a 136-symbol chain on `ob_l2` delivers about
+#: 268 messages a second, so pushing per message would be roughly 268x oversampled.
+PUSH_INTERVAL_SECONDS = 1.0
+
+#: The floor under `interval`, which arrives from the query string and is therefore
+#: attacker-controlled. **Measured** without it: `?interval=0` pushed 207 chains in three
+#: seconds, 69 a second against an intended one, each rebuilding a 69-strike ladder from
+#: 136 cached frames and serialising it. A hand-edited URL pegs a core and starves the
+#: event loop the Delta feed runs on. A negative value is a zero in disguise, because
+#: `asyncio.sleep` returns immediately on one.
+#:
+#: 0.02 is chosen because the endpoint tests drive the parameter and a higher floor would
+#: make the suite wait. It bounds the abuse rather than removing it — measured after the
+#: fix, `?interval=0` gives 21 pushes a second instead of 69, still well above the
+#: intended one. That is acceptable while this binds to loopback and serves public market
+#: data; it would not be if either changed.
+MIN_PUSH_INTERVAL_SECONDS = 0.02
+
+#: Underlyings the live feed subscribes at start-up. Every listed BTC option, both
+#: channels — about 600 messages and 300 KB a second, measured. That buys instant expiry
+#: switching with no subscribe round trip. Narrowing `ob_l2` to the watched expiry would
+#: cut it to roughly a third; see `docs/ingestion.md`.
+LIVE_UNDERLYINGS = ("BTC",)
+
+#: Environment switch: set to "0" to serve the REST endpoints and the websocket without
+#: opening a socket to Delta. Read at start-up rather than at import, so a test can set
+#: it — the suite sets it in `conftest.py`, because nothing in it may touch the network.
+LIVE_FEED_ENV = "DELTA_LIVE_FEED"
+
+
+def live_feed_enabled() -> bool:
+    return os.environ.get(LIVE_FEED_ENV, "1") != "0"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """One HTTP client for the process, so connections are reused across requests."""
+    """One HTTP client, one websocket to Delta, one chain cache, for the whole process.
+
+    The feed is started here rather than per request for the reason #3 gives: three
+    consumers each opening their own connection would burn the 150-per-5-minutes budget
+    and give three inconsistent views of one market.
+    """
     client = DeltaClient()
     await client.__aenter__()
     app.state.delta = client
+
+    app.state.fanout = FanOut()
+    app.state.stream = ChainStream()
+    app.state.stream.attach(app.state.fanout)
+    app.state.feed = DeltaFeed(app.state.fanout)
+    app.state.tasks = []
+
+    if live_feed_enabled():
+        try:
+            for underlying in LIVE_UNDERLYINGS:
+                symbols = [
+                    row["symbol"] for row in await client.tickers(underlying, None)
+                ]
+                app.state.feed.subscribe("ticker", symbols)
+                app.state.feed.subscribe("ob_l2", symbols)
+            app.state.tasks = [
+                asyncio.create_task(app.state.feed.run(), name="delta-feed"),
+                asyncio.create_task(app.state.stream.run(), name="chain-stream"),
+            ]
+            for task in app.state.tasks:
+                task.add_done_callback(_report_finished_task)
+        except DeltaUnavailable:
+            # The REST endpoints still work and the websocket reports "waiting". A
+            # start-up that dies because Delta was briefly unreachable is worse than one
+            # that comes up degraded and says so.
+            pass
+
     try:
         yield
     finally:
+        for task in app.state.tasks:
+            task.cancel()
+        if app.state.tasks:
+            await asyncio.gather(*app.state.tasks, return_exceptions=True)
         await client.aclose()
 
 
@@ -54,6 +158,29 @@ app.add_middleware(
 def get_delta_client() -> DeltaClient:
     """Overridden in tests so nothing here ever reaches the network."""
     return app.state.delta
+
+
+def _report_finished_task(task: asyncio.Task) -> None:
+    """Say something when a background task ends. It should never end on its own.
+
+    `DeltaFeed.run` returns normally once its retry budget is exhausted, and a task that
+    simply finishes raises nothing — so without this the feed can give up and the only
+    symptom is `/ws/chain` reporting `waiting` forever while `/health` still says ok. An
+    exception is worse: Python surfaces it as a "never retrieved" warning at garbage
+    collection, which may never reach the log anyone is reading.
+    """
+    if task.cancelled():
+        return  # shutdown, which is the one legitimate way for these to end
+    logger.error(
+        "background task %s ended unexpectedly: %s",
+        task.get_name(),
+        task.exception() or "returned without raising",
+    )
+
+
+def get_chain_stream() -> ChainStream:
+    """Overridden in tests, which feed the stream by hand instead of over a socket."""
+    return app.state.stream
 
 
 @app.get("/health")
@@ -109,3 +236,59 @@ async def _fetch(
         return await delta.tickers(underlying, expiry)
     except DeltaUnavailable as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.websocket("/ws/chain")
+async def live_chain(
+    websocket: WebSocket,
+    underlying: str,
+    expiry: str,
+    stream: Annotated[ChainStream, Depends(get_chain_stream)],
+    interval: float = PUSH_INTERVAL_SECONDS,
+) -> None:
+    """Push the chain for one underlying and expiry until the browser goes away.
+
+    The payload is the same `ChainResponse` `/chain` returns, wrapped in an envelope so
+    the three things the socket can say are distinguishable:
+
+        {"type": "chain",   "data": {...}}   here is the ladder
+        {"type": "waiting", "detail": "..."} nothing has arrived for this expiry yet
+        {"type": "error",   "detail": "..."} the request cannot ever succeed
+
+    **`waiting` is not an empty chain.** A `ChainResponse` with no rows renders as a
+    blank ladder and reads as "Delta lists nothing", when the truth is that the socket
+    has not spoken yet.
+
+    A websocket cannot return 400, so a bad parameter is reported in an `error` message
+    before closing. Closing silently would leave the browser reconnecting forever
+    against a request that can never work.
+    """
+    await websocket.accept()
+    interval = max(interval, MIN_PUSH_INTERVAL_SECONDS)
+    try:
+        symbol = normalise_underlying(underlying)
+        date = validate_expiry(expiry)
+    except ValidationError as exc:
+        await websocket.send_json({"type": "error", "detail": str(exc)})
+        await websocket.close()
+        return
+
+    try:
+        while True:
+            chain = stream.chain(symbol, date)
+            if chain is None:
+                await websocket.send_json(
+                    {
+                        "type": "waiting",
+                        "detail": f"no live quotes yet for {symbol} expiring {date}",
+                    }
+                )
+            else:
+                await websocket.send_json(
+                    {"type": "chain", "data": chain.model_dump(mode="json")}
+                )
+            await asyncio.sleep(interval)
+    except WebSocketDisconnect:
+        # The browser closed the tab. Ordinary, not a failure — and nothing to clean up,
+        # because this connection owns no subscription of its own.
+        return
