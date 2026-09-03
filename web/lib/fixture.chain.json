@@ -26,8 +26,8 @@
         "tick_size": 0.5,
         "computed": {
           "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
+          "iv_leg": "put",
+          "iv_reason": "no two-sided quote on the out-of-the-money leg",
           "delta": null,
           "gamma": null,
           "vega": null,
@@ -54,8 +54,8 @@
         "tick_size": 0.5,
         "computed": {
           "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
+          "iv_leg": "put",
+          "iv_reason": "no two-sided quote on the out-of-the-money leg",
           "delta": null,
           "gamma": null,
           "vega": null,
@@ -84,14 +84,14 @@
         "oi_value_usd": 44129.6,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.514293920064544,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.9699819622574248,
+          "gamma": 1.849182529688391e-05,
+          "vega": 4.870288936119875,
+          "theta": -30.202179062080177,
+          "rho": 5.8450067226185665
         }
       },
       "put": {
@@ -112,14 +112,14 @@
         "oi_value_usd": 291.4,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.514293920064544,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.030018037742575165,
+          "gamma": 1.849182529688391e-05,
+          "vega": 4.870288936119875,
+          "theta": -31.366824101844024,
+          "rho": -0.20195241697723484
         }
       }
     },
@@ -143,14 +143,14 @@
         "oi_value_usd": 60010.9,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.4815078502946254,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.954561300691815,
+          "gamma": 2.771611081540854e-05,
+          "vega": 6.8343814766915045,
+          "theta": -42.84605021054995,
+          "rho": 5.826459072472001
         }
       },
       "put": {
@@ -171,14 +171,14 @@
         "oi_value_usd": 700.8,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.4815078502946254,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.045438699308185004,
+          "gamma": 2.771611081540854e-05,
+          "vega": 6.8343814766915045,
+          "theta": -43.832695822417676,
+          "rho": -0.3056685057096571
         }
       }
     },
@@ -202,14 +202,14 @@
         "oi_value_usd": 127314.1,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.45184539943125185,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.9289840597124699,
+          "gamma": 4.197500800906173e-05,
+          "vega": 9.71279466568979,
+          "theta": -61.64134284357169,
+          "rho": 5.739471751014838
         }
       },
       "put": {
@@ -230,14 +230,14 @@
         "oi_value_usd": 2835.9,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.45184539943125185,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.07101594028753011,
+          "gamma": 4.197500800906173e-05,
+          "vega": 9.71279466568979,
+          "theta": -62.449989027584465,
+          "rho": -0.4778242657526762
         }
       }
     },
@@ -261,14 +261,14 @@
         "oi_value_usd": 283787.8,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.4265620155274536,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.8863546839608181,
+          "gamma": 6.303509331577703e-05,
+          "vega": 13.769815937381928,
+          "theta": -88.80627307757095,
+          "rho": 5.537312018048908
         }
       },
       "put": {
@@ -289,14 +289,14 @@
         "oi_value_usd": 13102.6,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.4265620155274536,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.11364531603918193,
+          "gamma": 6.303509331577703e-05,
+          "vega": 13.769815937381928,
+          "theta": -89.43691983368558,
+          "rho": -0.7651524373044615
         }
       }
     },
@@ -320,14 +320,14 @@
         "oi_value_usd": 497103.8,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.40450225952390617,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.8190219946940245,
+          "gamma": 9.09320564206162e-05,
+          "vega": 18.836556811370613,
+          "theta": -123.04020883646945,
+          "rho": 5.167745541285249
         }
       },
       "put": {
@@ -348,14 +348,14 @@
         "oi_value_usd": 50807.3,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.40450225952390617,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.18097800530597552,
+          "gamma": 9.09320564206162e-05,
+          "vega": 18.836556811370613,
+          "theta": -123.49285616471172,
+          "rho": -1.219887352653978
         }
       }
     },
@@ -379,14 +379,14 @@
         "oi_value_usd": 582373.7,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.3947319868560717,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.7736577226811101,
+          "gamma": 0.0001065005167184728,
+          "vega": 21.528689325837803,
+          "theta": -141.14191033256884,
+          "rho": 4.9033206526624635
         }
       },
       "put": {
@@ -407,14 +407,14 @@
         "oi_value_usd": 90623.6,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.3947319868560717,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.2263422773188899,
+          "gamma": 0.0001065005167184728,
+          "vega": 21.528689325837803,
+          "theta": -141.50555794685906,
+          "rho": -1.5268964605696909
         }
       }
     },
@@ -438,14 +438,14 @@
         "oi_value_usd": 625548.0,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.3858402496116322,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.7197512142186693,
+          "gamma": 0.0001219330849755344,
+          "vega": 24.093097983461035,
+          "theta": -158.10018655359045,
+          "rho": 4.580371921977724
         }
       },
       "put": {
@@ -466,14 +466,14 @@
         "oi_value_usd": 150304.0,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.3858402496116322,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.2802487857813307,
+          "gamma": 0.0001219330849755344,
+          "vega": 24.093097983461035,
+          "theta": -158.37483445394008,
+          "rho": -1.892429410547359
         }
       }
     },
@@ -497,14 +497,14 @@
         "oi_value_usd": 614811.0,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.37779813910894855,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.6575257725446622,
+          "gamma": 0.00013586384241591438,
+          "vega": 26.28616698336842,
+          "theta": -172.0176571080067,
+          "rho": 4.199969317313896
         }
       },
       "put": {
@@ -525,14 +525,14 @@
         "oi_value_usd": 231404.2,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.37779813910894855,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.34247422745533784,
+          "gamma": 0.00013586384241591438,
+          "vega": 26.28616698336842,
+          "theta": -172.20330529441895,
+          "rho": -2.3154162345041143
         }
       }
     },
@@ -556,14 +556,14 @@
         "oi_value_usd": 551666.5,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.3704929317413912,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.5880597628199401,
+          "gamma": 0.00014674808742531946,
+          "vega": 27.842993874666078,
+          "theta": -180.8341616760772,
+          "rho": 3.768872426267755
         }
       },
       "put": {
@@ -584,14 +584,14 @@
         "oi_value_usd": 329362.3,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.3704929317413912,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.4119402371800599,
+          "gamma": 0.00014674808742531946,
+          "vega": 27.842993874666078,
+          "theta": -180.9308101485484,
+          "rho": -2.7890973448431833
         }
       }
     },
@@ -615,14 +615,14 @@
         "oi_value_usd": 451666.9,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.36409492378604574,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": 0.5132812562598059,
+          "gamma": 0.00015298633206761494,
+          "vega": 28.525338811706916,
+          "theta": -182.93835546333617,
+          "rho": 3.29945247683256
         }
       },
       "put": {
@@ -643,14 +643,14 @@
         "oi_value_usd": 433353.3,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.36409492378604574,
+          "iv_leg": "put",
+          "iv_reason": "",
+          "delta": -0.4867187437401941,
+          "gamma": 0.00015298633206761494,
+          "vega": 28.525338811706916,
+          "theta": -182.9460042218775,
+          "rho": -3.301101513571307
         }
       }
     },
@@ -674,14 +674,14 @@
         "oi_value_usd": 347183.4,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.367045512426619,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": 0.4378206284142904,
+          "gamma": 0.00014999261212826496,
+          "vega": 28.19378231750562,
+          "theta": -181.7355674747388,
+          "rho": 2.8200503134875405
         }
       },
       "put": {
@@ -702,14 +702,14 @@
         "oi_value_usd": 536518.5,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.367045512426619,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": -0.5621793715857095,
+          "gamma": 0.00014999261212826496,
+          "vega": 28.19378231750562,
+          "theta": -181.65421651931752,
+          "rho": -3.8230878962092536
         }
       }
     },
@@ -733,14 +733,14 @@
         "oi_value_usd": 247640.0,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.37147760169098853,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": 0.3667180379466032,
+          "gamma": 0.0001415763265880394,
+          "vega": 26.933130033555617,
+          "theta": -173.90746462632546,
+          "rho": 2.3659828528149056
         }
       },
       "put": {
@@ -761,14 +761,14 @@
         "oi_value_usd": 608907.5,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.37147760169098853,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": -0.6332819620533968,
+          "gamma": 0.0001415763265880394,
+          "vega": 26.933130033555617,
+          "theta": -173.73711395697433,
+          "rho": -4.319739576174818
         }
       }
     },
@@ -792,14 +792,14 @@
         "oi_value_usd": 163991.3,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.37662132775930507,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": 0.30220856533208185,
+          "gamma": 0.0001293969435848288,
+          "vega": 24.95700600306441,
+          "theta": -160.6688594659227,
+          "rho": 1.952496508614723
         }
       },
       "put": {
@@ -820,14 +820,14 @@
         "oi_value_usd": 633873.8,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.37662132775930507,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": -0.6977914346679182,
+          "gamma": 0.0001293969435848288,
+          "vega": 24.95700600306441,
+          "theta": -160.40950908263062,
+          "rho": -4.775810139667929
         }
       }
     },
@@ -851,14 +851,14 @@
         "oi_value_usd": 101488.8,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.3824252614252445,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": 0.2456061583981734,
+          "gamma": 0.00011499049721779025,
+          "vega": 22.520191501951462,
+          "theta": -143.98324765931628,
+          "rho": 1.588652343498194
         }
       },
       "put": {
@@ -879,14 +879,14 @@
         "oi_value_usd": 608156.1,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.3824252614252445,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": -0.7543938416018265,
+          "gamma": 0.00011499049721779025,
+          "vega": 22.520191501951462,
+          "theta": -143.6348975620831,
+          "rho": -5.182238524077385
         }
       }
     },
@@ -910,14 +910,14 @@
         "oi_value_usd": 58837.9,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.38886292957082075,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": 0.1973700294312386,
+          "gamma": 9.977775460818784e-05,
+          "vega": 19.869815074302213,
+          "theta": -125.77750172012199,
+          "rho": 1.2778878677823764
         }
       },
       "put": {
@@ -938,14 +938,14 @@
         "oi_value_usd": 539918.5,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.38886292957082075,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": -0.8026299705687614,
+          "gamma": 9.977775460818784e-05,
+          "vega": 19.869815074302213,
+          "theta": -125.34015190894979,
+          "rho": -5.535587219086132
         }
       }
     },
@@ -969,14 +969,14 @@
         "oi_value_usd": 16702.4,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.4037743727079053,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": 0.12475224901716203,
+          "gamma": 7.112389109163867e-05,
+          "vega": 14.706787405812454,
+          "theta": -90.79511279710262,
+          "rho": 0.8088925664160013
         }
       },
       "put": {
@@ -997,14 +997,14 @@
         "oi_value_usd": 344771.7,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.4037743727079053,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": -0.875247750982838,
+          "gamma": 7.112389109163867e-05,
+          "vega": 14.706787405812454,
+          "theta": -90.17976355802602,
+          "rho": -6.089750959038363
         }
       }
     },
@@ -1028,14 +1028,14 @@
         "oi_value_usd": 4054.6,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.4211212789642211,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": 0.07806876232628812,
+          "gamma": 4.841337196475094e-05,
+          "vega": 10.440855224766057,
+          "theta": -62.73872142788332,
+          "rho": 0.5066777596166898
         }
       },
       "put": {
@@ -1056,14 +1056,14 @@
         "oi_value_usd": 176986.2,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.4211212789642211,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": -0.9219312376737119,
+          "gamma": 4.841337196475094e-05,
+          "vega": 10.440855224766057,
+          "theta": -61.94537276092615,
+          "rho": -6.477134204423532
         }
       }
     },
@@ -1087,14 +1087,14 @@
         "oi_value_usd": 340.3,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.46294298232160147,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": 0.03213818102018218,
+          "gamma": 2.1736354505854393e-05,
+          "vega": 5.15320914410106,
+          "theta": -29.72419553159839,
+          "rho": 0.20875357588938454
         }
       },
       "put": {
@@ -1115,14 +1115,14 @@
         "oi_value_usd": 53933.4,
         "tick_size": 0.5,
         "computed": {
-          "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
-          "delta": null,
-          "gamma": null,
-          "vega": null,
-          "theta": null,
-          "rho": null
+          "iv": 0.46294298232160147,
+          "iv_leg": "call",
+          "iv_reason": "",
+          "delta": -0.9678618189798178,
+          "gamma": 2.1736354505854393e-05,
+          "vega": 5.15320914410106,
+          "theta": -28.574848008883237,
+          "rho": -6.9453952653225475
         }
       }
     },
@@ -1147,8 +1147,8 @@
         "tick_size": 0.5,
         "computed": {
           "iv": null,
-          "iv_leg": null,
-          "iv_reason": "the forward could not be fitted from this chain",
+          "iv_leg": "call",
+          "iv_reason": "no two-sided quote on the out-of-the-money leg",
           "delta": null,
           "gamma": null,
           "vega": null,
@@ -1159,8 +1159,8 @@
       "put": null
     }
   ],
-  "forward": null,
-  "discount": null,
+  "forward": 77542.97069163604,
+  "discount": 0.9994462518023509,
   "years_to_expiry": 0.00852156265854896,
-  "forward_method": "F1"
+  "forward_method": "F1+assumed-rate"
 }
