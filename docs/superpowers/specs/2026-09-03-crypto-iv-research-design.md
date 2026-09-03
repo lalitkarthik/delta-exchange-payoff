@@ -1,23 +1,16 @@
 # Crypto option analytics: a build-and-measure study
 
-**Two tracks, one project.** We build a working live-analytics stack — websocket ingestion,
-fan-out, storage, caching, computed Greeks on screen — and we treat every design choice inside it
-as a measured experiment rather than a decision taken on taste.
+**Two tracks, one project.** We build a working live-analytics stack — ingestion, fan-out,
+storage, caching, computed Greeks on screen — and treat every design choice inside it as a
+measured experiment rather than a decision taken on taste.
 
-The architecture is borrowed deliberately from OpenAlgo and NautilusTrader. **Understanding those
-designs is a deliverable, not background reading**: each architecture ticket begins by studying
-how they solved it, and ends with our version plus a written note on what we took, what we left,
-and why.
-
-Every ticket carries: **the concept · why this way · learn first · the task · how you'll know ·
-what to notice.**
+**Every ticket is written to be learned from.** Six sections each: the concept explained from
+zero, why this way, what to read first, the task, how you'll know it worked, and what to notice.
+A ticket that produces working code and teaches nothing has failed.
 
 ---
 
 ## Problem Statement
-
-We want to price and risk-manage Delta's crypto options the way `payoff-project` does for NIFTY,
-and we want the live stack that feeds it.
 
 Delta publishes implied volatility and all five Greeks on REST and websocket. We cannot build on
 them. **As an input they are circular** — checking our maths against a number we took as input
@@ -28,28 +21,24 @@ buy one at any price. Computing IV ourselves is the only route to a historical s
 Underneath sits the harder problem. **Implied volatility is not observable.** It is inverted out
 of a price under assumptions — about the forward, the rate, the model, the solver. Change an
 assumption, get a different number, and no experiment says which is right, because there is no
-ground truth.
+ground truth to compare against.
 
-The same is true one level up. Nobody can tell us from first principles whether we need a message
-bus, whether Polars beats DuckDB, or whether caching earns its complexity at our volume. Both
-questions get the same treatment: **build the alternatives, measure them, write down the answer.**
+The same is true one level up. Nobody can say from first principles whether we need a message
+bus, or whether caching earns its complexity at our volume. Both get the same treatment: **build
+the alternatives, measure them, write down the answer.**
 
 ## Solution
 
-A stack built in seven tickets, where each ticket produces working code *and* a measured finding.
+Seven tickets. Each produces working code *and* a measured finding.
 
-For the maths: implement several independent methods, run them on the same chain, measure
-**agreement between them** and **cost of each**. Where methods agree, the assumption they differ
-on does not matter and we take the cheapest. Where they diverge, that names the assumption
-carrying the risk. Triangulation replaces the ground truth we do not have.
+Where methods agree, the assumption they differ on does not matter and we take the cheapest.
+Where they diverge, that names the assumption carrying the risk. Triangulation replaces the
+ground truth we do not have.
 
-**The accuracy criterion is `dIV ≤ 0.1 vol points` (0.001 decimal) between our own methods**, not
-against Delta. Delta's numbers are recorded alongside as an unexplained reference: if our methods
-cluster and Delta sits outside, that is a finding about their assumptions. A test asserts their
-values are never consumed as input.
-
-**The latency criterion is a full-chain recompute under 1 second**, and an incremental
-single-contract recompute under 40 ms — one frame at the chain's real update rate.
+- **Accuracy: `dIV ≤ 0.1 vol points` (0.001 decimal) between our own methods**, not against
+  Delta. Delta's values are an unexplained reference column; a test asserts they are never
+  consumed as input.
+- **Latency: full-chain recompute < 1 s, incremental single-contract < 40 ms.**
 
 ---
 
@@ -57,260 +46,425 @@ single-contract recompute under 40 ms — one frame at the chain's real update r
 
 Measured 2026-09-02/03 against `https://api.india.delta.exchange`. Re-verify before trusting.
 
+**Delta migrated its public channels.** The old names — `v2/ticker`, `l1_orderbook`,
+`l2_orderbook` — moved to the public endpoint as `ticker` / `ob_l1` / `ob_l2`, with the legacy
+names scheduled for removal **31 July 2026**. This is why `v2/ticker` is now rejected as an
+invalid channel. Source: OpenAlgo's Delta adapter, confirmed by our own probe.
+
 | Fact | Value |
 |---|---|
 | Public websocket | `wss://public-socket.india.delta.exchange` |
-| Channel | **`ticker`** — `v2/ticker` is rejected as invalid |
-| Contracts on one connection | **967** — every live option, no cap reached |
-| Quote updates, one contract | **0.186/s** — one every 5.4 s |
-| Quote updates, one expiry chain (136 contracts) | **25.3/s** |
-| Quote updates, all 967 | 187/s, **82 KB/s** |
-| Trades on an ATM contract | **~1 per 75 s** |
-| `mark_price` channel | **produced nothing in 75 s — treat as dead** |
+| `ticker` channel | **every 5 s** per contract (measured 5.4 s) — mark, OI, quotes, IV, Greeks |
+| `ob_l2` channel | **every 504 ms** per contract — top-15 order book, both sides |
+| Contracts on one connection, `ticker` | **967** — every live option, no cap reached |
+| Contracts on one connection, `ob_l2` | **136 verified** (a full chain), all delivering |
+| Throughput, `ticker`, all 967 | 187/s, **82 KB/s** |
+| Throughput, `ob_l2`, one chain (136) | 270/s, **131.7 KB/s** |
+| Trades on an ATM contract | ~1 per 75 s |
+| `mark_price` channel | produced nothing in 75 s — treat as dead |
 | Connection limit | 150 per IP per 5 min |
-| Rate limit, REST | weight 3 per market-data call; budget against 10,000 per 5 min |
 
-The websocket payload is abbreviated. Decoded field-by-field against REST:
+**The consequence that shapes the project: Delta publishes IV every 5 seconds, but the order book
+moves every 500 ms. If we compute our own IV from the book, our numbers can be ten times fresher
+than theirs.** That turns "replicate exactly as Delta" into something we can exceed rather than
+merely match.
+
+**A second consequence.** A quote update is not a trade — quotes move because spot moved, roughly
+400× more often than anyone trades. And recomputing 136 contracts on every `ob_l2` update is
+~270 chain-recomputes per second. **Incremental recompute, not full-chain.**
+
+The `ticker` payload is abbreviated. Decoded field-by-field against REST, and independently
+confirmed by OpenAlgo's adapter:
 
 ```
-d[].g   = [delta, gamma, rho, theta, vega]
-d[].qiv = [ask_iv, bid_iv, mark_iv]
+d[].g   = [delta, gamma, rho, theta, vega]      d[].m    = mark
+d[].qiv = [ask_iv, bid_iv, mark_iv]             d[].ohlc = [o, h, l, c]
 d[].q   = [best_ask, ask_size, best_bid, bid_size, impact_mid]
-d[].m   = mark      d[].oi = [oi_contracts, oi_value_usd]
-d[].ohlc = [o,h,l,c]   d[].pb = [band_lower, band_upper]
-sp      = spot      ts     = microsecond timestamp
-```
+d[].oi  = [oi_contracts, oi_value_usd]          sp = spot   ts = microseconds
 
-**Two consequences that shape everything.** A quote update is not a trade — quotes move because
-spot moved, roughly 400× more often than anyone trades. And recomputing 136 contracts on every
-update is ~3,400 IV solves per second to refresh data that individually changes every 5.4 s.
-**Incremental recompute, not full-chain recompute.**
+ob_l2:  a = [[price, size], ...]  asks, best first
+        b = [[price, size], ...]  bids
+```
 
 **History is usable under one rule:** `end` must be the contract's `settlement_time`, never `now`.
-With `end = now`, `/v2/history/candles` pads empty buckets by copying the last trade forward
+With `now`, `/v2/history/candles` pads empty buckets by copying the last trade forward
 indefinitely — `C-BTC-60000-270624` returns 801 daily bars of which 797 are fabricated. With
-`end = settlement_time`, 4 bars, all real. Under that rule `MARK:` gives 64 hourly bars with 64
-distinct values across a contract that expired in June 2024. Detail in `docs/delta-api-scope.md`.
+`settlement_time`, 4 bars, all real. Under that rule `MARK:` gives 64 hourly bars with 64 distinct
+values across a contract that expired in June 2024. Detail in `docs/delta-api-scope.md`.
 
 **Prior art.** `payoff-project/src/payoff/forward.py` implements parity OLS with a trust gate and
-two fallbacks, discounting at `D = e^(-0.065·T)` — r = 6.5% already in place. `docs/calculations.md`
-documents it and records the regression reproducing the source exactly on 316 of 376 minutes.
-The method transfers; the settlement convention does not.
+two fallbacks, discounting at `D = e^(-0.065·T)` — r = 6.5% already in place.
+`OpenAlgo broker/deltaexchange/` is prior art for our exact venue. **Trust our measurements over
+their constants**: their `MAX_SYMBOLS_PER_FRAME[ob_l2] = 1` is wrong today — we subscribed 136.
 
 ---
 
 ## The Seven Tickets
 
-Ordered by dependency. Each is one PR.
+Ordered by dependency. Each is one PR. **T1 and T4 can start in parallel.**
 
-### T1 · Foundations: inverse settlement, the parity forward, and the timing harness
+### T1 · Foundations: inverse settlement, the parity forward, the timing harness
 
-**Concept.** Put-call parity is an identity, not a model: `C − P = D·(F − K)` holds by arbitrage,
-with no assumption about volatility. Plot `C − P` against `K` and it is a straight line — its
-zero-crossing is the forward, its slope is the discount factor. So a regression recovers both
-from traded prices without assuming a rate.
+**The concept.** An option's price depends on where the market thinks the underlying will be *at
+expiry* — the **forward** — not where it is now. On a stock index those differ by financing cost.
+On crypto they differ by whatever the funding market says.
 
-**Why this way.** The alternative is assuming `F = S·e^(rT)`, which needs an `r` that nobody
-actually knows on a crypto venue. Recovering it from the market is the honest route — and T2
-measures whether it was worth the trouble.
+**Put-call parity** lets you recover the forward from prices alone. For European options on the
+same strike and expiry:
 
-**Learn first.** `payoff-project/docs/calculations.md` §1, for the derivation and the gating
-rules — our own prior art. Hull's parity section, for why it is arbitrage rather than a model.
+```
+C − P = D · (F − K)
+```
 
-**Task.** Establish in writing what **inverse settlement** changes — Delta's options are quoted
-in USD but margined and settled in the coin — before porting any pricing code. Then implement
-`F1` parity OLS over ATM±x for **x ∈ {3,5,7,9}**, `F2` single-strike parity, `F3` carry at
-r = 6.5%, `F4` spot with no forward. Build the timing harness (median and p95 over repeated runs)
-that every later ticket reports through.
+`C` and `P` are the call and put prices, `K` the strike, `F` the forward, `D` the discount factor.
+**This is an identity, not a model** — it holds by arbitrage. If it were violated you could buy
+one side, sell the other, and take a riskless profit. No assumption about volatility appears
+anywhere in it.
 
-**How you'll know.** `F1` and `F2` agree within a few dollars on a captured chain; the recovered
-discount implies a plausible rate; the harness reports per-function timings.
+Now read that equation as a straight line: plot `C − P` on the y-axis against `K` on the x-axis
+across all strikes, and you get a line with slope `−D` and a zero-crossing at `K = F`. So
+**fitting a line to observed prices recovers both the forward and the discount rate**, with no
+assumption about either. That fit is ordinary least squares — the `atm ± x` regression.
 
-**What to notice.** The forward is robust and the discount is fragile — they come from different
-features of the same line. Watch how much the recovered rate moves as x changes, and how little
-the forward does. **Inverse settlement is the highest-risk unknown in the project**: get it wrong
-and every number after looks plausible and is wrong.
+**Why this way.** The alternative assumes `F = S·e^(rT)`, which needs an `r`. On a crypto venue
+nobody actually knows `r` — there is no risk-free rate for BTC. Recovering it from traded prices
+is the honest route. T2 measures whether it was worth the trouble.
+
+**Learn first.**
+- `payoff-project/docs/calculations.md` §1 — the derivation *and* the gating rules. Our own prior
+  art, and it records that the regression reproduced the source exactly on 316 of 376 minutes.
+- Hull, *Options, Futures and Other Derivatives*, the put-call parity section — for why it is
+  arbitrage rather than a model. This distinction is the whole reason we trust it.
+- Any explanation of ordinary least squares that covers **what the residuals mean**. You need to
+  know when a fit is untrustworthy, not just how to compute one.
+
+**The task.** First, and before any code: establish **in writing what inverse settlement
+changes**. Delta's options are quoted in USD but margined and settled in the coin itself. A NIFTY
+option pays rupees; a Delta BTC option pays BTC. Work out what that does to the payoff and to the
+Greeks, and write it down.
+
+Then implement four forward estimators as pure functions over a chain snapshot:
+`F1` parity OLS over ATM±x for **x ∈ {3, 5, 7, 9}** · `F2` single-strike parity at the ATM strike
+· `F3` carry `F = S·e^(rT)` at r = 6.5% · `F4` spot used directly, no forward.
+
+Then the **timing harness** — median and p95 over repeated runs — that every later ticket reports
+through.
+
+**A design constraint.** These functions take a *chain snapshot* and must not care where it came
+from. Today REST provides one; after T4 the websocket will. Same signature either way.
+
+**How you'll know it worked.** `F1` and `F2` agree within a few dollars on a captured chain. The
+recovered discount implies a rate in a plausible range. The harness prints per-function timings.
+
+**What to notice.** **The forward is robust and the discount is fragile.** They come from
+different features of the same line — the forward is where it crosses zero, the discount is its
+slope. A slope is far more sensitive to noise at the wings than a crossing point is. Watch how
+much the recovered rate moves as you change x, and how little the forward does. That asymmetry is
+the single most useful intuition in this ticket.
+
+Also notice: **OLS returns a number whether the input deserves one or not.** That is why
+`payoff-project` gates the regression instead of trusting it. Carry the gate over.
+
+**Highest-risk item in the project:** inverse settlement. Get it wrong and every number
+downstream looks plausible and is wrong — the worst failure mode available, because nothing
+crashes.
 
 ---
 
 ### T2 · IV solvers, the model axis, and the agreement matrix
 
-**Concept.** Implied volatility is the number you must put into a pricing model to make it return
-the price you observe. There is no formula for it — you search. Different searches and different
-models give different answers, and the spread between them is the only error measure available.
+**The concept.** Black-Scholes takes volatility in and gives a price out. But we observe the
+*price* and want the *volatility*. There is no formula that inverts it — so you **search**: guess
+a vol, price it, compare to the observed price, adjust, repeat. The vol that reproduces the
+observed price is the **implied volatility**.
 
-**Why this way.** With no ground truth, agreement between independent methods is the evidence.
-This is the heart of the study.
+The search method matters more than you would expect:
+- **Newton-Raphson** uses the derivative (vega) to jump straight toward the answer. Fast — a few
+  iterations — but it can shoot off to nonsense when vega is tiny, which happens far from the
+  money and near expiry.
+- **Brent** brackets the answer between two bounds and never leaves them. Slower, but it cannot
+  diverge.
+- **Jäckel's "Let's Be Rational"** transforms the problem so that a well-behaved starting guess
+  is always available. Roughly two iterations to machine precision.
 
-**Learn first.** Jäckel, *Let's Be Rational* — why the naive Newton solve is fragile and what
-fixes it. `py_vollib` source, for a reference implementation to compare shapes against.
+**Black-76 vs Black-Scholes** is the other axis. Black-76 prices off the **forward**;
+Black-Scholes prices off **spot** plus a rate. They are the same model wearing different clothes —
+which is exactly why comparing them tells you whether the forward handling matters.
 
-**Task.** Implement `M1` Black-76 on the forward and `M2` Black-Scholes on spot; solvers `S1`
-Newton-Raphson with analytic vega, `S2` Brent, `S3` Jäckel, `S4` NumPy-vectorised. Cross with T1's
-forwards. Produce the **pairwise agreement matrix** by moneyness and time-to-expiry, and record
-where each solver fails — deep ITM, near expiry, illiquid wings. Also recover `r` from the
-regression slope (`R2`) and compare against the assumed 6.5% (`R1`).
+**Why this way.** With no ground truth, **agreement between independent methods is the only
+evidence available.** This is the heart of the study.
 
-**How you'll know.** Round-trip holds: pricing with the IV we solved returns the input price.
-Analytic limits hold: deep-ITM call delta → 1, ATM ≈ 0.5, vega → 0 far from the money. The
-agreement matrix is populated and every cell is explained.
+**Learn first.**
+- Jäckel, *Let's Be Rational* (the paper) — read the opening on **why naive Newton is fragile**.
+  You do not need to follow the whole construction; you need to understand the failure mode.
+- `py_vollib` source — a reference implementation to compare shapes against, not to copy.
+- Any clear derivation of **vega** — because vega is both the Newton step size and the reason the
+  solve fails when it is small. Understanding that one fact explains most solver failures.
 
-**What to notice.** **The `F3` vs `F4` comparison is the most valuable result in the study** — it
-measures what the forward is actually worth. NIFTY needs it. If crypto does not, a whole branch
-of T1 becomes unnecessary, and that is a real finding, not a failure.
+**The task.** Implement `M1` Black-76 on the forward and `M2` Black-Scholes on spot; solvers `S1`
+Newton with analytic vega, `S2` Brent, `S3` Jäckel, `S4` NumPy-vectorised Newton. Cross them with
+T1's four forwards. Produce the **pairwise agreement matrix**, sliced by moneyness and by time to
+expiry. Record where each solver fails — deep ITM, near expiry, illiquid wings. Recover `r` from
+the regression slope (`R2`) and compare against the assumed 6.5% (`R1`).
+
+**How you'll know it worked.** **Round-trip holds** — price with the IV you solved for and the
+input price comes back. That catches solver bugs with no reference implementation needed.
+**Analytic limits hold** — deep-ITM call delta → 1, ATM delta ≈ 0.5, vega → 0 far from the money,
+put-call parity holds on our own prices. Every cell of the agreement matrix has an explanation.
+
+**What to notice.** **The `F3` vs `F4` comparison is the most valuable result in the study.** It
+measures what the forward is actually *worth*. NIFTY needs it — `payoff-project` exists largely
+to recover one. If crypto does not, a whole branch of T1 becomes unnecessary. **That would be a
+finding, not a failure**, and it is worth running early precisely because it can delete work.
+
+Also notice where the solvers disagree. It will not be uniform — expect the wings and the
+front expiry. Those are exactly the regions where vega is small.
 
 ---
 
 ### T3 · Parallelisation and hitting the latency target
 
-**Concept.** "Make it fast" is meaningless without knowing where time goes. Profile first,
-optimise the top item, re-measure. Parallelism has a cost — process startup, data serialisation —
-that can exceed the work at small sizes.
+**The concept.** "Make it fast" means nothing until you know where the time goes. **Profile
+first, optimise the top item, measure again.** Intuition about performance is famously unreliable —
+the bottleneck is usually somewhere you did not suspect.
 
-**Why this way.** At 136 contracts per chain, naive per-contract solving may already be fast
-enough, in which case parallelism is complexity for nothing. We find out rather than assume.
+Three ways to go faster, in increasing order of complexity:
+- **Vectorisation** — NumPy does arithmetic on whole arrays in compiled C, so one call handles 136
+  contracts instead of 136 Python loop iterations. Python loop overhead per element is large; this
+  usually wins first and costs least.
+- **Multiprocessing** — real parallelism across CPU cores. Python's **GIL** (a lock that lets only
+  one thread run Python bytecode at a time) means *threads* do not help CPU-bound work. Processes
+  do, but each has startup cost and must serialise data in and out.
+- **Doing less work** — incremental recompute instead of full-chain. Usually the biggest win and
+  the one people reach for last.
 
-**Learn first.** NumPy vectorisation basics — why array-at-a-time beats loops. Python's GIL and
-why `multiprocessing` (not threads) is the CPU-bound answer.
+**Why this way.** At 136 contracts, plain per-contract solving may already be fast enough — in
+which case parallelism is complexity bought for nothing. We find out rather than assume.
 
-**Task.** Time every function individually. Compare scalar, NumPy-vectorised and multiprocess
+**Learn first.**
+- NumPy vectorisation basics — specifically *why* array-at-a-time beats a Python loop. The answer
+  is interpreter overhead, not arithmetic.
+- Python's GIL — enough to know why `multiprocessing` and not `threading` for CPU-bound work.
+- **Amdahl's law** — the ceiling on speedup when only part of a program parallelises. It tells you
+  when to stop optimising.
+
+**The task.** Time every function individually. Compare scalar, NumPy-vectorised and multiprocess
 across a full 136-contract chain. Compare **full-chain recompute against single-contract
 incremental**. Hit **< 1 s full chain**, target **< 40 ms incremental**.
 
-**How you'll know.** A timing table with medians and p95s; both targets met or a documented
-reason why not.
+**How you'll know it worked.** A timing table with medians and p95s, and both targets met — or a
+documented reason why not.
 
-**What to notice.** Where the time actually goes — likely the solver iterations, possibly the
-string-to-float conversion, possibly neither. The measurement usually surprises. Note the size at
-which parallelism starts winning; below it, the simpler code is also the faster code.
+**What to notice.** Where the time actually goes. Candidates: solver iterations, the
+string-to-float conversion at the API boundary, the forward refit. **The measurement usually
+surprises.** Note the chain size at which parallelism starts winning — below it, the simpler code
+is also the faster code, and that is worth knowing before you reach for a process pool.
 
 ---
 
 ### T4 · Ingestion and fan-out: one socket, many consumers
 
-**Concept.** A **message bus** is a middleman. Instead of the websocket handler calling the
-storage writer and the UI directly, it publishes messages to a bus, and anything interested
-subscribes. The publisher never knows who is listening. OpenAlgo runs exactly this — a websocket
-proxy on port 8765 fanning out over **ZeroMQ**; NautilusTrader does the same with its own bus.
+**The concept — websockets.** A REST call is a letter: you ask, they answer, the connection
+closes. A **websocket** is a phone line left open — the server pushes data whenever it has some,
+with no request. That is the only way to get 500 ms updates without hammering the API.
 
-**Why this way, and why not all the way.** We need **one** socket carrying all 967 contracts —
-three consumers each opening their own connection would burn the 150-per-5-min budget and give
-three inconsistent views. So the socket-owner/consumer split is mandatory. But a *broker process*
-is not: OpenAlgo needs ZeroMQ because it fans across 36 brokers and many users; we have one venue
-and one user at 82 KB/s. **We build the seam where OpenAlgo puts the bus, using an internal async
-fan-out** — so promoting to ZeroMQ later is a deployment change, not a rewrite.
+**The concept — a message bus.** Suppose the websocket handler needs to feed three things: the
+storage writer, the IV engine, the UI. The naive version has the handler call all three directly.
+Now the handler knows about all three, a slow one blocks the socket, and adding a fourth means
+editing the handler.
 
-**Learn first.** [ZeroMQ Guide](https://zguide.zeromq.org/) chapter 1, pub/sub only — enough to
-know what OpenAlgo is doing. OpenAlgo's `websocket_proxy/` module. NautilusTrader's message-bus
-docs, for the mature version of the same idea.
+A **message bus** puts a middleman in between. The handler **publishes** messages; interested
+components **subscribe**. The publisher never knows who is listening. This is the **publish/
+subscribe** pattern, and it buys three things: consumers become independent, a slow consumer
+cannot stall ingestion, and you add a consumer without touching the producer.
 
-**Task.** One connection to `wss://public-socket.india.delta.exchange`, `ticker` channel, all
-live options. Decode the abbreviated payload into a normalised record. Publish to an in-process
-fan-out where each consumer holds its own `asyncio.Queue`; a slow consumer must never stall the
-socket. Handle reconnection with resubscribe, and heartbeats — the documented 60 s idle
-disconnect did not reproduce in a 75 s test, so treat it as unverified and send them anyway.
-**Write the note: what we took from OpenAlgo, what we left, and why.**
+OpenAlgo runs exactly this — a websocket proxy fanning out over **ZeroMQ** (a library that gives
+you sockets speaking pub/sub without needing a broker server). NautilusTrader does the same with
+its own bus. **Two mature systems reached this independently.**
 
-**How you'll know.** All 967 contracts subscribed on one connection; measured throughput matches
-the 187/s and 82 KB/s baseline; killing a consumer does not disturb ingestion; pulling the network
-cable reconnects and resubscribes without losing the subscription set.
+**Why this way, and why not all the way.** We need **one** socket carrying every contract — three
+consumers each opening their own connection would burn the 150-per-5-min budget and give three
+inconsistent views of the market. So the socket-owner/consumer split is **mandatory**.
 
-**What to notice.** How much the indirection costs in latency, and how much it buys in
-independence. This is the pattern two mature systems reached independently — worth understanding
-why before deciding we are the exception.
+A separate broker *process* is not. OpenAlgo needs ZeroMQ because it fans across 36 brokers and
+many users; we have one venue and one user at 82 KB/s. **So we build the seam exactly where
+OpenAlgo puts the bus, using an in-process async fan-out.** Promoting to ZeroMQ later becomes a
+deployment change rather than a rewrite. Knowing *why* we are not using one is the point of this
+ticket — not cargo-culting it, and not cargo-culting its absence either.
+
+**Learn first.**
+- **`OpenAlgo broker/deltaexchange/streaming/delta_websocket.py` — read this first.** It is prior
+  art for our exact venue: channel names, the migration, auth signing, heartbeats.
+- [ZeroMQ Guide](https://zguide.zeromq.org/) chapter 1, **pub/sub only** — enough to understand
+  what OpenAlgo is doing. Do not read the whole guide.
+- **Backpressure** — what happens when a consumer is slower than the producer. This is the
+  problem the queue-per-consumer design exists to solve.
+
+**The task.** One connection to `wss://public-socket.india.delta.exchange`. Subscribe **both
+channels**: `ticker` (5 s — mark, OI, IV, Greeks) and `ob_l2` (504 ms — top-15 book). Decode the
+abbreviated payloads into one normalised record. Publish into an in-process fan-out where each
+consumer holds its own `asyncio.Queue` — **a slow consumer must never stall the socket.** Handle
+reconnection with full resubscribe, and send heartbeats every 30 s (OpenAlgo's interval; the
+documented 60 s idle disconnect did not reproduce in our 75 s test, so treat it as unverified and
+send them anyway).
+
+**Write the note**: what we took from OpenAlgo, what we left, and why.
+
+**How you'll know it worked.** All 967 contracts on `ticker` and a full chain on `ob_l2`, one
+connection. Throughput matches the 187/s and 270/s baselines. Killing a consumer does not disturb
+ingestion. Pulling the network cable reconnects and resubscribes without losing the subscription
+set.
+
+**What to notice.** **Delta publishes IV every 5 s; the book moves every 500 ms.** That gap is the
+opportunity — our computed IV can be ten times fresher than theirs. Measure what the fan-out
+indirection costs in latency and what it buys in independence; that measurement is the argument
+for or against promoting to a real bus later.
+
+And notice this: **OpenAlgo's `MAX_SYMBOLS_PER_FRAME[ob_l2] = 1` is wrong** — we subscribed 136
+successfully. Reference implementations go stale. Trust your own measurements.
 
 ---
 
 ### T5 · Storage: hive-partitioned Parquet via Polars
 
-**Concept.** **Parquet** stores columns rather than rows, so reading one field of a billion rows
-touches only that field. **Hive partitioning** encodes filters into directory names —
-`date=2026-09-03/underlying=BTC/` — so a query for one day skips every other directory without
-opening a file. **Polars** is a DataFrame library that reads both natively.
+**The concept — columnar storage.** A CSV stores row by row, so reading one column of a billion
+rows means reading all of them. **Parquet** stores column by column: all the marks together, all
+the strikes together. Reading one field touches only that field's bytes. It also compresses far
+better, because a column holds similar values.
 
-**Why this way.** OpenAlgo uses DuckDB for its history store ("Historify"). We do not have to
-choose: write hive Parquet and *both* DuckDB and Polars read it. That keeps the query engine a
-later decision rather than a commitment made now.
+**The concept — hive partitioning.** Instead of one enormous file, split the data into
+directories whose *names encode the filter*:
 
-**Learn first.** [Polars hive guide](https://docs.pola.rs/user-guide/io/hive/). OpenAlgo's
-Historify module, for how they laid out market data. Why columnar beats row storage for analytics.
+```
+date=2026-09-03/underlying=BTC/part-0.parquet
+date=2026-09-03/underlying=ETH/part-0.parquet
+```
 
-**Task.** Define the record: bid, ask, mark, LTP, OHLC, open interest, all three of Delta's IVs
-and five Greeks **as reference columns**, plus our computed IV and Greeks, plus spot and the
-exchange timestamp. Partition on `date/underlying` only — **expiry stays a column**, because
-adding it as a partition level explodes into thousands of tiny files and makes Parquet slower
-than CSV. Buffer in memory, flush on a size or time threshold, on a thread that cannot block the
-socket. **Store events as they arrive; never forward-fill.**
+A query for BTC on 3 September skips every other directory **without opening a single file** —
+the filter is answered by the path. This is called partition pruning.
 
-**How you'll know.** A day's capture reads back in Polars with correct types and no gaps beyond
-real ones; measured bytes-per-row and a projected daily footprint against the ~16M rows/day
-estimate.
+**The concept — buffering.** Writing a file per message would produce 270 tiny files a second,
+and Parquet is terrible at tiny files. So you accumulate records in memory and flush a batch on a
+size or time threshold. The flush must run somewhere it cannot block the socket.
 
-**What to notice.** The compression ratio against raw JSON, and the read-time difference the
-partitioning buys. And the discipline point: **forward-filling is exactly the defect we caught
-Delta committing.** We must not build it into our own store.
+**Why this way.** OpenAlgo uses DuckDB for its history store. We do not have to choose: **write
+hive Parquet and both DuckDB and Polars read it natively.** That keeps the query engine a later
+decision instead of a commitment made now.
+
+**Learn first.**
+- [Polars hive guide](https://docs.pola.rs/user-guide/io/hive/) — the practical mechanics.
+- Any explanation of **why columnar beats row storage for analytics** — the reason is the one
+  above, and it is worth understanding rather than accepting.
+- The **small-files problem** in data engineering — why thousands of tiny Parquet files perform
+  worse than a few large ones. This is what the partitioning decision below turns on.
+
+**The task.** Define the record: bid, ask, mark, LTP, OHLC, open interest, Delta's three IVs and
+five Greeks **as reference columns**, our computed IV and Greeks, spot, and the exchange
+timestamp. Partition on `date/underlying` **only** — **expiry stays a column**. Adding expiry as a
+partition level explodes into thousands of tiny directories and makes Parquet slower than CSV.
+Buffer in memory, flush on size or time, on a thread that cannot block the socket.
+
+**Store events as they arrive. Never forward-fill.**
+
+**How you'll know it worked.** A day's capture reads back in Polars with correct types and no gaps
+beyond real ones. Measured bytes-per-row and a projected daily footprint against the ~16M
+rows/day estimate.
+
+**What to notice.** The compression ratio against raw JSON, and the read-time difference
+partitioning actually buys — measure it both ways rather than trusting the theory.
+
+And the discipline point: **forward-filling is exactly the defect we caught Delta committing.**
+They pad empty buckets with the last trade and do not say so, and it makes their history
+untrustworthy. We must not build the same thing into our own store.
 
 ---
 
 ### T6 · Caching and the live read path
 
-**Concept.** The option chain is a **view**, not a stored object — the latest quote per contract,
-joined to the instrument master, pivoted at read time. `optionchainstream` does precisely this
-with two Redis structures; our REST engine already does it with a pivot per request.
+**The concept.** A **cache** keeps an expensive answer nearby so you do not recompute it. The hard
+part is never storing — it is knowing **when the stored answer went stale**. That question is
+cache invalidation, and it is the whole problem.
 
-**Why this way.** Storing an assembled chain means invalidating it 25 times a second. Storing the
-latest tick per contract means one cheap write per update and assembly only when someone looks.
+The design choice here is **materialise or view**. You could store an assembled option chain and
+update it — but at 270 updates a second you would invalidate it 270 times a second. Or you store
+**the latest quote per contract** and assemble the chain only when somebody asks. One cheap write
+per update; assembly on demand. **The chain is a view, not an object.**
 
-**Learn first.** `optionchainstream`'s Redis layout. Cache invalidation basics — why "when does
-this become stale" is the whole question. OpenAlgo's choice to cache in the browser (TanStack
-Query) rather than the server, and what that trades away.
+`optionchainstream` does exactly this with two Redis structures — live ticks, plus an instrument
+master — joined at read time. Our REST engine already does the same thing with a per-request
+pivot, so this ticket extends a pattern we have rather than introducing one.
 
-**Task.** An in-memory latest-tick cache keyed by symbol, fed from T4's fan-out. Serve `/chain`
-from it instead of hitting Delta per request. Wire **our** computed IV and Greeks into the
-existing ladder alongside Delta's, visibly distinguished. Coalesce repaints to 4–10 Hz — 25 Hz is
-faster than the eye needs and faster than the data is meaningful.
+**OpenAlgo's invalidation trick, worth stealing.** Their cache-invalidation messages ride **the
+same ZeroMQ bus as market data**, under a `CACHE_INVALIDATE_*` topic prefix, with the proxy's
+subscriber as the sole binder and every publisher connecting to it. No second port, no bind race,
+one bus. It is a genuinely elegant reuse of infrastructure already present.
 
-**How you'll know.** `/chain` served from cache is measurably faster than the REST round trip;
-the ladder shows both sets of numbers; the screen does not flicker.
+**Learn first.**
+- `optionchainstream`'s Redis layout — the two-structure join, our closest model.
+- `OpenAlgo database/cache_invalidation.py` — the shared-bus pattern above.
+- Cache invalidation fundamentals — TTL versus event-driven invalidation, and why "when does this
+  go stale" is the question that decides everything else.
 
-**What to notice.** This is where "replicate exactly as Delta" gets tested in the most honest way
-available — **their numbers and ours, side by side, on the same screen, updating live.** Any
-disagreement is immediately visible rather than buried in a report.
+**The task.** An in-memory latest-tick cache keyed by symbol, fed from T4's fan-out. Serve
+`/chain` from it rather than calling Delta per request. Wire **our** computed IV and Greeks into
+the existing ladder alongside Delta's, visibly distinguished. Coalesce repaints to 4–10 Hz — 25 Hz
+is faster than the eye needs and faster than the data is meaningful.
+
+**How you'll know it worked.** `/chain` served from cache is measurably faster than the REST round
+trip. The ladder shows both sets of numbers. The screen does not flicker.
+
+**What to notice.** This is where **"replicate exactly as Delta" gets its most honest test — their
+numbers and ours, side by side, on the same screen, updating live.** Any disagreement becomes
+immediately visible instead of buried in a report.
+
+And watch the freshness gap. Ours recompute from the 500 ms book; theirs arrive every 5 s. On a
+fast move you should be able to *see* our column lead theirs.
 
 ---
 
 ### T7 · Findings, and the historical vol surface
 
-**Concept.** The research deliverable. Also the proof that the whole premise works: if we can
-compute IV correctly, we can compute it for history where Delta never stored any.
+**The concept.** The research deliverable, and the proof the premise works: if we can compute IV
+correctly, we can compute it for history — where Delta never stored any.
 
-**Why this way.** A study whose results live only in code has not produced anything. And the
-historical surface is the commercial point — it is the thing that cannot be bought.
+The **volatility smile** is the shape you get plotting IV against strike for one expiry.
+Black-Scholes assumes one volatility for all strikes, which would make it flat. It is not — it
+curves, because the market prices tail risk more richly than a lognormal assumes. **The shape is
+the model's error made visible**, which is why plotting it is a correctness check and not
+decoration.
 
-**Learn first.** `docs/delta-api-scope.md` §3, on the `end = settlement_time` rule. The volatility
-smile — what shape theory predicts and why.
+**Why this way.** A study whose results live only in code has produced nothing. And the historical
+surface is the commercial point — it is the thing that cannot be bought, because Delta never
+stored it.
 
-**Task.** Write `docs/iv-method-comparison.md`: the agreement matrix, the timing table, the smile
-plots, and a plain-language conclusion naming which assumptions mattered. Then reconstruct IV for
-an expired contract from stored `MARK:` prices and plot its surface through time.
+**Learn first.**
+- `docs/delta-api-scope.md` §3, on the `end = settlement_time` rule — without it the historical
+  input is fabricated.
+- The volatility smile and skew — what shape theory predicts, and what a *wrong* shape looks like.
 
-**How you'll know.** Someone who was not in the room can read the document and know which method
-to use and why. The historical smile has a recognisable shape.
+**The task.** Write `docs/iv-method-comparison.md`: the agreement matrix, the timing table, the
+smile plots, and a plain-language conclusion naming **which assumptions mattered**. Then
+reconstruct IV for an expired contract from stored `MARK:` prices and plot its surface through
+time.
+
+**How you'll know it worked.** Someone who was not in the room can read the document and know
+which method to use and why. The historical smile has a recognisable shape.
 
 **What to notice.** Whether the historical surface looks like the live one. If it does not, the
-`MARK:` series is telling us something about how Delta computes marks.
+`MARK:` series is telling us something about how Delta computes marks — and that is worth knowing
+before anyone backtests on it.
 
 ---
 
 ## Out of Scope
 
-**Execution, orders, and anything needing an API key.** Nothing here authenticates.
+**Execution, orders, anything needing an API key.** Nothing here authenticates.
 
-**A ZeroMQ broker process.** T4 builds the seam; crossing it is a later decision, made from T4's
-measured latency rather than from taste.
+**A ZeroMQ broker process.** T4 builds the seam; crossing it is a later decision made from T4's
+measured latency, not from taste.
 
-**Choosing one winning method.** The output is a measured comparison. Picking a production
-default is a decision made *from* the findings.
+**Choosing one winning method.** The output is a measured comparison. Picking a production default
+is a decision made *from* the findings.
 
 **OpenAlgo's multi-broker adapter layer.** Deliberately not copied — we have one venue, and that
 abstraction is most of their complexity.
@@ -319,19 +473,21 @@ abstraction is most of their complexity.
 
 ## Further Notes
 
-**Sequencing.** T1 → T2 → T3 is the maths spine and can proceed against live REST with no
-infrastructure. T4 → T5 → T6 is the stack. **T1 and T4 can start in parallel** — different people,
-no shared state. T7 closes both tracks.
+**Sequencing.** T1 → T2 → T3 is the maths spine and needs no infrastructure — it runs against
+captured snapshots. T4 → T5 → T6 is the stack. **T1 and T4 can run in parallel**: different
+people, no shared state. T7 closes both.
 
 **Do T1's inverse-settlement note before anything else.** It is the one unknown that silently
 corrupts everything downstream.
 
 **Honesty rule, inherited from the API scope work.** Every number in the findings is tagged
-*measured*, with the request or run that produced it, or *assumed*. This project already reversed
-one verdict because a conclusion outran its evidence; tagging is what made that cheap.
+*measured*, with the request or run that produced it, or *assumed*. This project has already
+reversed one verdict because a conclusion outran its evidence, and twice corrected claims taken
+from documentation rather than measurement. Tagging is what makes those corrections cheap.
 
-**Reference implementations.** [OpenAlgo](https://github.com/marketcalls/openalgo) —
-architecture, the primary source. [NautilusTrader](https://github.com/nautechsystems/nautilus_trader)
-— the mature version of the same bus idea. [optionchainstream](https://github.com/ranjanrak/optionchainstream)
-— the chain-as-a-view pattern. Note that `openalgo-portfoliogreeks`' product documentation is
-about API-key management and contains no Greeks maths; read their source instead.
+**Reference implementations.** [OpenAlgo](https://github.com/marketcalls/openalgo) — architecture
+and, crucially, `broker/deltaexchange/`, prior art for our exact venue.
+[NautilusTrader](https://github.com/nautechsystems/nautilus_trader) — the mature version of the
+bus idea. [optionchainstream](https://github.com/ranjanrak/optionchainstream) — chain-as-a-view.
+Note that `openalgo-portfoliogreeks`' product documentation is about API-key management and
+contains no Greeks maths; read source, not READMEs. That mistake cost us a round of this spec.
