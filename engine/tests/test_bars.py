@@ -17,15 +17,20 @@ from datetime import datetime, timezone
 
 from deltapayoff.bars import (
     BarAggregator,
+    ComputedAggregator,
+    ComputedTick,
     ReferenceAggregator,
     ReferenceTick,
     SpotAggregator,
     SpotTick,
     Tick,
+    computed_ticks_from_chain,
     samples_from_ticker,
     tick_from_quote,
 )
+from deltapayoff.compute import MODEL_VERSION, NO_QUOTE
 from deltapayoff.feed import Quote
+from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
 
 SYMBOL = "C-BTC-77600-040926"
 
@@ -1015,3 +1020,280 @@ def test_the_quote_bars_wait_long_enough_for_a_fallback_to_arrive() -> None:
     assert aggregator.late == 0, "a fallback quote inside the watermark was called late"
     assert bar.from_book is True
     assert bar.bid_ticks == 1, "the fallback contaminated a bar the book had covered"
+
+
+# --- table C: our computed values, sampled from the chain cache ------------------
+
+
+def computed_leg(
+    symbol: str,
+    *,
+    iv: float | None,
+    iv_leg: str | None = None,
+    iv_reason: str = "",
+) -> Leg:
+    """One leg carrying a `computed` block. Greeks only where an `iv` exists, exactly as
+    `compute.enrich` builds them — a leg with no volatility has none."""
+    block = ComputedLeg(iv=iv, iv_leg=iv_leg, iv_reason=iv_reason)
+    if iv is not None:
+        block = ComputedLeg(
+            iv=iv,
+            iv_leg=iv_leg,
+            iv_reason="",
+            delta=0.51,
+            gamma=0.00012,
+            vega=31.4,
+            theta=-8.2,
+            rho=1.9,
+        )
+    return Leg(symbol=symbol, bid=70.0, ask=72.0, computed=block)
+
+
+def enriched_chain(
+    *,
+    second: int = 30,
+    minute: int = 0,
+    forward: float | None = 77590.4,
+    iv: float | None = 0.4321,
+) -> ChainResponse:
+    """A two-strike chain that has already been through enrichment.
+
+    Hand-built rather than run through `compute.enrich`, so that this seam's mapping is
+    asserted against values chosen here rather than against whatever the solver returns.
+    """
+    stamp = datetime.fromtimestamp(
+        (MINUTE_US + minute * MINUTE + second * SECOND_US) / 1e6, tz=timezone.utc
+    )
+    return ChainResponse(
+        underlying="BTC",
+        expiry="04-09-2026",
+        spot=77568.2,
+        atm_strike=77600.0,
+        fetched_at=stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        rows=[
+            ChainRow(
+                strike=77600.0,
+                call=computed_leg("C-BTC-77600-040926", iv=iv, iv_leg="call"),
+                put=computed_leg("P-BTC-77600-040926", iv=iv, iv_leg="call"),
+            ),
+            ChainRow(
+                strike=75600.0,
+                put=computed_leg(
+                    "P-BTC-75600-040926",
+                    iv=None,
+                    iv_leg="put",
+                    iv_reason=NO_QUOTE,
+                ),
+            ),
+        ],
+        forward=forward,
+        discount=0.99997892,
+        years_to_expiry=0.00114155,
+        forward_method="F1+assumed-rate",
+    )
+
+
+def test_an_enriched_chain_flattens_to_one_tick_per_listed_leg() -> None:
+    """Table C's grain is the contract, not the strike. One volatility is written to both
+    legs of a paired strike — that is what `iv_leg` is for — so a two-leg strike gives two
+    rows carrying the same number, and the unpaired strike gives one."""
+    ticks = computed_ticks_from_chain(enriched_chain())
+
+    assert [tick.symbol for tick in ticks] == [
+        "C-BTC-77600-040926",
+        "P-BTC-77600-040926",
+        "P-BTC-75600-040926",
+    ]
+    assert all(tick.forward == 77590.4 for tick in ticks)
+    assert all(tick.forward_method == "F1+assumed-rate" for tick in ticks)
+    assert all(tick.years_to_expiry == 0.00114155 for tick in ticks)
+    assert all(tick.discount == 0.99997892 for tick in ticks)
+
+
+def test_every_tick_is_stamped_with_the_model_that_produced_it() -> None:
+    """The point of the ticket that is easiest to skip. `mid-OTM` is already scheduled to
+    change — mid-versus-mark is #9's one unticked criterion — and without the stamp the
+    rows computed before and after that change are indistinguishable afterwards."""
+    ticks = computed_ticks_from_chain(enriched_chain())
+
+    assert {tick.model_version for tick in ticks} == {MODEL_VERSION}
+    assert MODEL_VERSION == "F1+assumed-6.5 / S1-newton / ACT365 / mid-OTM"
+
+
+def test_a_leg_with_no_volatility_carries_no_greeks_and_says_why() -> None:
+    """Reporting Greeks at some default volatility would put five plausible numbers in
+    the store that describe nothing. `compute.py` refuses that on the live path and this
+    is the same refusal carried into storage."""
+    ticks = {tick.symbol: tick for tick in computed_ticks_from_chain(enriched_chain())}
+    unsolved = ticks["P-BTC-75600-040926"]
+    solved = ticks["C-BTC-77600-040926"]
+
+    assert unsolved.iv is None
+    assert unsolved.iv_reason == NO_QUOTE
+    for greek in ("delta", "gamma", "vega", "theta", "rho"):
+        assert getattr(unsolved, greek) is None, greek
+        assert getattr(solved, greek) is not None, greek
+    assert solved.iv_reason is None, "a solved row carries an empty reason, not a null"
+
+
+def test_a_chain_that_was_never_enriched_yields_nothing_to_store() -> None:
+    """`Leg.computed` is `None` until the chain has been through `compute.enrich`. A raw
+    ladder holds none of our numbers, and a row of nulls would claim we computed
+    something and failed rather than that we never computed at all."""
+    raw = enriched_chain().model_copy(
+        update={
+            "rows": [
+                ChainRow(strike=77600.0, call=Leg(symbol="C-BTC-77600-040926", bid=70.0))
+            ]
+        }
+    )
+
+    assert computed_ticks_from_chain(raw) == []
+
+
+def test_a_sample_is_bucketed_on_the_instant_the_chain_was_computed() -> None:
+    """Table C is bucketed on **our** clock, and it is the only table that is.
+
+    A quote is an event the venue timed and we discovered late, so table A buckets on
+    Delta's `ts`. A computed value is not an event at all — it is arithmetic we did, at
+    an instant only we know. `fetched_at` is that instant, so the row lands in the minute
+    the screen actually showed it.
+    """
+    ticks = computed_ticks_from_chain(enriched_chain(minute=3, second=45))
+
+    assert all(
+        tick.exchange_us == MINUTE_US + 3 * MINUTE + 45 * SECOND_US for tick in ticks
+    )
+
+
+def sample(aggregator: ComputedAggregator, chain: ChainResponse) -> None:
+    """Offer one computed chain to the aggregator, exactly as the writer does."""
+    for tick in computed_ticks_from_chain(chain):
+        aggregator.add(tick)
+
+
+def test_the_last_sample_in_a_minute_is_the_one_stored() -> None:
+    """"Sampled at bar close" means the state the screen was showing when the minute
+    ended, so a minute holding several recomputes keeps the newest — and it is chosen by
+    the sample clock rather than by the order the loop happened to notice them in."""
+    aggregator = ComputedAggregator()
+    sample(aggregator, enriched_chain(second=10, iv=0.40))
+    sample(aggregator, enriched_chain(second=50, iv=0.44))
+    # Out of order on purpose: an earlier sample offered last must not win.
+    sample(aggregator, enriched_chain(second=30, iv=0.42))
+
+    bars = {bar.symbol: bar for bar in aggregator.seal(wall_after(1))}
+
+    assert bars["C-BTC-77600-040926"].iv == 0.44
+    assert len(bars) == 3, "one row per contract per minute, and no more"
+
+
+def test_a_minute_with_no_computed_chain_produces_no_row_at_all() -> None:
+    """**The most important test in this ticket**, and the descendant of #10's.
+
+    Minutes 0 and 4 are sampled; 1, 2 and 3 are a deliberate silence and must come back
+    as *nothing* — no row of nulls, and above all not the previous minute's volatility
+    carried forward. Delta's own `/v2/history/candles` pads empty buckets with the last
+    trade and does not say so; this is the standing assertion that the same defect cannot
+    enter here through a cache that keeps answering after the feed has stopped.
+    """
+    aggregator = ComputedAggregator()
+    sample(aggregator, enriched_chain(minute=0, second=30, iv=0.40))
+    sample(aggregator, enriched_chain(minute=4, second=30, iv=0.48))
+
+    bars = aggregator.seal(wall_after(5))
+    minutes = sorted({bar.minute for bar in bars})
+
+    assert minutes == [
+        datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+        datetime(2026, 9, 4, 9, 4, tzinfo=timezone.utc),
+    ]
+    for silent in (1, 2, 3):
+        stamp = datetime(2026, 9, 4, 9, silent, tzinfo=timezone.utc)
+        assert stamp not in minutes, f"minute {silent} was invented"
+    assert len(bars) == 6, "three contracts across two sampled minutes"
+
+
+def test_a_chain_that_stopped_being_recomputed_stops_producing_rows() -> None:
+    """The failure mode a cache invites, and the reason the grace is zero.
+
+    `ChainStream._computed` holds the last chain it managed to build **forever**. If the
+    socket dies at 09:00:30 the cache still answers at 09:05, and re-sampling it every
+    minute would fill the store with five identical rows describing a market that was not
+    observed. Sealing on the boundary makes the stale chain *late*, which is counted and
+    refused — absence is the record of absence.
+    """
+    aggregator = ComputedAggregator()
+    stale = enriched_chain(minute=0, second=30)
+
+    sample(aggregator, stale)
+    first = aggregator.seal(wall_after(1))
+    later = [bar for minute in (2, 3, 4) for bar in _resample(aggregator, stale, minute)]
+
+    assert len(first) == 3
+    assert later == [], "a dead feed's last chain was stored again"
+    assert aggregator.late == 9, "a refused sample was discarded silently"
+
+
+def _resample(
+    aggregator: ComputedAggregator, chain: ChainResponse, minute: int
+) -> list:
+    """Offer the same unchanged chain again a minute later, and seal."""
+    sample(aggregator, chain)
+    return aggregator.seal(wall_after(minute))
+
+
+def test_a_partial_minute_is_flushed_with_the_sample_it_actually_had() -> None:
+    """Process stop mid-minute. The sample taken is a real observation of a real instant
+    and is written, exactly as a partial quote bar is."""
+    aggregator = ComputedAggregator()
+    sample(aggregator, enriched_chain(second=20, iv=0.41))
+
+    bars = aggregator.flush()
+
+    assert len(bars) == 3
+    assert bars[0].minute == datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    assert bars[0].iv == 0.41
+
+
+def test_a_symbol_that_cannot_be_parsed_gets_no_computed_row() -> None:
+    """`underlying` is a directory name. A symbol that cannot be split into underlying,
+    expiry, strike and type is refused and counted rather than filed under a guess."""
+    aggregator = ComputedAggregator()
+    aggregator.add(
+        ComputedTick(
+            symbol="NOT-A-SYMBOL",
+            exchange_us=MINUTE_US + 30 * SECOND_US,
+            iv=0.4,
+            iv_leg="call",
+            iv_reason=None,
+            delta=0.5,
+            gamma=None,
+            vega=None,
+            theta=None,
+            rho=None,
+            forward=77590.4,
+            discount=1.0,
+            years_to_expiry=0.001,
+            forward_method="F1",
+            model_version=MODEL_VERSION,
+        )
+    )
+
+    assert aggregator.seal(wall_after(1)) == []
+    assert aggregator.unparseable == 1
+
+
+def test_the_computed_bar_carries_the_partition_and_filter_columns() -> None:
+    """`underlying` is the directory, and expiry, strike and option type are columns —
+    the same layout as every other table, so the four join without translation."""
+    aggregator = ComputedAggregator()
+    sample(aggregator, enriched_chain())
+
+    bars = {bar.symbol: bar for bar in aggregator.seal(wall_after(1))}
+    put = bars["P-BTC-75600-040926"]
+
+    assert put.underlying == "BTC"
+    assert put.expiry == "04-09-2026"
+    assert put.strike == 75600.0
+    assert put.option_type == "P"

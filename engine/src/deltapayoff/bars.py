@@ -81,7 +81,7 @@ channel outright rather than storing a table that was mysteriously empty. See
 
 ---
 
-**Three tables aggregate here, and they have different grains on purpose.**
+**Four tables are built here, and they have different grains on purpose.**
 
 *Table A, quote bars,* per contract per minute, from the book channel with the ticker
 channel as its **fallback**. Which one a minute's quotes came from is recorded in
@@ -105,6 +105,16 @@ carried an identical `sp` of 77651.9. Putting it on contract rows would store th
 four numbers 588 times a minute and, worse, would let two contracts whose frames
 straddled a boundary disagree about what spot was. It is also the best-sampled series in
 the feed at roughly 7,056 observations a bar, because every contract's frame carries it.
+
+*Table C, our computed values,* per contract per minute — and **it is the odd one out.**
+The other three fold ticks that arrived on the bus. Our implied volatility, our five
+Greeks, the fitted forward and the discount never arrive at all: they are produced by
+`ChainStream`'s 100 ms recompute loop and, until #12, lived exactly as long as the
+process did. So this table is **sampled from that cache at bar close** rather than
+aggregated, it is bucketed on **our** clock rather than the venue's — the instant we
+computed it is the only instant there is — and its grace is zero, because a sample has no
+stragglers to wait for. Every row carries `model_version`, which is what stops a later
+change to the model silently mixing two populations in one column.
 """
 
 from __future__ import annotations
@@ -114,6 +124,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .chain import expiry_from_symbol
+from .compute import MODEL_VERSION
 from .wire import decode_ticker, decode_ticker_extras
 
 #: One bar's width. Not configurable: every count and estimate in #5 is against minutes,
@@ -965,3 +976,235 @@ def samples_from_ticker(quote: Any) -> TickerSample | None:
         ),
         spot=SpotTick(symbol=symbol, exchange_us=stamp, spot=extras.spot),
     )
+
+
+# --- table C: our computed values, sampled from the chain cache ------------------
+
+
+#: What table C seals on, and it is **zero on purpose**.
+#:
+#: Every other grace period in this module answers the question "how late can a real
+#: observation still arrive?" — a quote is an event the venue timed and we discovered
+#: some milliseconds later, so a bar has to wait for the stragglers. Table C has no
+#: stragglers to wait for. The row is a *sample of a cache we own*, taken synchronously
+#: at the minute boundary; nothing can turn up afterwards claiming to belong to the
+#: minute just closed. Waiting would delay the row and admit nothing.
+#:
+#: It is also what makes the no-invention rule enforce itself. Sealing minute M the
+#: instant M ends means a chain still stamped inside M when M+1 closes is **late** by
+#: `_Watermarked`'s existing rule, and late is counted and refused. A dead feed leaves
+#: the chain cache holding its last computed chain forever; without this it would be
+#: re-sampled every minute and the store would fill with identical fabricated rows —
+#: precisely the venue defect this project documented.
+COMPUTED_GRACE_SECONDS = 0.0
+
+#: The format `chain.build_chain` writes `fetched_at` in. Second resolution, which is
+#: ample for a minute bucket and is why nothing here has to reason about microseconds.
+FETCHED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+@dataclass(frozen=True, slots=True)
+class ComputedTick:
+    """One contract's block of **our** numbers, as of one computed chain.
+
+    `exchange_us` is the instant we computed it, taken from the chain's `fetched_at`, and
+    this is the one table in the store that is **not** bucketed on the venue's clock.
+    That is deliberate rather than an oversight: a quote is an event Delta timed and we
+    discovered late, so bucketing it on our arrival would let our network move it across
+    a boundary. A computed value is not an event on the wire at all — it is arithmetic we
+    performed, and the only clock that knows when is ours. The cost is stated in
+    `docs/storage.md`: the prices behind a chain computed at 09:01:00.05 were read from
+    the venue roughly 200 ms earlier and belong to 09:00, so a sample landing within one
+    transit lag of a boundary can be attributed to the wrong side of it.
+
+    **No Delta-published figure appears here.** Their vols and Greeks are table B's
+    `venue_` columns, and the separation is what makes any agreement between the two
+    evidence rather than construction.
+    """
+
+    symbol: str
+    exchange_us: int
+
+    iv: float | None
+    #: The out-of-the-money side this strike's volatility was solved on. On a row that
+    #: was *not* solved it names the side that was attempted, which is `compute.enrich`'s
+    #: own spelling and is kept rather than nulled — it is recoverable from `strike`
+    #: against `forward` either way, so nulling it would hide nothing and would put the
+    #: store out of agreement with what the screen showed.
+    iv_leg: str | None
+    #: **`None` when solved, never an empty string.** `ComputedLeg` spells "no reason" as
+    #: `""` because it is a JSON payload; a store spells absence as null, and one column
+    #: holding both `""` and `null` for one fact is a column readers have to guess at.
+    iv_reason: str | None
+
+    delta: float | None
+    gamma: float | None
+    vega: float | None
+    theta: float | None
+    rho: float | None
+
+    forward: float | None
+    discount: float | None
+    years_to_expiry: float | None
+    #: What actually produced the forward — `F1`, `F1+assumed-rate` or `F2`. Stored per
+    #: row rather than inferred from `model_version`, because it varies **between chains
+    #: under one model** and it pins the largest single source of variation in everything
+    #: above it independently of anyone remembering to bump a string.
+    forward_method: str | None
+
+    #: See `compute.MODEL_VERSION`.
+    model_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class ComputedBar:
+    """One contract's minute of our numbers, sampled at bar close.
+
+    **Not an OHLC.** The other three tables summarise events that arrived during the
+    minute; this one records the state of a computed surface at the moment the minute
+    ended. An open/high/low/close of a volatility recomputed six hundred times a minute
+    would be four numbers nobody could reproduce from anything, and the whole point of
+    this table is that a row can be checked against the quote bar beside it.
+    """
+
+    symbol: str
+    underlying: str
+    expiry: str
+    strike: float
+    option_type: str
+    minute: datetime
+
+    iv: float | None
+    iv_leg: str | None
+    iv_reason: str | None
+
+    delta: float | None
+    gamma: float | None
+    vega: float | None
+    theta: float | None
+    rho: float | None
+
+    forward: float | None
+    discount: float | None
+    years_to_expiry: float | None
+    forward_method: str | None
+
+    model_version: str
+
+
+def _stamp_us(fetched_at: Any) -> int | None:
+    """A chain's `fetched_at` to microseconds since epoch, or `None`.
+
+    Guarded rather than trusted even though `chain.build_chain` is the only writer of
+    this field: a chain that cannot be placed on the clock cannot be bucketed, and
+    guessing a minute for it would file our numbers under a minute they did not describe.
+    """
+    try:
+        taken = datetime.strptime(fetched_at, FETCHED_AT_FORMAT)
+    except (TypeError, ValueError):
+        return None
+    return int(taken.replace(tzinfo=timezone.utc).timestamp()) * 1_000_000
+
+
+def computed_ticks_from_chain(chain: Any) -> list[ComputedTick]:
+    """One enriched `ChainResponse` to one tick per listed leg. **Pure.**
+
+    The grain is the **contract**, matching every other table, so a paired strike gives
+    two rows carrying the same volatility. That is not a duplicate: `compute.enrich`
+    recovers one number per strike from whichever leg is out of the money and writes it
+    to both sides, and `iv_leg` on each row names the side it came from. Storing it once
+    per strike instead would make table C the only table a reader could not join to the
+    other three on `symbol`.
+
+    A leg whose `computed` block is absent is **skipped, not stored as nulls**. That
+    block is `None` until the chain has been through `enrich`, and a row of nulls would
+    claim we tried and failed where the truth is that we never tried.
+    """
+    stamp = _stamp_us(getattr(chain, "fetched_at", None))
+    if stamp is None:
+        return []
+
+    ticks: list[ComputedTick] = []
+    for row in chain.rows:
+        for leg in (row.call, row.put):
+            if leg is None or leg.computed is None:
+                continue
+            block = leg.computed
+            ticks.append(
+                ComputedTick(
+                    symbol=leg.symbol,
+                    exchange_us=stamp,
+                    iv=block.iv,
+                    iv_leg=block.iv_leg,
+                    iv_reason=block.iv_reason or None,
+                    delta=block.delta,
+                    gamma=block.gamma,
+                    vega=block.vega,
+                    theta=block.theta,
+                    rho=block.rho,
+                    forward=chain.forward,
+                    discount=chain.discount,
+                    years_to_expiry=chain.years_to_expiry,
+                    forward_method=chain.forward_method,
+                    model_version=MODEL_VERSION,
+                )
+            )
+    return ticks
+
+
+class ComputedAggregator(_Watermarked):
+    """Our computed values by `(symbol, minute)`, **last sample in the minute wins.**
+
+    This is the one aggregator that folds nothing. The other three summarise a minute of
+    arrivals; here a minute holds a handful of samples of a surface recomputed every
+    100 ms, and the row wanted is the one the screen was showing when the minute ended.
+    So the fold is `_Last` on the sample clock, for the same reason every other close is
+    chosen that way: two samples must not be ordered by the accident of which loop pass
+    noticed them.
+
+    Sealed at a grace of zero. See `COMPUTED_GRACE_SECONDS` — there is no straggler to
+    wait for, and sealing on the boundary is what turns a stale chain into a **late**
+    sample that is counted and refused rather than into a fabricated row.
+    """
+
+    def __init__(self, grace_seconds: float = COMPUTED_GRACE_SECONDS) -> None:
+        super().__init__(grace_seconds)
+
+    def add(self, tick: ComputedTick) -> None:
+        if self._parsed(tick.symbol) is None:
+            return
+        minute_us = self._bucket(tick.exchange_us)
+        if minute_us is None:
+            return
+
+        self.ticks += 1
+        state = self._open.get((tick.symbol, minute_us))
+        if state is None:
+            state = self._open[(tick.symbol, minute_us)] = _Last()
+        state.update(tick, tick.exchange_us)
+
+    def _emit(self, key: tuple[str, int], state: _Last) -> ComputedBar:
+        symbol, minute_us = key
+        underlying, expiry, strike, option_type = self._meta[symbol]
+        last: ComputedTick = state.value
+        return ComputedBar(
+            symbol=symbol,
+            underlying=underlying,
+            expiry=expiry,
+            strike=strike,
+            option_type=option_type,
+            minute=_to_utc(minute_us),
+            iv=last.iv,
+            iv_leg=last.iv_leg,
+            iv_reason=last.iv_reason,
+            delta=last.delta,
+            gamma=last.gamma,
+            vega=last.vega,
+            theta=last.theta,
+            rho=last.rho,
+            forward=last.forward,
+            discount=last.discount,
+            years_to_expiry=last.years_to_expiry,
+            forward_method=last.forward_method,
+            model_version=last.model_version,
+        )

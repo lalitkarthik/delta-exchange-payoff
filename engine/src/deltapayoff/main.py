@@ -127,7 +127,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The writer is attached whether or not the feed runs, so `/health`-adjacent
     # introspection and the tests can see the subscription exists and is lossless. With
     # no feed nothing is published, so an undrained queue costs nothing.
-    app.state.writer = BarWriter(BarStore())
+    # Table C is **sampled from the chain cache**, not folded from the bus, because our
+    # implied volatility and Greeks are produced by the recompute loop rather than
+    # arriving on the wire. The writer is handed the stream's reader, not the stream, so
+    # the store never learns that a chain cache exists.
+    app.state.writer = BarWriter(BarStore(), chains=app.state.stream.computed_chains)
     app.state.writer.attach(app.state.fanout)
     app.state.feed = DeltaFeed(app.state.fanout)
     app.state.tasks = []

@@ -380,3 +380,42 @@ def test_a_failed_expiry_is_not_served_from_a_stale_cache() -> None:
     assert again is not None
     assert again.fetched_at >= first.fetched_at
     assert ("BTC", FITTABLE_EXPIRY) not in stream.dirty
+
+
+def test_the_computed_chains_are_offered_for_sampling_without_recomputing() -> None:
+    """What table C reads. The store samples the chains the recompute loop has **already**
+    produced; it never asks for one to be built.
+
+    That distinction is the whole reason this is a separate method from `chain()`, which
+    recomputes a dirty expiry synchronously so a reader never sees a stale ladder. Doing
+    that from the writer's drain loop would move a chain build onto the pass that has to
+    stay short, and would duplicate work the recompute task is already doing.
+    """
+    stream = ChainStream()
+    two_sided(stream)
+
+    assert stream.computed_chains() == [], "a chain was built for a sampler"
+
+    stream.recompute_dirty()
+    chains = stream.computed_chains()
+
+    assert [chain.expiry for chain in chains] == [FITTABLE_EXPIRY]
+    assert chains[0].rows[0].call.computed is not None
+    # A dirty expiry stays dirty: sampling must not pretend the loop has run.
+    stream.apply(quote(ticker("C-BTC-77600-040927", 590, 595), "ticker"))
+    assert stream.computed_chains() != []
+    assert stream.dirty == {("BTC", FITTABLE_EXPIRY)}
+
+
+def test_the_offered_chains_are_a_snapshot_the_loop_cannot_change_underneath() -> None:
+    """A list, not the live dictionary. The writer walks it while the recompute task may
+    be replacing entries, and mutating a dict during iteration raises."""
+    stream = ChainStream()
+    two_sided(stream)
+    stream.recompute_dirty()
+
+    held = stream.computed_chains()
+    stream.apply(quote(ticker("C-BTC-77600-040926", 590, 595), "ticker"))
+    stream.recompute_dirty()
+
+    assert len(held) == 1, "the sampler's snapshot grew under it"

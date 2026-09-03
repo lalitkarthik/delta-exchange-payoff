@@ -1,14 +1,17 @@
 # One-minute bars, in hive Parquet
 
-**Verdict: three of #5's four tables run end to end, and both watermarks are measured
+**Verdict: all four of #5's tables run end to end, and both watermarks are measured
 rather than guessed.** A frame published on the bus becomes a sealed one-minute bar and a
 partitioned Parquet file, read back in Polars with its types intact and **no row for a
-minute that had no arrivals** — in any of the three tables.
+minute that had no arrivals** — in any of the four tables.
 
 - **Table A, quote bars** — bid, ask and mid OHLC per contract per minute, from `ob_l2`,
   with `ticker` as the fallback and a `from_book` flag saying which.
 - **Table B, reference bars** — mark and last traded price as OHLC, open interest,
   turnover, Delta's five Greeks and three implied vols as last-value-in-bar.
+- **Table C, computed bars** — **ours**: implied volatility, five Greeks, the fitted
+  forward, the discount and the year fraction, each row stamped with the model that
+  produced it. Sampled from the chain cache at bar close, not folded from the bus.
 - **Table D, spot bars** — one row per minute per **underlying**, never per contract.
 
 The two channels **do not share a watermark**, and that is the finding this work turned
@@ -17,8 +20,8 @@ arrival-lag distributions. Table A now seals on the ticker's number because the 
 its fallback source — see §1.1.
 
 Implemented in `engine/src/deltapayoff/{bars,store,wire}.py`, with the lossless
-subscription in `fanout.py` and the writer task wired into `main.py`'s lifespan. Measured
-by `tools/measure_arrival_lag.py`.
+subscription in `fanout.py`, the sampling reader in `stream.py` and the writer task wired
+into `main.py`'s lifespan. Measured by `tools/measure_arrival_lag.py`.
 
 ## How to read this
 
@@ -324,7 +327,119 @@ whether the ingester was actually running.
 `spot_ticks` is `UInt32`. `UInt16` would have fitted 7,056 today and overflowed the moment
 ETH was turned on.
 
-## 8. Still open
+## 8. Table C, and the clock it does not share
+
+**Everything else in this store is an event the venue timed. Table C is not.** Our
+implied volatility and Greeks never arrive on the wire: they are made by `ChainStream`'s
+100 ms recompute loop, and until #12 they lived exactly as long as the process did.
+Restart, and there was no way to answer what the screen had said at a given minute.
+
+So the writer **samples** rather than folds. Once a minute, as the boundary passes, it
+reads `ChainStream.computed_chains()` — the chains the loop has *already* built — and
+flattens each into one row per listed leg. Three consequences follow, and each is a
+decision rather than an accident:
+
+**It is bucketed on our clock.** There is no venue timestamp on a number we computed. The
+row lands in the minute named by the chain's own `fetched_at`, which is when the loop
+produced it. The cost is stated rather than hidden: the prices behind a chain computed at
+09:01:00.05 were read from the venue about 200 ms earlier and belong to 09:00, so a
+sample landing within one transit lag of a boundary can be attributed to the wrong side
+of it. Every other table would be wrong to do this; this one has no alternative — the
+chain contract carries no venue stamp, and 136 contracts each with their own `ts` do not
+have one answer between them.
+
+**The same boundary has a second, smaller effect and it errs toward absence.** The writer
+detects the crossing within about a millisecond, because its drain loop wakes on every
+message and they arrive 1,323 a second. If the recompute loop happens to fire inside that
+millisecond, the chain it hands over is stamped in the *new* minute and the minute just
+closed gets no row for that expiry — roughly one minute in a hundred, per expiry. It is a
+missing row rather than an invented one, which is the direction this design chooses
+everywhere else, and the row is not lost so much as attributed to the following minute.
+
+**Its grace is zero**, and that is what enforces the no-invention rule rather than merely
+stating it. `ChainStream._computed` keeps answering after the socket dies — it holds the
+last chain it managed to build, forever. Sealing minute M the instant M ends means a
+chain still stamped inside M when M+1 closes is **late** by the existing watermark rule,
+counted and refused. A dead feed therefore writes nothing at all, instead of writing the
+same five plausible rows every minute until somebody notices. Sabotage-verified twice:
+stamping the sample with the minute being closed instead of with the instant the chain
+was computed makes `test_a_minute_with_no_computed_chain_gets_no_computed_row` grow two
+invented minutes and `test_a_cache_that_stops_being_recomputed_stops_producing_rows`
+write ten rows where two are true.
+
+**The sampling is edge-triggered on the boundary and reads the cache without touching
+it.** The drain loop spins on every message, measured at 1,322.9 a second, so flattening
+600 contracts on every pass would be the one piece of the writer capable of starving the
+socket reader. And it deliberately does not call `ChainStream.chain()`, which recomputes
+a dirty expiry synchronously — that would move a chain build onto the writer's pass and
+duplicate work the recompute task is already doing.
+
+**A row with no volatility carries no Greeks**, matching `compute.py` on the live path.
+Greeks at some default volatility would be five plausible numbers describing nothing.
+Absence is null and never zero throughout, including `iv_reason`, which is stored as null
+rather than as the empty string `ComputedLeg` uses in its JSON payload.
+
+**Delta's own figures are not in this table.** They are #11's `venue_` columns in table B,
+and the separation is the whole point: two columns called `delta` in one store is one
+careless join away from measuring how well we imitate Delta rather than what the prices
+imply.
+
+### The model version, and why it is a hand-written string
+
+Every row carries
+
+    F1+assumed-6.5 / S1-newton / ACT365 / mid-OTM
+
+One token per decision that defines the model: the parity regression with the 6.5%
+borrowed rate standing in when the discount cannot be fitted, Newton-Raphson, ACT/365,
+and inversion of the out-of-the-money leg's **midpoint**.
+
+**The fourth token is already scheduled to change.** Mid-versus-mark is #9's one unticked
+acceptance criterion. If that measurement says mark is the better input, the production
+input changes and every row stored before then was computed differently — two populations
+in one column with nothing to tell them apart, unless the stamp is on the row.
+
+A **content hash** of the modules was rejected: it changes when a docstring is edited,
+producing forty versions that are all the same model, and these files' docstrings are
+edited often. A **commit SHA** has the identical defect and is harder to read. The
+weakness of a hand-maintained string is that somebody forgets to bump it; that is partly
+covered because `forward_method` is stored per row independently and pins the largest
+single source of variation — `F1`, `F1+assumed-rate` or `F2` — whatever the string says.
+
+### The row reproduces offline, and what that does and does not prove
+
+`tests/test_store.py::test_a_stored_row_reproduces_offline_from_the_quote_bar_beside_it`
+publishes the captured 136-symbol chain on the bus, lets it be enriched exactly as it
+would be live, then **rebuilds the chain from the stored bytes alone** — bid and ask
+closes from table A, spot from table D, and the snapshot instant recovered by inverting
+table C's own `years_to_expiry` against the settlement time the expiry names — and runs
+`compute.enrich` over it. Forward, discount, year fraction, method, and every leg's
+volatility and five Greeks come back **exactly equal** to what table C holds.
+
+**What that proves:** the store carries every input the model needs, the columns mean what
+their names say, `Float64` survives Parquet without losing precision, and a reader with
+nothing but these files can re-derive the numbers rather than having to trust them. It is
+not tautological — the two tables are written by different paths, one folding ticks off
+the bus and one sampling the recompute cache, and both values have been through the file
+layer. Sabotage-verified: narrowing `iv` to `Float32` makes it fail on the seventh
+significant digit (`4.2968864068252675` against `4.296886444091797`).
+
+**What it does not prove:** in that test each contract gets exactly one tick in the
+minute, so `bid_close` *is* the tick that was live when the chain was computed and the
+agreement is exact by construction of the scenario. On a busy minute it is not: a bar's
+close is the last tick of the minute while the sample came from whatever chain the 100 ms
+loop had last produced, and those are usually but not always the same quote. So this
+establishes that the model is **reproducible from the stored schema**, not that every
+historical row will re-derive to the last decimal from its own bar. And it says nothing
+about whether the model is right — only that the store is honest about which model ran.
+
+**`fetched_at` is not stored as a column**, deliberately: `years_to_expiry` pins it
+exactly against a settlement time the expiry already names, and #5 asks that nothing
+trivially derivable be stored. The test inverts it rather than assuming it.
+
+---
+
+## 9. Still open
 
 - **The compression ratio against raw JSON is not measured.** #5's central claim is
   50–100 MB/day against ~52 GB/day of raw, roughly 500–1000x. That is `derived` arithmetic
@@ -332,8 +447,13 @@ ETH was turned on.
 - **Read time with and without partition pruning is not measured.** Pruning is verified as
   *behaviour*; whether it buys anything at our size is a separate question and a
   measurement, not an assertion.
-- **Table C is not built** — our computed implied vol and Greeks, sampled at bar close and
-  stamped with the model that produced them. It is the last of #5's four.
+- **Table C's own footprint is not measured**, and it is the table whose row width is
+  hardest to guess: nineteen columns, most of them `Float64`, against a dictionary-encoded
+  `iv_reason` that should compress to almost nothing. It needs the same recorded session
+  as the ratio above.
+- **The boundary attribution has not been measured against a live feed.** §8 argues that
+  a sample taken within one transit lag of a boundary can land on the wrong side of it.
+  How often that actually happens is a number nobody has taken.
 - **`Leg.oi_value_usd` is fed from `oi_change_usd_6h` on the websocket path**, so the live
   screen shows a six-hour change under a USD-open-interest label. Left alone deliberately
   — renaming the field changes the chain contract the web app reads — and wanting its own

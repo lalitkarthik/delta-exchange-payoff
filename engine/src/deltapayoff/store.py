@@ -1,12 +1,19 @@
 """Where the bars go: hive-partitioned Parquet, and the only module that touches a file.
 
-**Three tables, three dataset roots.** `quote-bars` is what the book did, `reference-bars`
-is what the venue said a contract was worth, and `spot-bars` is what the underlying did
-underneath both. They are three roots and not one root with a `table` partition key: a
-shared root forces every scan to carry a filter a directory should have answered, and
-puts three schemas in one dataset for Parquet's metadata to reconcile on every read. They
-share the **same** partition keys, so a reader joins spot to quotes on `date` and
-`underlying` with no translation. #5's table C, our computed values, gets a fourth root.
+**Four tables, four dataset roots.** `quote-bars` is what the book did, `reference-bars`
+is what the venue said a contract was worth, `spot-bars` is what the underlying did
+underneath both, and `computed-bars` is what **we** made of all of it. They are four roots
+and not one root with a `table` partition key: a shared root forces every scan to carry a
+filter a directory should have answered, and puts four schemas in one dataset for
+Parquet's metadata to reconcile on every read. They share the **same** partition keys, so
+a reader joins spot to quotes to our volatility on `date` and `underlying` with no
+translation.
+
+**And the fourth one is filled differently.** Tables A, B and D are folded from ticks the
+writer drains off the bus. Table C is **sampled** from `ChainStream`'s recompute cache at
+each minute boundary, because our implied volatility and Greeks are produced there rather
+than arriving on the wire. That is `BarWriter._sample_computed`, and it is the one place
+in this module that reads something other than its own queue.
 
 **Why columnar.** A CSV stores row by row, so reading one column of a billion rows means
 reading all of them. Parquet stores column by column: every mid together, every strike
@@ -74,22 +81,30 @@ from typing import Any
 import polars as pl
 
 from .bars import (
+    BUCKET_US,
     BarAggregator,
+    ComputedAggregator,
     ReferenceAggregator,
     SpotAggregator,
+    computed_ticks_from_chain,
     samples_from_ticker,
     tick_from_quote,
 )
 
-#: One directory per table. Three of #5's four exist; table C, our computed values, is
-#: still to come and gets its own root beside these rather than a column in one of them.
+#: One directory per table. All four of #5's now exist.
 #:
 #: **A single root with a `table` partition key was rejected.** It forces every scan to
-#: carry a filter that a directory should have answered, and it puts three schemas in one
+#: carry a filter that a directory should have answered, and it puts four schemas in one
 #: dataset, which Parquet's own metadata then has to reconcile on every read.
+#:
+#: `computed-bars` is a root of its own for a second reason: it is the only table whose
+#: rows can change meaning without any input changing, when the model behind them is
+#: revised. Keeping it separable is what makes `model_version` something a reader can
+#: filter a whole dataset on rather than a column buried among the venue's.
 DATASET = "quote-bars"
 REFERENCE_DATASET = "reference-bars"
 SPOT_DATASET = "spot-bars"
+COMPUTED_DATASET = "computed-bars"
 
 #: Hourly. Sixty minutes is the crash-loss budget, stated as a number rather than implied.
 FLUSH_SECONDS = 3600.0
@@ -197,6 +212,52 @@ SPOT_SCHEMA: dict[str, Any] = {
     #: inside `UInt32` and far outside `UInt16`, which 7,056 would have fitted today and
     #: overflowed the moment ETH was turned on.
     "spot_ticks": pl.UInt32,
+}
+
+#: Table C. **Our** numbers, under the bare names, beside nothing of Delta's — their
+#: figures are table B's `venue_` columns and the separation is what makes any agreement
+#: between the two evidence rather than construction.
+#:
+#: Four columns are per **chain** rather than per contract and are repeated down every
+#: row of an expiry: `forward`, `discount`, `years_to_expiry` and `forward_method`. That
+#: repetition costs almost nothing here — a run of one value is what dictionary encoding
+#: and run-length compression are for — and it buys a row that can be checked on its own
+#: without a join to a table that does not exist.
+#:
+#: `iv_leg`, `iv_reason`, `forward_method` and `model_version` are dictionary-encoded for
+#: the same reason `symbol` is: each is one of a handful of short strings repeated
+#: millions of times a day. `iv_reason` is the largest of them and the one that would
+#: otherwise cost the most, at roughly fifty characters of sentence per unsolved strike.
+#:
+#: **`model_version` is on every row and not in a sidecar file.** A per-file or per-day
+#: manifest would be one more thing to join, one more thing to lose, and it would answer
+#: the wrong question the day a model changes mid-hour. A column answers it for the row
+#: in front of you.
+COMPUTED_SCHEMA: dict[str, Any] = {
+    "symbol": pl.Categorical,
+    "expiry": pl.Categorical,
+    "option_type": pl.Categorical,
+    "strike": pl.Float64,
+    "minute": pl.Datetime("us", "UTC"),
+    "iv": pl.Float64,
+    "iv_leg": pl.Categorical,
+    #: Null when solved. `ComputedLeg` spells "no reason" as `""` because it is a JSON
+    #: payload; a store spells absence as null, and a column holding both for one fact
+    #: is a column every reader has to guess at.
+    "iv_reason": pl.Categorical,
+    #: Ours, and **null together with `iv`**. Greeks at some default volatility would be
+    #: five plausible numbers describing nothing, which is the failure `compute.py`
+    #: refuses on the live path and this table refuses in storage.
+    "delta": pl.Float64,
+    "gamma": pl.Float64,
+    "vega": pl.Float64,
+    "theta": pl.Float64,
+    "rho": pl.Float64,
+    "forward": pl.Float64,
+    "discount": pl.Float64,
+    "years_to_expiry": pl.Float64,
+    "forward_method": pl.Categorical,
+    "model_version": pl.Categorical,
 }
 
 #: The partition columns. They live in the directory names, not in the files, which is
@@ -331,16 +392,21 @@ class BarWriter:
     It is not folded into `ChainStream`: that holds only the *latest* state per contract
     while this needs *every* state, and one structure serving both would make them fight.
 
-    **One writer, one subscription, three tables.** Both channels arrive on the same
+    **One writer, one subscription, four tables.** Both channels arrive on the same
     queue, so a second writer would mean a second lossless subscription carrying the same
-    messages and two watermarks drifting apart on two clocks. The three aggregators seal
-    independently — the quote, reference and spot tables have different graces and
-    different grains — but they are driven from one drain loop and flushed in one thread
-    hop, so the socket reader waits on one disk trip an hour rather than three.
+    messages and two watermarks drifting apart on two clocks. The four aggregators seal
+    independently — they have different graces and different grains — but they are driven
+    from one drain loop and flushed in one thread hop, so the socket reader waits on one
+    disk trip an hour rather than four.
 
-    The reference and spot stores are **derived from the quote store's root** rather than
-    defaulted separately. A test that hands this a temporary directory must not have two
-    of its three tables quietly write into the repository's own `data/`.
+    **Table C does not come off that queue at all.** Our implied volatility and Greeks
+    are made by `ChainStream`'s recompute loop, so the writer *samples* that loop's cache
+    once a minute through the `chains` callable. A callable rather than the stream itself:
+    this module has no business knowing a chain cache exists, and a test hands it a list.
+
+    The other three stores are **derived from the quote store's root** rather than
+    defaulted separately. A test that hands this a temporary directory must not have three
+    of its four tables quietly write into the repository's own `data/`.
 
     `clock` is injected so tests drive sealing and flushing without waiting on a real one.
     """
@@ -354,6 +420,8 @@ class BarWriter:
         tick_seconds: float = TICK_SECONDS,
         reference_store: BarStore | None = None,
         spot_store: BarStore | None = None,
+        computed_store: BarStore | None = None,
+        chains: Callable[[], Iterable[Any]] | None = None,
     ) -> None:
         self.store = store or BarStore()
         self.aggregator = aggregator or BarAggregator()
@@ -365,6 +433,19 @@ class BarWriter:
             self.store.root, dataset=SPOT_DATASET, schema=SPOT_SCHEMA
         )
         self.spot = SpotAggregator()
+        self.computed_store = computed_store or BarStore(
+            self.store.root, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA
+        )
+        self.computed = ComputedAggregator()
+        #: Where table C comes from: a callable handing back the chains the recompute
+        #: loop has already computed. A **callable** rather than the `ChainStream`
+        #: itself, so this module never learns that a chain cache exists and a test can
+        #: hand it a list. `None` means there is nothing to sample and table C stays
+        #: empty, which is what the three-table tests and the REST-only app want.
+        self.chains = chains
+        #: The minute this last sampled in. Sampling is edge-triggered on the boundary
+        #: rather than done every pass — see `_sample_computed`.
+        self._sampled_minute_us: int | None = None
         self.clock = clock
         self.flush_seconds = flush_seconds
         self.tick_seconds = tick_seconds
@@ -447,21 +528,73 @@ class BarWriter:
                 except asyncio.QueueEmpty:
                     break
 
-            self._seal()
+            now = self.clock()
+            self._sample_computed(now)
+            self._seal(now)
             await self._maybe_flush()
 
-    def _seal(self) -> None:
-        """Move every eligible bar from the three aggregators into their stores.
+    def _sample_computed(self, now: float, *, force: bool = False) -> int:
+        """Read the chain cache once, as a minute closes. Returns samples taken.
 
-        Each seals on its own watermark and its own key, so this is three independent
-        decisions taken at **one** wall-clock reading rather than one decision applied
-        three times. Reading the clock once matters: three readings could straddle a
-        boundary and put one table's bar a minute away from another's.
+        **This is the one table that is sampled rather than folded.** Tables A, B and D
+        are built from ticks arriving on the bus; our implied volatility and Greeks are
+        produced by `ChainStream`'s 100 ms recompute loop and exist only in its cache, so
+        the writer reads that cache instead of the queue. That also makes table C
+        independent of the ticker work: it needs no new subscription and no new frame.
+
+        **Edge-triggered on the minute boundary, and that is a cost decision.** The drain
+        loop below spins on every message — measured, 1,322.9 a second — and flattening
+        every listed contract on every pass would be the one piece of this writer capable
+        of starving the socket reader. Once a minute it is a few hundred dataclasses on a
+        task that is already awake.
+
+        **It reads the cache and never asks it to recompute.** `ChainStream.chain()`
+        recomputes a dirty expiry synchronously; calling it from here would move that
+        work onto the writer's pass and duplicate what the recompute task already does.
+        The provider hands back what has already been computed, which is also exactly
+        what "sampled at bar close" means: the state the screen was showing.
+
+        **Nothing is stamped here.** The tick carries the instant the *chain* was
+        computed, so a cache that has stopped being recomputed yields samples that are
+        late by `_Watermarked`'s existing rule and are counted and refused. Stamping them
+        with the minute being closed instead would forward-fill a dead feed forever,
+        which is the defect this whole store exists to refuse — and it is the sabotage
+        `test_a_minute_with_no_computed_chain_gets_no_computed_row` was verified against.
         """
-        now = self.clock()
+        if self.chains is None:
+            return 0
+
+        minute_us = int(now * 1e6) - int(now * 1e6) % BUCKET_US
+        if not force:
+            if self._sampled_minute_us is None or minute_us == self._sampled_minute_us:
+                # The first pass only learns which minute it started in. Sampling here
+                # would attribute a chain to a minute still open, and the boundary that
+                # follows collects that same chain anyway.
+                self._sampled_minute_us = minute_us
+                return 0
+        self._sampled_minute_us = minute_us
+
+        taken = 0
+        for chain in self.chains():
+            for tick in computed_ticks_from_chain(chain):
+                self.computed.add(tick)
+                taken += 1
+        return taken
+
+    def _seal(self, now: float | None = None) -> None:
+        """Move every eligible bar from the four aggregators into their stores.
+
+        Each seals on its own watermark and its own key, so this is four independent
+        decisions taken at **one** wall-clock reading rather than one decision applied
+        four times. Reading the clock once matters: four readings could straddle a
+        boundary and put one table's bar a minute away from another's — and table C's
+        grace is zero, so it is the one most easily moved by a second reading.
+        """
+        now = self.clock() if now is None else now
         self.store.add(self.aggregator.seal(now))
         self.reference_store.add(self.reference.seal(now))
         self.spot_store.add(self.spot.seal(now))
+        self.computed_store.add(self.computed.seal(now))
 
     async def _maybe_flush(self) -> None:
         """Write if the flush interval has elapsed. **Off the event loop.**
@@ -496,6 +629,7 @@ class BarWriter:
             self.store.flush()
             + self.reference_store.flush()
             + self.spot_store.flush()
+            + self.computed_store.flush()
         )
 
     async def aclose(self) -> None:
@@ -504,9 +638,15 @@ class BarWriter:
         The partial bars this produces carry their **true** tick counts and no flag —
         the counts already say they are short.
         """
+        # The open minute's computed state is a real observation too, so the cache is
+        # sampled once more before the aggregators are drained. A cache that stopped
+        # being recomputed some minutes ago yields a sample that is late and refused, so
+        # a stopped feed still contributes nothing on the way out.
+        self._sample_computed(self.clock(), force=True)
         self.store.add(self.aggregator.flush())
         self.reference_store.add(self.reference.flush())
         self.spot_store.add(self.spot.flush())
+        self.computed_store.add(self.computed.flush())
         await asyncio.to_thread(self._flush_all)
 
     def stats(self) -> dict[str, Any]:
@@ -537,5 +677,11 @@ class BarWriter:
                 "flushes": self.spot_store.flushes,
                 "rows_written": self.spot_store.rows_written,
                 "buffered": self.spot_store.buffered,
+            },
+            "computed": {
+                **self.computed.stats(),
+                "flushes": self.computed_store.flushes,
+                "rows_written": self.computed_store.rows_written,
+                "buffered": self.computed_store.buffered,
             },
         }

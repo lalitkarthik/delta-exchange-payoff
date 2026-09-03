@@ -150,6 +150,32 @@ class ChainStream:
             self.dirty.discard(key)
         return computed
 
+    def computed_chains(self) -> list[ChainResponse]:
+        """Every chain the recompute loop has produced, as it currently stands.
+
+        **What #5's table C is sampled from.** Our implied volatility and Greeks are not
+        on the wire — they are made here, every 100 ms, and until this ticket they lived
+        exactly as long as the process did. The bar writer reads this once a minute and
+        stores the result beside the quote bars for the same minute.
+
+        **Deliberately not `chain()`.** That method recomputes a dirty expiry
+        synchronously so a reader never sees a stale ladder; calling it from the writer's
+        drain loop would move a chain build onto a pass that has to stay short and would
+        duplicate work `recompute_forever` is already doing. This hands back what has
+        *already* been computed, which is also exactly what "the state the screen was
+        showing" means.
+
+        A **list**, not the live dictionary. The writer walks it while this loop may be
+        replacing entries, and a dict mutated during iteration raises. Each value is a
+        `ChainResponse` that recompute *replaces* rather than mutates, so a snapshot of
+        references is stable for as long as the caller holds it.
+
+        Every chain carries the instant it was computed in `fetched_at`, which is what
+        lets a chain the loop has stopped refreshing be recognised as stale rather than
+        stored again — see `bars.ComputedAggregator`.
+        """
+        return list(self._computed.values())
+
     def _compute(self, key: tuple[str, str]) -> ChainResponse | None:
         """Build the raw chain for `key` and enrich it. `None` if nothing has arrived."""
         raw = self.raw_chain(*key)

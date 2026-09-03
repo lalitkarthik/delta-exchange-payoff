@@ -47,6 +47,28 @@ from .greeks import report_greeks
 from .models import ChainResponse, ComputedLeg, Leg
 from .solvers import implied_vol_newton
 
+#: **The model, named.** One token per decision that currently defines what the numbers
+#: below mean: `F1+assumed-6.5` is the parity regression with the 6.5% borrowed rate
+#: standing in when the discount cannot be fitted, `S1-newton` is the solver,
+#: `ACT365` is the day count, and `mid-OTM` is inversion of the out-of-the-money leg's
+#: **midpoint**.
+#:
+#: **It earns its keep because the fourth token is already scheduled to change.**
+#: Mid-versus-mark is #9's one unticked acceptance criterion, and if that measurement
+#: says mark is the better input then the production input changes and every row stored
+#: before then was computed differently. Two populations, one column, nothing to tell
+#: them apart — unless the stamp is on the row.
+#:
+#: **A content hash of these modules was rejected.** It changes when a docstring is
+#: edited, producing forty versions that are all the same model, and this file's
+#: docstrings are edited often. A commit SHA has the identical defect and is harder to
+#: read. The weakness of a hand-maintained string is that somebody forgets to bump it;
+#: that is partly covered because `forward_method` is stored per row independently and
+#: pins the largest single source of variation whatever this string says.
+#:
+#: **Bump this whenever any of the four decisions changes.**
+MODEL_VERSION = "F1+assumed-6.5 / S1-newton / ACT365 / mid-OTM"
+
 #: Said when a leg exists but nobody is quoting it, so there is no midpoint to invert.
 NO_QUOTE = "no two-sided quote on the out-of-the-money leg"
 

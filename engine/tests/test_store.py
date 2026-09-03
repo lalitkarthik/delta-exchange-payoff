@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
@@ -23,6 +23,9 @@ import pytest
 
 from deltapayoff.bars import (
     BarAggregator,
+    ComputedAggregator,
+    ComputedBar,
+    ComputedTick,
     QuoteBar,
     ReferenceAggregator,
     ReferenceBar,
@@ -32,9 +35,15 @@ from deltapayoff.bars import (
     SpotTick,
     Tick,
 )
+from deltapayoff.chain import EXPIRY_FORMAT, nearest_strike
+from deltapayoff.compute import MODEL_VERSION, enrich
 from deltapayoff.fanout import FanOut
 from deltapayoff.feed import Quote
+from deltapayoff.forward import DAYS_PER_YEAR, SETTLEMENT_HOUR_UTC
+from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
 from deltapayoff.store import (
+    COMPUTED_DATASET,
+    COMPUTED_SCHEMA,
     REFERENCE_DATASET,
     REFERENCE_SCHEMA,
     SPOT_DATASET,
@@ -42,6 +51,7 @@ from deltapayoff.store import (
     BarStore,
     BarWriter,
 )
+from deltapayoff.wire import chain_from_frames, decode_ob_l2, decode_ticker
 
 MINUTE_US = int(datetime(2026, 9, 4, 9, 0, 0, tzinfo=timezone.utc).timestamp() * 1e6)
 MINUTE = 60_000_000
@@ -1335,3 +1345,653 @@ def test_the_writer_refuses_to_run_before_it_is_attached(tmp_path: Path) -> None
             await BarWriter(BarStore(tmp_path)).run()
 
     asyncio.run(scenario())
+
+
+# --- table C: our computed values ------------------------------------------------
+
+
+def computed_bar(
+    symbol: str = "C-BTC-77600-040926",
+    minute: datetime | None = None,
+    *,
+    underlying: str = "BTC",
+    expiry: str = "04-09-2026",
+    strike: float = 77600.0,
+    option_type: str = "C",
+    iv: float | None = 0.43212345,
+    iv_leg: str | None = "call",
+    iv_reason: str | None = None,
+) -> ComputedBar:
+    greeks: dict[str, float | None] = dict(
+        delta=0.51234567, gamma=0.00012345, vega=31.41592653, theta=-8.2, rho=1.9
+    )
+    if iv is None:
+        greeks = dict.fromkeys(greeks)
+    return ComputedBar(
+        symbol=symbol,
+        underlying=underlying,
+        expiry=expiry,
+        strike=strike,
+        option_type=option_type,
+        minute=minute or datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+        iv=iv,
+        iv_leg=iv_leg,
+        iv_reason=iv_reason,
+        forward=77590.43210987,
+        discount=0.99997892,
+        years_to_expiry=0.00114155,
+        forward_method="F1+assumed-rate",
+        model_version=MODEL_VERSION,
+        **greeks,
+    )
+
+
+def test_a_computed_bar_round_trips_through_parquet_with_its_values_and_its_types(
+    tmp_path: Path,
+) -> None:
+    """Values, **types** and the model stamp. The stamp is dictionary-encoded because it
+    is one short string repeated on every row of every day, and it is the column that
+    makes a later change to the model visible instead of silent."""
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add([computed_bar()])
+    assert store.flush() == 1
+
+    frame = store.scan().collect()
+    schema = frame.collect_schema()
+    row = frame.row(0, named=True)
+
+    assert frame.height == 1
+    for column in (
+        "strike",
+        "iv",
+        "delta",
+        "gamma",
+        "vega",
+        "theta",
+        "rho",
+        "forward",
+        "discount",
+        "years_to_expiry",
+    ):
+        assert schema[column] == pl.Float64, column
+    for column in (
+        "symbol",
+        "expiry",
+        "option_type",
+        "underlying",
+        "iv_leg",
+        "iv_reason",
+        "forward_method",
+        "model_version",
+    ):
+        assert schema[column] == pl.Categorical, column
+    assert schema["minute"] == pl.Datetime("us", "UTC")
+    assert schema["date"] == pl.Date
+
+    # Full 64-bit precision, not a 32-bit float's seven digits.
+    assert row["iv"] == 0.43212345
+    assert row["vega"] == 31.41592653
+    assert row["forward"] == 77590.43210987
+    assert row["model_version"] == MODEL_VERSION
+    assert row["forward_method"] == "F1+assumed-rate"
+    assert row["date"] == date(2026, 9, 4)
+    assert row["underlying"] == "BTC"
+
+
+def test_a_computed_row_without_a_volatility_carries_no_greeks_and_nulls_not_zeros(
+    tmp_path: Path,
+) -> None:
+    """Absence is null and never zero. A zero delta is a real and meaningful number —
+    a deep out-of-the-money option has one — so writing zeros for "we could not solve
+    this" would put five plausible figures in the store that describe nothing."""
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add([computed_bar(iv=None, iv_reason="the solver did not converge")])
+    store.flush()
+
+    row = store.scan().collect().row(0, named=True)
+
+    assert row["iv"] is None
+    for greek in ("delta", "gamma", "vega", "theta", "rho"):
+        assert row[greek] is None, greek
+    assert row["iv_reason"] == "the solver did not converge"
+
+
+def test_the_computed_table_stores_none_of_delta_s_own_figures(tmp_path: Path) -> None:
+    """The separation that makes any agreement between us and the venue evidence rather
+    than construction. Delta's vols and Greeks are table B's `venue_` columns; a second
+    column called `delta` in this table would be one careless join away from measuring
+    how well we imitate them."""
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add([computed_bar()])
+    store.flush()
+
+    columns = set(store.scan().collect_schema().names())
+
+    assert not [name for name in columns if name.startswith("venue_")]
+    for absent in ("mark_close", "mark_iv", "bid_iv", "ask_iv", "oi_contracts", "spot"):
+        assert absent not in columns, absent
+    # ...and ours are there under the bare names.
+    assert {"iv", "delta", "gamma", "vega", "theta", "rho"} <= columns
+
+
+def test_the_computed_row_count_equals_the_minutes_that_actually_had_a_chain(
+    tmp_path: Path,
+) -> None:
+    """"No invented rows" made executable at the file layer: minutes 0 and 4 were
+    computed, 1, 2 and 3 were not, and the file holds two rows rather than five."""
+    aggregator = ComputedAggregator()
+    for minute in (0, 4):
+        aggregator.add(
+            computed_tick(MINUTE_US + minute * MINUTE + 30 * 1_000_000, iv=0.4 + minute)
+        )
+
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add(aggregator.seal((MINUTE_US + 5 * MINUTE) / 1e6 + 3600.0))
+    store.flush()
+
+    frame = store.scan().collect().sort("minute")
+
+    assert frame.height == 2
+    assert frame["minute"].to_list() == [
+        datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+        datetime(2026, 9, 4, 9, 4, tzinfo=timezone.utc),
+    ]
+
+
+def computed_tick(exchange_us: int, iv: float | None = 0.43) -> ComputedTick:
+    return ComputedTick(
+        symbol="C-BTC-77600-040926",
+        exchange_us=exchange_us,
+        iv=iv,
+        iv_leg="call",
+        iv_reason=None,
+        delta=0.5,
+        gamma=0.0001,
+        vega=31.4,
+        theta=-8.2,
+        rho=1.9,
+        forward=77590.4,
+        discount=0.99997892,
+        years_to_expiry=0.00114155,
+        forward_method="F1",
+        model_version=MODEL_VERSION,
+    )
+
+
+def test_a_filtered_scan_returns_only_the_matching_computed_partition(
+    tmp_path: Path,
+) -> None:
+    """Pruning as behaviour rather than as configuration: two dates and two underlyings
+    written, a filtered scan asserted to hold only the matching rows."""
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add(
+        [
+            computed_bar(minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)),
+            computed_bar(minute=datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc)),
+            computed_bar(
+                symbol="C-ETH-4000-040926",
+                underlying="ETH",
+                strike=4000.0,
+                minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+            ),
+        ]
+    )
+    store.flush()
+
+    frame = (
+        store.scan()
+        .filter(pl.col("date") == date(2026, 9, 4), pl.col("underlying") == "BTC")
+        .collect()
+    )
+
+    assert frame.height == 1
+    assert frame.row(0, named=True)["symbol"] == "C-BTC-77600-040926"
+
+
+def sampled_chain(minute: int, second: int, iv: float | None = 0.43) -> ChainResponse:
+    """A two-leg enriched chain stamped inside minute `minute`, as the recompute loop
+    would have left it in `ChainStream._computed`."""
+    stamp = datetime.fromtimestamp(
+        (MINUTE_US + minute * MINUTE + second * 1_000_000) / 1e6, tz=timezone.utc
+    )
+    block = ComputedLeg(
+        iv=iv,
+        iv_leg="call",
+        delta=0.5,
+        gamma=0.0001,
+        vega=31.4,
+        theta=-8.2,
+        rho=1.9,
+    )
+    return ChainResponse(
+        underlying="BTC",
+        expiry="04-09-2026",
+        spot=77568.2,
+        atm_strike=77600.0,
+        fetched_at=stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        rows=[
+            ChainRow(
+                strike=77600.0,
+                call=Leg(symbol="C-BTC-77600-040926", computed=block),
+                put=Leg(symbol="P-BTC-77600-040926", computed=block),
+            )
+        ],
+        forward=77590.4,
+        discount=0.99997892,
+        years_to_expiry=0.00114155,
+        forward_method="F1+assumed-rate",
+    )
+
+
+def test_the_writer_samples_the_chain_cache_at_each_minute_boundary(
+    tmp_path: Path,
+) -> None:
+    """Table C is **sampled**, not folded from the bus. The computed surface is produced
+    by the recompute loop rather than arriving on the wire, so the writer reads the cache
+    once as each minute closes and stores the state the screen was showing."""
+    held: list[ChainResponse] = []
+
+    async def scenario():
+        now = MINUTE_US / 1e6 + 30.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: list(held),
+        )
+        writer.attach(FanOut())
+        task = asyncio.create_task(writer.run())
+
+        held.append(sampled_chain(0, 50, iv=0.40))
+        await asyncio.sleep(0.05)
+        now = (MINUTE_US + MINUTE) / 1e6 + 0.5
+        await asyncio.sleep(0.05)
+
+        held[:] = [sampled_chain(1, 50, iv=0.44)]
+        now = (MINUTE_US + 2 * MINUTE) / 1e6 + 0.5
+        await asyncio.sleep(0.05)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await writer.aclose()
+        return writer
+
+    writer = asyncio.run(scenario())
+    frame = writer.computed_store.scan().collect().sort("minute", "symbol")
+
+    assert frame.height == 4, "two contracts across two closed minutes"
+    assert frame["minute"].to_list() == [
+        datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+        datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+        datetime(2026, 9, 4, 9, 1, tzinfo=timezone.utc),
+        datetime(2026, 9, 4, 9, 1, tzinfo=timezone.utc),
+    ]
+    assert frame["iv"].to_list() == [0.40, 0.40, 0.44, 0.44]
+    assert set(frame["model_version"].to_list()) == {MODEL_VERSION}
+    assert set(frame["symbol"].to_list()) == {
+        "C-BTC-77600-040926",
+        "P-BTC-77600-040926",
+    }
+
+
+def test_a_minute_with_no_computed_chain_gets_no_computed_row(tmp_path: Path) -> None:
+    """**The deliberate-silence test, at the file layer.**
+
+    Five minutes; exactly one of them was computed. Minutes 0 and 1 pass with the cache
+    holding nothing at all — the recompute loop has produced no chain yet, which is what
+    process start and an expiry nobody has quoted both look like. Minute 2 is computed.
+    Then the feed stops and the cache keeps answering with that same chain forever, which
+    is what a dead socket looks like from here.
+
+    Only minute 2 may appear. Not a row of nulls for the others, and above all not minute
+    2's volatility carried into 3 and 4 — that is the defect this project documented in
+    Delta's own `/v2/history/candles`, where 797 of 801 daily bars are the last trade
+    repeated. It would be invisible: plausible rows describing a market nobody observed.
+
+    **Sabotage-verified.** With `_sample_computed` stamping each tick with the minute it
+    is closing instead of with the instant the chain was computed — the plausible mistake,
+    since the row *is* attributed to that minute — this fails with three minutes.
+    """
+    held: list[ChainResponse] = []
+
+    async def scenario():
+        now = MINUTE_US / 1e6 + 30.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: list(held),
+        )
+        writer.attach(FanOut())
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)
+
+        # Minutes 0 and 1 close with nothing computed at all.
+        for minute in (1, 2):
+            now = (MINUTE_US + minute * MINUTE) / 1e6 + 0.5
+            await asyncio.sleep(0.03)
+
+        # Minute 2 is computed, and then the feed stops: the cache goes on holding this
+        # one chain while minutes 3 and 4 close over it.
+        held.append(sampled_chain(2, 50, iv=0.48))
+        for minute in (3, 4, 5):
+            now = (MINUTE_US + minute * MINUTE) / 1e6 + 0.5
+            await asyncio.sleep(0.03)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await writer.aclose()
+        return writer
+
+    writer = asyncio.run(scenario())
+    frame = writer.computed_store.scan().collect().sort("symbol")
+    minutes = sorted(set(frame["minute"].to_list()))
+
+    assert minutes == [datetime(2026, 9, 4, 9, 2, tzinfo=timezone.utc)]
+    for silent in (0, 1, 3, 4):
+        stamp = datetime(2026, 9, 4, 9, silent, tzinfo=timezone.utc)
+        assert stamp not in minutes, f"minute {silent} was invented"
+    assert frame.height == 2, "two contracts, one minute, and nothing else"
+    assert frame["iv"].to_list() == [0.48, 0.48]
+
+
+def test_a_cache_that_stops_being_recomputed_stops_producing_rows(
+    tmp_path: Path,
+) -> None:
+    """The same rule, with the refusal counted rather than merely observed.
+
+    `ChainStream._computed` keeps answering after the socket dies — it holds the last
+    chain it managed to build, forever. Re-sampling it every minute would write identical
+    rows for a market that was not observed. The sample is bucketed on the instant the
+    chain was **computed**, so a frozen cache is late rather than fresh, and a discarded
+    observation with no counter behind it is the same lie as a silent drop.
+    """
+    frozen = sampled_chain(0, 50, iv=0.40)
+
+    async def scenario():
+        now = MINUTE_US / 1e6 + 30.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: [frozen],
+        )
+        writer.attach(FanOut())
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)
+
+        for minute in (1, 2, 3, 4, 5):
+            now = (MINUTE_US + minute * MINUTE) / 1e6 + 0.5
+            await asyncio.sleep(0.03)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await writer.aclose()
+        return writer
+
+    writer = asyncio.run(scenario())
+    frame = writer.computed_store.scan().collect()
+
+    assert frame.height == 2, "a dead feed's last chain was stored again"
+    assert set(frame["minute"].to_list()) == {
+        datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    }
+    assert writer.computed.late >= 8, "a refused sample was discarded silently"
+
+
+def test_the_writers_computed_store_shares_the_root_it_was_given(
+    tmp_path: Path,
+) -> None:
+    """The fourth table is derived from the quote store's root like the other two, so a
+    test handed a temporary directory does not have one of its four tables quietly write
+    into the repository's own `data/`."""
+    writer = BarWriter(BarStore(tmp_path))
+
+    assert writer.computed_store.root == tmp_path
+    assert writer.computed_store.dataset == COMPUTED_DATASET
+    assert writer.stats()["computed"]["rows_written"] == 0
+
+
+def test_a_writer_with_no_chain_source_writes_no_computed_rows(tmp_path: Path) -> None:
+    """`chains` is optional. A writer with nothing to sample stores nothing rather than
+    storing empty minutes, and the other three tables are unaffected."""
+    writer = BarWriter(BarStore(tmp_path))
+
+    writer._sample_computed(MINUTE_US / 1e6)
+    writer._sample_computed((MINUTE_US + MINUTE) / 1e6)
+
+    assert writer.computed.stats()["ticks"] == 0
+    assert writer.computed_store.buffered == 0
+
+
+def test_the_running_app_stores_our_computed_values_too(monkeypatch, tmp_path) -> None:
+    """The fourth table through the real application.
+
+    A ticker frame on the live bus is enriched by the recompute loop, and the writer
+    samples that loop's own cache rather than the queue — which is the whole structural
+    difference between this table and the other three. The row lands because shutdown
+    takes a final sample of the open minute, exactly as it flushes a partial quote bar.
+
+    The assertion is on **content**, not on a row count, because a real minute boundary
+    may fall inside the window and legitimately split the sample across two minutes.
+    Whether silence produces rows is pinned by the deliberate-silence tests above, on an
+    injected clock where it can be asserted exactly.
+    """
+    from fastapi.testclient import TestClient
+
+    from deltapayoff import main
+
+    monkeypatch.setenv("DELTA_LIVE_FEED", "1")
+    monkeypatch.setattr(main, "DeltaClient", _StubDeltaClient)
+    monkeypatch.setattr(main, "DeltaFeed", _StubFeed)
+    monkeypatch.setattr(main, "BarStore", lambda *a, **k: BarStore(tmp_path))
+
+    symbol = "C-BTC-77600-040926"
+    with TestClient(main.app) as client:
+        assert client.get("/health").status_code == 200
+        writer, stream = main.app.state.writer, main.app.state.stream
+        assert writer.computed_store.root == tmp_path
+        assert writer.chains == stream.computed_chains, "the writer samples nothing"
+
+        now = time.time()
+        main.app.state.fanout.publish(
+            Quote(
+                symbol=symbol,
+                channel="ticker",
+                bid=1066.0,
+                ask=1080.0,
+                received_at=now,
+                frame=ticker_frame(symbol, int(now * 1e6)),
+            )
+        )
+        time.sleep(0.4)  # the recompute loop runs every 100 ms
+        assert stream.computed_chains(), "the loop computed nothing to sample"
+
+    computed = (
+        BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+        .scan()
+        .collect()
+    )
+
+    assert computed.height >= 1, "table C is not produced by the running app"
+    assert set(computed["symbol"].to_list()) == {symbol}
+    assert set(computed["model_version"].to_list()) == {MODEL_VERSION}
+    assert set(computed["underlying"].to_list()) == {"BTC"}
+    # Delta's own figures stay in table B. Nothing of theirs is written here.
+    assert not [
+        name for name in computed.collect_schema().names() if name.startswith("venue_")
+    ]
+
+
+def test_a_stored_row_reproduces_offline_from_the_quote_bar_beside_it(
+    tmp_path: Path, ws_ticker_frames, ws_book_frames
+) -> None:
+    """**What makes `model_version` verifiable rather than decorative.**
+
+    The captured 136-symbol chain is published on the bus and enriched exactly as it
+    would be live, so table A gets its quote bars and table C gets our volatility and
+    Greeks for the same minute. Then the chain is **rebuilt from the stored bytes alone**
+    — bid and ask closes from table A, spot from table D, and the snapshot instant
+    recovered by inverting table C's own `years_to_expiry` — and `compute.enrich` is run
+    over it offline. What it produces must be what table C already holds.
+
+    **What this proves.** That the store carries every input our model needs, that the
+    columns mean what their names say, that the types survive Parquet without losing
+    precision, and that a reader with nothing but these files can re-derive the numbers
+    rather than having to trust them. It is not tautological: the two tables are written
+    by different paths — one folds ticks off the bus, the other samples the recompute
+    loop's cache — and the comparison is between values that have both been through the
+    file layer.
+
+    **What it does not prove.** Each contract gets exactly one tick in this minute, so
+    `bid_close` *is* the tick that was live when the chain was computed and the agreement
+    is exact. On a busy minute it is not: a bar's close is the last tick of the minute
+    while the sample was taken from whatever chain the 100 ms loop had last produced, and
+    those are usually but not always the same quote. So this establishes that the model
+    is reproducible from the stored schema — **not** that every historical row will
+    re-derive to the last decimal from its own bar. It also says nothing about whether
+    the model is right; it says the store is honest about which model ran.
+    """
+    minute_start = datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    taken = minute_start + timedelta(seconds=50)
+    live = enrich(
+        chain_from_frames(
+            "BTC", "04-09-2026", ws_ticker_frames, ws_book_frames, fetched_at=taken
+        )
+    )
+
+    async def scenario():
+        now = MINUTE_US / 1e6 + 55.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: [live],
+        )
+        bus = FanOut()
+        writer.attach(bus)
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)
+
+        stamp = MINUTE_US + 50_000_000
+        for symbol, frame in ws_ticker_frames.items():
+            _, leg = decode_ticker(frame)
+            bus.publish(
+                Quote(
+                    symbol=symbol,
+                    channel="ticker",
+                    bid=leg.bid,
+                    ask=leg.ask,
+                    received_at=now,
+                    frame={**frame, "ts": stamp},
+                )
+            )
+        for symbol, frame in ws_book_frames.items():
+            _, bid, ask = decode_ob_l2(frame)
+            bus.publish(
+                Quote(
+                    symbol=symbol,
+                    channel="ob_l2",
+                    bid=bid,
+                    ask=ask,
+                    received_at=now,
+                    frame={**frame, "ts": stamp},
+                )
+            )
+
+        await asyncio.sleep(0.1)
+        now = (MINUTE_US + MINUTE) / 1e6 + 10.0  # past every grace period
+        await asyncio.sleep(0.1)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await writer.aclose()
+
+    asyncio.run(scenario())
+
+    quotes = BarStore(tmp_path).scan().collect()
+    spots = BarStore(tmp_path, dataset=SPOT_DATASET, schema=SPOT_SCHEMA).scan().collect()
+    computed = (
+        BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+        .scan()
+        .collect()
+    )
+    stored = {row["symbol"]: row for row in computed.iter_rows(named=True)}
+
+    assert stored, "table C is empty; there is nothing to reproduce"
+    assert sum(1 for row in stored.values() if row["iv"] is not None) >= 20, (
+        "almost nothing solved, so an agreement below would prove very little"
+    )
+
+    # --- the offline reconstruction, from the stored bytes and nothing else ---
+    sample = next(iter(stored.values()))
+    # `fetched_at` is not a column, and does not need to be: `years_to_expiry` pins it
+    # exactly against a settlement time the expiry already names, and #5 asks that
+    # nothing trivially derivable be stored.
+    settles = datetime.strptime(sample["expiry"], EXPIRY_FORMAT).replace(
+        hour=SETTLEMENT_HOUR_UTC, tzinfo=timezone.utc
+    )
+    recovered = settles - timedelta(
+        seconds=round(sample["years_to_expiry"] * DAYS_PER_YEAR * 86_400)
+    )
+    assert recovered == taken, "the snapshot instant cannot be recovered from the store"
+
+    legs: dict[float, dict[str, Leg]] = {}
+    for row in quotes.iter_rows(named=True):
+        side = "call" if row["option_type"] == "C" else "put"
+        legs.setdefault(row["strike"], {})[side] = Leg(
+            symbol=row["symbol"], bid=row["bid_close"], ask=row["ask_close"]
+        )
+    spot = spots.row(0, named=True)["spot_close"]
+    rebuilt = ChainResponse(
+        underlying="BTC",
+        expiry=sample["expiry"],
+        spot=spot,
+        atm_strike=nearest_strike(list(legs), spot),
+        fetched_at=recovered.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        rows=[
+            ChainRow(strike=strike, call=sides.get("call"), put=sides.get("put"))
+            for strike, sides in sorted(legs.items())
+        ],
+    )
+
+    offline = enrich(rebuilt)
+
+    assert offline.forward_method == sample["forward_method"]
+    assert offline.forward == sample["forward"]
+    assert offline.discount == sample["discount"]
+    assert offline.years_to_expiry == sample["years_to_expiry"]
+
+    checked = 0
+    for row in offline.rows:
+        for leg in (row.call, row.put):
+            if leg is None:
+                continue
+            block, kept = leg.computed, stored[leg.symbol]
+            assert block.iv == kept["iv"], leg.symbol
+            assert (block.iv_reason or None) == kept["iv_reason"], leg.symbol
+            for greek in ("delta", "gamma", "vega", "theta", "rho"):
+                assert getattr(block, greek) == kept[greek], f"{leg.symbol} {greek}"
+            checked += 1
+
+    assert checked == len(stored) == quotes.height
