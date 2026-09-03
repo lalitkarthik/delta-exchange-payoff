@@ -7,6 +7,11 @@ The three JSON fixtures under `tests/fixtures/`:
   captured from production on 2026-09-01. 128 tickers, spot 77568.2.
 * `tickers-btc-all-expiries.json` — the same call without `expiry_date`, subsetted to
   one call and one put per listed expiry so the file stays small. Real rows, untouched.
+* `tickers-btc-multi-expiry.json` — a verbatim `GET /v2/tickers` for BTC options with
+  no `expiry_date` filter, captured from production on 2026-09-02T08:40:14Z. 588
+  contracts across eight expiries, half a day to 85 days out, spot 77874.2. This is the
+  fixture the agreement matrix slices by time to expiry; the chain capture above is one
+  expiry and cannot.
 * `tickers-absent-quotes.json` — three rows lifted from the chain capture and then
   hand-edited to carry the absent-value spellings Delta uses: `"0"`, `""` and `null`.
   Delta's live snapshots quote every strike, so the edge cases have to be constructed.
@@ -57,3 +62,8 @@ def all_expiry_tickers() -> list[dict[str, Any]]:
 @pytest.fixture
 def absent_quote_tickers() -> list[dict[str, Any]]:
     return load_fixture("tickers-absent-quotes.json")["result"]
+
+
+@pytest.fixture
+def multi_expiry_tickers() -> list[dict[str, Any]]:
+    return load_fixture("tickers-btc-multi-expiry.json")["result"]
