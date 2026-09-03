@@ -228,12 +228,17 @@ def f4_spot(chain: ChainResponse) -> ForwardResult:
     )
 
 
-#: The widths #2 asks F1 to be swept over.
-SWEEP_WIDTHS = (3, 5, 7, 9)
+#: The widths #2 asks F1 to be swept over, plus `None` — every paired strike, no window.
+#:
+#: `None` was added after the sweep measured why it had to be. Each narrow window on the
+#: captured chain implies a rate the gate rejects, and the reason is that a slope needs a
+#: wide base: ATM+/-3 spans 1.3% of spot, the full chain spans 38.7%. Trimming the wings
+#: is the usual instinct for noisy data and it is the wrong one here.
+SWEEP_WIDTHS: tuple[int | None, ...] = (3, 5, 7, 9, None)
 
 
 def sweep_widths(
-    chain: ChainResponse, widths: tuple[int, ...] = SWEEP_WIDTHS
+    chain: ChainResponse, widths: tuple[int | None, ...] = SWEEP_WIDTHS
 ) -> list[ForwardResult]:
     """F1 at each window width, so the two can be compared side by side.
 

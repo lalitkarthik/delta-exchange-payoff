@@ -4,9 +4,13 @@
 window widths put the forward inside a $1.23 band and the implied rate inside a
 26.5-percentage-point one. Same fits, same data, same line — read at two different places.
 
+**Use every paired strike, not a window.** Each narrow window implies a rate the gate rejects.
+The unwindowed fit passes, and the rate it recovers — 2.824% — independently matches the
+2.749% implied by the basis. It costs 0.065 ms against 0.055 ms.
+
 A second finding, unexpected and worth #4's attention early: **assuming a 6.5% carry rate is
-worse than assuming no carry at all.** F3 misses the parity forward by $30.10, F4 by $22.40.
-The borrowed constant is 2.3x the rate this chain actually implies.
+worse than assuming no carry at all.** F3 misses the parity forward by $30.30, F4 by $22.19.
+The borrowed constant is 2.4x the rate this chain actually implies.
 
 Companion to `docs/settlement.md`, which establishes that no correction terms are needed
 anywhere in what follows. Implemented in `engine/src/deltapayoff/forward.py`, tested in
@@ -51,7 +55,7 @@ the recovered forward from 78,400 to 124,404 on a planted chain — the mutation
 
 | | Method | Assumes | Reads option prices |
 |---|---|---|---|
-| `F1` | parity OLS over ATM +/- x, x in {3,5,7,9} | nothing | yes, up to 2x+1 strikes |
+| `F1` | parity OLS over ATM +/- x, x in {3,5,7,9, all} | nothing | yes, up to 2x+1 strikes |
 | `F2` | parity inverted at the money strike | an `r`, for `D` only | yes, one strike |
 | `F3` | carry, `F = S·e^(rT)` at r = 6.5% | an `r`, and that carry holds | no |
 | `F4` | spot, `F = S` | that the basis is zero | no |
@@ -81,17 +85,19 @@ forward is usually still worth having.
 
 **Measured** on `engine/tests/fixtures/tickers-btc-04-09-2026.json` — the 04-09-2026 BTC
 chain, snapshot 2026-08-31T16:49:17Z, spot 77,568.2, 65 strikes of which **63 quote both
-sides**, T = 3.799 days. 200 runs per method.
+sides**, T = 3.799 days. 500 runs per method. Distance is measured against the unwindowed
+fit, which is the reference because it is the only one assuming nothing that also passes.
 
-| method | n | forward | basis | D | implied r | trusted | median | p95 |
-|---|---|---|---|---|---|---|---|---|
-| F1 ATM+/-3 | 7 | 77,589.96 | +21.76 | 1.000428 | **-4.111%** | no | 0.057 ms | 0.067 ms |
-| F1 ATM+/-5 | 11 | 77,590.60 | +22.40 | 1.001265 | **-12.147%** | no | 0.055 ms | 0.079 ms |
-| F1 ATM+/-7 | 15 | 77,591.19 | +22.99 | 1.001786 | **-17.144%** | no | 0.056 ms | 0.088 ms |
-| F1 ATM+/-9 | 19 | 77,590.60 | +22.40 | 0.999026 | +9.363% | yes | 0.058 ms | 0.093 ms |
-| F2 | 1 | 77,587.99 | +19.79 | 0.999324 | 6.500% (assumed) | yes | 0.019 ms | 0.020 ms |
-| F3 | 0 | 77,620.70 | +52.50 | 0.999324 | 6.500% (assumed) | yes | 0.015 ms | 0.017 ms |
-| F4 | 0 | 77,568.20 | 0.00 | 1.000000 | 0.000% | yes | 0.002 ms | 0.002 ms |
+| method | n | forward | vs ref | basis | D | implied r | trusted | median | p95 |
+|---|---|---|---|---|---|---|---|---|---|
+| F1 ATM+/-3 | 7 | 77,589.96 | -0.43 | +21.76 | 1.000428 | **-4.111%** | no | 0.055 ms | 0.070 ms |
+| F1 ATM+/-5 | 11 | 77,590.60 | +0.21 | +22.40 | 1.001265 | **-12.147%** | no | 0.059 ms | 0.084 ms |
+| F1 ATM+/-7 | 15 | 77,591.19 | +0.80 | +22.99 | 1.001786 | **-17.144%** | no | 0.066 ms | 0.133 ms |
+| F1 ATM+/-9 | 19 | 77,590.60 | +0.20 | +22.40 | 0.999026 | +9.363% | yes | 0.058 ms | 0.082 ms |
+| **F1 all pairs** | **63** | **77,590.39** | **ref** | **+22.19** | **0.999706** | **+2.824%** | **yes** | **0.065 ms** | **0.089 ms** |
+| F2 | 1 | 77,587.99 | -2.40 | +19.79 | 0.999324 | 6.500% (assumed) | yes | 0.019 ms | 0.021 ms |
+| F3 | 0 | 77,620.70 | **+30.30** | +52.50 | 0.999324 | 6.500% (assumed) | yes | 0.015 ms | 0.016 ms |
+| F4 | 0 | 77,568.20 | **-22.19** | 0.00 | 1.000000 | 0.000% | yes | 0.002 ms | 0.002 ms |
 
 ### The forward is robust; the discount is fragile
 
@@ -109,33 +115,49 @@ strongest evidence available that it is a property of the method rather than of 
 ### Wider is better, which inverts the prior art's instinct
 
 The narrow windows fail and the wide ones pass — the opposite of the usual "trim the noisy
-wings" reflex. ATM+/-3 spans $1,000 on a $77,600 underlying, 1.3%, and over 3.8 days the true
-tilt is `D ~ 0.9997`. There is almost no signal in that range for a slope to sit on. The prior
-art measured the same thing from the other side: its rejected minutes spanned a median 850
-strike points against 1,300 for accepted ones.
+wings" reflex. Read the strike span against the verdict:
 
-**For the discount, reach wider. For the forward, it does not matter.**
+| window | strike range | span as % of spot | implied rate | gate |
+|---|---|---|---|---|
+| ATM+/-3 | 77200–78200 | 1.3% | -4.111% | rejected |
+| ATM+/-5 | 76800–78500 | 2.2% | -12.147% | rejected |
+| ATM+/-7 | 76500–78800 | 3.0% | -17.144% | rejected |
+| ATM+/-9 | 75500–79200 | 4.8% | +9.363% | passed |
+| all pairs | 58000–88000 | **38.7%** | **+2.824%** | passed |
+
+Over 3.8 days the true tilt is `D ~ 0.9997`. Across a $1,000 range that tilt is a rounding
+error, and the fit reads quote noise as slope instead. The prior art measured the same thing
+from the other side: its rejected minutes spanned a median 850 strike points against 1,300 for
+accepted ones.
+
+**The unwindowed fit is corroborated independently.** Its 2.824% is not graded against
+anything in the regression — but the basis it produces, +$22.19 on a spot of 77,568.2 over
+3.799 days, implies **2.749%** by direct arithmetic. Two routes through different numbers,
+agreeing to 8 basis points. None of the rejected windows can say that.
+
+**For the discount, reach wider. For the forward, it does not matter.** `SWEEP_WIDTHS` carries
+`None` as a fifth entry for exactly this reason.
 
 ### F2 corroborates F1 independently
 
-F2 lands within **$2.61** of every F1 window while using a completely different construction —
-one strike inverted, no regression, an assumed `D`. Two methods sharing no arithmetic agreeing
-to three decimal places of a percent is about as close to independent confirmation as a single
-chain snapshot can offer.
+F2 lands **$2.40** from the unwindowed fit, and within **$3.20** of every F1 window, while
+using a completely different construction — one strike inverted, no regression, an assumed `D`.
+Two methods sharing no arithmetic agreeing to four parts in a hundred thousand is about as
+close to independent confirmation as a single chain snapshot can offer.
 
 ### The assumed rate is roughly 2.3x too large
 
-The parity basis is **+$22.40** over 3.799 days, an implied **2.774%** annualised. The borrowed
-`r = 6.5%` produces +$52.50.
+The parity basis is **+$22.19** over 3.799 days, an implied **2.749%** annualised. The borrowed
+`r = 6.5%` produces +$52.50 instead.
 
 So on this chain:
 
 ```
-F3 error vs F1    +$30.10       carry at 6.5%
-F4 error vs F1    -$22.40       no carry at all
+F3 error vs F1    +$30.30       carry at 6.5%
+F4 error vs F1    -$22.19       no carry at all
 ```
 
-**Ignoring carry beats assuming the wrong carry, by 34%.** That is one snapshot and not a
+**Ignoring carry beats assuming the wrong carry, by 37%.** That is one snapshot and not a
 finding yet, but it is the cheapest thing #4 can test and it points at deleting work rather
 than adding it. If it holds across expiries, F3 should be dropped rather than tuned — a rate
 fitted to make F3 match F1 would just be F1 with extra steps.

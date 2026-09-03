@@ -241,8 +241,8 @@ def test_sweep_returns_one_result_per_width() -> None:
 
     results = sweep_widths(chain)
 
-    assert [r.width for r in results] == [3, 5, 7, 9]
-    assert [r.n_pairs for r in results] == [7, 11, 15, 19]
+    assert [r.width for r in results] == [3, 5, 7, 9, None]
+    assert [r.n_pairs for r in results] == [7, 11, 15, 19, 21]
 
 
 def test_a_window_clips_rather_than_reaching_past_the_end_of_the_chain() -> None:
@@ -323,8 +323,8 @@ def test_compare_forwards_answers_every_method_with_a_timing(chain_tickers) -> N
     and a timing out, for each of the seven answers (F1 at four widths, then F2-F4)."""
     results = compare_forwards(captured_chain(chain_tickers), runs=5)
 
-    assert [r.method for r in results] == ["F1", "F1", "F1", "F1", "F2", "F3", "F4"]
-    assert [r.width for r in results] == [3, 5, 7, 9, None, None, None]
+    assert [r.method for r in results] == ["F1"] * 5 + ["F2", "F3", "F4"]
+    assert [r.width for r in results] == [3, 5, 7, 9, None, None, None, None]
     for result in results:
         assert result.forward is not None
         assert result.discount is not None
@@ -348,3 +348,21 @@ def test_comparison_survives_a_chain_with_no_two_sided_strikes(
     assert results[("F1", 3)].trusted is False
     assert results[("F2", None)].forward is None
     assert results[("F4", None)].forward == chain.spot
+
+
+def test_the_sweep_includes_an_unwindowed_fit_over_every_paired_strike(
+    chain_tickers,
+) -> None:
+    """The widest fit is the honest one on this data, so it belongs in the sweep.
+
+    Every narrow window on the captured chain implies a rate the gate rejects. Over all
+    63 paired strikes — a 38.7% span rather than 1.3% — the fit passes, and the rate it
+    recovers agrees with the basis computed independently from spot.
+    """
+    results = sweep_widths(captured_chain(chain_tickers))
+
+    unwindowed = results[-1]
+    assert unwindowed.width is None
+    assert unwindowed.n_pairs == 63
+    assert unwindowed.trusted is True
+    assert unwindowed.implied_rate == pytest.approx(0.0282, abs=5e-4)
