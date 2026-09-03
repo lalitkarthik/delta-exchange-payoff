@@ -173,3 +173,54 @@ measurement that says so, and `docs/forward.md` keeps them for the same reason.
 - **`greeks.rho` still does not reconcile** with a textbook vanilla rho, carried over from
   `docs/settlement.md` §5. Our own Greeks are not yet compared against Delta's as reference
   columns — that comparison belongs here and is not done.
+
+---
+
+## 7. Sources
+
+**Peter Jäckel, "Let's Be Rational", Wilmott, 2015, pp. 40–53.**
+DOI [10.1002/wilm.10395](https://doi.org/10.1002/wilm.10395) ·
+reference C source at <https://www.jaeckel.org/LetsBeRational.7z> ·
+Python port <https://github.com/vollib/lets_be_rational>
+
+The method S3 is named for. Two things were taken from it. The **reduction to normalised
+Black** — expressing price as `b(x, s)` with `x = ln(F/K)` and `s = sigma·sqrt(T)`, which turns
+the solve into one equation in one unknown that behaves identically at every strike and expiry,
+and which is what makes three derivatives short enough to write down. And the **higher-order
+Householder step**, which the paper's own abstract specifies as **convergence order four** — the
+third-order Householder step implemented here, since a Householder method of order `d` converges
+at order `d + 1`.
+
+**What was not taken**, and the paper is explicit that this is the substance of it: the initial
+guess. Jäckel uses *four rational function branches selected on log-moneyness*, two of them
+combined with nonlinear transformations of the input price, and it is that construction — not the
+iteration — that delivers machine precision in **two** iterations for all possible inputs. S3
+seeds from Manaster-Koehler instead and takes five on this chain. The paper's reformulation
+avoiding cancellation in `b` is likewise not implemented, and §6 measures what that costs.
+
+**This was implemented from the method's published structure, not from reading the C source.**
+The description above was checked against the paper's abstract afterwards. Anyone extending S3
+should read `LetsBeRational.7z` first — that is where the branches live.
+
+**S. Manaster and G. Koehler, "The Calculation of Implied Variances from the Black-Scholes
+Model: A Note", Journal of Finance 37(1), 1982, pp. 227–230.**
+DOI [10.1111/j.1540-6261.1982.tb01105.x](https://doi.org/10.1111/j.1540-6261.1982.tb01105.x)
+
+Where `sigma_0 = sqrt(2·|ln(F/K)| / T)` comes from — the volatility at which vega is maximised
+for a given strike, which is what makes Newton's descent from it monotone. Adopting it took this
+project from 19 of 65 strikes solved to 63 of 65; see `engine/src/deltapayoff/solvers.py`.
+
+**M. Brenner and M. Subrahmanyam, "A Simple Formula to Compute the Implied Standard Deviation",
+Financial Analysts Journal 44(5), 1988.**
+
+`sigma ~ sqrt(2·pi/T)·C/(D·F)`. Exact at the money and useless away from it, which is precisely
+the failure this project measured before adding Manaster-Koehler beside it.
+
+**A. S. Householder, *The Numerical Treatment of a Single Nonlinear Equation*, McGraw-Hill, 1970.**
+
+The family the order-three step belongs to.
+
+**R. P. Brent, *Algorithms for Minimization without Derivatives*, Prentice-Hall, 1973, ch. 4.**
+
+S2. Implemented directly rather than pulled from SciPy, so the engine keeps S1 through S3 on the
+standard library alone.

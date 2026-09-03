@@ -16,8 +16,20 @@ of the money, close to expiry. In those regions there is no answer to find, and 
 correct behaviour is to decline rather than to return the number one bad iteration lands
 on. A refusal is recoverable; a plausible wrong number is not.
 
-S2 (Brent), S3 (Jäckel) and S4 (vectorised) answer the same question differently, and T2
-exists to measure where they disagree.
+S2 (Brent), S3 (Jaeckel-shaped) and S4 (vectorised) answer the same question differently,
+and T2 exists to measure where they disagree.
+
+Sources, with what was taken from each, are in `docs/implied-vol.md` §7:
+
+* Jaeckel, "Let's Be Rational", Wilmott 2015, doi:10.1002/wilm.10395, C source at
+  <https://www.jaeckel.org/LetsBeRational.7z> — S3's normalisation and higher-order
+  step. **Not** his four-branch rational initial guess, which is the part that gets his
+  method to two iterations for all inputs.
+* Manaster and Koehler, Journal of Finance 37(1), 1982, pp. 227-230,
+  doi:10.1111/j.1540-6261.1982.tb01105.x — the seed below, and the single change that
+  took this project from 19 of 65 strikes solved to 63 of 65.
+* Brenner and Subrahmanyam, Financial Analysts Journal 44(5), 1988 — the other seed.
+* Brent, *Algorithms for Minimization without Derivatives*, 1973, ch. 4 — S2.
 """
 
 from __future__ import annotations
