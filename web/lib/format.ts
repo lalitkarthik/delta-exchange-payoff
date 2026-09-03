@@ -75,6 +75,34 @@ export function formatDelta(value: number | null): string {
 }
 
 /**
+ * Gamma, which is several orders of magnitude smaller than every other Greek.
+ *
+ * On a BTC chain it runs around `0.000086`. Three decimals would print that as `0.000`
+ * for the whole ladder — a column of zeros claiming there is no convexity anywhere,
+ * which is the same lie `formatIv` refuses to tell about a floored volatility. So it is
+ * scaled by 10,000 and the header says so: `0.86` on a header reading `Γ ×10⁴`.
+ *
+ * Scaling in the formatter rather than in the engine keeps the contract's number the
+ * real one. This is presentation, exactly like `formatIv`'s `* 100`.
+ */
+export function formatGamma(value: number | null): string {
+  if (value === null) return EMPTY;
+  return (value * 10_000).toFixed(2);
+}
+
+/**
+ * Vega, theta and rho, which share a scale and a convention.
+ *
+ * All three arrive already scaled by the engine — vega and rho per one percent, theta
+ * as one calendar day — so this only has to choose a precision. Two decimals: they run
+ * from single digits to a few hundred USD and a third would be noise.
+ */
+export function formatGreek(value: number | null): string {
+  if (value === null) return EMPTY;
+  return value.toFixed(2);
+}
+
+/**
  * Open interest, in contracts.
  *
  * This is the one column where a zero is routine and genuine — a listed strike that

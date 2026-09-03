@@ -38,15 +38,17 @@
   --ink-soft: #5b6773;
   --ink-faint: #93a0ac;
 
-  --call: #1f6feb;
-  --put: #d1383a;
+  /* Calls green, puts red — the convention a desk reads without thinking. */
+  --call: #15803d;
+  --put: #b91c1c;
   --accent: #4338ca;
 
-  /* Price direction. Deliberately NOT --call/--put: those are blue and red, and an
-     uptick painted blue reads as "this is a call" rather than "this went up". Green
-     and red are what a trading screen means by up and down. */
-  --up: #1a7f37;
-  --down: #d1383a;
+  /* Price direction. Deep rather than bright: these paint whole cells on a table
+     that repaints every second, and a light tint reads as a highlight while a deep
+     one reads as a state. Kept as their own tokens even though they now share the
+     call/put hues, because the two mean different things and may diverge again. */
+  --up: #14532d;
+  --down: #7f1d1d;
   --atm: #fff6d6;
   --atm-line: #e0b400;
   /* The in-the-money wash. A tint rather than an alpha, so it composes predictably with
@@ -81,11 +83,13 @@
     --ink-soft: #9aa7b4;
     --ink-faint: #6b7885;
 
-    --call: #4d9bff;
+    /* Headings stay legible on the dark ground, so these are lighter than the
+       light theme's - it is the tints below that carry the depth. */
+    --call: #3fb950;
     --put: #ff6b6b;
     --accent: #8b7cf6;
-    --up: #3fb950;
-    --down: #ff6b6b;
+    --up: #1a7f37;
+    --down: #a51d1d;
     --atm: #3a3016;
     --atm-line: #e0b400;
     --itm: #241a1c;
@@ -106,9 +110,14 @@
   --ink-soft: #9aa7b4;
   --ink-faint: #6b7885;
 
-  --call: #4d9bff;
+  /* Must mirror the prefers-color-scheme block above. This one wins when the theme
+     is chosen explicitly rather than inherited, so a token missing here falls back
+     to the light value and one cell ends up painted for the wrong ground. */
+  --call: #3fb950;
   --put: #ff6b6b;
   --accent: #8b7cf6;
+  --up: #1a7f37;
+  --down: #a51d1d;
   --atm: #3a3016;
   --atm-line: #e0b400;
   --itm: #241a1c;
@@ -376,13 +385,13 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
  * blue and red, and an uptick painted blue reads as a statement about the contract
  * rather than about the price.
  */
-table.chain tbody td.moved-up { background: color-mix(in srgb, var(--up) 14%, transparent); }
-table.chain tbody td.moved-down { background: color-mix(in srgb, var(--down) 14%, transparent); }
+table.chain tbody td.moved-up { background: color-mix(in srgb, var(--up) 78%, transparent); }
+table.chain tbody td.moved-down { background: color-mix(in srgb, var(--down) 78%, transparent); }
 
 /* The in-the-money wash and a direction tint can land on the same cell. The tint wins,
  * because it is the thing that just changed; the wash is static context. */
-table.chain tbody td.itm.moved-up { background: color-mix(in srgb, var(--up) 20%, var(--itm)); }
-table.chain tbody td.itm.moved-down { background: color-mix(in srgb, var(--down) 20%, var(--itm)); }
+table.chain tbody td.itm.moved-up { background: color-mix(in srgb, var(--up) 82%, var(--itm)); }
+table.chain tbody td.itm.moved-down { background: color-mix(in srgb, var(--down) 82%, var(--itm)); }
 
 .arrow {
   margin-left: 3px;
@@ -393,8 +402,23 @@ table.chain tbody td.itm.moved-down { background: color-mix(in srgb, var(--down)
   line-height: 1;
 }
 
-.arrow-up { color: var(--up); }
-.arrow-down { color: var(--down); }
+/* The glyph sits ON the deep tint, so it cannot be the same colour as it. These are
+   the light ends of each hue, chosen for contrast against the fill rather than
+   against the page. */
+.arrow-up { color: #7ee2a0; }
+.arrow-down { color: #ff9f9f; }
+
+/* A price on a deep tint needs to lift off it too.
+ *
+ * The mix percentage is high enough that the tint stays dark against BOTH grounds.
+ * That matters: `color-mix` with `transparent` composites over whatever is behind,
+ * so the same percentage yields a much lighter result on the light theme's near-white
+ * surface than on the dark one. Measured at 55%, white text on the light theme's
+ * up-tint gave a contrast ratio of 3.6:1, below the 4.5:1 that ordinary text needs;
+ * at 78% it clears it. Lower this and the light theme quietly becomes unreadable
+ * while the dark theme still looks fine. */
+table.chain tbody td.moved-up,
+table.chain tbody td.moved-down { color: #ffffff; }
 
 /* Respect a reduced-motion preference by removing the tint rather than the glyph: the
  * colour is the part that reads as movement, and the arrow still carries the meaning. */

@@ -12,6 +12,8 @@ import {
 import {
   DASH,
   formatDelta,
+  formatGamma,
+  formatGreek,
   formatIv,
   formatOi,
   formatPrice,
@@ -24,10 +26,14 @@ import {
  *
  * Calls read outward-in from the left and puts inward-out to the right:
  *
- *     OI  Δ  IV  Bid  Ask  |  STRIKE  |  Ask  Bid  IV  Δ  OI
+ *     OI  ρ  Θ  ν  Γ  Δ  IV  Bid  Ask  |  STRIKE  |  Ask  Bid  IV  Δ  Γ  ν  Θ  ρ  OI
  *
  * so the two columns either side of the strike are always the tradeable prices, and the
- * position-sized figures sit out at the edges. Mark price is not a column; it is in the
+ * position-sized figures sit out at the edges. The Greeks read outward in order of how
+ * often a desk looks at them: delta and the volatility nearest the prices, rho furthest
+ * away. Nineteen columns is wide, and the wrapper scrolls horizontally rather than
+ * shrinking the type — a dense numeric table that cannot be read is worse than one that
+ * has to be scrolled. Mark price is not a column; it is in the
  * cell tooltip beside all three IVs, because a trader deals at the bid and the ask.
  *
  * **The IV and Δ columns are ours, not Delta's.** They used to be the venue's published
@@ -75,6 +81,10 @@ function inTheMoney(strike: number, spot: number, side: "call" | "put"): boolean
   return side === "call" ? strike < spot : strike > spot;
 }
 
+/** OI, rho, theta, vega, gamma, delta, IV, bid, ask. Used by the header `colSpan`, by
+ *  the hatched cells of an unlisted side, and nowhere else — one number, three readers. */
+const COLUMNS_PER_SIDE = 9;
+
 /**
  * One side of one row: five cells, in reading order for that side.
  *
@@ -91,13 +101,13 @@ function QuoteCells({ leg, side, strike, spot, previous }: {
 }) {
   if (leg === null) {
     const label = `No ${side} listed at this strike`;
+    // One hatched cell per column on this side. Built from a count rather than repeated
+    // by hand so it cannot drift out of step with `outwardIn` below.
     return (
       <>
-        <td className="blank" title={label} />
-        <td className="blank" title={label} />
-        <td className="blank" title={label} />
-        <td className="blank" title={label} />
-        <td className="blank" title={label} />
+        {Array.from({ length: COLUMNS_PER_SIDE }, (_, i) => (
+          <td key={i} className="blank" title={label} />
+        ))}
       </>
     );
   }
@@ -159,6 +169,10 @@ function QuoteCells({ leg, side, strike, spot, previous }: {
   // wrong in one place.
   const outwardIn = [
     cell("oi", formatOi(leg.oi)),
+    cell("rho", formatGreek(ours?.rho ?? null)),
+    cell("theta", formatGreek(ours?.theta ?? null)),
+    cell("vega", formatGreek(ours?.vega ?? null)),
+    cell("gamma", formatGamma(ours?.gamma ?? null)),
     cell("delta", formatDelta(ours?.delta ?? null)),
     cell("iv", formatIv(ours?.iv ?? null)),
     priced("bid"),
@@ -227,25 +241,33 @@ export function ChainLadder({ chain }: { chain: ChainResponse }) {
         </caption>
         <thead>
           <tr>
-            <th className="side-head side-call" colSpan={5}>
+            <th className="side-head side-call" colSpan={COLUMNS_PER_SIDE}>
               Calls
             </th>
             <th className="side-head">Strike</th>
-            <th className="side-head side-put" colSpan={5}>
+            <th className="side-head side-put" colSpan={COLUMNS_PER_SIDE}>
               Puts
             </th>
           </tr>
           <tr>
             <th>OI</th>
-            <th>Δ</th>
-            <th>IV</th>
+            <th title="Rho, per one percent. Computed here, not the venue's.">ρ</th>
+            <th title="Theta, one calendar day. Computed here, not the venue's.">Θ</th>
+            <th title="Vega, per volatility point. Computed here, not the venue's.">ν</th>
+            <th title="Gamma, scaled by 10,000 so it is readable. Computed here.">Γ ×10⁴</th>
+            <th title="Delta, with respect to the forward. Computed here.">Δ</th>
+            <th title="Implied volatility, solved from the out-of-the-money leg.">IV</th>
             <th>Bid</th>
             <th>Ask</th>
             <th style={{ textAlign: "center" }}>Strike</th>
             <th>Ask</th>
             <th>Bid</th>
-            <th>IV</th>
-            <th>Δ</th>
+            <th title="Implied volatility, solved from the out-of-the-money leg.">IV</th>
+            <th title="Delta, with respect to the forward. Computed here.">Δ</th>
+            <th title="Gamma, scaled by 10,000 so it is readable. Computed here.">Γ ×10⁴</th>
+            <th title="Vega, per volatility point. Computed here, not the venue's.">ν</th>
+            <th title="Theta, one calendar day. Computed here, not the venue's.">Θ</th>
+            <th title="Rho, per one percent. Computed here, not the venue's.">ρ</th>
             <th>OI</th>
           </tr>
         </thead>
