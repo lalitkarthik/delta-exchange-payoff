@@ -4,3 +4,9 @@
 fastapi>=0.115
 httpx>=0.27
 uvicorn>=0.30
+
+# S4 only. S1, S2 and S3 need nothing outside the standard library; the vectorised
+# solver needs NumPy for the array work and SciPy for `ndtr`, because NumPy ships no
+# error function. Whether that trade is worth making is what `docs/solvers.md` measures.
+numpy>=2.0
+scipy>=1.14
