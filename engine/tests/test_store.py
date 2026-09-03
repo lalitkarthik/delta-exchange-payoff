@@ -14,6 +14,7 @@ a read-time threshold — a timing assertion would be flaky and would not be the
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -239,6 +240,75 @@ def test_a_filtered_scan_returns_only_the_matching_partition(tmp_path: Path) -> 
         "date=2026-09-05/underlying=BTC",
         "date=2026-09-05/underlying=ETH",
     }
+
+
+def test_a_partition_filter_is_answered_by_the_paths_before_a_file_is_opened(
+    tmp_path: Path,
+) -> None:
+    """Pruning is the whole reason the tree is shaped this way, and the test above cannot
+    see it — a scan that opened all four files and then dropped three rows would pass it
+    identically. This one reads Polars' own optimised plan and asserts the filtered scan
+    carries **one** source where the unfiltered one carries four.
+
+    It matters because `scan()` names `**/*.parquet` rather than the directory, and a
+    glob is exactly the kind of change that could quietly stop the hive keys being read
+    off the path.
+    """
+    store = BarStore(tmp_path)
+    for day in (4, 5):
+        for underlying, symbol, strike in (
+            ("BTC", "C-BTC-77600-040926", 77600.0),
+            ("ETH", "C-ETH-3000-040926", 3000.0),
+        ):
+            store.add(
+                [
+                    bar(
+                        symbol=symbol,
+                        underlying=underlying,
+                        strike=strike,
+                        minute=datetime(2026, 9, day, 9, 0, tzinfo=timezone.utc),
+                    )
+                ]
+            )
+        store.flush()
+
+    def sources(plan: str) -> int:
+        """How many files the plan will open. Polars abbreviates a long list as
+        `first.parquet, ... N other sources`, so both spellings are counted."""
+        listed = plan.count(".parquet")
+        more = re.search(r"(\d+) other sources", plan)
+        return listed + (int(more.group(1)) if more else 0)
+
+    everything = store.scan().explain(optimized=True)
+    pruned = (
+        store.scan()
+        .filter(pl.col("date") == date(2026, 9, 4), pl.col("underlying") == "BTC")
+        .explain(optimized=True)
+    )
+
+    assert sources(everything) == 4, everything
+    assert sources(pruned) == 1, pruned
+    assert "date=2026-09-04/underlying=BTC" in pruned.replace("\\", "/")
+
+
+def test_a_scan_ignores_a_file_in_the_tree_that_is_not_part_of_the_dataset(
+    tmp_path: Path,
+) -> None:
+    """Regression, and a sharp one. Handed a bare directory, `scan_parquet` **raises**
+    the moment that directory holds anything whose extension is not `.parquet` — it does
+    not skip the file. Compaction puts two such things in a partition while it runs, its
+    `.tmp` output and its manifest, so a bare-directory scan made every partition
+    unreadable for the duration of a compaction and permanently unreadable after a crash.
+    """
+    store = BarStore(tmp_path)
+    store.add([bar()])
+    assert store.flush() == 1
+    directory = store.path / "date=2026-09-04" / "underlying=BTC"
+    (directory / "_compaction.json").write_text("{}", encoding="utf-8")
+    (directory / "compact-000001.parquet.tmp").write_bytes(b"not a parquet file")
+    (directory / "notes.txt").write_text("hello", encoding="utf-8")
+
+    assert store.scan().collect().height == 1
 
 
 def test_expiry_strike_and_option_type_are_columns_not_partition_levels(

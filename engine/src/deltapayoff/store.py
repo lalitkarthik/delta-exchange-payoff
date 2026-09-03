@@ -73,8 +73,13 @@ this is the reader's problem, not the store's.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -271,6 +276,118 @@ def default_root() -> Path:
     return Path(__file__).resolve().parents[3] / "data"
 
 
+# --------------------------------------------------------------------------------------
+# Compaction
+#
+# **Hourly flushing buys a sixty-minute crash budget and pays for it in files.** Twenty-
+# four per table per partition per day is roughly 26,000 a year across the four tables,
+# and Parquet is bad at that: every file carries its own header and footer, its own
+# dictionary pages, and its own row-group statistics, and a reader has to open every one
+# of them before it can decide it wants none of them. Folding a closed day into one file
+# per table per partition takes the year to about a thousand.
+#
+# **This is the most dangerous code in the store, and the danger is one specific
+# ordering.** A compaction that removes its inputs before its output is known-good does
+# not corrupt a day, it *deletes* one, permanently, with nothing left to re-run from.
+# So the sequence below is written to make that impossible rather than unlikely, and
+# every stage of it is interrupted on purpose by `tests/test_compaction.py`.
+#
+# The sequence, and what a crash at each point leaves behind:
+#
+#   1. Recover any run that was already in flight (below).
+#   2. List the partition's `*.parquet`. That list *includes* an earlier compacted file,
+#      so a partition that gained late hourly files after being compacted folds back to
+#      one file rather than to two.
+#   3. Read them, concatenate, write to `<name>.parquet.tmp`.
+#      Crash here: the tmp is not a `*.parquet`, so no reader and no later compaction can
+#      see it. Every input is still present. The next run deletes it and starts over.
+#   4. **Verify the tmp by reading it back off the disk** — every row group decompressed,
+#      the row count equal to the sum of the inputs' own counts, the schema equal to this
+#      store's. Nothing has been deleted at this point and nothing will be if this fails.
+#   5. Write the manifest, atomically. This is the commit point: it names the output and
+#      the exact list of files the output has been verified to contain.
+#      Crash from here on and recovery is driven by the manifest, not by a directory
+#      listing, which is what makes a half-finished delete recoverable rather than
+#      truncating.
+#   6. Delete the inputs, **then** publish the tmp over the output name with `os.replace`.
+#
+# **One compactor at a time.** Two processes compacting the same partition concurrently
+# would race on one manifest name and is not defended against, because the nightly job is
+# a single process and a lock file would be a second thing to leave behind after a crash.
+# It is stated here rather than left to be discovered.
+#
+# **Deleting before publishing is deliberate, and it is the house rule applied to a file
+# layout.** The other order — publish, then delete — leaves a window in which the output
+# and all of its inputs are readable at once, and a reader landing in that window gets
+# every row of the day *twice*. This one leaves a window in which the day reads short
+# while its rows sit safe in a tmp the next run will publish. A gap is visible and
+# recoverable; a silent doubling is invention, and this store refuses invention
+# everywhere else.
+# --------------------------------------------------------------------------------------
+
+#: Compacted output files are named `compact-000001.parquet`. The generation number
+#: matters more than it looks: an output that reused a name already in the directory
+#: could not be `os.replace`d into place without destroying an input first.
+COMPACT_PREFIX = "compact-"
+COMPACT_PATTERN = re.compile(re.escape(COMPACT_PREFIX) + r"(\d+)\.parquet$")
+
+#: The in-progress output. **Not** a `*.parquet`, so `scan()` cannot read it, a second
+#: compaction cannot fold it in, and a crash before the commit point leaves something
+#: inert rather than something half-visible.
+TMP_SUFFIX = ".tmp"
+
+#: The commit record, written into the partition it describes. A sidecar rather than a
+#: central journal: the file that says what to finish lives next to the files it is about,
+#: so a partition is recoverable on its own and a lost central index cannot orphan one.
+MANIFEST_NAME = "_compaction.json"
+
+#: Every point at which `compact_partition` can be interrupted, in order. Exported
+#: because `tests/test_compaction.py` parametrises over it and asserts it has covered all
+#: of them — a stage added here without a crash test fails the suite rather than shipping
+#: untested.
+COMPACTION_STAGES = (
+    "after-write",
+    "after-verify",
+    "after-manifest",
+    "during-delete",
+    "after-delete",
+    "after-publish",
+)
+
+
+class CompactionUnsound(RuntimeError):
+    """The compacted file did not verify. **Nothing was deleted.**
+
+    Raised before the commit point, so the partition is exactly as it was and the
+    compaction can simply be run again — or not run at all, which costs file count and
+    no data.
+    """
+
+
+class CompactionInterrupted(RuntimeError):
+    """Test-only: a simulated crash at a named stage. See `COMPACTION_STAGES`."""
+
+
+@dataclass(frozen=True, slots=True)
+class Compaction:
+    """What one partition's compaction did. Returned rather than logged, because the
+    measurements in `docs/storage.md` are computed from these and a number that came out
+    of a log line is a number nobody can re-derive."""
+
+    dataset: str
+    date: str
+    underlying: str
+    files_before: int
+    files_after: int
+    rows: int
+    bytes_before: int
+    bytes_after: int
+    #: `False` when the partition was already one file, or empty, or missing. A no-op is
+    #: reported rather than hidden: "compaction ran and did nothing" and "compaction did
+    #: not run" are different facts.
+    compacted: bool
+
+
 class BarStore:
     """Sealed bars in, Parquet files out. Buffered; nothing is written until `flush`.
 
@@ -370,14 +487,311 @@ class BarStore:
         A reader opening it before the first flush is asking a legitimate question, and
         "nothing yet" is a legitimate answer — the same discipline as a minute with no
         row.
+
+        **The glob is load-bearing and was not always here.** Handed a bare directory,
+        `scan_parquet` refuses outright the moment that directory holds anything whose
+        extension is not `.parquet` — it raises rather than skipping the file. Compaction
+        puts two such things in a partition while it runs, its `.tmp` output and its
+        manifest, so a bare-directory scan would make every partition *unreadable* for
+        the duration of a compaction and permanently unreadable after a crash. Naming
+        `**/*.parquet` explicitly restores the obvious behaviour: files that are not part
+        of the dataset are not part of the dataset. Hive partitioning and its pruning are
+        unaffected — the keys are still read from the paths.
         """
         if not any(self.path.rglob("*.parquet")):
             return pl.LazyFrame(schema={**self.schema, **HIVE_SCHEMA})
         return pl.scan_parquet(
-            self.path,
+            self.path / "**" / "*.parquet",
             hive_partitioning=True,
             hive_schema=HIVE_SCHEMA,
         )
+
+    # -- compaction --------------------------------------------------------------------
+
+    def partitions(self) -> list[tuple[str, str]]:
+        """Every `(date, underlying)` this dataset holds, read off the directory names.
+
+        The paths are the index. There is no manifest of partitions and there should not
+        be: a second copy of the tree's shape is a second thing that can be wrong about
+        it, and this one is already answerable by a listing.
+        """
+        if not self.path.is_dir():
+            return []
+        found: list[tuple[str, str]] = []
+        for day in sorted(self.path.glob("date=*")):
+            if not day.is_dir():
+                continue
+            for underlying in sorted(day.glob("underlying=*")):
+                if underlying.is_dir():
+                    found.append(
+                        (day.name.split("=", 1)[1], underlying.name.split("=", 1)[1])
+                    )
+        return found
+
+    def compact(
+        self,
+        *,
+        before: str | None = None,
+        interrupt_at: str | None = None,
+    ) -> list[Compaction]:
+        """Compact every partition older than `before` (default: today, UTC).
+
+        **The open day is excluded by default and that is not tidiness.** Compaction
+        reads a file whole; `flush` writes one with `write_parquet` straight to its final
+        name, which is not atomic. Compacting the partition the writer is still flushing
+        into is a race against a half-written file - survivable, because a torn read
+        raises before anything is deleted, but pointless when waiting one day removes it.
+
+        A file that appears *after* the input list is taken is never deleted: only the
+        names the manifest recorded are removed, so a flush landing mid-compaction
+        survives and is folded in by the next run.
+        """
+        cutoff = before or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return [
+            self.compact_partition(day, underlying, interrupt_at=interrupt_at)
+            for day, underlying in self.partitions()
+            if day < cutoff
+        ]
+
+    def compact_partition(
+        self,
+        day: str,
+        underlying: str,
+        *,
+        interrupt_at: str | None = None,
+    ) -> Compaction:
+        """One partition's hourly files into one file. See this module's compaction note.
+
+        `interrupt_at` is a **test seam and nothing else**: it raises
+        `CompactionInterrupted` at one of `COMPACTION_STAGES`, so the crash tests
+        interrupt the real code path at a real stage rather than hand-building the
+        wreckage a crash is imagined to leave. Hand-built wreckage tests the test's
+        imagination; this tests the code.
+        """
+        if interrupt_at is not None and interrupt_at not in COMPACTION_STAGES:
+            raise ValueError(f"unknown compaction stage {interrupt_at!r}")
+
+        def trip(stage: str) -> None:
+            if stage == interrupt_at:
+                raise CompactionInterrupted(stage)
+
+        directory = self.path / f"date={day}" / f"underlying={underlying}"
+        if not directory.is_dir():
+            return Compaction(
+                dataset=self.dataset,
+                date=day,
+                underlying=underlying,
+                files_before=0,
+                files_after=0,
+                rows=0,
+                bytes_before=0,
+                bytes_after=0,
+                compacted=False,
+            )
+
+        self._recover(directory)
+
+        inputs = sorted(path for path in directory.glob("*.parquet") if path.is_file())
+        bytes_before = sum(path.stat().st_size for path in inputs)
+        if len(inputs) <= 1:
+            # Already one file, or empty. **A no-op, not a rewrite** - re-compacting a
+            # compacted partition must not double it, and must not churn it either.
+            return Compaction(
+                dataset=self.dataset,
+                date=day,
+                underlying=underlying,
+                files_before=len(inputs),
+                files_after=len(inputs),
+                rows=sum(self._rows(path) for path in inputs),
+                bytes_before=bytes_before,
+                bytes_after=bytes_before,
+                compacted=False,
+            )
+
+        # The expected row count comes from the inputs' own footers, one file at a time -
+        # **not** from the height of the frame about to be written. Deriving it from the
+        # thing being checked is how a verification step passes by construction and
+        # proves nothing.
+        expected = sum(self._rows(path) for path in inputs)
+
+        output = directory / self._next_output_name(directory)
+        tmp = output.with_suffix(output.suffix + TMP_SUFFIX)
+
+        # Sorted on `minute` so the one file's row-group statistics are monotone and a
+        # reader asking for part of a day can skip the rest of it. On hourly inputs the
+        # sort is very nearly a no-op - they already arrive in order - and it costs one
+        # pass over a day that is being rewritten anyway.
+        pl.read_parquet(inputs).sort("minute", maintain_order=True).write_parquet(tmp)
+        trip("after-write")
+
+        try:
+            self._verify(tmp, expected)
+        except CompactionUnsound:
+            # Before the commit point, so nothing has been deleted and the tmp vouches
+            # for nothing. Clearing it here rather than leaving it for the next run's
+            # recovery keeps a failed compaction from leaving a file in the tree that
+            # nobody can account for.
+            tmp.unlink(missing_ok=True)
+            raise
+        trip("after-verify")
+
+        names = [path.name for path in inputs]
+        self._write_manifest(directory, output.name, names, expected)
+        trip("after-manifest")
+
+        halfway = len(names) // 2
+        for index, name in enumerate(names):
+            if index == halfway:
+                trip("during-delete")
+            (directory / name).unlink(missing_ok=True)
+        trip("after-delete")
+
+        os.replace(tmp, output)
+        trip("after-publish")
+
+        (directory / MANIFEST_NAME).unlink(missing_ok=True)
+        return Compaction(
+            dataset=self.dataset,
+            date=day,
+            underlying=underlying,
+            files_before=len(inputs),
+            files_after=1,
+            rows=expected,
+            bytes_before=bytes_before,
+            bytes_after=output.stat().st_size,
+            compacted=True,
+        )
+
+    def _recover(self, directory: Path) -> None:
+        """Finish or discard a compaction that was interrupted. Idempotent.
+
+        Two states, and the manifest is what tells them apart:
+
+        **No manifest.** Nothing had committed, so any `*.tmp` is the output of a run
+        that died before its commit point. Every input it was built from is still on
+        disk, so the tmp is worth nothing and is removed. Leaving it would be harmless
+        and would also be a file nobody could ever explain.
+
+        **A manifest.** The output it names has been verified to contain exactly the
+        files it lists, so the run finishes: re-verify that output - whether it is still
+        a tmp or has already been published - then delete whatever of the listed inputs
+        is left, and only then drop the manifest. The deletes are by name and
+        `missing_ok`, which is what makes a half-finished delete resumable rather than
+        truncating: a directory listing would see the surviving inputs and rebuild from
+        those alone, which is exactly the truncation this is here to prevent.
+        """
+        manifest_path = directory / MANIFEST_NAME
+        if not manifest_path.is_file():
+            for stale in directory.glob("*" + TMP_SUFFIX):
+                stale.unlink(missing_ok=True)
+            return
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        output = directory / manifest["output"]
+        tmp = output.with_suffix(output.suffix + TMP_SUFFIX)
+        if not output.exists() and not tmp.exists():
+            # Cannot happen: the manifest is only written after the tmp verifies, and
+            # `os.replace` is atomic, so one of the two is always there. If it ever does,
+            # the day is gone and the loudest possible failure is the only honest answer.
+            raise CompactionUnsound(
+                f"{manifest_path} names {manifest['output']}, which does not exist"
+            )
+
+        rows = int(manifest["rows"])
+        if not output.exists():
+            # **Verified again before anything is deleted**, exactly as on the first
+            # pass. The manifest already says this file verified once, but a recovery is
+            # by definition running after something went wrong, and re-reading a file
+            # that is about to become the only copy of a day is the cheapest possible
+            # place to spend a second.
+            self._verify(tmp, rows)
+            for name in manifest["inputs"]:
+                (directory / name).unlink(missing_ok=True)
+            os.replace(tmp, output)
+        else:
+            self._verify(output, rows)
+            for name in manifest["inputs"]:
+                (directory / name).unlink(missing_ok=True)
+            if tmp.exists():
+                tmp.unlink()
+
+        manifest_path.unlink(missing_ok=True)
+
+    def _verify(self, path: Path, expected_rows: int) -> None:
+        """Read the file back off the disk and check its row count and its schema.
+
+        **A full read, not a footer peek.** The row count and the schema both live in
+        Parquet's metadata, so checking them there costs nothing and proves nothing about
+        the pages underneath. This is the one gate standing between a bad write and a
+        deleted day, so it decompresses every page, and the cost - one extra pass over a
+        file just written and still in the page cache - is the cheapest insurance here.
+        """
+        try:
+            frame = pl.read_parquet(path)
+        except Exception as error:
+            raise CompactionUnsound(f"{path} did not read back: {error}") from error
+        if frame.height != expected_rows:
+            raise CompactionUnsound(
+                f"{path} holds {frame.height} rows, expected {expected_rows}"
+            )
+        wanted = dict(pl.DataFrame(schema=self.schema).schema)
+        if dict(frame.schema) != wanted:
+            raise CompactionUnsound(f"{path} has the wrong schema: {frame.schema}")
+
+    def _write_manifest(
+        self, directory: Path, output: str, inputs: list[str], rows: int
+    ) -> None:
+        """The commit point. Written to a temporary name and `os.replace`d into place, so
+        a crash mid-write leaves no manifest rather than half of one - a truncated JSON
+        file would fail to parse on every later run and wedge the partition forever."""
+        payload = json.dumps({"output": output, "inputs": inputs, "rows": rows}, indent=2)
+        staging = directory / (MANIFEST_NAME + TMP_SUFFIX)
+        staging.write_text(payload, encoding="utf-8")
+        os.replace(staging, directory / MANIFEST_NAME)
+
+    @staticmethod
+    def _rows(path: Path) -> int:
+        """One file's row count, from its footer. No column is read."""
+        return int(pl.scan_parquet(path).select(pl.len()).collect().item())
+
+    @staticmethod
+    def _next_output_name(directory: Path) -> str:
+        """The next unused `compact-NNNNNN.parquet` in this partition."""
+        used = [
+            int(match.group(1))
+            for path in directory.glob(COMPACT_PREFIX + "*.parquet")
+            if (match := COMPACT_PATTERN.fullmatch(path.name))
+        ]
+        return f"{COMPACT_PREFIX}{max(used, default=0) + 1:06d}.parquet"
+
+
+def all_stores(root: Path | str | None = None) -> list[BarStore]:
+    """The four tables, in one list, sharing a root.
+
+    Every caller that wants to do a thing to the whole store - compact it, measure it -
+    otherwise has to restate which four datasets exist and which schema goes with which,
+    and the fourth one would be forgotten exactly once.
+    """
+    return [
+        BarStore(root, dataset=DATASET, schema=SCHEMA),
+        BarStore(root, dataset=REFERENCE_DATASET, schema=REFERENCE_SCHEMA),
+        BarStore(root, dataset=SPOT_DATASET, schema=SPOT_SCHEMA),
+        BarStore(root, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA),
+    ]
+
+
+def compact_all(
+    root: Path | str | None = None, *, before: str | None = None
+) -> list[Compaction]:
+    """Compact every partition of every table older than `before` (default: today, UTC).
+
+    This is the nightly job. It is a plain function and not a scheduled task because a
+    scheduler is the operator's to choose, and a function is the thing a test, a cron
+    entry and a person at a prompt can all call.
+    """
+    return [
+        result for store in all_stores(root) for result in store.compact(before=before)
+    ]
 
 
 class BarWriter:

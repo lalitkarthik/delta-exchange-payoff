@@ -19,6 +19,7 @@ tools/.env
 tools/out/
 
 # the bar store. Market data is never committed: it is regenerable from the feed,
-# it is Delta's to publish rather than ours to redistribute, and at an estimated
-# 50-100 MB/day a year of it would be 20-35 GB in a git history.
+# it is Delta's to publish rather than ours to redistribute, and at a measured
+# 143 MB/day (docs/storage.md section 10, not the 50-100 MB/day originally
+# estimated) a year of it would be about 52 GB in a git history.
 data/
