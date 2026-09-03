@@ -26,7 +26,12 @@ from __future__ import annotations
 
 import pytest
 
-from deltapayoff.wire import chain_from_frames, decode_ob_l2, decode_ticker
+from deltapayoff.wire import (
+    chain_from_frames,
+    decode_ob_l2,
+    decode_ticker,
+    decode_ticker_extras,
+)
 
 EXPIRY = "04-09-2026"
 
@@ -187,3 +192,127 @@ def test_a_websocket_chain_solves_with_the_untouched_forward_and_solver_code(
     assert forward.forward == pytest.approx(77_650.0, abs=400.0)
     assert forward.trusted is True
     assert sum(1 for r in solved.values() if r.converged) >= 55
+
+
+# --- the fields `decode_ticker` has no `Leg` field for ---------------------------
+
+
+def _rest_by_symbol(rest_snapshot) -> dict[str, dict]:
+    return {row["symbol"]: row for row in rest_snapshot}
+
+
+def test_the_24_hour_ohlc_is_read_in_the_order_the_rest_snapshot_names(
+    ws_ticker_frames, rest_snapshot
+) -> None:
+    """`ohlc` is four bare numbers with no names. The REST snapshot captured **at the
+    same moment** names all four, so the ordering is checked against an independent
+    source rather than against a restatement of the constant in `wire.py`.
+
+    119 of the 120 symbols REST reports a candle for agree element for element, and the
+    one that does not traded between the two captures. On 81 of them the close differs
+    from the open, the high *and* the low, so a transposed index cannot pass this by
+    coincidence.
+    """
+    rest = _rest_by_symbol(rest_snapshot)
+    agreeing = 0
+    discriminating = 0
+
+    for symbol, frame in ws_ticker_frames.items():
+        row = rest.get(symbol)
+        if row is None or "close" not in row:
+            continue
+        candle = frame["d"][0].get("ohlc")
+        if candle != [row["open"], row["high"], row["low"], row["close"]]:
+            continue  # it traded between the two captures
+        agreeing += 1
+        extras = decode_ticker_extras(frame)
+        assert extras.last_traded_price == row["close"], symbol
+        if row["close"] not in (row["open"], row["high"], row["low"]):
+            discriminating += 1
+
+    assert agreeing >= 100, "the fixtures stopped overlapping; the check is vacuous"
+    assert discriminating >= 50, "no symbol distinguishes the close from open/high/low"
+
+
+def test_a_contract_that_never_traded_has_no_last_traded_price(
+    ws_ticker_frames,
+) -> None:
+    """Delta sends `ohlc: [null, null, null, null]` for a contract with no trades, and
+    `to: [null, null]` with it. Sixteen of the 136 captured symbols are in that state.
+
+    Absent must stay absent. A zero here would read as "it last traded at zero", which
+    is a price nobody paid — the same lie as a forward-filled bar.
+    """
+    never_traded = [
+        symbol
+        for symbol, frame in ws_ticker_frames.items()
+        if frame["d"][0].get("ohlc") == [None, None, None, None]
+    ]
+
+    assert len(never_traded) >= 10, "the fixture no longer covers a never-traded contract"
+    for symbol in never_traded:
+        extras = decode_ticker_extras(ws_ticker_frames[symbol])
+        assert extras.last_traded_price is None, symbol
+        assert extras.turnover is None, symbol
+        # ...while spot, which belongs to the underlying and not to the contract, is
+        # still there. A contract nobody traded is still quoted against a live BTC.
+        assert extras.spot is not None and extras.spot > 0.0, symbol
+
+
+def test_turnover_is_the_first_element_and_the_second_is_its_usd_twin(
+    ws_ticker_frames, rest_snapshot
+) -> None:
+    """`to` is two numbers. REST names them `turnover` and `turnover_usd`, and on this
+    chain — quoted in USD — they are equal on all 120 symbols that traded. Only the
+    first is decoded; storing the second would store the same number twice."""
+    rest = _rest_by_symbol(rest_snapshot)
+    checked = 0
+
+    for symbol, frame in ws_ticker_frames.items():
+        row = rest.get(symbol)
+        if row is None or row.get("turnover") is None:
+            continue
+        extras = decode_ticker_extras(frame)
+        assert extras.turnover == row["turnover"], symbol
+        assert frame["d"][0]["to"][1] == row["turnover_usd"], symbol
+        checked += 1
+
+    assert checked >= 100
+
+
+def test_the_open_interest_second_element_is_a_six_hour_change_not_a_usd_notional(
+    ws_ticker_frames, rest_snapshot
+) -> None:
+    """**The mislabel this ticket found.** `wire.decode_ticker` calls `oi[1]`
+    `oi_value_usd`. It is not: on **all 136** captured symbols it equals REST's
+    `oi_change_usd_6h`, and it is *not* REST's `oi_value_usd` on 126 of them — it even
+    goes negative, which a notional cannot.
+
+    The value is left where it is because renaming `Leg.oi_value_usd` changes the chain
+    contract the web app reads, which is not this ticket's to change. What this test does
+    is stop the mistake being made twice: the reference bars store this number under the
+    name it actually has, and store no USD open interest at all, because the ticker
+    channel does not carry one.
+    """
+    rest = _rest_by_symbol(rest_snapshot)
+    matches_change = 0
+    matches_notional = 0
+    negative = 0
+
+    for symbol, frame in ws_ticker_frames.items():
+        row = rest.get(symbol)
+        interest = frame["d"][0].get("oi") or []
+        if row is None or len(interest) < 2:
+            continue
+        value = float(interest[1])
+        assert float(interest[0]) == float(row["oi_contracts"]), symbol
+        if value == float(row["oi_change_usd_6h"]):
+            matches_change += 1
+        if value == float(row["oi_value_usd"]):
+            matches_notional += 1
+        if value < 0.0:
+            negative += 1
+
+    assert matches_change == 136, "oi[1] stopped being the six-hour change"
+    assert matches_notional <= 10, "oi[1] is the USD notional after all"
+    assert negative > 0, "a USD notional cannot be negative; this one is"

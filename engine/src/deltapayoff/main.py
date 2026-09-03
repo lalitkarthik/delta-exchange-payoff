@@ -17,6 +17,15 @@ one-minute bars and writes hive-partitioned Parquet. It is **not** folded into
 state, and sharing one structure would make them fight. It subscribes losslessly, and its
 disk write runs in a worker thread — a flush on this event loop would stop the socket
 reader, fill the receive buffer and get us disconnected.
+
+**Both channels the feed subscribes are stored, into three tables.** `ob_l2` becomes the
+quote bars; `ticker` becomes the reference bars and the spot bars, and also supplies the
+quote bars' fallback for a contract whose book is silent. One writer takes one lossless
+subscription and drives all three — a second writer would mean a second subscription
+carrying the same messages and two watermarks drifting apart on two clocks.
+
+`BarStore()` here names the quote table only; the writer derives the other two roots from
+it, so there is exactly one place that decides where market data lands.
 """
 
 from __future__ import annotations

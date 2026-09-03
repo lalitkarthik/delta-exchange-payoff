@@ -10,8 +10,19 @@ meaning**. Measured from live frames on 2026-09-03:
     q    = [best_ask, ask_size, best_bid, bid_size, impact_mid]
     qiv  = [ask_iv, bid_iv, mark_iv]
     g    = [delta, gamma, rho, theta, vega]
-    oi   = [oi_contracts, oi_value_usd]
+    oi   = [oi_contracts, oi_change_usd_6h]
+    ohlc = [open, high, low, close]          -- Delta's rolling 24-HOUR trade candle
+    to   = [turnover, turnover_usd]
     sp   = spot          ts = microseconds        m = mark
+
+**`oi[1]` is not open interest in USD**, whatever this module has called it since #3.
+Checked against the REST snapshot captured alongside the frames on 2026-09-03, it equals
+`oi_change_usd_6h` on **all 136** symbols and REST's `oi_value_usd` on ten; it also goes
+negative, which a notional cannot. The ticker channel carries no USD open interest at
+all. `Leg.oi_value_usd` is still fed from it here because renaming that field changes the
+chain contract `web/lib/contract.ts` reads and that is not #11's to change — but nothing
+new consumes it under that name, and `bars.samples_from_ticker` stores the number as
+`oi_change_usd_6h`. `tests/test_wire.py` pins the finding so it cannot be made twice.
 
 The abbreviation is not gratuitous. At about 500 bytes a message and 320 messages a
 second, writing `"best_bid"` instead of position 2 would roughly double the byte rate for
@@ -32,7 +43,7 @@ two transports.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 from .chain import build_chain
 from .convert import to_int, to_number, to_quote_number
@@ -45,8 +56,20 @@ _ASK, _ASK_SIZE, _BID, _BID_SIZE = 0, 1, 2, 3
 _ASK_IV, _BID_IV, _MARK_IV = 0, 1, 2
 _DELTA, _GAMMA, _RHO, _THETA, _VEGA = 0, 1, 2, 3, 4
 
-#: Positions in `oi`.
-_OI_CONTRACTS, _OI_VALUE_USD = 0, 1
+#: Positions in `oi`. The second is a **six-hour change**, not a notional — see the
+#: module docstring. The constant is named for what the number is, not for the `Leg`
+#: field it currently lands in.
+_OI_CONTRACTS, _OI_CHANGE_USD_6H = 0, 1
+
+#: Positions in `ohlc`, Delta's rolling **24-hour** trade candle. Only the close is ever
+#: read: it is the last traded price and worth keeping, while the high, low and open are
+#: a 24-hour window that would be re-stored identically 1,440 times a day.
+_OHLC_OPEN, _OHLC_HIGH, _OHLC_LOW, _OHLC_CLOSE = 0, 1, 2, 3
+
+#: Positions in `to`. The two are equal on every captured symbol — this chain is quoted
+#: in USD, so `turnover` and `turnover_usd` are the same number — and only the first is
+#: read, because storing a number twice invites the two copies to disagree.
+_TURNOVER, _TURNOVER_USD = 0, 1
 
 
 def _at(values: list[Any] | None, index: int) -> Any:
@@ -85,7 +108,51 @@ def decode_ticker(frame: dict[str, Any]) -> tuple[str, Leg]:
         theta=to_number(_at(greeks, _THETA)),
         vega=to_number(_at(greeks, _VEGA)),
         oi=to_number(_at(interest, _OI_CONTRACTS)),
-        oi_value_usd=to_number(_at(interest, _OI_VALUE_USD)),
+        # Mislabelled, knowingly and narrowly: this is `oi_change_usd_6h`. See the
+        # module docstring. Nothing added after #11 reads it under this name.
+        oi_value_usd=to_number(_at(interest, _OI_CHANGE_USD_6H)),
+    )
+
+
+class TickerExtras(NamedTuple):
+    """The three ticker fields `Leg` has no place for, named rather than positional.
+
+    Returned as a `NamedTuple` and not a bare triple on purpose: this module exists
+    because position-as-meaning is how Delta's payloads go wrong, and handing the caller
+    three anonymous floats would rebuild the same hazard one layer up.
+    """
+
+    last_traded_price: float | None
+    turnover: float | None
+    spot: float | None
+
+
+def decode_ticker_extras(frame: dict[str, Any]) -> TickerExtras:
+    """One `ticker` frame to the fields the reference and spot bars need.
+
+    **Only `ohlc`'s close is taken.** That array is a rolling 24-hour trade candle, so
+    its close is the last traded price — a real observation that moves — while its open,
+    high and low are a 24-hour window that would be re-stored identically 1,440 times a
+    day. Delta's own field names in the REST snapshot captured beside these frames name
+    all four, and `tests/test_wire.py` checks the ordering against them rather than
+    against the constants above.
+
+    **A contract that never traded sends `ohlc: [null, null, null, null]`** and
+    `to: [null, null]` — sixteen of the 136 captured symbols. Absent stays absent: a
+    zero here would read as "it last traded at zero", a price nobody paid.
+
+    **`sp` is a property of the underlying, not of the contract.** Measured, all 136
+    frames captured inside a 0.06 s window carried an identical `sp` of 77651.9, which
+    is why spot gets a table of its own at per-underlying grain rather than a column on
+    588 contract rows.
+    """
+    body = (frame.get("d") or [{}])[0]
+    candle = body.get("ohlc") or []
+    turnover = body.get("to") or []
+    return TickerExtras(
+        last_traded_price=to_number(_at(candle, _OHLC_CLOSE)),
+        turnover=to_number(_at(turnover, _TURNOVER)),
+        spot=to_number(frame.get("sp")),
     )
 
 

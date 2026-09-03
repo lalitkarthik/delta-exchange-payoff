@@ -1,5 +1,13 @@
 """Where the bars go: hive-partitioned Parquet, and the only module that touches a file.
 
+**Three tables, three dataset roots.** `quote-bars` is what the book did, `reference-bars`
+is what the venue said a contract was worth, and `spot-bars` is what the underlying did
+underneath both. They are three roots and not one root with a `table` partition key: a
+shared root forces every scan to carry a filter a directory should have answered, and
+puts three schemas in one dataset for Parquet's metadata to reconcile on every read. They
+share the **same** partition keys, so a reader joins spot to quotes on `date` and
+`underlying` with no translation. #5's table C, our computed values, gets a fourth root.
+
 **Why columnar.** A CSV stores row by row, so reading one column of a billion rows means
 reading all of them. Parquet stores column by column: every mid together, every strike
 together. Reading one field touches only that field's bytes, and a column of similar
@@ -65,10 +73,23 @@ from typing import Any
 
 import polars as pl
 
-from .bars import BarAggregator, QuoteBar, tick_from_quote
+from .bars import (
+    BarAggregator,
+    ReferenceAggregator,
+    SpotAggregator,
+    samples_from_ticker,
+    tick_from_quote,
+)
 
-#: The dataset root. One directory per table; #5's other three tables get their own.
+#: One directory per table. Three of #5's four exist; table C, our computed values, is
+#: still to come and gets its own root beside these rather than a column in one of them.
+#:
+#: **A single root with a `table` partition key was rejected.** It forces every scan to
+#: carry a filter that a directory should have answered, and it puts three schemas in one
+#: dataset, which Parquet's own metadata then has to reconcile on every read.
 DATASET = "quote-bars"
+REFERENCE_DATASET = "reference-bars"
+SPOT_DATASET = "spot-bars"
 
 #: Hourly. Sixty minutes is the crash-loss budget, stated as a number rather than implied.
 FLUSH_SECONDS = 3600.0
@@ -107,11 +128,80 @@ SCHEMA: dict[str, Any] = {
     "mid_low": pl.Float64,
     "mid_close": pl.Float64,
     "mid_ticks": pl.UInt32,
+    #: Provenance. `Boolean` and **not nullable in practice**: every emitted bar came
+    #: from one channel or the other, and a third state would mean a bar with no
+    #: observation behind it, which this store does not write at all.
+    "from_book": pl.Boolean,
     "last_lts": pl.Datetime("us", "UTC"),
 }
 
+#: Table B. Mark and the last traded price are prices and get a range; the eleven
+#: reference levels below them get one value each, because an open/high/low/close of rho
+#: would be four numbers describing nothing.
+#:
+#: Everything Delta publishes as its own opinion carries a `venue_` prefix. #5's table C
+#: stores our computed Greeks and implied vol under the bare names, and two columns
+#: called `delta` in one store is exactly the confusion `tests/test_no_delta_inputs.py`
+#: exists to prevent — one of them would eventually be read as the other.
+#:
+#: Open interest is in **contracts** only. `oi[1]` on the wire is Delta's
+#: `oi_change_usd_6h`, not a USD notional — verified against the REST snapshot captured
+#: beside the frames, see `wire`'s docstring — so it is stored under that name and no
+#: USD open interest is stored at all, because the channel does not carry one.
+#:
+#: `oi_contracts` and `turnover` are `Float64` rather than an integer type: Delta sends
+#: them as decimal strings, turnover is genuinely fractional, and one numeric type across
+#: the table is one fewer thing for a reader to remember.
+REFERENCE_SCHEMA: dict[str, Any] = {
+    "symbol": pl.Categorical,
+    "expiry": pl.Categorical,
+    "option_type": pl.Categorical,
+    "strike": pl.Float64,
+    "minute": pl.Datetime("us", "UTC"),
+    "mark_open": pl.Float64,
+    "mark_high": pl.Float64,
+    "mark_low": pl.Float64,
+    "mark_close": pl.Float64,
+    "mark_ticks": pl.UInt32,
+    "ltp_open": pl.Float64,
+    "ltp_high": pl.Float64,
+    "ltp_low": pl.Float64,
+    "ltp_close": pl.Float64,
+    "ltp_ticks": pl.UInt32,
+    "oi_contracts": pl.Float64,
+    "oi_change_usd_6h": pl.Float64,
+    "turnover": pl.Float64,
+    "venue_delta": pl.Float64,
+    "venue_gamma": pl.Float64,
+    "venue_rho": pl.Float64,
+    "venue_theta": pl.Float64,
+    "venue_vega": pl.Float64,
+    "venue_bid_iv": pl.Float64,
+    "venue_ask_iv": pl.Float64,
+    "venue_mark_iv": pl.Float64,
+}
+
+#: Table D. 1,440 rows a day per underlying, and **no contract identity at all** — the
+#: symbol that carried the frame is not a column, because spot belongs to BTC rather than
+#: to `P-BTC-78500-040926` and storing the messenger would invite a reader to join on it.
+#:
+#: `underlying` is absent for the same reason as everywhere else: it is the partition
+#: directory's name, and storing it twice invites the two copies to disagree.
+SPOT_SCHEMA: dict[str, Any] = {
+    "minute": pl.Datetime("us", "UTC"),
+    "spot_open": pl.Float64,
+    "spot_high": pl.Float64,
+    "spot_low": pl.Float64,
+    "spot_close": pl.Float64,
+    #: Roughly 7,056 a bar, because every contract's ticker frame carries spot. Well
+    #: inside `UInt32` and far outside `UInt16`, which 7,056 would have fitted today and
+    #: overflowed the moment ETH was turned on.
+    "spot_ticks": pl.UInt32,
+}
+
 #: The partition columns. They live in the directory names, not in the files, which is
-#: the whole point — the filter is answered by the path.
+#: the whole point — the filter is answered by the path. All three tables share them, so
+#: a reader joins spot to quotes on `date` and `underlying` without a schema translation.
 HIVE_SCHEMA: dict[str, Any] = {"date": pl.Date, "underlying": pl.Categorical}
 
 
@@ -121,12 +211,26 @@ def default_root() -> Path:
 
 
 class BarStore:
-    """Sealed bars in, Parquet files out. Buffered; nothing is written until `flush`."""
+    """Sealed bars in, Parquet files out. Buffered; nothing is written until `flush`.
 
-    def __init__(self, root: Path | str | None = None, dataset: str = DATASET) -> None:
+    One class, three tables. The layout, the partitioning, the file naming and the
+    empty-scan behaviour are identical for all of them and only the column list differs,
+    so `schema` is a constructor argument rather than three near-identical classes. A
+    subclass per table would put the interesting decision — which columns — in the least
+    visible place, and would have to re-inherit the file naming that is the one thing
+    here that has already gone wrong once.
+    """
+
+    def __init__(
+        self,
+        root: Path | str | None = None,
+        dataset: str = DATASET,
+        schema: dict[str, Any] | None = None,
+    ) -> None:
         self.root = Path(root) if root is not None else default_root()
         self.dataset = dataset
-        self._buffer: list[QuoteBar] = []
+        self.schema: dict[str, Any] = dict(SCHEMA if schema is None else schema)
+        self._buffer: list[Any] = []
         self.flushes = 0
         self.rows_written = 0
 
@@ -138,7 +242,7 @@ class BarStore:
     def buffered(self) -> int:
         return len(self._buffer)
 
-    def add(self, bars: Iterable[QuoteBar]) -> int:
+    def add(self, bars: Iterable[Any]) -> int:
         """Buffer sealed bars. Returns how many are now waiting.
 
         A bar that cannot be partitioned is **refused loudly** rather than placed under a
@@ -171,7 +275,7 @@ class BarStore:
         buffered, self._buffer = self._buffer, []
         self.flushes += 1
 
-        groups: dict[tuple[str, str], list[QuoteBar]] = {}
+        groups: dict[tuple[str, str], list[Any]] = {}
         for bar in buffered:
             key = (bar.minute.strftime("%Y-%m-%d"), bar.underlying)
             groups.setdefault(key, []).append(bar)
@@ -188,12 +292,11 @@ class BarStore:
         self.rows_written += written
         return written
 
-    @staticmethod
-    def _frame(bars: list[QuoteBar]) -> pl.DataFrame:
+    def _frame(self, bars: list[Any]) -> pl.DataFrame:
         """Bars to a typed frame. The partition columns are deliberately absent: they are
         the directory names, and storing them twice invites the two copies to disagree."""
-        columns = {name: [getattr(bar, name) for bar in bars] for name in SCHEMA}
-        return pl.DataFrame(columns, schema=SCHEMA)
+        columns = {name: [getattr(bar, name) for bar in bars] for name in self.schema}
+        return pl.DataFrame(columns, schema=self.schema)
 
     def scan(self) -> pl.LazyFrame:
         """The whole dataset, lazily, with the partition columns restored from the paths.
@@ -208,7 +311,7 @@ class BarStore:
         row.
         """
         if not any(self.path.rglob("*.parquet")):
-            return pl.LazyFrame(schema={**SCHEMA, **HIVE_SCHEMA})
+            return pl.LazyFrame(schema={**self.schema, **HIVE_SCHEMA})
         return pl.scan_parquet(
             self.path,
             hive_partitioning=True,
@@ -228,6 +331,17 @@ class BarWriter:
     It is not folded into `ChainStream`: that holds only the *latest* state per contract
     while this needs *every* state, and one structure serving both would make them fight.
 
+    **One writer, one subscription, three tables.** Both channels arrive on the same
+    queue, so a second writer would mean a second lossless subscription carrying the same
+    messages and two watermarks drifting apart on two clocks. The three aggregators seal
+    independently — the quote, reference and spot tables have different graces and
+    different grains — but they are driven from one drain loop and flushed in one thread
+    hop, so the socket reader waits on one disk trip an hour rather than three.
+
+    The reference and spot stores are **derived from the quote store's root** rather than
+    defaulted separately. A test that hands this a temporary directory must not have two
+    of its three tables quietly write into the repository's own `data/`.
+
     `clock` is injected so tests drive sealing and flushing without waiting on a real one.
     """
 
@@ -238,17 +352,26 @@ class BarWriter:
         clock: Callable[[], float] = time.time,
         flush_seconds: float = FLUSH_SECONDS,
         tick_seconds: float = TICK_SECONDS,
+        reference_store: BarStore | None = None,
+        spot_store: BarStore | None = None,
     ) -> None:
         self.store = store or BarStore()
         self.aggregator = aggregator or BarAggregator()
+        self.reference_store = reference_store or BarStore(
+            self.store.root, dataset=REFERENCE_DATASET, schema=REFERENCE_SCHEMA
+        )
+        self.reference = ReferenceAggregator()
+        self.spot_store = spot_store or BarStore(
+            self.store.root, dataset=SPOT_DATASET, schema=SPOT_SCHEMA
+        )
+        self.spot = SpotAggregator()
         self.clock = clock
         self.flush_seconds = flush_seconds
         self.tick_seconds = tick_seconds
         self._subscription = None
         self._last_flush: float | None = None
-        #: Quotes taken off the bus that were not `ob_l2` frames with a `ts`. Counted,
-        #: because "the writer ignored most of the bus" should be a number and not a
-        #: discovery.
+        #: Bus records that were neither channel, or carried no `ts`. Counted, because
+        #: "the writer ignored most of the bus" should be a number and not a discovery.
         self.skipped = 0
         self.flush_errors = 0
 
@@ -258,12 +381,32 @@ class BarWriter:
         return self._subscription
 
     def ingest(self, quote: Any) -> None:
-        """One bus record into the aggregator. Pure arithmetic; no IO."""
+        """One bus record into whichever aggregators it feeds. Pure arithmetic; no IO.
+
+        A book frame feeds the quote bars alone. A ticker frame feeds all three: the
+        reference bars and the spot bars own it outright, and the quote bars take its
+        `q` array as the **fallback** they use only if the book stays silent for that
+        contract-minute.
+
+        The two converters do not overlap — `tick_from_quote` refuses `ticker` and
+        `samples_from_ticker` refuses `ob_l2` — so no frame can be counted twice into
+        one bar.
+        """
         tick = tick_from_quote(quote)
-        if tick is None:
+        if tick is not None:
+            self.aggregator.add(tick)
+            return
+
+        sample = samples_from_ticker(quote)
+        if sample is None:
             self.skipped += 1
             return
-        self.aggregator.add(tick)
+        if sample.quote is not None:
+            self.aggregator.add(sample.quote)
+        if sample.reference is not None:
+            self.reference.add(sample.reference)
+        if sample.spot is not None:
+            self.spot.add(sample.spot)
 
     async def run(self) -> None:
         """Drain, seal, flush, forever. Cancel to stop.
@@ -304,8 +447,21 @@ class BarWriter:
                 except asyncio.QueueEmpty:
                     break
 
-            self.store.add(self.aggregator.seal(self.clock()))
+            self._seal()
             await self._maybe_flush()
+
+    def _seal(self) -> None:
+        """Move every eligible bar from the three aggregators into their stores.
+
+        Each seals on its own watermark and its own key, so this is three independent
+        decisions taken at **one** wall-clock reading rather than one decision applied
+        three times. Reading the clock once matters: three readings could straddle a
+        boundary and put one table's bar a minute away from another's.
+        """
+        now = self.clock()
+        self.store.add(self.aggregator.seal(now))
+        self.reference_store.add(self.reference.seal(now))
+        self.spot_store.add(self.spot.seal(now))
 
     async def _maybe_flush(self) -> None:
         """Write if the flush interval has elapsed. **Off the event loop.**
@@ -323,23 +479,44 @@ class BarWriter:
             return
         self._last_flush = now
         try:
-            await asyncio.to_thread(self.store.flush)
+            await asyncio.to_thread(self._flush_all)
         except asyncio.CancelledError:
             raise
         except Exception:
             self.flush_errors += 1
 
-    async def aclose(self) -> None:
-        """Flush the partial bars and write everything out. For process stop.
+    def _flush_all(self) -> int:
+        """Write all three tables. **Blocking IO, and always on a worker thread.**
 
-        The partial bar this produces carries its **true** tick counts and no flag —
-        the counts already say it is short.
+        One thread hop for three files rather than three: the hop is what keeps the disk
+        off the event loop, and three of them an hour would be three chances for the
+        socket reader to be descheduled instead of one.
+        """
+        return (
+            self.store.flush()
+            + self.reference_store.flush()
+            + self.spot_store.flush()
+        )
+
+    async def aclose(self) -> None:
+        """Flush the partial bars from all three tables and write them out. For stop.
+
+        The partial bars this produces carry their **true** tick counts and no flag —
+        the counts already say they are short.
         """
         self.store.add(self.aggregator.flush())
-        await asyncio.to_thread(self.store.flush)
+        self.reference_store.add(self.reference.flush())
+        self.spot_store.add(self.spot.flush())
+        await asyncio.to_thread(self._flush_all)
 
     def stats(self) -> dict[str, Any]:
-        """The writer's own view, beside the aggregator's and the bus's."""
+        """The writer's own view, beside each aggregator's and the bus's.
+
+        The quote table's counters stay at the top level, where they have always been.
+        The other two are **nested rather than merged**: three aggregators publish the
+        same six key names, and flattening them would either collide silently or need a
+        prefix on every one, which is a nested dictionary with worse spelling.
+        """
         queued = 0 if self._subscription is None else self._subscription.queue.qsize()
         return {
             "skipped": self.skipped,
@@ -349,4 +526,16 @@ class BarWriter:
             "buffered": self.store.buffered,
             "queued": queued,
             **self.aggregator.stats(),
+            "reference": {
+                **self.reference.stats(),
+                "flushes": self.reference_store.flushes,
+                "rows_written": self.reference_store.rows_written,
+                "buffered": self.reference_store.buffered,
+            },
+            "spot": {
+                **self.spot.stats(),
+                "flushes": self.spot_store.flushes,
+                "rows_written": self.spot_store.rows_written,
+                "buffered": self.spot_store.buffered,
+            },
         }

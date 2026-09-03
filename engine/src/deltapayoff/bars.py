@@ -71,12 +71,40 @@ eighteen is self-evidently short — and a dedicated flag would be true for a fe
 rows a day while inviting readers to treat it as the only kind of incomplete bar, which
 it is not.
 
-**Not aggregated here: the `ticker` channel.** Measured in the same run, its frames carry
-a `ts` a median 3,176 ms and up to 5,298.8 ms behind our arrival — a full republish cycle
-of staleness, because that stamp appears to mark the underlying quote rather than the
-publish. Bucketing that channel on `ts` under any grace this side of six seconds would
-call almost every frame late. It needs its own watermark and its own table (#5's table B)
-and is out of scope for #10.
+**The `ticker` channel has its own watermark, and that is the whole reason it needed
+one.** Measured in the same run, its frames carry a `ts` a median 3,176 ms and up to
+5,298.8 ms behind our arrival — a full republish cycle of staleness, because that stamp
+appears to mark the underlying quote rather than the publish. Bucketing it on `ts` under
+`ob_l2`'s 2.0 s grace would call almost every frame late, which is why #10 refused the
+channel outright rather than storing a table that was mysteriously empty. See
+`TICKER_GRACE_SECONDS`.
+
+---
+
+**Three tables aggregate here, and they have different grains on purpose.**
+
+*Table A, quote bars,* per contract per minute, from the book channel with the ticker
+channel as its **fallback**. Which one a minute's quotes came from is recorded in
+`from_book`, because a bar sampled 118 times and a bar sampled 12 times are different
+objects and a tick count alone cannot tell "quiet book" from "no book at all".
+
+*Table B, reference bars,* per contract per minute, from the ticker channel: mark and
+last traded price as OHLC, everything else last-value-in-bar. **Mark and LTP are prices
+and they move, so they get a range; open interest, turnover, Delta's five Greeks and its
+three implied vols are levels, and an OHLC of rho means nothing.** The LTP is the
+**close** of Delta's rolling 24-hour candle and nothing else from it: the high, low and
+open of that field are a 24-hour window that would be re-stored identically 1,440 times a
+day. This knowingly discards eleven of every twelve samples of Delta's own vols and
+Greeks, which republish every 5,001 ms. That loss is accepted — the finding it would
+preserve, that their vol steps while ours moves continuously underneath it, is a live
+observation to capture once, not a reason to store ten million rows a day forever.
+
+*Table D, spot bars,* per **underlying** per minute. Spot is a property of the underlying
+and not of a contract: measured, all 136 ticker frames captured inside a 0.06 s window
+carried an identical `sp` of 77651.9. Putting it on contract rows would store the same
+four numbers 588 times a minute and, worse, would let two contracts whose frames
+straddled a boundary disagree about what spot was. It is also the best-sampled series in
+the feed at roughly 7,056 observations a bar, because every contract's frame carries it.
 """
 
 from __future__ import annotations
@@ -86,14 +114,56 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .chain import expiry_from_symbol
+from .wire import decode_ticker, decode_ticker_extras
 
 #: One bar's width. Not configurable: every count and estimate in #5 is against minutes,
 #: and a second width would make two populations of rows indistinguishable in one table.
 BUCKET_US = 60_000_000
 
-#: How long past a bar's boundary we wait before sealing it. See the module docstring —
-#: `derived` from a measured arrival-lag distribution, 2026-09-04.
+#: `ob_l2`'s own watermark. See the module docstring — `derived` from a measured
+#: arrival-lag distribution, 2026-09-04. It is no longer what the quote bars seal on,
+#: for the reason `QUOTE_GRACE_SECONDS` gives, and it stays here because it is still the
+#: book channel's lateness bound and the number every `ob_l2` figure is argued from.
 GRACE_SECONDS = 2.0
+
+#: `ticker`'s watermark, measured the same way and **fifteen times larger**, because
+#: that channel's `ts` is not a publish time.
+#:
+#: `tools/measure_arrival_lag.py`, 2026-09-04, 60 s, all 685 listed BTC options, lossless
+#: queue: 8,220 frames, mean 3,078.7 ms, p50 2,882.5, p90 4,415.8, p95 4,557.4, p99
+#: 4,691.4, p99.9 4,696.4, **max 4,696.6**, min 981.7. An earlier 45 s run the same day
+#: saw a max of **5,298.8 ms** over 6,165 frames, and that larger figure is the one this
+#: number is chosen against.
+#:
+#: The shape is structural rather than stochastic, which is what makes a modest multiple
+#: safe: the stamp marks the quote the frame describes and the channel republishes every
+#: 5,001 ms, so the lag is bounded by one republish interval plus transit — 5,001 ms plus
+#: `ob_l2`'s measured 510.3 ms maximum is a **5,511 ms ceiling**. Eight seconds is 1.5x
+#: the worst frame ever observed and 1.45x that ceiling, and the remaining 2.5 s absorbs
+#: the two things the measurement cannot: unsynchronised clocks (our `time.time()` and
+#: Delta's `ts` are two clocks and an NTP offset of tens of milliseconds is ordinary) and
+#: queue latency, since the watermark is read when the writer drains.
+TICKER_GRACE_SECONDS = 8.0
+
+#: What the **quote** bars seal on, and it is the ticker's number rather than the book's.
+#:
+#: #10 sealed table A at 2.0 s because `ob_l2` was its only source. #11 gives it a
+#: second: the ticker channel's `q` array is the fallback when the book is silent for a
+#: contract, exactly as `wire.chain_from_frames` already overrides one with the other.
+#: A bar that seals at 2.0 s has closed four seconds before its fallback could arrive,
+#: so every fallback quote would be counted late, the fallback would be dead code and
+#: the provenance flag would be a constant `True`. Sealing on the larger of the two
+#: watermarks is the only choice that makes the fallback reachable at all.
+#:
+#: The cost is that a quote bar is written six seconds later than it used to be, inside
+#: an hourly flush. Nothing downstream can notice. The cost of the alternative is a
+#: whole column of quotes that never arrive.
+QUOTE_GRACE_SECONDS = TICKER_GRACE_SECONDS
+
+#: The two channel names, spelled once. `feed.Quote.channel` and `Tick.source` both
+#: carry them and a typo in either would silently route every tick to the fallback.
+BOOK_CHANNEL = "ob_l2"
+TICKER_CHANNEL = "ticker"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +176,12 @@ class Tick:
 
     Either price may be absent. `bid=None, ask=None` is not a quote at all and advances
     nothing; one side present advances that side alone.
+
+    `source` is the channel this came from — `"ob_l2"` or `"ticker"`. It decides which
+    of a bucket's two sets of series the tick lands in and therefore what `from_book`
+    says; it never decides which bucket, because both channels are bucketed on the
+    venue's `ts`. It defaults to the book because the book is the source of every quote
+    that is not a fallback.
     """
 
     symbol: str
@@ -113,6 +189,7 @@ class Tick:
     bid: float | None = None
     ask: float | None = None
     lts_us: int | None = None
+    source: str = BOOK_CHANNEL
 
     @property
     def mid(self) -> float | None:
@@ -157,6 +234,13 @@ class QuoteBar:
     mid_close: float | None
     mid_ticks: int
 
+    #: **True** when this minute's quotes came from the order book channel, **False**
+    #: when the book was silent for this contract and the ticker channel's slower `q`
+    #: array supplied them instead. Not decoration: a bar sampled 118 times and a bar
+    #: sampled 12 times are different objects, and a tick count alone cannot distinguish
+    #: a quiet book from no book at all. Twelve could be either.
+    from_book: bool
+
     #: The last `lts` seen in this minute, as a UTC timestamp. Carried, never bucketed on.
     last_lts: datetime | None
 
@@ -200,12 +284,54 @@ class _Series:
 
 
 @dataclass(slots=True)
+class _Last:
+    """One last-value-in-bar field, chosen by the **venue's** clock.
+
+    The same argument as `_Series.close`, for the same reason: two ticks in one minute
+    can reach us out of order, and taking the last *received* would let our network pick
+    which sample the bar reports.
+    """
+
+    value: Any = None
+    at: int = -1
+
+    def update(self, value: Any, exchange_us: int) -> None:
+        if exchange_us >= self.at:
+            self.value, self.at = value, exchange_us
+
+
+@dataclass(slots=True)
 class _OpenBar:
     bid: _Series = field(default_factory=_Series)
     ask: _Series = field(default_factory=_Series)
     mid: _Series = field(default_factory=_Series)
     last_lts_us: int | None = None
     last_lts_at: int = -1
+
+    @property
+    def observed(self) -> bool:
+        """Whether this source contributed anything at all to the bar. The mid is not
+        consulted: a run of one-sided ticks is a real observation of this channel and
+        must not read as silence."""
+        return bool(self.bid.ticks or self.ask.ticks)
+
+
+@dataclass(slots=True)
+class _Sources:
+    """One bucket's two candidate bars, one per channel, kept apart until the bar is
+    emitted.
+
+    They are not merged. `wire.chain_from_frames` overrides a ticker quote with a book
+    quote **wholesale** for a live chain, and a bar has to make the same choice or its
+    provenance flag would be answering for a mixture. A book bar with two stale ticker
+    samples folded into its high and low is a bar nothing can describe.
+    """
+
+    book: _OpenBar = field(default_factory=_OpenBar)
+    ticker: _OpenBar = field(default_factory=_OpenBar)
+
+    def of(self, source: str) -> _OpenBar:
+        return self.ticker if source == TICKER_CHANNEL else self.book
 
 
 def _to_utc(microseconds: int) -> datetime:
@@ -240,16 +366,26 @@ def _parse_symbol(symbol: str) -> tuple[str, str, float, str] | None:
     return parts[1].upper(), expiry, strike, parts[0]
 
 
-class BarAggregator:
-    """Every open bar, keyed by `(symbol, minute)`. Feed it ticks; ask it for bars.
+class _Watermarked:
+    """The sealing machinery every table shares: bucket, watermark, seal, flush, count.
 
-    Nothing here reads a clock or touches a file. `seal(now)` is given the wall clock,
+    Three tables aggregate on the same clock discipline and differ only in what they
+    fold into a bucket, so the discipline lives here once. Writing it three times would
+    give three chances to get lateness subtly different, and lateness is the rule most
+    likely to be got subtly wrong — a bar sealed a beat early loses real observations and
+    says nothing.
+
+    A key is always `(name, minute_us)`: the contract for tables A and B, the underlying
+    for table D. Bars come back sorted by minute then name, so two runs over the same
+    ticks produce byte-comparable files.
+
+    Nothing here reads a clock or touches a file. `seal(now)` is *given* the wall clock,
     which is what makes lateness a test parameter instead of a race.
     """
 
-    def __init__(self, grace_seconds: float = GRACE_SECONDS) -> None:
+    def __init__(self, grace_seconds: float) -> None:
         self.grace_seconds = grace_seconds
-        self._open: dict[tuple[str, int], _OpenBar] = {}
+        self._open: dict[tuple[str, int], Any] = {}
         #: Symbol metadata, parsed once per contract rather than once per tick.
         self._meta: dict[str, tuple[str, str, float, str]] = {}
         #: The newest minute boundary already sealed. A tick for it or earlier is late.
@@ -261,54 +397,38 @@ class BarAggregator:
         self.late = 0
         #: Ticks whose symbol could not be parsed into underlying, expiry, strike, type.
         self.unparseable = 0
-        #: Ticks carrying neither a bid nor an ask. Not a quote; advances no series.
+        #: Ticks carrying nothing to fold in. Not an observation; advances no series.
         self.empty = 0
         self.bars_emitted = 0
 
-    def add(self, tick: Tick) -> None:
-        """Fold one tick into its bar. Cheap and synchronous — the socket reader is
-        upstream of this and must never wait on it."""
-        meta = self._meta.get(tick.symbol)
+    def _parsed(self, symbol: str) -> tuple[str, str, float, str] | None:
+        """Symbol metadata, cached. A symbol that cannot be parsed is **counted** and
+        refused rather than stored under a guess: `underlying` is a directory name and a
+        wrong guess files quotes under a day or an asset they did not happen in."""
+        meta = self._meta.get(symbol)
         if meta is None:
-            meta = _parse_symbol(tick.symbol)
+            meta = _parse_symbol(symbol)
             if meta is None:
                 self.unparseable += 1
-                return
-            self._meta[tick.symbol] = meta
+                return None
+            self._meta[symbol] = meta
+        return meta
 
-        if tick.bid is None and tick.ask is None:
-            self.empty += 1
-            return
+    def _bucket(self, exchange_us: int) -> int | None:
+        """The minute this tick belongs to, or `None` if that minute is already sealed.
 
-        minute_us = tick.exchange_us - tick.exchange_us % BUCKET_US
+        Late is a **policy**, not an accident: the tick is refused and `late` moves.
+        """
+        minute_us = exchange_us - exchange_us % BUCKET_US
         if self._sealed_through_us is not None and minute_us <= self._sealed_through_us:
             self.late += 1
-            return
+            return None
+        return minute_us
 
-        self.ticks += 1
-        bar = self._open.get((tick.symbol, minute_us))
-        if bar is None:
-            bar = self._open[(tick.symbol, minute_us)] = _OpenBar()
-
-        if tick.bid is not None:
-            bar.bid.update(tick.bid, tick.exchange_us)
-        if tick.ask is not None:
-            bar.ask.update(tick.ask, tick.exchange_us)
-        mid = tick.mid
-        if mid is not None:
-            bar.mid.update(mid, tick.exchange_us)
-
-        # Last by the venue's clock, like every other close in the bar. `lts` is stored
-        # and never bucketed on, so this is the only thing it participates in.
-        if tick.lts_us is not None and tick.exchange_us >= bar.last_lts_at:
-            bar.last_lts_us, bar.last_lts_at = tick.lts_us, tick.exchange_us
-
-    def seal(self, now: float) -> list[QuoteBar]:
+    def seal(self, now: float) -> list[Any]:
         """Emit every bar whose minute closed at least `grace_seconds` ago by `now`.
 
-        `now` is a wall clock in seconds, on the same epoch as the venue's `ts`. Bars
-        come back sorted by minute then symbol, so a writer's output is deterministic and
-        two runs over the same ticks produce byte-comparable files.
+        `now` is a wall clock in seconds, on the same epoch as the venue's `ts`.
 
         **The watermark advances whether or not anything was open.** A quiet minute still
         seals: otherwise a tick that turned up ten minutes late for an empty bucket would
@@ -325,7 +445,7 @@ class BarAggregator:
         self.bars_emitted += len(bars)
         return bars
 
-    def flush(self) -> list[QuoteBar]:
+    def flush(self) -> list[Any]:
         """Emit every open bar regardless of the watermark, for process start and stop.
 
         The partial bar this produces carries its **true** tick counts and no flag. Nine
@@ -338,8 +458,8 @@ class BarAggregator:
         bars = [self._emit(key, self._open.pop(key)) for key in keys]
         # The watermark moves with the flush. Without this a tick arriving afterwards
         # for a minute just written would open a *second* bar for it, and the store
-        # would hold two rows for one contract-minute with no way to tell which is
-        # whole. Emitted is emitted, however it was emitted.
+        # would hold two rows for one key-minute with no way to tell which is whole.
+        # Emitted is emitted, however it was emitted.
         if keys:
             newest = max(minute for _, minute in keys)
             if self._sealed_through_us is None or newest > self._sealed_through_us:
@@ -347,9 +467,91 @@ class BarAggregator:
         self.bars_emitted += len(bars)
         return bars
 
-    def _emit(self, key: tuple[str, int], bar: _OpenBar) -> QuoteBar:
+    def _emit(self, key: tuple[str, int], state: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+    def stats(self) -> dict[str, int]:
+        """What went in, what came out, and what was refused. Every refusal is counted;
+        none of them is silent."""
+        return {
+            "ticks": self.ticks,
+            "late": self.late,
+            "unparseable": self.unparseable,
+            "empty": self.empty,
+            "bars_emitted": self.bars_emitted,
+            "open_bars": len(self._open),
+        }
+
+
+class BarAggregator(_Watermarked):
+    """Every open quote bar, keyed by `(symbol, minute)`. Feed it ticks; ask it for bars.
+
+    Two sources reach the same bar and they do **not** mix. `ob_l2` is the book channel
+    and owns the quotes; `ticker` carries the same two numbers about ten times more
+    slowly and is the **fallback** for a contract whose book is silent — exactly the
+    precedence `wire.chain_from_frames` already applies to a live chain, where a book
+    frame overrides a ticker one wholesale rather than being averaged with it.
+
+    So each bucket holds two independent sets of series, one per source, and the emitted
+    bar takes the book's if it saw anything at all and the ticker's otherwise. Folding
+    both into one set was rejected: a book bar with two stale ticker samples mixed into
+    its high and low would be a bar whose provenance is unanswerable, and the provenance
+    is the whole point of the flag.
+    """
+
+    def __init__(self, grace_seconds: float = QUOTE_GRACE_SECONDS) -> None:
+        super().__init__(grace_seconds)
+
+    def add(self, tick: Tick) -> None:
+        """Fold one tick into its bar. Cheap and synchronous — the socket reader is
+        upstream of this and must never wait on it.
+
+        `tick.source` decides which of the bucket's two sets of series it lands in. It
+        never decides which bucket: both channels are bucketed on the venue's `ts`, and
+        the only difference between them is how long the bar waits before sealing.
+        """
+        if self._parsed(tick.symbol) is None:
+            return
+
+        if tick.bid is None and tick.ask is None:
+            self.empty += 1
+            return
+
+        minute_us = self._bucket(tick.exchange_us)
+        if minute_us is None:
+            return
+
+        self.ticks += 1
+        sources = self._open.get((tick.symbol, minute_us))
+        if sources is None:
+            sources = self._open[(tick.symbol, minute_us)] = _Sources()
+        bar = sources.of(tick.source)
+
+        if tick.bid is not None:
+            bar.bid.update(tick.bid, tick.exchange_us)
+        if tick.ask is not None:
+            bar.ask.update(tick.ask, tick.exchange_us)
+        mid = tick.mid
+        if mid is not None:
+            bar.mid.update(mid, tick.exchange_us)
+
+        # Last by the venue's clock, like every other close in the bar. `lts` is stored
+        # and never bucketed on, so this is the only thing it participates in. Only the
+        # book channel carries it; a `ticker` frame has no `lts` at all.
+        if tick.lts_us is not None and tick.exchange_us >= bar.last_lts_at:
+            bar.last_lts_us, bar.last_lts_at = tick.lts_us, tick.exchange_us
+
+    def _emit(self, key: tuple[str, int], sources: _Sources) -> QuoteBar:
+        """The chosen source wins the whole bar, not a column of it.
+
+        `from_book` is not decoration. A bar built from 118 book samples and one built
+        from 12 ticker samples are different objects, and a tick count alone cannot tell
+        "quiet book" from "no book at all" — 12 could be either. The flag can.
+        """
         symbol, minute_us = key
         underlying, expiry, strike, option_type = self._meta[symbol]
+        from_book = sources.book.observed
+        bar = sources.book if from_book else sources.ticker
         return QuoteBar(
             symbol=symbol,
             underlying=underlying,
@@ -372,21 +574,9 @@ class BarAggregator:
             mid_low=bar.mid.low,
             mid_close=bar.mid.close,
             mid_ticks=bar.mid.ticks,
+            from_book=from_book,
             last_lts=None if bar.last_lts_us is None else _to_utc(bar.last_lts_us),
         )
-
-    def stats(self) -> dict[str, int]:
-        """What went in, what came out, and what was refused. Every refusal is counted;
-        none of them is silent."""
-        return {
-            "ticks": self.ticks,
-            "late": self.late,
-            "unparseable": self.unparseable,
-            "empty": self.empty,
-            "bars_emitted": self.bars_emitted,
-            "open_bars": len(self._open),
-        }
-
 
 def tick_from_quote(quote: Any) -> Tick | None:
     """A `feed.Quote` to a `Tick`, or `None` if it cannot be bucketed.
@@ -425,4 +615,353 @@ def tick_from_quote(quote: Any) -> Tick | None:
         bid=quote.bid,
         ask=quote.ask,
         lts_us=lts_us,
+    )
+
+
+# --- table D: spot bars, one row per underlying per minute -----------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SpotTick:
+    """One underlying's price at one venue instant, carried on a contract's frame.
+
+    `symbol` is the contract the frame arrived on and is used for **nothing but working
+    out which underlying this is**. It is deliberately not stored: spot belongs to BTC,
+    not to `P-BTC-78500-040926`, and keeping the messenger on the row would invite a
+    reader to join on it.
+    """
+
+    symbol: str
+    exchange_us: int
+    spot: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class SpotBar:
+    """One underlying's minute. 1,440 rows a day per underlying and no more.
+
+    `underlying` is here because it is the partition directory's name; there is no
+    contract identity on this row at all, which is the point of the table.
+    """
+
+    underlying: str
+    minute: datetime
+
+    spot_open: float | None
+    spot_high: float | None
+    spot_low: float | None
+    spot_close: float | None
+    spot_ticks: int
+
+
+class SpotAggregator(_Watermarked):
+    """Spot bars, keyed by `(underlying, minute)`.
+
+    **The best-sampled series in the feed**: every one of ~588 contracts' ticker frames
+    carries the same `sp`, so a minute holds roughly 7,056 observations of it against the
+    118 an individual contract's book gets. That is why the tick count is worth storing —
+    it is the one number that says whether the ingester was actually running.
+
+    Sealed on the ticker watermark, because that is the channel it arrives on.
+    """
+
+    def __init__(self, grace_seconds: float = TICKER_GRACE_SECONDS) -> None:
+        super().__init__(grace_seconds)
+
+    def add(self, tick: SpotTick) -> None:
+        meta = self._parsed(tick.symbol)
+        if meta is None:
+            return
+        if tick.spot is None:
+            # An absent `sp` is not a spot of zero. A bar opened on it would be a row
+            # invented out of no observation.
+            self.empty += 1
+            return
+        minute_us = self._bucket(tick.exchange_us)
+        if minute_us is None:
+            return
+
+        self.ticks += 1
+        key = (meta[0], minute_us)
+        series = self._open.get(key)
+        if series is None:
+            series = self._open[key] = _Series()
+        series.update(tick.spot, tick.exchange_us)
+
+    def _emit(self, key: tuple[str, int], series: _Series) -> SpotBar:
+        underlying, minute_us = key
+        return SpotBar(
+            underlying=underlying,
+            minute=_to_utc(minute_us),
+            spot_open=series.open,
+            spot_high=series.high,
+            spot_low=series.low,
+            spot_close=series.close,
+            spot_ticks=series.ticks,
+        )
+
+
+# --- table B: reference bars, one row per contract per minute --------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceTick:
+    """One ticker frame's worth of what a contract was *worth*, as opposed to quoted at.
+
+    Every `venue_` field is **Delta's own opinion** and travels as a reference column.
+    The prefix is not decoration either: #5's table C stores our computed Greeks and
+    implied vol under the bare names, and two columns called `delta` in one store would
+    be exactly the confusion `tests/test_no_delta_inputs.py` exists to prevent.
+
+    Not carried, and deliberately: the price band, the 24-hour mark change, the symbol
+    echo and the product id — static or derivable — and the ticker's own bid and ask,
+    which the book channel already owns and which reach table A as a fallback rather than
+    as columns of their own.
+    """
+
+    symbol: str
+    exchange_us: int
+
+    mark: float | None
+    last_traded_price: float | None
+
+    oi_contracts: float | None
+    #: **Not** open interest in USD, whatever `wire.decode_ticker` calls it. Verified
+    #: against the REST snapshot captured beside the frames: `oi[1]` equals Delta's
+    #: `oi_change_usd_6h` on all 136 symbols, is not its `oi_value_usd` on 126 of them,
+    #: and goes negative, which a notional cannot. The ticker channel carries no USD
+    #: open interest, so this store does not pretend to one.
+    oi_change_usd_6h: float | None
+    turnover: float | None
+
+    venue_delta: float | None
+    venue_gamma: float | None
+    venue_rho: float | None
+    venue_theta: float | None
+    venue_vega: float | None
+
+    venue_bid_iv: float | None
+    venue_ask_iv: float | None
+    venue_mark_iv: float | None
+
+    @property
+    def observed(self) -> bool:
+        """Whether this frame carried anything at all.
+
+        A frame whose `d` list is empty — control traffic, a truncated payload, a
+        contract Delta has stopped populating — decodes to fifteen `None`s. Opening a
+        bucket on that would emit a row where every column is null and every count is
+        zero: a row with **no observation behind it**, which is the same fabrication as a
+        forward-fill wearing different clothes.
+
+        One field is enough. A contract that has never traded has no last traded price
+        and its mark still moves, and that bar is a real record of a real minute.
+        """
+        return any(
+            value is not None
+            for name, value in (
+                (name, getattr(self, name))
+                for name in self.__slots__
+                if name not in ("symbol", "exchange_us")
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceBar:
+    """One contract's minute of reference values.
+
+    Two series get a range because they are prices that move; the eleven levels below
+    them get one sample, because an open/high/low/close of rho would be four numbers
+    describing nothing.
+    """
+
+    symbol: str
+    underlying: str
+    expiry: str
+    strike: float
+    option_type: str
+    minute: datetime
+
+    mark_open: float | None
+    mark_high: float | None
+    mark_low: float | None
+    mark_close: float | None
+    mark_ticks: int
+
+    ltp_open: float | None
+    ltp_high: float | None
+    ltp_low: float | None
+    ltp_close: float | None
+    ltp_ticks: int
+
+    oi_contracts: float | None
+    oi_change_usd_6h: float | None
+    turnover: float | None
+
+    venue_delta: float | None
+    venue_gamma: float | None
+    venue_rho: float | None
+    venue_theta: float | None
+    venue_vega: float | None
+
+    venue_bid_iv: float | None
+    venue_ask_iv: float | None
+    venue_mark_iv: float | None
+
+
+@dataclass(slots=True)
+class _OpenReference:
+    mark: _Series = field(default_factory=_Series)
+    ltp: _Series = field(default_factory=_Series)
+    last: _Last = field(default_factory=_Last)
+
+
+class ReferenceAggregator(_Watermarked):
+    """Reference bars, keyed by `(symbol, minute)`, sealed on the ticker watermark.
+
+    **Last-value-in-bar means the last frame's values, taken together.** The alternative
+    — each field carrying its own most-recent non-null — was rejected: it produces a row
+    whose delta came from 09:00:12 and whose vega came from 09:00:47, which is not a
+    snapshot of anything and would quietly break any reader that assumed the eleven
+    reference figures were mutually consistent. Taking one frame whole costs the
+    occasional field that was null in the final sample and buys a row that describes a
+    moment that actually existed.
+    """
+
+    def __init__(self, grace_seconds: float = TICKER_GRACE_SECONDS) -> None:
+        super().__init__(grace_seconds)
+
+    def add(self, tick: ReferenceTick) -> None:
+        if self._parsed(tick.symbol) is None:
+            return
+        if not tick.observed:
+            self.empty += 1
+            return
+        minute_us = self._bucket(tick.exchange_us)
+        if minute_us is None:
+            return
+
+        self.ticks += 1
+        state = self._open.get((tick.symbol, minute_us))
+        if state is None:
+            state = self._open[(tick.symbol, minute_us)] = _OpenReference()
+
+        # Mark and LTP are prices. A contract that has never traded has no LTP at all —
+        # Delta sends `ohlc: [null, null, null, null]` — and `ltp_ticks` stays at zero,
+        # which is the honest record of "no trade has ever happened here".
+        if tick.mark is not None:
+            state.mark.update(tick.mark, tick.exchange_us)
+        if tick.last_traded_price is not None:
+            state.ltp.update(tick.last_traded_price, tick.exchange_us)
+        state.last.update(tick, tick.exchange_us)
+
+    def _emit(self, key: tuple[str, int], state: _OpenReference) -> ReferenceBar:
+        symbol, minute_us = key
+        underlying, expiry, strike, option_type = self._meta[symbol]
+        last: ReferenceTick = state.last.value
+        return ReferenceBar(
+            symbol=symbol,
+            underlying=underlying,
+            expiry=expiry,
+            strike=strike,
+            option_type=option_type,
+            minute=_to_utc(minute_us),
+            mark_open=state.mark.open,
+            mark_high=state.mark.high,
+            mark_low=state.mark.low,
+            mark_close=state.mark.close,
+            mark_ticks=state.mark.ticks,
+            ltp_open=state.ltp.open,
+            ltp_high=state.ltp.high,
+            ltp_low=state.ltp.low,
+            ltp_close=state.ltp.close,
+            ltp_ticks=state.ltp.ticks,
+            oi_contracts=last.oi_contracts,
+            oi_change_usd_6h=last.oi_change_usd_6h,
+            turnover=last.turnover,
+            venue_delta=last.venue_delta,
+            venue_gamma=last.venue_gamma,
+            venue_rho=last.venue_rho,
+            venue_theta=last.venue_theta,
+            venue_vega=last.venue_vega,
+            venue_bid_iv=last.venue_bid_iv,
+            venue_ask_iv=last.venue_ask_iv,
+            venue_mark_iv=last.venue_mark_iv,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TickerSample:
+    """What one `ticker` frame is worth to the store: a fallback quote, a row of
+    reference values, and one observation of spot.
+
+    Returned together because they come from one frame and one decode. Three separate
+    converters would parse the same payload three times at 137 frames a second, and would
+    give three places for the frame's shape to be assumed differently.
+    """
+
+    quote: Tick | None
+    reference: ReferenceTick | None
+    spot: SpotTick | None
+
+
+def samples_from_ticker(quote: Any) -> TickerSample | None:
+    """A `feed.Quote` from the `ticker` channel to everything the store wants from it.
+
+    **The array offsets are not repeated here.** `wire.decode_ticker` and
+    `wire.decode_ticker_extras` own them, and `tests/test_wire.py` checks their ordering
+    against the REST snapshot captured beside the frames. Re-indexing `g` or `qiv` in a
+    second place is precisely how a transposed index gets into a store that will outlive
+    everyone's memory of the wire format — the numbers stay plausible and nothing
+    crashes.
+
+    A frame with no `ts` is refused whole. Bucketing it on our arrival time would be the
+    one thing this module exists not to do, and a reference row without a bucket is not
+    salvageable.
+    """
+    if quote is None or quote.channel != TICKER_CHANNEL:
+        return None
+    frame = quote.frame or {}
+    try:
+        stamp = int(frame["ts"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    _, leg = decode_ticker(frame)
+    extras = decode_ticker_extras(frame)
+    symbol = quote.symbol
+
+    fallback = None
+    if quote.bid is not None or quote.ask is not None:
+        fallback = Tick(
+            symbol=symbol,
+            exchange_us=stamp,
+            bid=quote.bid,
+            ask=quote.ask,
+            source=TICKER_CHANNEL,
+        )
+
+    return TickerSample(
+        quote=fallback,
+        reference=ReferenceTick(
+            symbol=symbol,
+            exchange_us=stamp,
+            mark=leg.mark,
+            last_traded_price=extras.last_traded_price,
+            oi_contracts=leg.oi,
+            # `Leg.oi_value_usd` is fed from `oi[1]`, which is the six-hour change. The
+            # name is wrong upstream and is not propagated: see `wire`'s docstring.
+            oi_change_usd_6h=leg.oi_value_usd,
+            turnover=extras.turnover,
+            venue_delta=leg.delta,
+            venue_gamma=leg.gamma,
+            venue_rho=leg.rho,
+            venue_theta=leg.theta,
+            venue_vega=leg.vega,
+            venue_bid_iv=leg.bid_iv,
+            venue_ask_iv=leg.ask_iv,
+            venue_mark_iv=leg.mark_iv,
+        ),
+        spot=SpotTick(symbol=symbol, exchange_us=stamp, spot=extras.spot),
     )
