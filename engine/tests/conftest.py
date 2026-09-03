@@ -12,6 +12,11 @@ The three JSON fixtures under `tests/fixtures/`:
   contracts across eight expiries, half a day to 85 days out, spot 77874.2. This is the
   fixture the agreement matrix slices by time to expiry; the chain capture above is one
   expiry and cannot.
+* `ws-ticker-04-09-2026.json`, `ws-ob-l2-04-09-2026.json`, `rest-04-09-2026.json` —
+  captured together on 2026-09-03 by `tools/capture_ws.py`. One verbatim websocket frame
+  per symbol on each channel for the 04-09-2026 BTC chain, 136 symbols, plus the REST
+  response for the same expiry taken alongside. The pairing is the point: it lets the
+  same contracts be read two ways so the wire decoder can be checked rather than assumed.
 * `tickers-absent-quotes.json` — three rows lifted from the chain capture and then
   hand-edited to carry the absent-value spellings Delta uses: `"0"`, `""` and `null`.
   Delta's live snapshots quote every strike, so the edge cases have to be constructed.
@@ -67,3 +72,18 @@ def absent_quote_tickers() -> list[dict[str, Any]]:
 @pytest.fixture
 def multi_expiry_tickers() -> list[dict[str, Any]]:
     return load_fixture("tickers-btc-multi-expiry.json")["result"]
+
+
+@pytest.fixture
+def ws_ticker_frames() -> dict[str, Any]:
+    return load_fixture("ws-ticker-04-09-2026.json")["frames"]
+
+
+@pytest.fixture
+def ws_book_frames() -> dict[str, Any]:
+    return load_fixture("ws-ob-l2-04-09-2026.json")["frames"]
+
+
+@pytest.fixture
+def rest_snapshot() -> list[dict[str, Any]]:
+    return load_fixture("rest-04-09-2026.json")["result"]

@@ -10,3 +10,6 @@ uvicorn>=0.30
 # error function. Whether that trade is worth making is what `docs/solvers.md` measures.
 numpy>=2.0
 scipy>=1.14
+
+# The websocket client for T4's ingestion, and for tools/probe_ws.py.
+websockets>=15.0
