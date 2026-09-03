@@ -48,10 +48,30 @@ against `K` across every paired strike, whose slope is `-D` and whose zero cross
 `forward_method` names it — `F1` is that regression. `years_to_expiry` is ACT/365, and it is
 the clock both the volatility and the Greeks below are quoted on.
 
-**All four are `null` together when the fit is refused**, and then no leg carries a computed
-volatility either. A fit is refused below five paired strikes, or when the implied rate lands
-outside `(0%, 30%)` — a negative rate or an implausible one means the prices are not a parity
-line, and pricing a whole chain against a forward we do not believe would produce a ladder of
+`forward_method` takes one of three values, and it matters which:
+
+| `F1` | The regression fitted both the forward and the discount, and both passed the gate. |
+| `F1+assumed-rate` | The regression's forward, with the **discount assumed at 6.5%**. |
+| `F2` | Parity inverted at the money strike alone, discount assumed. Used on chains too sparse to fit a line. |
+
+**`F1+assumed-rate` is the common case near expiry, and it is not a degraded answer.** The
+regression recovers the forward and the discount from *different features of one line* — the
+forward is where `C - P` crosses zero, the discount is the line's slope — and those have very
+different noise. `docs/forward.md` §4 measured it: across window choices the forward spans
+$1.23 on a $77,590 number while the implied rate runs −17.1% to +9.4%. A crossing is an
+interpolation inside the strike range and noise barely moves it; a slope is a tilt measured
+across that range, where a small error becomes a large one in `D`.
+
+Under a day to expiry the true discount is within a few parts per hundred thousand of 1, so
+its implied rate is quote noise — measured on the live 04-09-2026 chain a second apart, the
+fitted discount moved between 0.99997892 and 1.00001939, taking the rate from +1.03% to
+−0.95%. So a failed gate discredits the **discount**, not the forward: the forward stands and
+the discount is assumed. The 6.5% is borrowed from `payoff-project`, not measured — there is
+no risk-free rate for BTC — and the method name says so rather than passing it off as a fit.
+
+**All four fields are `null` together only when no method works at all**, and then no leg
+carries a computed volatility either. That takes a chain both too sparse to fit a line and
+unquoted at the money. Pricing against a forward we do not believe would produce a ladder of
 plausible, uniformly wrong numbers with nothing to signal it.
 
 ### A leg

@@ -249,30 +249,36 @@ def test_a_thin_chain_still_prices_through_the_money_strike() -> None:
     assert enriched.forward == pytest.approx(PLANTED_FORWARD, rel=1e-4)
 
 
-def test_a_flat_discount_falls_back_to_f2_rather_than_blanking() -> None:
-    """The front-expiry bug, pinned.
+def test_a_negative_implied_rate_keeps_the_forward_and_assumes_a_discount() -> None:
+    """The front-expiry bug, pinned, and the reason the forward is not thrown away.
 
     Under a day to expiry the true discount factor is within a few parts per hundred
-    thousand of exactly 1, so the rate implied by it is quote noise. `f1_parity_fit`
-    will not trust a fit whose implied rate is non-positive, which makes trusting the
-    forward a coin flip on the last digit of a quote — measured on the live 04-09-2026
-    chain, the fitted discount flapped between 0.99997892 and 1.00001939 and the rate
-    with it, between +1.03% and -0.95%, blanking every Greek on the screen each time it
+    thousand of exactly 1, so the rate implied by it is quote noise. Measured on the live
+    04-09-2026 chain one second apart, the fitted discount flapped between 0.99997892 and
+    1.00001939 and the rate with it, +1.03% to -0.95%, blanking every Greek each time it
     went negative.
 
-    The forward itself is not in doubt: F1 and F2 agreed to four parts per million
-    across those same ticks. So a chain whose *discount* cannot be fitted falls back to
-    assuming one, which is exactly what F2 is for, rather than refusing to price at all.
+    `docs/forward.md` §4 already establishes why the answer is to keep the forward: across
+    window choices it spans $1.23 on a $77,590 number while the implied rate runs -17.1%
+    to +9.4%. They come from different features of one line - the forward is where it
+    crosses zero, an interpolation inside the strike range that noise barely moves, and
+    the discount is its slope, where a small tilt is a large error.
 
-    A discount of exactly 1.0 reproduces the condition: the implied rate is 0, and
-    `trusted` requires it to be strictly positive.
+    So a bad rate discredits the discount, not the forward. The forward stands and the
+    discount is assumed at 6.5% - the same borrowed constant the sibling project uses,
+    since no risk-free rate exists for BTC.
+
+    A planted discount above 1 reproduces the condition exactly: it is a negative rate,
+    which is what the gate refuses.
     """
-    chain = priced_chain(STRIKES, discount=1.0)
+    chain = priced_chain(STRIKES, discount=1.0005)
 
     enriched = enrich(chain)
 
-    assert enriched.forward_method == "F2"
-    assert enriched.forward == pytest.approx(PLANTED_FORWARD, rel=1e-6)
+    # The forward is F1's, unchanged - not F2's, and not refused.
+    assert enriched.forward == pytest.approx(PLANTED_FORWARD, rel=1e-9)
+    assert enriched.forward_method == "F1+assumed-rate"
+    assert enriched.discount is not None and enriched.discount < 1.0
     assert all(row.call.computed.iv is not None for row in enriched.rows)
 
 

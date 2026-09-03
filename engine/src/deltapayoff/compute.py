@@ -34,7 +34,15 @@ familiarity rather than accuracy.
 
 from __future__ import annotations
 
-from .forward import f1_parity_fit, f2_single_strike, mid, year_fraction
+from .forward import (
+    ASSUMED_RATE,
+    MIN_PAIRS,
+    assumed_discount,
+    f1_parity_fit,
+    f2_single_strike,
+    mid,
+    year_fraction,
+)
 from .greeks import report_greeks
 from .models import ChainResponse, ComputedLeg, Leg
 from .solvers import implied_vol_newton
@@ -102,21 +110,44 @@ def enrich(chain: ChainResponse) -> ChainResponse:
     years = year_fraction(chain)
 
     if not fit.trusted and years > 0.0:
-        # **F1 fits the discount as well as the forward, and near expiry it cannot.**
-        # Under a day out the true discount factor sits within a few parts per hundred
-        # thousand of 1, so the rate implied by it is quote noise — measured on the live
-        # 04-09-2026 chain, the fitted discount flapped between 0.99997892 and 1.00001939
-        # from one second to the next, taking the implied rate from +1.03% to -0.95% and
-        # back. `f1_parity_fit` will not trust a non-positive rate, quite rightly, but
-        # that makes a sign test on noise decide whether the whole chain prices.
+        # **A failed gate discredits the discount, not the forward.**
         #
-        # The forward is not what is in doubt: across those same ticks F1 and F2 agreed
-        # to four parts per million. So where the discount cannot be fitted we assume one
-        # instead of fitting it, which is precisely what F2 is for. `forward_method` on
-        # the response says which was used, so nobody has to guess afterwards.
-        fallback = f2_single_strike(chain)
-        if fallback.trusted and fallback.forward is not None:
-            fit = fallback
+        # F1 recovers both from one line: the forward is where `C - P` crosses zero, and
+        # the discount is the line's slope. Those are different features with very
+        # different noise. `docs/forward.md` §4 measured it — across window choices the
+        # forward spans $1.23 on a $77,590 number, 1.6 basis points, while the implied
+        # rate runs -17.1% to +9.4%. A crossing is an interpolation inside the strike
+        # range and noise barely moves it; a slope is a tilt measured across that range,
+        # where a small error is a large one in `D`.
+        #
+        # Near expiry this stops being academic. Under a day out the true discount is
+        # within a few parts per hundred thousand of 1, so its implied rate is pure
+        # quote noise: measured on the live 04-09-2026 chain a second apart, the fitted
+        # discount moved between 0.99997892 and 1.00001939, taking the rate from +1.03%
+        # to -0.95%. The gate rightly refuses a negative rate — but that let a sign test
+        # on noise decide whether the entire chain priced.
+        #
+        # So the forward stands and only the discount is replaced, with the same 6.5%
+        # the sibling project assumes. There is no risk-free rate for BTC; this is a
+        # borrowed constant and `forward_method` says so rather than passing it off as
+        # a fit.
+        if fit.forward is not None and fit.n_pairs >= MIN_PAIRS:
+            fit = fit.model_copy(
+                update={
+                    "method": "F1+assumed-rate",
+                    "discount": assumed_discount(chain),
+                    "implied_rate": ASSUMED_RATE,
+                    "trusted": True,
+                }
+            )
+        else:
+            # Too few pairs for the crossing to be an interpolation worth trusting
+            # either. F2 needs one strike quoting both sides rather than five, so a
+            # sparse chain is still priceable — from a single point, and with the same
+            # assumed discount.
+            fallback = f2_single_strike(chain)
+            if fallback.trusted and fallback.forward is not None:
+                fit = fallback
 
     if not fit.trusted or fit.forward is None or years <= 0.0:
         # No forward, or the contract has settled. Every strike gets the same honest
