@@ -79,6 +79,23 @@
   --up: #4fb87c;
   --down: #e8636b;
 
+  /*
+   * The two comparison overlays on the smile.
+   *
+   * Every other role in this palette is taken: amber is the forward, the warm greys are
+   * the live curve and the type, and green/red are call and put on the ladder. Reusing
+   * any of them would make a time offset look like a side, or like the reference the
+   * curve is read against. So the overlays get the two hues nothing else on this product
+   * uses, and they are told apart from each other by a dash pattern as well as by hue -
+   * `OVERLAY_DASH` in `SmileChart.tsx` - so the pair survives a red-green deficiency and
+   * a monochrome printout, where hue alone would not.
+   *
+   * `measured` in the browser on the rendered chart, stroke against resolved background;
+   * the numbers are recorded in full beside the `.overlay-option` rules below.
+   */
+  --overlay-1h: #5ec8e0;
+  --overlay-24h: #b09cf0;
+
   --atm: #3a2c10;
   --atm-line: #f2a93b;
   /* The in-the-money wash, and the row under the pointer.
@@ -137,6 +154,11 @@
     --up: #177244;
     --down: #b5342b;
 
+    /* Darker than they look like they should be, for the same reason the accent is:
+       the dark values are 1.4:1 and 1.9:1 on paper. */
+    --overlay-1h: #0f6a86;
+    --overlay-24h: #6b4bb8;
+
     --atm: #fdf0cf;
     --atm-line: #d99a1a;
     --itm: #f1e9dc;
@@ -165,6 +187,9 @@
   --accent: #8a5607;
   --up: #177244;
   --down: #b5342b;
+
+  --overlay-1h: #0f6a86;
+  --overlay-24h: #6b4bb8;
 
   --atm: #fdf0cf;
   --atm-line: #d99a1a;
@@ -819,6 +844,135 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
 }
 
 .scale-option:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* ------------------------------------------------ the comparison overlays
+ *
+ * Two toggles that put the same expiry an hour and a day earlier on the same axis, and
+ * the buttons carry their own swatch so the control is the key. A legend under the plot
+ * would be the same information twice, in the place a reader looks last.
+ *
+ * They sit on the page ground beside the axis toggle, so every pair here resolves
+ * against `--bg`, and the strokes they stand for are measured against `--surface`, which
+ * is what the plot is.
+ *
+ * `measured` in the browser on the rendered chart, 2026-09-04, BTC 25-09-2026 at
+ * 12:47Z, each stroke read off its own SVG element and each ground resolved by walking
+ * up to the first ancestor that actually paints one:
+ *   -1h stroke   on div.plot (--surface)      9.92:1 dark / 6.03:1 light
+ *   -24h stroke  on div.plot (--surface)      8.13:1 dark / 6.22:1 light
+ *   -1h swatch   on the pressed button        7.72:1 dark / 4.85:1 light
+ *   -24h swatch  on the pressed button        6.32:1 dark / 5.00:1 light
+ *   -1h swatch   hovered (same ground)        7.72:1 dark / 4.85:1 light
+ *   button label at rest / pressed            5.55 / 9.58 dark, 5.52 / 12.95 light
+ * For reference, taken in the same run: the primary curve is 12.31:1 dark / 16.09:1
+ * light and the forward rule is 9.64:1 / 6.05:1, so nothing here is the brightest thing
+ * on the chart. Every value clears 4.5:1, let alone the 3:1 a graphical object needs.
+ * The previous ticket shipped a reference line at 2.41:1 and a hover cursor at 1.40:1 by
+ * measuring tokens against tokens instead of elements against grounds; these were taken
+ * the other way.
+ *
+ * **The pressed state is not carried by colour.** The swatch is the overlay's hue
+ * whether the button is on or off - it has to be, because it is the key - so pressing is
+ * said with the same solid bar and brighter ink the axis toggle uses, plus the swatch
+ * going from a hairline to full opacity. Three channels, none of them hue.
+ */
+
+.overlay-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.overlay-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  padding: 4px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);          /* 5.55:1 dark, 5.52:1 light, on --bg */
+  cursor: pointer;
+}
+
+.overlay-option + .overlay-option { border-left: 1px solid var(--line-strong); }
+
+.overlay-option:hover { background: var(--row-hover); color: var(--ink); }
+
+.overlay-option[aria-pressed="true"] {
+  background: var(--row-hover);
+  color: var(--ink);
+  font-weight: 700;
+  box-shadow: inset 0 -2px 0 0 var(--ink);
+}
+
+.overlay-option:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* The swatch is the dash pattern, drawn at the size a legend key would be. Built from a
+   repeating gradient rather than a border so it can show the same broken line the curve
+   does - `8 4` for the hour, `2 4` for the day - because the dash is half of what tells
+   the two apart and a solid chip would drop that half. */
+.overlay-swatch {
+  display: inline-block;
+  width: 20px;
+  height: 2px;
+  vertical-align: middle;
+  opacity: 0.55;
+}
+
+.overlay-option[aria-pressed="true"] .overlay-swatch { opacity: 1; }
+
+.overlay-swatch[data-overlay="h1"],
+.overlay-option[data-overlay="h1"] .overlay-swatch {
+  background: repeating-linear-gradient(
+    to right,
+    var(--overlay-1h) 0 8px,
+    transparent 8px 12px
+  );
+}
+
+/* Three pixels tall rather than two, matching `OVERLAY_WIDTH` in `SmileChart.tsx`: the
+   dotted series is drawn heavier on the chart for the duty-cycle reason given there, and
+   a key that did not carry that difference would be a key to a different line. */
+.overlay-swatch[data-overlay="d1"],
+.overlay-option[data-overlay="d1"] .overlay-swatch {
+  height: 3px;
+  background: repeating-linear-gradient(
+    to right,
+    var(--overlay-24h) 0 2px,
+    transparent 2px 6px
+  );
+}
+
+/* A swatch standing on its own in a warning - full strength, since there is no pressed
+   state to distinguish it from. */
+.notice .overlay-swatch { opacity: 1; }
+
+/* Pushes the axis toggle to the right of the row so the two control groups read as two
+   groups rather than as one strip of four buttons. */
+.plot-controls-gap { flex: 1 1 auto; }
+
+/* The overlay's own colour on its line of the hover readout, and the signed difference
+   beside the figure. The difference is dimmer than the figure because it is derived from
+   two numbers already on the card rather than being a third measurement.
+   `--ink-faint` is 4.76:1 dark and 4.70:1 light on the tooltip's --bg. */
+.chart-tip-diff {
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+
+/* The right end of the scrubber's track when the stream is filling it. Brighter than the
+   stamp it replaces because it is a state rather than a label.
+   `--ink` is 12.72:1 dark, 14.90:1 light, on --bg. */
+.scrub-live-end {
+  color: var(--ink);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
 
 /* A header figure that is a stamp rather than a number - the model version and the
    forward method. It has to fit in a row sized for six-digit prices, so it drops a

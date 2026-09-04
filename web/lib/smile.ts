@@ -25,6 +25,7 @@
  * one, which is exactly what the contract does with `iv: null`.
  */
 import type { SmileMinute, SmilePoint, SmileResponse } from "./contract";
+import type { OverlayId } from "./overlay";
 
 /** One strike, ready to draw. Percent, because that is the unit the axis is in. */
 export interface SmileDatum {
@@ -113,6 +114,74 @@ export function toRows(minute: SmileMinute, grid?: readonly number[]): SmileDatu
   });
 }
 
+/**
+ * The board with any strikes the live push listed and the stored day did not.
+ *
+ * The live chain is not obliged to list the same ladder the store spent the day
+ * writing — Delta adds strikes as spot moves. Returning the **same array reference**
+ * when there is nothing to add is not a micro-optimisation: the grid is a memo
+ * dependency for every series on the chart, and a fresh array once a second would
+ * rebuild all of them for no change in what they say.
+ */
+export function mergeStrikes(grid: readonly number[], extra: readonly SmilePoint[]): number[] {
+  const known = new Set(grid);
+  let added = false;
+  for (const point of extra) {
+    if (!known.has(point.strike)) {
+      known.add(point.strike);
+      added = true;
+    }
+  }
+  return added ? [...known].sort((a, b) => a - b) : (grid as number[]);
+}
+
+/**
+ * The chart's dataset: one entry per strike on the board, carrying the primary curve's
+ * volatility and one column per overlay switched on.
+ *
+ * Flat columns rather than a nested object because that is what a `dataKey` addresses,
+ * and one dataset rather than three because the three curves share an x-axis and
+ * Recharts draws sibling `<Line>`s off one array. An overlay that is switched off, or
+ * that has no minute to draw, leaves its column `null` at every strike — which is the
+ * same absence the primary curve uses, so nothing renders and nothing is claimed.
+ */
+export interface SmileRow extends SmileDatum {
+  /** `−1h`, in percent at this strike. `null` when absent, unsolved or unstored. */
+  ov_h1: number | null;
+  /** `−24h`, same rules. */
+  ov_d1: number | null;
+}
+
+/** The column each overlay's values are written into. Named, not built from the id, so
+ *  the type system knows every column the chart can address. */
+export const OVERLAY_COLUMN = { h1: "ov_h1", d1: "ov_d1" } as const satisfies Record<
+  OverlayId,
+  keyof SmileRow
+>;
+
+export function toChartRows(
+  minute: SmileMinute,
+  grid: readonly number[] | undefined,
+  overlays: readonly { id: OverlayId; minute: SmileMinute }[],
+): SmileRow[] {
+  const rows: SmileRow[] = toRows(minute, grid).map((row) => ({
+    ...row,
+    ov_h1: null,
+    ov_d1: null,
+  }));
+
+  for (const overlay of overlays) {
+    const column = OVERLAY_COLUMN[overlay.id];
+    const byStrike = new Map(overlay.minute.points.map((point) => [point.strike, point]));
+    for (const row of rows) {
+      const point = byStrike.get(row.strike);
+      row[column] = point && point.iv !== null ? point.iv * 100 : null;
+    }
+  }
+
+  return rows;
+}
+
 /** The solved volatilities, in percent. Empty when nothing on the curve solved. */
 export function solvedPercents(rows: readonly SmileDatum[]): number[] {
   const out: number[] = [];
@@ -177,4 +246,16 @@ export function formatOffset(offset: number): string {
 /** A volatility in percent, at the precision the axis it sits on needs. */
 export function formatPercent(pct: number, decimals: number): string {
   return `${pct.toFixed(decimals)}%`;
+}
+
+/**
+ * A difference between two volatilities, in **volatility points**: `+0.42`, `-1.30`.
+ *
+ * No percent sign, because it is not one — it is a difference of two percentages, and
+ * writing `+0.42%` for it is the mistake that turns "half a vol point" into "half a
+ * percent of the vol". The sign is always printed, on the positive side too.
+ */
+export function formatSignedPoints(points: number): string {
+  const sign = points > 0 ? "+" : points < 0 ? "−" : "";
+  return `${sign}${Math.abs(points).toFixed(2)}`;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import {
   CartesianGrid,
   Label,
@@ -18,6 +18,7 @@ import {
 
 import type { SmileMinute } from "@/lib/contract";
 import { formatStrike } from "@/lib/format";
+import type { OverlayId } from "@/lib/overlay";
 import {
   linearTicks,
   logDomain,
@@ -29,10 +30,12 @@ import {
 import {
   formatOffset,
   formatPercent,
+  formatSignedPoints,
+  OVERLAY_COLUMN,
   solvedPercents,
-  toRows,
+  toChartRows,
   unsolvedStrikes,
-  type SmileDatum,
+  type SmileRow,
 } from "@/lib/smile";
 
 /**
@@ -68,6 +71,22 @@ import {
  * The curve is `--ink` rather than the amber. The amber marks the forward, which is this
  * screen's money row — the accent is spent on the reference the reader navigates by, and
  * a curve in the same colour would leave neither of them meaning anything.
+ *
+ * **The comparison overlays take neither of those two roles.** Two more amber things
+ * would leave the forward meaning nothing, and two more warm greys would be
+ * indistinguishable from the curve at a glance, so the overlays are the only two hues on
+ * this screen that are not already spoken for: a cyan for `−1h` and a violet for `−24h`.
+ * They are told apart from the primary and from each other by **hue and by dash
+ * together**, never by hue alone — the primary is solid, `−1h` is long-dashed and `−24h`
+ * is dotted, so the three remain separable where hue does not survive, which includes
+ * every red-green deficiency and a printout. `OVERLAY_DASH` below carries the patterns
+ * and `--overlay-1h` / `--overlay-24h` in `globals.css` carry the measured ratios.
+ *
+ * **Overlays get no dots.** The dots are what says "this is a data point you may read a
+ * number off", and the number this screen is for is the one on the curve for the minute
+ * the scrubber is standing on. The overlays are context for that number, so they are a
+ * line and nothing else. Their values are still in the hover, where a reader who wants
+ * one asks for it.
  */
 
 /** Roughly how many ticks each axis wants. Chosen for a 900-ish pixel plot. */
@@ -79,7 +98,43 @@ const IV_TICK_TARGET = 8;
 const X_PAD = 0.02;
 const Y_PAD = 0.08;
 
+/**
+ * The second channel each overlay is identified by, after hue.
+ *
+ * Deliberately not close to the forward line's `5 4`: that rule is amber and horizontal
+ * to the eye's reading of the chart, and a dash pattern shared with it would invite the
+ * two to be read as one family. Long dash for the hour, dotted for the day — the further
+ * back in time, the more broken the line, which is a mnemonic rather than a rule.
+ */
+const OVERLAY_DASH: Record<OverlayId, string> = { h1: "8 4", d1: "2 4" };
+
+/**
+ * Stroke width per overlay, and it is not the same number twice.
+ *
+ * A dash pattern is a duty cycle: `8 4` paints two thirds of its length and `2 4` paints
+ * one third. At an equal width the dotted series lays down half the ink of the dashed
+ * one and reads as the fainter of the two — which would say "less important", a claim
+ * about a day ago that nothing supports. The extra half pixel on the dotted series
+ * equalises the presence rather than the number. `measured` on the rendered chart at
+ * 1.5px both, the dotted line was legible but visibly the weaker of the two.
+ */
+const OVERLAY_WIDTH: Record<OverlayId, number> = { h1: 1.5, d1: 2 };
+
+/** The stroke token per overlay. Defined in `globals.css`, measured in both variants. */
+const OVERLAY_STROKE: Record<OverlayId, string> = {
+  h1: "var(--overlay-1h)",
+  d1: "var(--overlay-24h)",
+};
+
 export type VolScale = "linear" | "log";
+
+/** One historical curve to draw beside the primary. Resolved by `lib/overlay.ts`. */
+export interface ChartOverlay {
+  id: OverlayId;
+  /** `−1h` / `−24h`, as the control spells it. */
+  label: string;
+  minute: SmileMinute;
+}
 
 export function SmileChart({
   minute,
@@ -87,6 +142,7 @@ export function SmileChart({
   scale,
   underlying,
   expiry,
+  overlays = [],
 }: {
   minute: SmileMinute;
   /**
@@ -102,13 +158,37 @@ export function SmileChart({
   scale: VolScale;
   underlying: string;
   expiry: string;
+  /**
+   * The comparison curves, already resolved to a stored minute each. An overlay the
+   * store could not answer for never reaches this component — the screen says so above
+   * the plot instead, because a series that renders as nothing and a series that renders
+   * as zero look identical on an axis and only one of them is true.
+   */
+  overlays?: readonly ChartOverlay[];
 }) {
-  const rows = useMemo(() => toRows(minute, grid), [minute, grid]);
+  const rows = useMemo(
+    () => toChartRows(minute, grid, overlays),
+    // `overlays` is rebuilt by the screen on every live tick; its *contents* are what
+    // matter, so the memo is keyed on the identity of each overlay's minute rather than
+    // on the array. Without this the whole dataset is rebuilt once a second for nothing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [minute, grid, overlays.map((o) => `${o.id}:${o.minute.minute}`).join("|")],
+  );
   const forward = minute.forward;
 
   const model = useMemo(() => {
     const strikes = rows.map((row) => row.strike);
     const solved = solvedPercents(rows);
+
+    // The vertical domain has to hold every curve on the axis, not just the primary —
+    // an overlay clipped at the frame would read as a curve that flattens out there.
+    const spanning = [...solved];
+    for (const overlay of overlays) {
+      for (const row of rows) {
+        const value = row[OVERLAY_COLUMN[overlay.id]];
+        if (value !== null) spanning.push(value);
+      }
+    }
 
     const xDomain = paddedDomain(
       Math.min(...strikes),
@@ -126,13 +206,13 @@ export function SmileChart({
     // The log branch drops any non-positive volatility, which the solver does not
     // produce — but a log axis given a zero silently renders nothing at all, and a blank
     // chart is the worst failure mode on this screen.
-    const positives = solved.filter((v) => v > 0);
+    const positives = spanning.filter((v) => v > 0);
     const useLog = scale === "log" && positives.length > 0;
 
     const yDomain: [number, number] = useLog
       ? logDomain(Math.min(...positives), Math.max(...positives), Y_PAD)
-      : solved.length > 0
-        ? paddedDomain(Math.min(...solved), Math.max(...solved), Y_PAD)
+      : spanning.length > 0
+        ? paddedDomain(Math.min(...spanning), Math.max(...spanning), Y_PAD)
         : [0, 1];
     const ivTicks = useLog
       ? logTicks(yDomain[0], yDomain[1], IV_TICK_TARGET)
@@ -146,9 +226,17 @@ export function SmileChart({
       ivTicks,
       useLog,
       ivDecimals: tickDecimals(ivTicks),
+      // A dotted rule is a claim about **this** minute's solver, so it is read off the
+      // primary curve alone. An overlay's own refusals belong to another minute and
+      // marking them here would put that minute's failures on this one's axis.
       unsolved: unsolvedStrikes(rows),
       byStrike: new Map(rows.map((row) => [row.strike, row])),
     };
+    // `overlays` is read above but is not a dependency, because it cannot change without
+    // `rows` changing: the memo below is keyed on the overlay set, so a switched overlay
+    // hands this one a new array. Listing it as well would recompute the whole model on
+    // every live tick, since the screen rebuilds the array each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows, forward, scale]);
 
   const strikeTick = (props: XAxisTickContentProps) => (
@@ -202,7 +290,7 @@ export function SmileChart({
    */
   const tooltip = (props: TooltipContentProps) => {
     if (!props.active) return null;
-    const fromPayload = props.payload?.[0]?.payload as SmileDatum | undefined;
+    const fromPayload = props.payload?.[0]?.payload as SmileRow | undefined;
     const row = fromPayload ?? model.byStrike.get(Number(props.label));
     if (!row) return null;
 
@@ -233,6 +321,34 @@ export function SmileChart({
               <dd>{row.reason}</dd>
             </>
           ) : null}
+
+          {/* One line per overlay on screen, in the overlay's own colour so the row and
+              the curve are the same thing. The signed figure beside it is this minute
+              minus that one — the subtraction of two numbers already on the readout,
+              which is the comparison the overlay exists to make. */}
+          {overlays.map((overlay) => {
+            const value = row[OVERLAY_COLUMN[overlay.id]];
+            return (
+              <Fragment key={overlay.id}>
+                <dt style={{ color: OVERLAY_STROKE[overlay.id] }}>{overlay.label}</dt>
+                <dd>
+                  {value === null ? (
+                    "—"
+                  ) : (
+                    <>
+                      {formatPercent(value, 2)}
+                      {row.ivPct === null ? null : (
+                        <span className="chart-tip-diff">
+                          {" "}
+                          {formatSignedPoints(row.ivPct - value)}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </dd>
+              </Fragment>
+            );
+          })}
         </dl>
       </div>
     );
@@ -381,6 +497,31 @@ export function SmileChart({
             isAnimationActive={false}
             wrapperStyle={{ outline: "none" }}
           />
+
+          {/*
+            The overlays, drawn **before** the primary so the primary paints over them:
+            the curve for the minute on the scrubber is the subject, and the two
+            historical ones are the ground it is read against. They obey the same two
+            rules the primary does — `type="linear"` and no `connectNulls` — because a
+            comparison curve that smoothed or bridged where the primary breaks would be
+            comparing a drawing to a measurement.
+          */}
+          {overlays.map((overlay) => (
+            <Line
+              key={overlay.id}
+              xAxisId="strike"
+              yAxisId="iv"
+              type="linear"
+              dataKey={OVERLAY_COLUMN[overlay.id]}
+              name={`${overlay.label} · ${overlay.minute.minute}`}
+              stroke={OVERLAY_STROKE[overlay.id]}
+              strokeWidth={OVERLAY_WIDTH[overlay.id]}
+              strokeDasharray={OVERLAY_DASH[overlay.id]}
+              isAnimationActive={false}
+              dot={false}
+              activeDot={false}
+            />
+          ))}
 
           {/*
             `type="linear"` and no `connectNulls`. See the note at the head of this file:

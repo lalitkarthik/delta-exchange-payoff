@@ -2,16 +2,31 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { SmileChart, type VolScale } from "@/components/SmileChart";
+import { SmileChart, type ChartOverlay, type VolScale } from "@/components/SmileChart";
 import ThemeToggle from "@/components/ThemeToggle";
 import TimeScrubber from "@/components/TimeScrubber";
-import { UNDERLYINGS, type SmileResponse, type Underlying } from "@/lib/contract";
+import {
+  UNDERLYINGS,
+  type ChainResponse,
+  type SmileResponse,
+  type Underlying,
+} from "@/lib/contract";
 import { ENGINE_URL, loadExpiries, loadSmile, type Source } from "@/lib/engine";
 import { formatFetchedClock, formatLocalClock, formatSpot, localZoneLabel } from "@/lib/format";
+import { LIVE_STATUS_LABEL, subscribeChain, type LiveStatus } from "@/lib/live";
+import { smileMinuteFromChain } from "@/lib/livesmile";
+import {
+  NO_OVERLAYS,
+  OVERLAYS,
+  resolveOverlay,
+  type OverlayId,
+  type OverlayState,
+} from "@/lib/overlay";
 import {
   formatTimeToExpiry,
   hoursToExpiry,
   isDying,
+  mergeStrikes,
   solvedPercents,
   strikeGrid,
   toRows,
@@ -22,6 +37,7 @@ import {
   EMPTY_TIMELINE,
   indexOfStamp,
   lastIndex,
+  withLiveMinute,
 } from "@/lib/timeline";
 import { viewQuery, type ViewRequest } from "@/lib/view";
 
@@ -42,6 +58,25 @@ function message(err: unknown): string {
 const URL_SETTLE_MS = 200;
 
 /**
+ * How often the live curve is allowed to be redrawn.
+ *
+ * **A ladder and a smile are read differently and that is the whole argument.** The
+ * chain screen takes every push, and it is right to: a ladder is read one cell at a
+ * time, so a cell that changes under the eye is a cell that has news. A smile is read as
+ * a *shape* — the tilt of the wings against the middle — and a shape has to hold still
+ * long enough to be seen. At the stream's own rate the curve shimmers and the skew is
+ * unreadable; at about a second it still reads as live and the shape settles between
+ * frames.
+ *
+ * The sampler below is trailing, not leading: it publishes the newest push it holds when
+ * the tick comes round and drops everything older, so the curve is never more than one
+ * interval behind the stream and never renders a frame it is about to throw away. The
+ * cost is that the first curve after a subscription waits up to one interval, which is
+ * invisible beside the round trip that preceded it.
+ */
+const LIVE_REDRAW_MS = 1000;
+
+/**
  * The volatility screen: a smile, a day to move it through, and everything a reader
  * needs to know how far to trust what is on the axis.
  *
@@ -60,7 +95,14 @@ const URL_SETTLE_MS = 200;
  *
  * **The whole day arrives in one request and the scrubber is an index into it.** No
  * fetch is issued while time moves; `docs/smile-contract.md` sends the day precisely so
- * that none has to be.
+ * that none has to be. The two comparison overlays are a second index into the same
+ * array, so switching one on costs no request either.
+ *
+ * **The right edge is live.** The store withholds the open minute by design, so the
+ * newest sealed bar always trails the market. The chain stream fills that edge: the same
+ * push the ladder renders, projected into a smile minute by `lib/livesmile.ts` and
+ * sampled to about 1 Hz by `LIVE_REDRAW_MS`. Standing on the right edge follows it;
+ * scrubbing off it pins a stored minute by stamp and stops following.
  *
  * **The view has an address.** Underlying, expiry and minute go into the URL in UTC, so
  * a link means the same curve in every timezone, and they come back out of it on load.
@@ -96,6 +138,23 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
    * picked would make two ordinary smiles incomparable by eye.
    */
   const [scale, setScale] = useState<VolScale>("linear");
+
+  /**
+   * Which comparison overlays are on.
+   *
+   * **Deliberately not reset when the underlying or the expiry changes.** An overlay is
+   * a way of reading a curve, like the axis toggle beside it, not a fact about one
+   * series — a reader comparing every expiry against an hour ago wants to keep
+   * comparing. It is reset only by being switched off, which is a click, and it costs
+   * nothing to carry across a series change because the new day arrives with its own
+   * hour-ago minute in it.
+   */
+  const [overlayOn, setOverlayOn] = useState<OverlayState>(NO_OVERLAYS);
+
+  /** The newest push the sampler has published. See `LIVE_REDRAW_MS`. */
+  const [liveChain, setLiveChain] = useState<ChainResponse | null>(null);
+  const [liveStatus, setLiveStatus] = useState<LiveStatus>("connecting");
+  const [liveDetail, setLiveDetail] = useState<string | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -162,13 +221,81 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
   }, [underlying, expiry]);
 
   /**
+   * One live subscription per series, sampled down to `LIVE_REDRAW_MS`.
+   *
+   * **The same socket the chain screen reads, and the same object off it.** The stream
+   * carries a chain; this screen draws a smile; `lib/livesmile.ts` is the projection
+   * between them and carries the argument for doing it here rather than asking the
+   * engine for a second payload or polling `/smile` on a timer. Nothing is recomputed —
+   * the volatility this chart plots is the identical field of the identical push the
+   * ladder prints.
+   *
+   * `latest` is a plain local rather than a ref because it belongs to this
+   * subscription: it is created with the socket and dies with it, so a push that
+   * arrived for the old expiry can never be published against the new one.
+   */
+  useEffect(() => {
+    if (!expiry) return;
+    setLiveChain(null);
+
+    let latest: ChainResponse | null = null;
+    const sampler = window.setInterval(() => {
+      if (latest === null) return;
+      setLiveChain(latest);
+      latest = null;
+    }, LIVE_REDRAW_MS);
+
+    const stop = subscribeChain(underlying, expiry, {
+      onChain: (chain) => {
+        latest = chain;
+      },
+      onStatus: (next, detail) => {
+        setLiveStatus(next);
+        setLiveDetail(detail ?? null);
+      },
+    });
+
+    return () => {
+      window.clearInterval(sampler);
+      stop();
+    };
+  }, [underlying, expiry]);
+
+  /**
+   * The live push as a minute of the smile, or `null`.
+   *
+   * The series is checked rather than assumed. The subscription is torn down and rebuilt
+   * on every change of underlying or expiry, so a mismatch should be impossible — and
+   * this screen puts two sources of the same expiry's curve on one axis, which is
+   * exactly the place where "should be impossible" is worth one comparison.
+   */
+  const liveMinute = useMemo(() => {
+    if (!liveChain) return null;
+    if (liveChain.underlying !== underlying || liveChain.expiry !== expiry) return null;
+    return smileMinuteFromChain(liveChain);
+  }, [liveChain, underlying, expiry]);
+
+  /**
    * The day laid out minute by minute, and the board's full strike list.
    *
    * Both are derived from the response and both are memoised on it, because both are
-   * walked on every drag step and neither can change while the reader is dragging.
+   * walked on every drag step and neither can change while the reader is dragging. The
+   * live minute is then folded onto the right edge of each: `withLiveMinute` puts it one
+   * position past the store's last sealed bar, and `mergeStrikes` adds any strike the
+   * push lists that the stored day never did — returning the same array when there is
+   * none, so a second's tick does not rebuild every series on the chart.
    */
-  const timeline = useMemo(() => (smile ? buildTimeline(smile) : EMPTY_TIMELINE), [smile]);
-  const grid = useMemo(() => (smile ? strikeGrid(smile) : []), [smile]);
+  const storedTimeline = useMemo(() => (smile ? buildTimeline(smile) : EMPTY_TIMELINE), [smile]);
+  const timeline = useMemo(
+    () => withLiveMinute(storedTimeline, liveMinute),
+    [storedTimeline, liveMinute],
+  );
+
+  const storedGrid = useMemo(() => (smile ? strikeGrid(smile) : []), [smile]);
+  const grid = useMemo(
+    () => mergeStrikes(storedGrid, liveMinute?.points ?? []),
+    [storedGrid, liveMinute],
+  );
 
   const last = lastIndex(timeline);
   const askedIndex = wanted === null ? -1 : indexOfStamp(timeline, wanted);
@@ -187,10 +314,34 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
   const stamp = index >= 0 ? (timeline.stamps[index] ?? null) : null;
   const minute = index >= 0 ? (timeline.minutes[index] ?? null) : null;
 
+  /** Standing on the live position — the right edge, following the stream. */
+  const onLive = index >= 0 && index === timeline.liveIndex;
+
   const rows = useMemo(() => (minute ? toRows(minute, grid) : []), [minute, grid]);
   const solved = solvedPercents(rows);
   const hours = minute ? hoursToExpiry(minute) : null;
   const stamps = smile?.model_versions ?? [];
+
+  /**
+   * The overlays that are switched on, each resolved against the minute the scrubber is
+   * standing on — never against the wall clock. `lib/overlay.ts` carries the argument
+   * for both the offsets and the exact anchor. **No request is issued here or anywhere
+   * below it**: an overlay is a second index into the day the client already holds.
+   */
+  const resolved = useMemo(
+    () => OVERLAYS.filter((spec) => overlayOn[spec.id]).map((spec) => resolveOverlay(spec, stamp, timeline)),
+    [overlayOn, stamp, timeline],
+  );
+
+  const drawn: ChartOverlay[] = [];
+  const absent: typeof resolved = [];
+  for (const overlay of resolved) {
+    if (overlay.minute) drawn.push({ id: overlay.spec.id, label: overlay.spec.label, minute: overlay.minute });
+    else absent.push(overlay);
+  }
+
+  const toggleOverlay = (id: OverlayId) =>
+    setOverlayOn((current) => ({ ...current, [id]: !current[id] }));
 
   /**
    * The address bar follows the view; it never drives it after the first render.
@@ -221,8 +372,26 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
     setWanted(null);
   };
 
+  /**
+   * Where the scrubber puts the view, and the one place "following live" is spelled.
+   *
+   * **Standing on the right edge means following the right edge, not pinning the stamp
+   * that happens to be there.** The live minute rolls over once a minute; pinning its
+   * stamp would leave the reader looking at a curve that stopped updating the moment
+   * they stepped onto it, and the screen would be stuck on a stale minute in exactly the
+   * way the ticket forbids. `null` is already this component's spelling of "whatever the
+   * right edge is", so the edge case is the absence of a case.
+   *
+   * Every other position pins by stamp, which is what makes scrubbing back and then
+   * forward again land where it started even though the timeline grew underneath it.
+   */
   const pickIndex = (next: number) => {
-    setWanted(timeline.stamps[clampIndex(timeline, next)] ?? null);
+    const at = clampIndex(timeline, next);
+    if (at < 0 || at === lastIndex(timeline)) {
+      setWanted(null);
+      return;
+    }
+    setWanted(timeline.stamps[at] ?? null);
   };
 
   return (
@@ -303,8 +472,18 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
           </span>
         </div>
 
+        {/* Two chips, because this screen has two sources and they fail separately: the
+            stored day arrived over HTTP and does not change, the live edge arrives over
+            a socket and can stop without the figures on screen looking any different. */}
         <span className="chip" title={fallbackReason ?? `Read from ${ENGINE_URL}/smile.`}>
           {source === "fixture" ? "fixture" : "stored"}
+        </span>
+
+        <span
+          className="chip"
+          title={liveDetail ?? `Streaming from ${ENGINE_URL}/ws/chain, sampled at ${LIVE_REDRAW_MS} ms.`}
+        >
+          {LIVE_STATUS_LABEL[liveStatus]}
         </span>
 
         <ThemeToggle />
@@ -329,11 +508,26 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
 
         {error ? <p className="notice error">{error}</p> : null}
 
+        {liveStatus === "error" ? (
+          <p className="notice error">
+            {liveDetail ?? "The live stream reported an error."} The stored day below is
+            unaffected; only the right edge has stopped moving.
+          </p>
+        ) : null}
+
+        {liveStatus === "closed" ? (
+          <p className="notice warn">
+            Lost the connection to the engine at <code>{ENGINE_URL}</code>. Retrying — the
+            curve is the last minute that arrived and it is not moving.
+          </p>
+        ) : null}
+
         {source === "fixture" && !error ? (
           <p className="notice warn">
             Showing the committed smile fixture, not the store — a real capture of{" "}
             <strong>
-              {timeline.stamps.length} minute{timeline.stamps.length === 1 ? "" : "s"}
+              {storedTimeline.stamps.length} minute
+              {storedTimeline.stamps.length === 1 ? "" : "s"}
             </strong>
             , not a day.{" "}
             {fallbackReason ?? `Set NEXT_PUBLIC_USE_FIXTURE=0 and start the engine for stored data.`}
@@ -375,9 +569,32 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
           <TimeScrubber timeline={timeline} index={index} onChange={pickIndex} />
         ) : null}
 
-        {/* The axis control, on its own row above the plot rather than in the header:
-            it changes how the chart is drawn and nothing about what the figures say. */}
+        {/* The chart's own controls, on their own row above the plot rather than in the
+            header: they change how the chart is drawn and nothing about what the figures
+            say. The overlay buttons carry their own swatch, so the control *is* the key
+            — a legend under the plot would be the same information twice, in the place a
+            reader looks last. */}
         <div className="plot-controls">
+          <span className="stat-label">Compare</span>
+          <div className="overlay-toggle" role="group" aria-label="Comparison overlays">
+            {OVERLAYS.map((spec) => (
+              <button
+                key={spec.id}
+                type="button"
+                className="overlay-option"
+                data-overlay={spec.id}
+                aria-pressed={overlayOn[spec.id]}
+                title={spec.title}
+                onClick={() => toggleOverlay(spec.id)}
+              >
+                <span className="overlay-swatch" aria-hidden="true" />
+                {spec.label}
+              </button>
+            ))}
+          </div>
+
+          <span className="plot-controls-gap" />
+
           <span className="stat-label">Vol axis</span>
           <div className="scale-toggle" role="group" aria-label="Volatility axis scale">
             {(["linear", "log"] as const).map((option) => (
@@ -394,6 +611,20 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
           </div>
         </div>
 
+        {/* An overlay that is on and has nothing to draw. Said in words, at the size of
+            every other admission on this screen, because a series that renders as
+            nothing and a series that renders as zero are the same picture and only one
+            of them is true. */}
+        {absent.map((overlay) => (
+          <p key={overlay.spec.id} className="notice warn">
+            <span className="overlay-swatch" data-overlay={overlay.spec.id} aria-hidden="true" />{" "}
+            <strong>{overlay.spec.label} has nothing to draw.</strong> {overlay.absence} No
+            line is drawn for it and none is implied: a flat line would claim the
+            volatility was zero at that minute, and an overlay that quietly rendered as
+            nothing would be indistinguishable from one that had.
+          </p>
+        ))}
+
         {renderPlot()}
 
         <p className="note">
@@ -408,8 +639,18 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
           offset from the forward, which is why their ticks are evenly spaced; the strike
           axis is the whole day&rsquo;s board, so it holds still while the scrubber moves.
           Hover any point for the strike, the volatility, its offset from the forward, the
-          out-of-the-money leg it was solved on, and the solver&rsquo;s reason when there is
-          no number.
+          out-of-the-money leg it was solved on, the solver&rsquo;s reason when there is no
+          number, and the same strike on any overlay that is switched on.{" "}
+          <strong>
+            The right edge is live and redraws about once a second
+          </strong>{" "}
+          — the same push the chain screen&rsquo;s ladder renders, sampled down because a
+          shape has to hold still to be read while a ladder does not. Everything left of
+          it is a sealed minute out of the store. The overlays are the same expiry an hour
+          and a day earlier, anchored to the minute the scrubber is on rather than to the
+          clock, drawn from minutes already in this response &mdash; switching one on asks
+          the engine for nothing. An anchor the store holds no bar for draws no line and
+          says so above.
         </p>
       </main>
     </div>
@@ -431,13 +672,13 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
   function renderPlot() {
     if (error) return null;
 
-    if (!smile || timeline.stamps.length === 0) {
+    if (timeline.stamps.length === 0) {
       return (
         <section className="plot-empty" aria-label="Smile plot">
           <p>
             {busy || !smile
               ? "Reading the store…"
-              : `No stored minutes for ${underlying} ${expiry}.`}
+              : `No stored minutes for ${underlying} ${expiry}, and nothing on the stream yet.`}
             {smile && timeline.stamps.length === 0 ? (
               <>
                 <br />
@@ -511,6 +752,7 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
           scale={scale}
           underlying={underlying}
           expiry={expiry}
+          overlays={drawn}
         />
       </>
     );

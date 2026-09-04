@@ -60,6 +60,16 @@ export interface Timeline {
    * simply no empty positions to land on, and nothing to mark. See `MAX_POSITIONS`.
    */
   gridded: boolean;
+  /**
+   * The position carrying the live minute, or `-1` when the stream has sent nothing.
+   *
+   * **It is always the last position when it exists**, which `withLiveMinute` enforces —
+   * the live minute is the right edge by definition, and a "live" position sitting
+   * anywhere else would mean the store had sealed a minute ahead of the stream. That
+   * invariant is what lets the screen spell "follow the live curve" as "stand on the
+   * right edge" rather than as a second piece of state that can disagree with the first.
+   */
+  liveIndex: number;
 }
 
 export const EMPTY_TIMELINE: Timeline = {
@@ -69,6 +79,7 @@ export const EMPTY_TIMELINE: Timeline = {
   storedCount: 0,
   emptyCount: 0,
   gridded: true,
+  liveIndex: -1,
 };
 
 /** `2026-09-04T11:50:00Z` — the only spelling the store, the contract and the URL use. */
@@ -89,6 +100,49 @@ function stampOf(ms: number): string {
   );
 }
 
+/** The minute an instant belongs to, in the store's spelling. `null` if unparseable. */
+export function minuteOfInstant(iso: string): string | null {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return null;
+  return stampOf(Math.floor(ms / MINUTE_MS) * MINUTE_MS);
+}
+
+/**
+ * A stamp moved by whole minutes, in the same spelling. `null` if unparseable.
+ *
+ * This is what anchors a comparison overlay: `−1h` is the scrubber's own minute minus
+ * sixty, not the wall clock minus sixty. Arithmetic on the stamp rather than on a
+ * `Date` in the reader's zone, because a UTC minute has no daylight saving in it and a
+ * local one does.
+ */
+export function shiftStamp(stamp: string, minutes: number): string | null {
+  const ms = Date.parse(stamp);
+  if (!Number.isFinite(ms)) return null;
+  return stampOf(ms + minutes * MINUTE_MS);
+}
+
+/** The empty runs and the two counts, read off a positions array. */
+function scan(minutes: readonly (SmileMinute | null)[]): {
+  gaps: Gap[];
+  storedCount: number;
+  emptyCount: number;
+} {
+  const gaps: Gap[] = [];
+  let storedCount = 0;
+  let run = 0;
+  for (let i = 0; i < minutes.length; i++) {
+    if (minutes[i]) {
+      storedCount++;
+      if (run > 0) gaps.push({ start: i - run, length: run });
+      run = 0;
+    } else {
+      run++;
+    }
+  }
+  if (run > 0) gaps.push({ start: minutes.length - run, length: run });
+  return { gaps, storedCount, emptyCount: minutes.length - storedCount };
+}
+
 function ungridded(minutes: readonly SmileMinute[]): Timeline {
   return {
     stamps: minutes.map((m) => m.minute),
@@ -97,6 +151,7 @@ function ungridded(minutes: readonly SmileMinute[]): Timeline {
     storedCount: minutes.length,
     emptyCount: 0,
     gridded: false,
+    liveIndex: -1,
   };
 }
 
@@ -130,38 +185,103 @@ export function buildTimeline(response: SmileResponse): Timeline {
 
   const stamps: string[] = [];
   const minutes: (SmileMinute | null)[] = [];
-  const gaps: Gap[] = [];
-  let storedCount = 0;
-  let run = 0;
 
   for (let i = 0; i < span; i++) {
     const stamp = stampOf(startMs + i * MINUTE_MS);
-    const minute = byStamp.get(stamp) ?? null;
     stamps.push(stamp);
-    minutes.push(minute);
-    if (minute) {
-      storedCount++;
-      if (run > 0) gaps.push({ start: i - run, length: run });
-      run = 0;
-    } else {
-      run++;
-    }
+    minutes.push(byStamp.get(stamp) ?? null);
   }
-  if (run > 0) gaps.push({ start: span - run, length: run });
+
+  const counted = scan(minutes);
 
   // A stored minute the grid could not place would be a contract violation — the stamps
   // are minute-aligned and inside the span by construction. If one ever is, the grid is
   // abandoned rather than shipped with a minute the reader cannot reach.
-  if (storedCount !== stored.length) return ungridded(stored);
+  if (counted.storedCount !== stored.length) return ungridded(stored);
 
-  return {
-    stamps,
-    minutes,
-    gaps,
-    storedCount,
-    emptyCount: span - storedCount,
-    gridded: true,
-  };
+  return { stamps, minutes, ...counted, gridded: true, liveIndex: -1 };
+}
+
+/**
+ * The stored day with the live minute standing one position past its right edge.
+ *
+ * **The live minute is not a stored minute and this is where the difference is kept.**
+ * `docs/smile-contract.md` deliberately withholds the open minute — "a bar that has not
+ * sealed is not yet a bar" — so the store's right edge always trails the stream. This
+ * puts the stream's minute immediately after it, as one more position.
+ *
+ * **The minutes in between are not laid out as empty positions, and that is the decision
+ * in this function.** Everywhere else, a `null` position means "the store wrote no bar
+ * at this minute", and the scrubber marks it as a hole. The minutes between the last
+ * sealed bar and the live push are not that: they are minutes this screen has *not
+ * asked about*. The day was read once, in one request, and the response is as of the
+ * moment it was read. Filling that stretch with nulls would let the screen claim an
+ * outage the store does not have, and the claim would grow by a minute a minute while a
+ * session stayed open. The step from the last stored minute to the live one is therefore
+ * one position wide however long it is; both ends name their own minute on the clock and
+ * in the header, so nothing on screen misstates the time.
+ *
+ * Three placements, and the third is a contradiction rather than a shape:
+ *
+ *   - Past the stored edge: appended, and it is the last position.
+ *   - Equal to the last stored stamp: the store sealed the minute the stream is still
+ *     inside. The live snapshot replaces the sealed bar — both describe that minute and
+ *     the live one is the later observation of it.
+ *   - **Before** the stored edge: the store would be ahead of the stream, which cannot
+ *     happen while both read the same feed. The timeline is returned untouched rather
+ *     than growing a position out of order, and the screen has no live curve until the
+ *     stream catches up.
+ *
+ * Returns the timeline unchanged, by reference, whenever there is nothing to add — so a
+ * memo keyed on it does not recompute the whole day sixty times a minute.
+ */
+export function withLiveMinute(timeline: Timeline, live: SmileMinute | null): Timeline {
+  if (!live) return timeline;
+
+  const liveMs = Date.parse(live.minute);
+  if (!Number.isFinite(liveMs)) return timeline;
+
+  if (timeline.stamps.length === 0) {
+    return {
+      stamps: [live.minute],
+      minutes: [live],
+      gaps: [],
+      storedCount: 1,
+      emptyCount: 0,
+      gridded: timeline.gridded,
+      liveIndex: 0,
+    };
+  }
+
+  const lastStamp = timeline.stamps[timeline.stamps.length - 1];
+  if (lastStamp === undefined) return timeline;
+  const lastMs = Date.parse(lastStamp);
+  if (!Number.isFinite(lastMs) || liveMs < lastMs) return timeline;
+
+  const minutes = [...timeline.minutes];
+  const stamps = [...timeline.stamps];
+  if (liveMs === lastMs) {
+    minutes[minutes.length - 1] = live;
+  } else {
+    stamps.push(live.minute);
+    minutes.push(live);
+  }
+
+  return { ...timeline, stamps, minutes, ...scan(minutes), liveIndex: minutes.length - 1 };
+}
+
+/**
+ * The last minute the store answered for, which is not the same as the last position
+ * once the live minute is standing past it.
+ *
+ * An overlay anchor beyond this stamp is not a hole in the store — it is a minute this
+ * screen's one request predates. `lib/overlay.ts` uses it to tell those two apart.
+ */
+export function storedThrough(timeline: Timeline): string | null {
+  for (let i = timeline.stamps.length - 1; i >= 0; i--) {
+    if (i !== timeline.liveIndex && timeline.minutes[i]) return timeline.stamps[i] ?? null;
+  }
+  return null;
 }
 
 /** The position of a UTC stamp, or `-1` when this timeline does not contain it. */

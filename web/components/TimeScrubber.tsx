@@ -67,6 +67,29 @@ export default function TimeScrubber({
   const stamp = timeline.stamps[index] ?? "";
   const stored = timeline.minutes[index] != null;
 
+  /**
+   * The right edge, when the stream is filling it.
+   *
+   * `withLiveMinute` guarantees the live position is the last one, so "live" and "the
+   * end of the track" are the same place — which is what lets the End key, the last
+   * click on the track and the `›` button all mean "follow the market" without any of
+   * them knowing that they do.
+   */
+  const liveAt = timeline.liveIndex;
+  const onLive = liveAt >= 0 && index === liveAt;
+
+  /**
+   * How many of these positions the **store** wrote, which is not how many carry a
+   * minute: the live one carries a minute nobody has sealed. `timeline.storedCount`
+   * counts positions with data — the gap marks need that — so the live one is taken
+   * back out here rather than being reported as a bar the store holds.
+   *
+   * The subtraction assumes the live position was added rather than laid over an
+   * already-sealed minute. That is the store's own design: `docs/smile-contract.md`
+   * withholds the open minute, so it cannot have sealed the one the stream is inside.
+   */
+  const storedBars = timeline.storedCount - (liveAt >= 0 ? 1 : 0);
+
   // Only one position: the control is real but there is nowhere to go, and it says so
   // rather than pretending to be draggable. This is the committed-fixture case.
   const frozen = last <= 0;
@@ -126,7 +149,9 @@ export default function TimeScrubber({
             aria-label="Minute"
             aria-valuetext={
               stamp
-                ? `${formatLocalClock(stamp)} ${zone} — ${stored ? "stored" : "no stored minute"} — ${stamp}`
+                ? `${formatLocalClock(stamp)} ${zone} — ${
+                    onLive ? "live" : stored ? "stored" : "no stored minute"
+                  } — ${stamp}`
                 : undefined
             }
           />
@@ -146,7 +171,10 @@ export default function TimeScrubber({
             short name is never the only thing on offer. */}
         <span className="scrub-clock" title={`${stamp} · ${localZoneName()}`}>
           <span className="scrub-time">{stamp ? formatLocalClock(stamp) : "—"}</span>
-          <span className="scrub-zone">{zone}</span>
+          {/* Which of the two sources the curve on screen came from. A sealed bar and a
+              live push are the same picture, and the difference is the whole reason the
+              right edge exists. */}
+          <span className="scrub-zone">{onLive ? "LIVE" : zone}</span>
         </span>
       </div>
 
@@ -162,13 +190,14 @@ export default function TimeScrubber({
           ) : timeline.gridded ? (
             <>
               {" · "}
-              {timeline.storedCount} stored
+              {storedBars} stored
               {timeline.emptyCount > 0 ? (
                 <>
                   {" · "}
                   <span className="scrub-count-missing">{timeline.emptyCount} missing</span>
                 </>
               ) : null}
+              {liveAt >= 0 ? <> · 1 live</> : null}
             </>
           ) : (
             // Past `MAX_POSITIONS` the positions are the stored minutes alone, so there
@@ -177,8 +206,15 @@ export default function TimeScrubber({
             <> · stored minutes only — span too wide to mark the gaps</>
           )}
         </span>
-        <span>
-          {timeline.stamps[last] ? formatLocalStamp(timeline.stamps[last]) : ""}
+        {/* The right end of the track names itself as live rather than as a time: the
+            time it would print is the minute the stream is inside, which is already on
+            the clock above and will be a different minute by the time it is read. */}
+        <span className={liveAt === last && last >= 0 ? "scrub-live-end" : undefined}>
+          {liveAt === last && last >= 0
+            ? "LIVE"
+            : timeline.stamps[last]
+              ? formatLocalStamp(timeline.stamps[last])
+              : ""}
         </span>
       </div>
     </section>

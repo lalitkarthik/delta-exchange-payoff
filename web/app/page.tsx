@@ -6,25 +6,12 @@ import { ChainLadder } from "@/components/ChainLadder";
 import ThemeToggle from "@/components/ThemeToggle";
 import { UNDERLYINGS, type ChainResponse, type Underlying } from "@/lib/contract";
 import { ENGINE_URL, loadExpiries } from "@/lib/engine";
-import { subscribeChain, type LiveStatus } from "@/lib/live";
+import { LIVE_STATUS_LABEL, subscribeChain, type LiveStatus } from "@/lib/live";
 import { formatFetchedAt, formatFetchedClock, formatSpot } from "@/lib/format";
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
-
-/**
- * What the chip says. `waiting` is distinct from `live` on purpose: an empty ladder and
- * a ladder that has not arrived look identical, and only one of them means Delta lists
- * nothing.
- */
-const STATUS_LABEL: Record<LiveStatus, string> = {
-  connecting: "connecting…",
-  live: "live",
-  waiting: "waiting for quotes…",
-  closed: "reconnecting…",
-  error: "error",
-};
 
 /**
  * One header row of figures, then the ladder, in the sibling chain screen's shell.
@@ -190,7 +177,7 @@ export default function Page() {
             and the only difference is whether they are still moving — so the state of
             the connection is named every time rather than only when it is bad. */}
         <span className="chip" title={statusDetail ?? `Streaming from ${ENGINE_URL}.`}>
-          {STATUS_LABEL[status]}
+          {LIVE_STATUS_LABEL[status]}
         </span>
 
         {/* Last, and pushed right by `margin-left: auto`: it changes how the figures look
