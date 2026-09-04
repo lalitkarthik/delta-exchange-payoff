@@ -10,6 +10,7 @@ right, implied vol and Greeks straight off the venue. No calculation of our own 
 | | |
 |---|---|
 | The engine/web interface | [`docs/chain-contract.md`](./docs/chain-contract.md) |
+| The stored volatility surface | [`docs/smile-contract.md`](./docs/smile-contract.md) |
 | What the API actually gives you | `docs/delta-api-scope.md` *(in progress)* |
 
 State lives in the issues, not in files. If an issue and a file disagree, the issue wins.

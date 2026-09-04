@@ -3,6 +3,10 @@
 The interface between the engine and the web app. Both are built against this file, so it is
 fixed before either exists. Change it by changing this file first.
 
+> `/smile` — the stored volatility surface the smile screen reads — has its own file:
+> [smile-contract.md](smile-contract.md). This one covers `/expiries`, `/chain` and
+> `/ws/chain`, which all serve Delta **now**; that one serves what was already stored.
+
 Delta has **no option-chain endpoint**. A chain is `GET /v2/tickers` filtered by underlying and
 expiry, with the rows pivoted so a call and a put sharing a strike land on one line. The engine
 does that pivot. The web app does no arithmetic at all.

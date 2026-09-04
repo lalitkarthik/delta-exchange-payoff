@@ -25,8 +25,14 @@
  * The `satisfies` below is the point of this file: if the JSON ever drifts from the
  * contract types, `tsc --noEmit` fails here rather than the page failing in a browser.
  */
-import type { ChainResponse, ExpiriesResponse, Underlying } from "./contract";
+import type {
+  ChainResponse,
+  ExpiriesResponse,
+  SmileResponse,
+  Underlying,
+} from "./contract";
 import chain from "./fixture.chain.json";
+import smile from "./fixture.smile.json";
 
 /**
  * TypeScript widens a string literal in an imported JSON module to `string`, so
@@ -83,5 +89,54 @@ export function fixtureChain(underlying: Underlying, expiry: string): ChainRespo
   throw new Error(
     `No fixture for ${underlying} ${expiry}. The committed fixture covers ` +
       `${FIXTURE_CHAIN.underlying} ${FIXTURE_CHAIN.expiry} only — start the engine for the rest.`,
+  );
+}
+
+/**
+ * The smile fixture, `fixture.smile.json`, shaped to `docs/smile-contract.md`.
+ *
+ * **Built from the chain fixture beside it, not invented.** Every volatility here is the
+ * one the engine actually solved for BTC 04-09-2026 at 2026-09-03T10:28:30Z — the same
+ * capture `fixture.chain.json` holds — read off its `computed` blocks and de-duplicated
+ * to one point per strike. The curve is therefore a real one: 20 strikes from 76000 to
+ * 79200 around a fitted forward of 77646.88, and `iv_leg` genuinely flips from `put` to
+ * `call` as the strikes cross it. That flip is the thing a made-up fixture would get
+ * wrong and the thing the hover exists to explain.
+ *
+ * Two deliberate departures from the capture, both of them the chain fixture's own
+ * house rule — construct the edge case the capture did not contain, and say so:
+ *
+ *   - **Strike 79400 carries a null `iv`** and the reason `"no two-sided quote"`. The
+ *     capture solved every listed strike, but 1.2% of the real store does not, and the
+ *     screen has to break the line there rather than join 79200 to nothing. Without it
+ *     the null path would ship untested — and there is no test runner here to catch it.
+ *   - **`iv_reason` is `null` where the chain fixture spells it `""`.** That is the
+ *     store's spelling and the contract's, not a slip.
+ *
+ * **One minute, because one chain was captured.** Forward-filling it into a day of
+ * identical curves would be fabrication of exactly the kind `docs/storage-start-here.md`
+ * refuses, and a scrubber dragging across twenty copies of one shape would teach its
+ * reader something false. In fixture mode the scrubber therefore has one position; the
+ * rest of the day needs a real capture from a running engine.
+ */
+const rawSmile = smile satisfies Omit<SmileResponse, "underlying"> & { underlying: string };
+
+export const FIXTURE_SMILE: SmileResponse = {
+  ...rawSmile,
+  underlying: narrowUnderlying(rawSmile.underlying),
+};
+
+/**
+ * Only BTC / 04-09-2026 was captured, as with the chain. Every other pair reports an
+ * honest gap rather than a plausible invention — and gives the screen's error path
+ * something real to render without an engine.
+ */
+export function fixtureSmile(underlying: Underlying, expiry: string): SmileResponse {
+  if (underlying === FIXTURE_SMILE.underlying && expiry === FIXTURE_SMILE.expiry) {
+    return FIXTURE_SMILE;
+  }
+  throw new Error(
+    `No smile fixture for ${underlying} ${expiry}. The committed fixture covers ` +
+      `${FIXTURE_SMILE.underlying} ${FIXTURE_SMILE.expiry} only — start the engine for the rest.`,
   );
 }

@@ -1558,6 +1558,52 @@ def computed_bar(
     )
 
 
+def test_the_unflushed_buffer_reads_back_with_the_same_schema_as_the_disk(
+    tmp_path: Path,
+) -> None:
+    """`pending()` is `scan()`'s twin for the rows that are not on disk yet.
+
+    The two are concatenated by `smile.read_smile`, so a column present on one and absent
+    from the other — or typed differently — would break the union rather than degrade it.
+    The partition columns are the risk: `_frame` deliberately omits them because on disk
+    they are directory names, so `pending` has to rebuild them from the bars.
+    """
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add([computed_bar(minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc))])
+
+    pending = store.pending().collect()
+
+    assert pending.height == 1
+    assert pending.collect_schema() == store.scan().collect_schema()
+    assert pending.row(0, named=True)["date"] == date(2026, 9, 4)
+    assert pending.row(0, named=True)["underlying"] == "BTC"
+    assert store.scan().collect().height == 0, "nothing has been written"
+
+
+def test_a_flush_empties_what_pending_reports(tmp_path: Path) -> None:
+    """The two halves of the union must never both hold a row: a bar is buffered or it is
+    filed, and one counted twice would draw a strike twice on the curve."""
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add([computed_bar()])
+    assert store.pending().collect().height == 1
+
+    store.flush()
+
+    assert store.pending().collect().height == 0
+    assert store.scan().collect().height == 1
+
+
+def test_an_empty_buffer_still_reports_the_full_schema(tmp_path: Path) -> None:
+    """An empty frame with the real schema, not a frame with no columns. The union is
+    built before anything is known about whether either side holds rows."""
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+
+    empty = store.pending().collect()
+
+    assert empty.height == 0
+    assert set(empty.collect_schema()) == set(COMPUTED_SCHEMA) | {"date", "underlying"}
+
+
 def test_a_computed_bar_round_trips_through_parquet_with_its_values_and_its_types(
     tmp_path: Path,
 ) -> None:

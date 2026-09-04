@@ -1,8 +1,8 @@
 /**
  * Types for the engine's HTTP interface.
  *
- * These mirror `docs/chain-contract.md` field for field. That file is the authority;
- * if this file and the contract disagree, this file is wrong.
+ * These mirror `docs/chain-contract.md` and `docs/smile-contract.md` field for field.
+ * Those files are the authority; if this file and a contract disagree, this file is wrong.
  *
  * Two rules from the contract are load-bearing for every type here:
  *
@@ -132,6 +132,82 @@ export interface ChainResponse {
   years_to_expiry: number | null;
   /** Which method produced the forward. `"F1"` is the parity regression. */
   forward_method: string | null;
+}
+
+/**
+ * One strike's implied volatility at one minute. `docs/smile-contract.md`.
+ *
+ * **One point per strike, not per leg.** The store's grain is the contract, so a paired
+ * strike holds two rows carrying the same number; put-call parity gives the strike one
+ * volatility and the engine solves it on whichever side is out of the money. `iv_leg`
+ * names that side, which is why the pair is not two independent solves — and why the
+ * hover has to show it: the leg flips from put to call across the forward, and a reader
+ * who does not know that reads the change in the curve's character as a break in the
+ * arithmetic.
+ *
+ * **An unsolved strike arrives as a point with a null `iv`, never as a missing point.**
+ * The line breaks there and is never drawn across it. Dropping the point would join two
+ * neighbours through a gap and let a reader take a number off a segment that describes
+ * nothing.
+ *
+ * No Greeks. They are stored beside these rows and deliberately not served.
+ */
+export interface SmilePoint {
+  strike: number;
+  /** Decimal fraction. 0.3189 is 31.89%. `null` when the strike could not be solved. */
+  iv: number | null;
+  /** `"call"` or `"put"`. `null` exactly when `iv` is. */
+  iv_leg: string | null;
+  /** `null` when solved — not `""`. `/chain`'s `ComputedLeg.iv_reason` spells it the
+   * other way, and the two are deliberately not unified: this one is the store's. */
+  iv_reason: string | null;
+}
+
+/**
+ * One sealed minute of one expiry: the chain-level numbers, then the curve.
+ *
+ * `forward` is what the offset axis and the reference line are both read off, so it
+ * arrives per minute rather than being inferred from spot — measured, spot-as-forward
+ * disagrees with the fitted forward by up to 1.626 vol points.
+ */
+export interface SmileMinute {
+  /** ISO 8601 UTC, second precision — `"2026-09-04T09:00:00Z"`. Never a local time. */
+  minute: string;
+  /** The forward this minute's volatilities were solved against. */
+  forward: number | null;
+  discount: number | null;
+  /** ACT/365. The clock this minute's volatility is quoted on. */
+  years_to_expiry: number | null;
+  /** `"F1"`, `"F1+assumed-rate"` or `"F2"`. See `docs/chain-contract.md`. */
+  forward_method: string | null;
+  /** The stamp on this minute's rows, read from the data rather than hardcoded. */
+  model_version: string | null;
+  /** Ascending by strike. */
+  points: SmilePoint[];
+}
+
+/**
+ * `GET /smile?underlying=BTC&expiry=04-09-2026` — the whole stored day for one expiry.
+ *
+ * One request, not one per minute: measured, the entire store for one expiry reads in
+ * 6.8 ms against 4.5 ms for a single minute, so scrubbing is an index into `minutes` and
+ * an overlay is a second index into the same array. Nothing here is fetched again while
+ * the scrubber moves.
+ *
+ * `model_versions` is a **list** because the model can change mid-day. A response
+ * spanning two stamps reports both, and the header says so rather than putting two
+ * differently computed curves on one axis in silence.
+ *
+ * An empty `minutes` is a 200, not an error: an underlying nobody has collected yet and
+ * a day nobody has lived through are both "nothing yet".
+ */
+export interface SmileResponse {
+  underlying: Underlying;
+  expiry: ExpiryDate;
+  /** Every distinct stamp in this response, ascending. Empty when there are no rows. */
+  model_versions: string[];
+  /** Ascending by minute. */
+  minutes: SmileMinute[];
 }
 
 /** FastAPI's default error shape. */

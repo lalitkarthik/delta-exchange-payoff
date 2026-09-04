@@ -517,6 +517,45 @@ class BarStore:
             hive_schema=HIVE_SCHEMA,
         )
 
+    def pending(self) -> pl.LazyFrame:
+        """The **unflushed** buffer, shaped exactly like `scan()`. Never touches a file.
+
+        `scan()` is the disk and only the disk, so any reader that wants everything this
+        store holds has to ask for both. That is not a convenience: the flush interval is
+        five minutes, so at any instant up to five minutes of sealed bars exist only here,
+        and a reader that skipped them would report a right edge behind the live data with
+        nothing to signal it. `/smile` is the first such reader — see `smile.read_smile`.
+
+        The partition columns are rebuilt from the bars, because `_frame` deliberately
+        omits them: on disk they are the directory names, and here they have to be
+        materialised so the two halves of a union have one schema. They are derived from
+        the same two attributes `flush` files a bar under, so the buffered row lands in
+        the partition it will land in.
+
+        **The copy is the concurrency story.** `BarWriter` flushes from a worker thread
+        while this may be called from the event loop, and `list()` over a list is a single
+        C-level copy — so a caller sees the buffer as it was, never a half-flushed one.
+        `flush` empties by rebinding, so a flush that lands mid-read costs this reader
+        nothing: those rows are on disk by then and the next read finds them there.
+        """
+        buffered = list(self._buffer)
+        if not buffered:
+            return pl.LazyFrame(schema={**self.schema, **HIVE_SCHEMA})
+        return (
+            self._frame(buffered)
+            .with_columns(
+                pl.Series(
+                    "date", [bar.minute.date() for bar in buffered], dtype=pl.Date
+                ),
+                pl.Series(
+                    "underlying",
+                    [bar.underlying for bar in buffered],
+                    dtype=pl.Categorical,
+                ),
+            )
+            .lazy()
+        )
+
     # -- compaction --------------------------------------------------------------------
 
     def partitions(self) -> list[tuple[str, str]]:

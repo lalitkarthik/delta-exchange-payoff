@@ -20,6 +20,7 @@ what is deliberately unbuilt, and what the repo currently gets wrong.
 | [`docs/implied-vol.md`](./implied-vol.md) | Two models, four solvers, the agreement matrix |
 | [`docs/ingestion.md`](./ingestion.md) | One socket, the fan-out, what it costs |
 | [`docs/chain-contract.md`](./chain-contract.md) | The engine ↔ web interface |
+| [`docs/smile-contract.md`](./smile-contract.md) | `/smile` — a day of stored IV per expiry, disk **and** buffer |
 
 Then read `git log`. Twenty-one commits, each message written to explain a decision rather
 than to label a diff. They are worth more than a summary of them.
