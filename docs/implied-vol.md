@@ -11,7 +11,9 @@ over twenty combinations. So M1-versus-M2 is the forward axis wearing different 
 already has a name in #2 — it is F3.
 
 Companion to `docs/forward.md`, which recovers the forwards, and `docs/settlement.md`, which
-establishes that no correction term is needed anywhere in either.
+establishes that no correction term is needed anywhere in either. `docs/greeks.md` carries the
+same four forwards one step further, into the five Greeks, and §2.1 below is the one result
+from it that belongs here.
 
 ## How to read this
 
@@ -82,6 +84,37 @@ a future chain misbehaves, and 2 ms is a cheap insurance premium.
 
 **Note F1 vs F2 fails here and passed on the single 3.8-day chain** (`docs/forward.md`: median
 0.0131, p95 0.0366). The extra expiries are what changed, and §3 says why.
+
+### 2.1 The forward axis is the forward, not the discount
+
+Every pair above varies a forward **and** a discount together, so the table cannot say which of
+the two it is measuring. **Measured** by `tools/measure_greeks.py` on the 04-09-2026 chain, by
+re-solving each method against the reference's `D` and leaving only its `F` to differ:
+
+| method | end-to-end `(F, D)` | forward-only `(F, D_ref)` | the discount's share |
+|---|---|---|---|
+| F2 | 0.0366 | 0.0334 | 9% |
+| F3 | 0.4216 | 0.4230 | ~0% |
+| F4 | 0.3114 | 0.3078 | 1% |
+
+*p95 `dIV` in vol points against F1 all pairs, 63 strikes.*
+
+**Holding the discount fixed changes the disagreement by at most 9%.** So the forward axis is
+named correctly: what it measures is the forward, and the discount rides along contributing
+almost nothing. That is worth stating because the discount is the fragile half — `docs/forward.md`
+§4.1 measured the forward spanning $1.23 across window choices while the implied rate spanned
+-17.1% to +9.4% — and it would have been reasonable to assume the fragile half dominated here.
+It does not.
+
+**This corrects one sentence in §3.** That section says of F1 and F2 that *"the only thing they
+differ on is how `D` is obtained"*. True of the two methods, but not of the gap between their
+volatilities: on the 3.8-day chain F1 and F2 also differ by **$2.40** of forward, and that
+$2.40 is what 91% of the `dIV` above is made of. The discount is the smaller term on this axis.
+
+**Implied volatility is the exception rather than the rule.** Carried into the Greeks, the split
+inverts: `docs/greeks.md` §5 measures theta as almost entirely discount-driven, with the same
+substitution cutting its median error by 53x. Volatility, delta and gamma follow the forward;
+theta follows the discount.
 
 ---
 
