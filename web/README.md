@@ -1,6 +1,13 @@
 # web
 
-Next.js App Router front end for the option chain. One page, one ladder.
+Next.js App Router front end for the option chain. Two screens, listed by a rail down
+the left edge: the chain ladder at `/`, and the volatility screen at `/volatility`.
+
+The volatility screen is a **shell**. It has a title, a tab strip whose second tab is
+present and disabled, and an empty plot region; it holds no series and draws no chart.
+It exists so that the change which draws the smile is about drawing a smile and not
+about routing as well. `lib/screens.ts` is the one list of screens the rail renders —
+adding a screen is an entry there and a directory under `app/`.
 
 It renders `GET /chain` from the engine and **does no arithmetic**. The only number it
 touches is IV, which it multiplies by 100 to display as a percentage — the contract
@@ -140,15 +147,18 @@ OI  Δ  IV  Bid  Ask  |  STRIKE  |  Ask  Bid  IV  Δ  OI
 ## Files
 
 ```
-app/page.tsx             the page: header figures, pickers, load and refresh
-app/layout.tsx           document shell, and the anti-flash theme script
+app/page.tsx             the chain screen: header figures, pickers, the live ladder
+app/volatility/page.tsx  the volatility screen, as a shell: title, tabs, empty plot
+app/layout.tsx           document shell, the rail, and the anti-flash theme script
 app/globals.css          all styling, plain CSS, no framework — ported from the sibling
 components/ChainLadder.tsx   the ladder table
 components/ThemeToggle.tsx   Auto / Light / Dark, ported from the sibling
+components/ScreenRail.tsx    the rail, and which screen is current
 lib/contract.ts          types mirroring docs/chain-contract.md
 lib/engine.ts            the only place that talks to the engine
 lib/format.ts            the only place a number becomes text
 lib/theme.ts             what a stored theme means; pure, no DOM
+lib/screens.ts           which screens exist, and which one a path is on; pure
 lib/fixture.ts           fixture loading, and what it covers
 lib/fixture.chain.json   one committed /chain response
 ```

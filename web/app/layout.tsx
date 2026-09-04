@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 
+import ScreenRail from "@/components/ScreenRail";
 import "./globals.css";
 import { THEME_KEY } from "@/lib/theme";
 
@@ -31,7 +32,19 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <head>
         <script dangerouslySetInnerHTML={{ __html: NO_FLASH }} />
       </head>
-      <body>{children}</body>
+      <body>
+        {/*
+          The rail lives here rather than in a page, so it is rendered once and outlives
+          every navigation. A page owning its own copy would mean the chain's rail and
+          the volatility screen's rail were two components that had to be kept looking
+          alike, and it would tear the chain's live subscription down and rebuild it on
+          a click that landed back on the chain.
+        */}
+        <div className="app">
+          <ScreenRail />
+          {children}
+        </div>
+      </body>
     </html>
   );
 }

@@ -475,3 +475,172 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
 /* Nothing animates, so there is no motion to reduce. The former rule removed the fill
    under `prefers-reduced-motion` and left the glyph; the glyph is all there is now, and
    a static coloured character is not motion. */
+
+/* --------------------------------------------------------- screens: the rail
+ *
+ * The app is more than one screen, so it has a rail down the left edge listing them.
+ * It sits in the root layout beside the page, which is why `.app` is a flex row a
+ * viewport tall: the rail is the fixed column and the screen takes the rest. `.shell`
+ * still declares its own `height: 100vh` and is unchanged - inside a container that is
+ * itself exactly that tall, it resolves to the same box it always did.
+ *
+ * `min-width: 0` on the screen is the same rule the ladder already relies on vertically:
+ * a flex item's `min-width: auto` is the width of its widest content, so without it the
+ * nineteen-column table would push the rail off the left of the viewport instead of
+ * scrolling inside its own pane.
+ *
+ * **Every pair below was measured on the rendered element against its resolved
+ * background, in both variants**, which is the only measurement that catches a hover
+ * state swapping the ground out from under the text. Two candidates were discarded on
+ * those numbers: `--ink-faint` on `--row-hover` is 3.58:1 dark and 4.08:1 light, and
+ * `--ink-soft` on the same ground is 4.18:1 dark - so a rail entry that only brightened
+ * its background on hover would have been *less* readable hovered than at rest. The
+ * whole entry brightens to `--ink` instead.
+ */
+
+.app { display: flex; height: 100vh; }
+.app > .shell { flex: 1; min-width: 0; }
+
+.rail {
+  flex: none;
+  width: 68px;
+  display: flex;
+  flex-direction: column;
+  padding-top: 6px;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+}
+
+/* The whole entry is the target, not the three letters: a 68px-wide strip where only
+   the glyphs are clickable is a strip that gets clicked and does nothing. */
+.rail-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 9px 4px;
+  text-decoration: none;
+  color: var(--ink-soft);          /* 5.37:1 dark, 5.97:1 light, on --surface */
+}
+
+.rail-code { font-size: 12px; font-weight: 700; letter-spacing: 0.14em; }
+.rail-name {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);         /* 4.61:1 dark, 5.08:1 light, on --surface */
+}
+
+/* Hover brightens the text as well as the ground. See the note above: keeping the two
+   greys over `--row-hover` would have put 3.58:1 on screen. `--ink` there is 9.58:1
+   dark and 12.95:1 light.
+   Excluded on the current screen deliberately - the amber wash has to survive being
+   hovered, and the cheapest way to guarantee that is to not swap it. */
+.rail-item:hover:not([aria-current="page"]) { background: var(--row-hover); color: var(--ink); }
+.rail-item:hover:not([aria-current="page"]) .rail-name { color: var(--ink); }
+
+.rail-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* The current screen, marked the way the money row is: an amber bar down the left edge
+   and an amber wash behind it. That is the fifth thing the accent is spent on, and it
+   earns it on the same grounds as the other four - it is the one entry the eye should
+   find without reading the list.
+   `--accent` on `--atm` is 6.79:1 dark and 5.43:1 light; the name under it is `--ink`
+   at 8.67:1 and 14.44:1. */
+.rail-item[aria-current="page"] {
+  background: var(--atm);
+  color: var(--accent);
+  box-shadow: inset 3px 0 0 0 var(--atm-line);
+}
+.rail-item[aria-current="page"] .rail-name { color: var(--ink); }
+
+/* ------------------------------------------------------- screens: the title */
+
+/* The screen's own name, beside the wordmark. Not amber: the wordmark next to it is,
+   and two amber words in one row means neither of them is the one to read first. */
+.screen-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+
+/* --------------------------------------------------------- screens: the tabs
+ *
+ * The strip sits on the page ground rather than on `--surface`, so the resolved
+ * background behind every label here is `--bg`.
+ */
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 var(--pad);
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.tab {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-soft);          /* 5.55:1 dark, 5.52:1 light, on --bg */
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;             /* the underline sits on the strip's own rule */
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+/* The selected tab wears the accent, because the strip is a control and this is the
+   part of it that is acting. 9.96:1 dark, 5.60:1 light, on --bg. */
+.tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+
+/*
+ * The tab that is not built yet.
+ *
+ * It keeps `--ink-soft` - the same grey it would have unselected - because a disabled
+ * control still has to be read, and dimming it to the point where it obviously cannot
+ * be pressed is dimming it to the point where it cannot be identified. The state is
+ * carried by three things that are not contrast: the cursor, a dotted rule where the
+ * selected tab has a solid one, and the badge beside the label.
+ */
+.tab:disabled { cursor: not-allowed; border-bottom-style: dotted; border-bottom-color: var(--line-strong); }
+/* No hover rule for it, on purpose: a ground that lights up under the pointer says
+   "press me", which is the opposite of what this tab means. */
+
+.tab-soon {
+  margin-left: 7px;
+  padding: 0 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--ink-faint);         /* 4.76:1 dark, 4.70:1 light, on --bg */
+}
+
+/* ------------------------------------------------- screens: the plot region */
+
+/* The chart's box, standing empty. It is drawn at the size the chart will occupy rather
+   than collapsed to its message, so the screen does not change shape when the series
+   arrives. */
+.plot-empty {
+  margin: var(--pad);
+  min-height: 340px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink-faint);         /* 4.61:1 dark, 5.08:1 light, on --surface */
+  font-size: 11px;
+  text-align: center;
+  line-height: 1.7;
+}
+
+.plot-empty p { margin: 0; }
