@@ -1857,6 +1857,163 @@ def test_the_writer_samples_the_chain_cache_at_each_minute_boundary(
     }
 
 
+def test_the_chain_cache_is_sampled_several_times_within_one_minute(
+    tmp_path: Path,
+) -> None:
+    """Six observations of the minute, not one.
+
+    One sample per minute is a single instant deciding a whole minute: if the cache's
+    stamp falls a hair on the wrong side of the boundary the minute is refused outright,
+    which is `measured` at 217 of 904 minutes on the live store for expiry 25-09-2026 on
+    2026-09-04. `ComputedAggregator`'s own docstring describes "a handful of samples"
+    being folded; this is what makes the handful exist.
+
+    The clock is driven, never waited on. Six ten-second steps across one minute, with
+    the cache recomputed at each, must reach the aggregator as six samples per contract.
+    """
+    held: list[ChainResponse] = []
+
+    async def scenario():
+        # Five seconds before the minute opens, so the boundary itself is one of the
+        # steps below rather than something the first pass consumed.
+        now = MINUTE_US / 1e6 - 5.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: list(held),
+        )
+        writer.attach(FanOut())
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)
+
+        for second in (0, 10, 20, 30, 40, 50):
+            held[:] = [sampled_chain(0, second, iv=0.40)]
+            now = MINUTE_US / 1e6 + second
+            await asyncio.sleep(0.03)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return writer
+
+    writer = asyncio.run(scenario())
+
+    assert writer.stats()["computed"]["ticks"] == 12, (
+        "six samples of a two-leg chain, one every ten seconds"
+    )
+
+
+def test_a_minute_keeps_the_freshest_sample_taken_inside_it(tmp_path: Path) -> None:
+    """The gap, reproduced: the cache moves on a fraction after the boundary.
+
+    The recompute loop runs every 100 ms, so by the time the writer's pass notices the
+    minute has turned, the cache commonly holds a chain stamped in the **new** minute.
+    Sampling only at the boundary then attributes nothing to the minute that just
+    closed — every one of those losses is exactly one minute long, which is what
+    `run lengths: [(1, 217)]` says on the live store.
+
+    Sampling inside the minute means the minute keeps the freshest observation taken
+    while it was open: `_Last` on the chain's own clock, the fold the aggregator already
+    documents. Nothing is invented — 0.47 is a chain that really was computed at 09:00:45.
+    """
+    held: list[ChainResponse] = []
+
+    async def scenario():
+        # Five seconds into the minute, which is where a writer that has been running
+        # all day always is: the minute it is closing is one it was already inside.
+        now = MINUTE_US / 1e6 + 5.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: list(held),
+        )
+        writer.attach(FanOut())
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)
+
+        for second, iv in ((20, 0.41), (45, 0.47)):
+            held[:] = [sampled_chain(0, second, iv=iv)]
+            now = MINUTE_US / 1e6 + second
+            await asyncio.sleep(0.03)
+
+        # 09:01:00.2 — the recompute that lands just past the boundary. The writer's
+        # pass at 09:01:00.5 now finds a chain belonging to minute 1, and minute 0 has
+        # nothing left in the cache to be sampled from.
+        held[:] = [sampled_chain(1, 0, iv=0.52)]
+        now = (MINUTE_US + MINUTE) / 1e6 + 0.5
+        await asyncio.sleep(0.05)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await writer.aclose()
+        return writer
+
+    writer = asyncio.run(scenario())
+    frame = writer.computed_store.scan().collect()
+    opening = frame.filter(
+        pl.col("minute") == datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    )
+
+    assert opening.height == 2, "the minute whose quotes were captured has no curve"
+    assert set(opening["iv"].to_list()) == {0.47}, "not the freshest sample in the minute"
+
+
+def test_a_sample_refused_as_late_is_counted_where_an_operator_can_read_it(
+    tmp_path: Path,
+) -> None:
+    """Sampling six times a minute refuses six times as often, so the refusals have to
+    be readable rather than inferred from two tables compared by hand months later.
+
+    `_Watermarked.late` already counts them and `BarWriter.stats()` already nests the
+    aggregator's own dictionary under `computed`; this pins that path so the number
+    cannot quietly stop being reachable. No new counter, no new mechanism.
+    """
+    frozen = sampled_chain(0, 50, iv=0.40)
+
+    async def scenario():
+        now = MINUTE_US / 1e6 - 5.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: [frozen],
+        )
+        writer.attach(FanOut())
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)
+
+        for minute in (1, 2):
+            for second in (0, 20, 40):
+                now = (MINUTE_US + minute * MINUTE) / 1e6 + second
+                await asyncio.sleep(0.03)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return writer
+
+    writer = asyncio.run(scenario())
+    computed = writer.stats()["computed"]
+
+    assert computed["late"] > 0, "a refused sample was discarded silently"
+    assert computed["late"] == writer.computed.late
+
+
 def test_a_minute_with_no_computed_chain_gets_no_computed_row(tmp_path: Path) -> None:
     """**The deliberate-silence test, at the file layer.**
 

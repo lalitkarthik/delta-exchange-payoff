@@ -10,10 +10,11 @@ a reader joins spot to quotes to our volatility on `date` and `underlying` with 
 translation.
 
 **And the fourth one is filled differently.** Tables A, B and D are folded from ticks the
-writer drains off the bus. Table C is **sampled** from `ChainStream`'s recompute cache at
-each minute boundary, because our implied volatility and Greeks are produced there rather
-than arriving on the wire. That is `BarWriter._sample_computed`, and it is the one place
-in this module that reads something other than its own queue.
+writer drains off the bus. Table C is **sampled** from `ChainStream`'s recompute cache —
+every ten seconds and again at each minute boundary — because our implied volatility and
+Greeks are produced there rather than arriving on the wire. That is
+`BarWriter._sample_computed`, and it is the one place in this module that reads something
+other than its own queue.
 
 **Why columnar.** A CSV stores row by row, so reading one column of a billion rows means
 reading all of them. Parquet stores column by column: every mid together, every strike
@@ -124,6 +125,31 @@ COMPUTED_DATASET = "computed-bars"
 #: unflushed stretch no restart could recover. Paid for in files: 288 per table per day
 #: before compaction rather than 24, which compaction folds back to one overnight.
 FLUSH_SECONDS = 300.0
+
+#: How often table C's chain cache is sampled, on top of the sample the minute boundary
+#: still takes. Roughly six observations of a minute rather than one.
+#:
+#: **One sample per minute lost a quarter of them.** `measured` on the live store on
+#: 2026-09-04 for expiry 25-09-2026: 217 of 904 minutes held quote bars and no computed
+#: bar, and every single gap was exactly one minute long — `run lengths: [(1, 217)]`.
+#: With one edge-triggered sample and a grace of zero, a cached chain whose stamp fell a
+#: hair on the wrong side of the boundary refused the whole minute. More observations of
+#: the same cache is the entire change: the same stamps, the same refusal rule.
+#:
+#: **Ten seconds is chosen against a measured cost, not picked.** The drain loop spins on
+#: every message — `measured`, both channels together, 1,322.9 a second — and flattening
+#: every listed contract on every pass is the one piece of this writer capable of
+#: starving the socket reader. Six passes a minute is three orders of magnitude below
+#: that. `measured` 2026-09-04, 690 legs across five cached expiries flattened and folded
+#: on this machine's Python 3.12: **2.69 ms per pass, 16.1 ms of loop time a minute**.
+#: Lower the interval and that margin is what is being spent — and the ceiling is the
+#: 508 ms book refresh, not the sample.
+#:
+#: **It narrows the window; it does not close it.** A minute is now lost only if the
+#: cache was stale for the whole of it rather than for one unlucky instant. The residual
+#: rate is a number to re-measure with `tools/measure_computed_gaps.py` after this has
+#: run a day, not one to predict.
+COMPUTED_SAMPLE_SECONDS = 10.0
 
 #: How often the writer wakes to seal bars when the bus is quiet. Well under the grace
 #: period, so a bar is written within a second or so of becoming eligible — and it costs
@@ -865,8 +891,9 @@ class BarWriter:
 
     **Table C does not come off that queue at all.** Our implied volatility and Greeks
     are made by `ChainStream`'s recompute loop, so the writer *samples* that loop's cache
-    once a minute through the `chains` callable. A callable rather than the stream itself:
-    this module has no business knowing a chain cache exists, and a test hands it a list.
+    through the `chains` callable — every `COMPUTED_SAMPLE_SECONDS` and again at each
+    minute edge. A callable rather than the stream itself: this module has no business
+    knowing a chain cache exists, and a test hands it a list.
 
     The other three stores are **derived from the quote store's root** rather than
     defaulted separately. A test that hands this a temporary directory must not have three
@@ -907,9 +934,11 @@ class BarWriter:
         #: hand it a list. `None` means there is nothing to sample and table C stays
         #: empty, which is what the three-table tests and the REST-only app want.
         self.chains = chains
-        #: The minute this last sampled in. Sampling is edge-triggered on the boundary
-        #: rather than done every pass — see `_sample_computed`.
+        #: The minute this last sampled in, and the clock reading it last sampled at.
+        #: Sampling is on a timer plus the minute edge rather than done every pass —
+        #: see `_sample_computed`.
         self._sampled_minute_us: int | None = None
+        self._sampled_at: float | None = None
         self.clock = clock
         self.flush_seconds = flush_seconds
         self.tick_seconds = tick_seconds
@@ -998,7 +1027,8 @@ class BarWriter:
             await self._maybe_flush()
 
     def _sample_computed(self, now: float, *, force: bool = False) -> int:
-        """Read the chain cache once, as a minute closes. Returns samples taken.
+        """Read the chain cache every ten seconds, and at each minute edge. Returns
+        samples taken.
 
         **This is the one table that is sampled rather than folded.** Tables A, B and D
         are built from ticks arriving on the bus; our implied volatility and Greeks are
@@ -1006,11 +1036,24 @@ class BarWriter:
         the writer reads that cache instead of the queue. That also makes table C
         independent of the ticker work: it needs no new subscription and no new frame.
 
-        **Edge-triggered on the minute boundary, and that is a cost decision.** The drain
-        loop below spins on every message — measured, 1,322.9 a second — and flattening
-        every listed contract on every pass would be the one piece of this writer capable
-        of starving the socket reader. Once a minute it is a few hundred dataclasses on a
-        task that is already awake.
+        **On a timer, and the interval is a cost decision.** The drain loop below spins
+        on every message — measured, 1,322.9 a second — and flattening every listed
+        contract on every pass would be the one piece of this writer capable of starving
+        the socket reader. Six passes a minute is three orders of magnitude below that:
+        a few hundred dataclasses on a task that is already awake. See
+        `COMPUTED_SAMPLE_SECONDS` for the numbers behind the ten.
+
+        **The minute edge still takes a sample of its own**, so the state as the minute
+        closes is always observed however the timer happens to have fallen.
+
+        **Six samples a minute is what the aggregator was built for.**
+        `ComputedAggregator` folds `_Last` on the chain's own clock and its docstring
+        describes exactly this — a handful of samples of a surface recomputed every
+        100 ms, of which the freshest in the minute wins. With one sample per minute that
+        fold never had anything to choose between, and a chain stamped a hair past the
+        boundary refused the whole minute: `measured`, 217 of 904 minutes on 2026-09-04.
+        Nothing else about the path moves. **This narrows the window from one instant to
+        ten seconds; it does not remove it**, and it recovers nothing already lost.
 
         **It reads the cache and never asks it to recompute.** `ChainStream.chain()`
         recomputes a dirty expiry synchronously; calling it from here would move that
@@ -1030,13 +1073,18 @@ class BarWriter:
 
         minute_us = int(now * 1e6) - int(now * 1e6) % BUCKET_US
         if not force:
-            if self._sampled_minute_us is None or minute_us == self._sampled_minute_us:
-                # The first pass only learns which minute it started in. Sampling here
-                # would attribute a chain to a minute still open, and the boundary that
-                # follows collects that same chain anyway.
-                self._sampled_minute_us = minute_us
+            due = (
+                self._sampled_at is None
+                or now - self._sampled_at >= COMPUTED_SAMPLE_SECONDS
+                # The minute edge, kept as a trigger of its own: the timer alone would
+                # leave the last observation of a minute up to ten seconds short of its
+                # close, and this table's row is meant to be the state at the boundary.
+                or minute_us != self._sampled_minute_us
+            )
+            if not due:
                 return 0
         self._sampled_minute_us = minute_us
+        self._sampled_at = now
 
         taken = 0
         for chain in self.chains():

@@ -113,6 +113,11 @@ Aggregation is compression. Forward-filling is fabrication.
 4. **Bars flush to disk.** Every five minutes. A crash costs at most 5 minutes.
 5. **A day compacts.** 24 files become 1. Verified by full read-back *before* anything is deleted.
 
+**`computed-bars` does not come this way.** Our IV and Greeks are never on the wire, so
+that table is **sampled** from the chain cache — **every ten seconds**, plus once as each
+minute boundary passes — and the minute keeps the freshest sample taken inside it.
+Sampling once a minute lost a quarter of them; see below.
+
 ---
 
 ## Word list
@@ -167,6 +172,11 @@ cd engine && ./.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.mai
 ./engine/.venv/Scripts/python.exe tools/compact_store.py --dry-run
 ```
 
+**Count the minutes that have quotes but no volatility of ours:**
+```bash
+./engine/.venv/Scripts/python.exe tools/measure_computed_gaps.py --expiry 25-09-2026
+```
+
 **Measure the store:**
 ```bash
 ./engine/.venv/Scripts/python.exe tools/measure_store.py
@@ -185,7 +195,14 @@ cd engine && ./.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.mai
 3. No lock stops two compactors running at once. Documented, not defended against.
 4. The aggregator is not yet checked against a raw frame capture.
 5. `lts`'s meaning is unverified. It is stored and decides nothing.
-6. Table C can lose a row to a ~1 ms boundary race. Always a **missing** row, never an invented one.
+6. Table C loses a row when the cache is stale for a whole minute. `measured` on
+   2026-09-04, expiry 25-09-2026: sampling once a minute lost **217 of 904 minutes —
+   24%** — every gap exactly one minute long, while the quotes for those minutes were
+   captured all along. [#23](https://github.com/lalitkarthik/delta-exchange-payoff/issues/23)
+   samples every ten seconds instead. That **narrows** the window from one instant to ten
+   seconds; it does not close it, and the 217 stay lost. The rate that survives it is
+   unmeasured — run `tools/measure_computed_gaps.py` after a full day. Always a
+   **missing** row, never an invented one.
 
 ---
 
