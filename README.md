@@ -11,6 +11,7 @@ right, implied vol and Greeks straight off the venue. No calculation of our own 
 |---|---|
 | The engine/web interface | [`docs/chain-contract.md`](./docs/chain-contract.md) |
 | What the API actually gives you | `docs/delta-api-scope.md` *(in progress)* |
+| What the forward costs, paid in Greeks | [`docs/greeks.md`](./docs/greeks.md) |
 
 State lives in the issues, not in files. If an issue and a file disagree, the issue wins.
 
