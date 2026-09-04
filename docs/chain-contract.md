@@ -93,6 +93,7 @@ plausible, uniformly wrong numbers with nothing to signal it.
   "rho": 12.9,
   "oi": 148.0,
   "oi_value_usd": 1150400.0,
+  "oi_change_usd_6h": 74608.2,
   "tick_size": 0.5,
   "computed": {
     "iv": 0.3712,
@@ -143,6 +144,31 @@ at weekends, which is right for an index that closes and wrong here — crypto t
 and this venue lists weekend expiries. Measured: a 1/252 step overstates theta by **1.456x**.
 
 ## Rules that are not negotiable
+
+**The three open-interest fields are three different quantities, and Delta's names invite
+mixing them up.** `oi` is **contracts**. `oi_value_usd` is that position's **notional in USD**.
+`oi_change_usd_6h` is how the notional **moved over six hours**, and it goes negative.
+
+| field | quantity | where it comes from |
+|---|---|---|
+| `oi` | contracts | both transports |
+| `oi_value_usd` | USD notional | **REST only — `null` on the websocket** |
+| `oi_change_usd_6h` | six-hour change, may be negative | both transports |
+
+Two traps here, both measured rather than reasoned about, and both were live in this
+codebase until T5 found them.
+
+**REST's own `oi` field is not contracts — it is the notional in BTC.** `contract_value` is
+0.001, and `oi_contracts == oi * 1000` on all 136 captured symbols. The engine reads
+`oi_contracts` and never `oi`, so both transports report contracts and the ladder's OI column
+means one thing.
+
+**The `ticker` websocket channel carries no USD notional at all.** Its `oi` array is
+`[contracts, six_hour_change]`. The second position was read as `oi_value_usd` from T4 until
+T5 measured it: it equals `oi_change_usd_6h` on all 136 symbols, equals the real
+`oi_value_usd` on ten, and **goes negative, which a notional cannot**. On the websocket path
+`oi_value_usd` is therefore `null` — absent, not derived. Contracts x `contract_value` x spot
+would reproduce it, but that is a calculation and this field reports an observation.
 
 **Every decimal is a JSON number or `null`. Never a string.** Delta sends decimals as strings to
 preserve precision. The engine converts once, at the boundary. The web app never calls

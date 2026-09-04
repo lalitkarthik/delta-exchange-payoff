@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -97,3 +98,22 @@ def ws_book_frames() -> dict[str, Any]:
 @pytest.fixture
 def rest_snapshot() -> list[dict[str, Any]]:
     return load_fixture("rest-04-09-2026.json")["result"]
+
+@pytest.fixture
+def ws_captured_at(ws_ticker_frames) -> datetime:
+    """The instant the websocket fixtures were captured, read off the frames.
+
+    A snapshot has to be priced as of when it was taken. `chain_from_frames` defaults
+    `fetched_at` to the current clock, so a test that omits it silently re-dates a
+    2026-09-03 capture to today — and `year_fraction` measures from `fetched_at` to
+    settlement. The 04-09-2026 fixture then walks its own time to expiry down to nothing.
+
+    That is not hypothetical. It fired on 2026-09-04: the fitted discount's implied rate
+    reached 38.8% and `f1_parity_fit` refused the chain, failing a test that had asserted
+    a trusted forward since T4 without anyone touching the code.
+
+    Taken from the frames' own `ts` rather than the fixture's `captured` date string,
+    because `ts` is microsecond-exact and cannot drift from the data beside it.
+    """
+    stamps = [frame["ts"] for frame in ws_ticker_frames.values() if frame.get("ts")]
+    return datetime.fromtimestamp(max(stamps) / 1e6, tz=timezone.utc)

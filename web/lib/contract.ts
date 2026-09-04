@@ -87,8 +87,12 @@ export interface Leg {
   theta: number | null;
   vega: number | null;
   rho: number | null;
+  /** Open interest in **contracts**, on both transports. */
   oi: number | null;
+  /** The USD notional. REST carries it; the websocket does not, so it is null live. */
   oi_value_usd: number | null;
+  /** How the notional moved over six hours. May be negative. Both transports. */
+  oi_change_usd_6h: number | null;
   tick_size: number | null;
   /** Ours. `null` on a chain that has not been through the engine's enrichment. */
   computed: ComputedLeg | null;

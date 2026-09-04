@@ -19,10 +19,9 @@ meaning**. Measured from live frames on 2026-09-03:
 Checked against the REST snapshot captured alongside the frames on 2026-09-03, it equals
 `oi_change_usd_6h` on **all 136** symbols and REST's `oi_value_usd` on ten; it also goes
 negative, which a notional cannot. The ticker channel carries no USD open interest at
-all. `Leg.oi_value_usd` is still fed from it here because renaming that field changes the
-chain contract `web/lib/contract.ts` reads and that is not #11's to change — but nothing
-new consumes it under that name, and `bars.samples_from_ticker` stores the number as
-`oi_change_usd_6h`. `tests/test_wire.py` pins the finding so it cannot be made twice.
+all, so `Leg.oi_value_usd` is **`None`** on this path — absent rather than derived — and
+the number travels as `oi_change_usd_6h`, which is what it is. `tests/test_wire.py` pins
+both the finding and the agreement between the two transports, so neither can regress.
 
 The abbreviation is not gratuitous. At about 500 bytes a message and 320 messages a
 second, writing `"best_bid"` instead of position 2 would roughly double the byte rate for
@@ -108,9 +107,11 @@ def decode_ticker(frame: dict[str, Any]) -> tuple[str, Leg]:
         theta=to_number(_at(greeks, _THETA)),
         vega=to_number(_at(greeks, _VEGA)),
         oi=to_number(_at(interest, _OI_CONTRACTS)),
-        # Mislabelled, knowingly and narrowly: this is `oi_change_usd_6h`. See the
-        # module docstring. Nothing added after #11 reads it under this name.
-        oi_value_usd=to_number(_at(interest, _OI_CHANGE_USD_6H)),
+        # The websocket carries no USD notional. Absent, never a stand-in: deriving
+        # one from contracts x contract size x spot is a calculation, and this field
+        # reports an observation. See the module docstring.
+        oi_value_usd=None,
+        oi_change_usd_6h=to_number(_at(interest, _OI_CHANGE_USD_6H)),
     )
 
 
@@ -199,8 +200,12 @@ def _as_rest_ticker(symbol: str, leg: Leg, spot: float | None) -> dict[str, Any]
             "theta": leg.theta,
             "vega": leg.vega,
         },
-        "oi": leg.oi,
+        # `oi_contracts`, because that is the key `chain.build_leg` reads. Both
+        # transports report open interest in contracts; REST's own `oi` is the
+        # notional in BTC and is not what this is.
+        "oi_contracts": leg.oi,
         "oi_value_usd": leg.oi_value_usd,
+        "oi_change_usd_6h": leg.oi_change_usd_6h,
     }
 
 

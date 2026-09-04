@@ -961,9 +961,7 @@ def samples_from_ticker(quote: Any) -> TickerSample | None:
             mark=leg.mark,
             last_traded_price=extras.last_traded_price,
             oi_contracts=leg.oi,
-            # `Leg.oi_value_usd` is fed from `oi[1]`, which is the six-hour change. The
-            # name is wrong upstream and is not propagated: see `wire`'s docstring.
-            oi_change_usd_6h=leg.oi_value_usd,
+            oi_change_usd_6h=leg.oi_change_usd_6h,
             turnover=extras.turnover,
             venue_delta=leg.delta,
             venue_gamma=leg.gamma,

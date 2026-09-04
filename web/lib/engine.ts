@@ -110,6 +110,7 @@ const NUMERIC_LEG_FIELDS = [
   "rho",
   "oi",
   "oi_value_usd",
+  "oi_change_usd_6h",
   "tick_size",
 ] as const;
 

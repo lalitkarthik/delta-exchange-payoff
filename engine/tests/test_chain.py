@@ -76,8 +76,13 @@ def test_a_row_carries_every_contract_field(chain_tickers) -> None:
     assert call.theta == -161.78721439
     assert call.vega == 27.06304078
     assert call.rho == 2.99484353
-    assert call.oi == 41.134
+    # `oi` is **contracts**, from REST's `oi_contracts`. It used to read REST's `oi`,
+    # which is the notional in BTC - 41.134 BTC against 41,134 contracts, a factor of
+    # 1,000 that is exactly `contract_value`. The websocket has always sent contracts,
+    # so the two transports disagreed by that factor on the field the ladder renders.
+    assert call.oi == 41134.0
     assert call.oi_value_usd == 3190258.4318
+    assert call.oi_change_usd_6h == 538728.51
     assert call.tick_size == 0.1
 
 
@@ -94,7 +99,8 @@ def test_no_decimal_leaves_the_engine_as_a_string(chain_tickers) -> None:
     payload = chain(chain_tickers).model_dump()
     numeric = {
         "strike", "bid", "ask", "mark", "bid_iv", "ask_iv", "mark_iv",
-        "delta", "gamma", "theta", "vega", "rho", "oi", "oi_value_usd", "tick_size",
+        "delta", "gamma", "theta", "vega", "rho", "oi", "oi_value_usd",
+        "oi_change_usd_6h", "tick_size",
     }
     for key in ("spot", "atm_strike"):
         assert isinstance(payload[key], float), key
