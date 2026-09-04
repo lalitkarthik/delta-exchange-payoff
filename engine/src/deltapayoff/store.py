@@ -31,12 +31,18 @@ thousands of directories holding a handful of rows each, and Parquet performs ba
 many small files — every one carries header and footer overhead and a reader has to open
 all of them. Strike and option type are columns for the same reason, more so.
 
-**Why hourly, and where the flush runs.** A file per bar would produce hundreds of tiny
-files an hour. So sealed bars accumulate in memory and are written on a timer: hourly
-caps crash loss at sixty minutes and produces files usable before any compaction runs.
-A whole-day buffer was rejected — a crash at 23:00 loses the day. Fifteen minutes was
-rejected as producing files small enough that the design would be leaning on compaction
-to rescue a choice made on purpose.
+**Why every five minutes, and where the flush runs.** A file per bar would produce
+hundreds of tiny files an hour. So sealed bars accumulate in memory and are written on a
+timer, and the timer's period *is* the crash-loss budget, because the engine has no
+graceful stop. It was hourly, on the argument that fifteen minutes would produce files
+small enough to be leaning on compaction. That argument lost to what an hour actually
+cost: three unrecoverable stretches in one day, up to sixty minutes each. Five minutes
+caps the loss at five, at 288 files per table per day before compaction folds them back
+to one. File sizes at that cadence are `derived` in #16 by dividing the measured hourly
+files by twelve — about 81 KB, 84 KB, 276 KB and 350 bytes for quote, computed,
+reference and spot bars. Spot's 350 bytes is below Parquet's own footer, which is
+harmless at 52 KB of table a day but is the first thing to look at if the small-file
+count ever bites: that one table can flush on a slower cadence on its own.
 
 **And the write must never happen in the socket reader's path.** If it did, the reader
 would stop draining the connection while the disk worked, the operating system's receive
@@ -111,8 +117,13 @@ REFERENCE_DATASET = "reference-bars"
 SPOT_DATASET = "spot-bars"
 COMPUTED_DATASET = "computed-bars"
 
-#: Hourly. Sixty minutes is the crash-loss budget, stated as a number rather than implied.
-FLUSH_SECONDS = 3600.0
+#: Every five minutes. This number **is** the crash-loss budget: the engine has no
+#: graceful stop, so whatever sits in the buffer when the process dies is gone. Five
+#: minutes rather than sixty because that loss has been paid three times in one day —
+#: 2h52m to a closed laptop and about 62 minutes to a teardown, each ending in an
+#: unflushed stretch no restart could recover. Paid for in files: 288 per table per day
+#: before compaction rather than 24, which compaction folds back to one overnight.
+FLUSH_SECONDS = 300.0
 
 #: How often the writer wakes to seal bars when the bus is quiet. Well under the grace
 #: period, so a bar is written within a second or so of becoming eligible — and it costs
@@ -443,9 +454,9 @@ class BarStore:
 
         One file per `(date, underlying)` per flush, named from the flush ordinal and the
         earliest minute in it so a directory listing sorts chronologically and two flushes
-        can never collide. An empty buffer writes nothing at all — an hourly flush over a
-        quiet hour must not leave an empty file behind, which would be all overhead and no
-        rows.
+        can never collide. An empty buffer writes nothing at all — a flush over a quiet
+        five minutes must not leave an empty file behind, which would be all overhead and
+        no rows.
         """
         if not self._buffer:
             return 0
@@ -811,7 +822,7 @@ class BarWriter:
     messages and two watermarks drifting apart on two clocks. The four aggregators seal
     independently — they have different graces and different grains — but they are driven
     from one drain loop and flushed in one thread hop, so the socket reader waits on one
-    disk trip an hour rather than four.
+    disk trip an interval rather than four.
 
     **Table C does not come off that queue at all.** Our implied volatility and Greeks
     are made by `ChainStream`'s recompute loop, so the writer *samples* that loop's cache
@@ -1018,7 +1029,7 @@ class BarWriter:
         would close a connection we simply failed to drain.
 
         A failed flush must not kill the writer: the buffer is already emptied by then, so
-        that flush's rows are lost, but a task that dies takes every later hour with it.
+        that flush's rows are lost, but a task that dies takes every later flush with it.
         Counted, because a silent loss is the lie this project keeps refusing.
         """
         now = self.clock()
@@ -1036,7 +1047,7 @@ class BarWriter:
         """Write all three tables. **Blocking IO, and always on a worker thread.**
 
         One thread hop for three files rather than three: the hop is what keeps the disk
-        off the event loop, and three of them an hour would be three chances for the
+        off the event loop, and three of them per interval would be three chances for the
         socket reader to be descheduled instead of one.
         """
         return (

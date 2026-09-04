@@ -90,7 +90,7 @@ mistakes:
 - **Too short discards real observations.** Every late tick is a quote that happened and
   is now gone, and because congestion is what makes ticks late, the ticks lost are
   disproportionately the ones from fast-moving minutes.
-- **Too long delays a bar by two seconds inside an hourly flush.** Nothing downstream can
+- **Too long delays a bar by two seconds inside a five-minute flush.** Nothing downstream can
   notice.
 
 Two properties of the number stop it being a network latency, and both argue for headroom
@@ -145,7 +145,7 @@ be dead code, and `from_book` would be a constant `True` — a column storing no
 Sealing on the larger of the two watermarks is the only choice that makes the fallback
 reachable.
 
-The cost is that a quote bar is written six seconds later, inside an hourly flush;
+The cost is that a quote bar is written six seconds later, inside a five-minute flush;
 nothing downstream can notice. `tests/test_bars.py::test_the_quote_bars_wait_long_enough
 _for_a_fallback_to_arrive` fails when the grace is put back to 2.0 s — sabotage-verified.
 
@@ -463,12 +463,29 @@ trivially derivable be stored. The test inverts it rather than assuming it.
 
 ## 9. Compaction, and the ordering that keeps a day
 
-**Hourly flushing buys a sixty-minute crash budget and pays for it in files.** Twenty-four
-per table per partition per day is roughly **26,000 a year** across the four tables, and
-Parquet is bad at that: every file carries its own header and footer, its own dictionary
-pages and its own row-group statistics, and a reader has to open every one of them before
-it can decide it wants none. Folding a closed day into one file per table per partition
-takes the year to about **a thousand**.
+**Flushing every five minutes buys a five-minute crash budget and pays for it in files.**
+The engine has no graceful stop, so the flush interval *is* the restart-loss window:
+whatever sits in the buffer when the process dies is gone, and a restart cannot recover
+it. #16 moved that window from sixty minutes to five, after an hour's worth was lost three
+times in one day. The price is 288 files per table per partition per day — twelve times
+the file count, so roughly **312,000 a year** across the four tables against the 26,000
+this section was written for — and Parquet is bad at that:
+every file carries its own header and footer, its own dictionary pages and its own
+row-group statistics, and a reader has to open every one of them before it can decide it
+wants none. Folding a closed day into one file per table per partition takes the year back
+to about **a thousand**, so compaction is now carrying more of the design than it was.
+
+`derived`, #16, from run F's measured hourly files divided by twelve: a five-minute flush
+writes roughly 81 KB of quote bars, 84 KB of computed, 276 KB of reference and **350 bytes**
+of spot. Spot's file is smaller than Parquet's own footer. Harmless at 52 KB of table a
+day, but it is the first thing to look at if the file count ever bites — that one table can
+be given a slower cadence without touching the others.
+
+**The whole-day read cost against this layout is not yet measured.** `derived` in #16 from
+run G's per-file scan cost (1.83 ms for the first file, about 0.30 ms for each after it), a
+read of the current uncompacted day rises from about 6.8 ms to roughly **88 ms**. That is an
+extrapolation, and #16 leaves it open deliberately: it needs a real day written at the new
+cadence before it can be replaced by a measurement.
 
 `BarStore.compact_partition` does it; `tools/compact_store.py` is the nightly entry point;
 `compact_all()` is the same thing as a function, because a scheduler is the operator's
@@ -484,7 +501,7 @@ that asymmetry.
 
 1. **Recover** any run already in flight (below).
 2. **List** the partition's `*.parquet`. The list *includes* an earlier compacted file, so
-   a partition that gained late hourly files after being compacted folds back to one file
+   a partition that gained late flush files after being compacted folds back to one file
    rather than to two. "Already compacted" is therefore `len(inputs) <= 1` — a property of
    the directory, not of a filename.
 3. **Write** the concatenation to `compact-NNNNNN.parquet.tmp`.
@@ -571,7 +588,7 @@ straight to its final name, which is not atomic, so compacting the partition the
 still flushing into races a half-written file. A torn read raises before anything is
 deleted, so it is survivable rather than dangerous — but waiting one day removes it. A file
 that appears *after* the input list is taken is never deleted, because only the names in
-the manifest are, so an hourly flush landing mid-compaction survives and is folded in next
+the manifest are, so a flush landing mid-compaction survives and is folded in next
 time. Pinned by `test_a_flush_that_lands_mid_compaction_is_not_deleted_by_it`.
 
 ### The regression compaction uncovered
@@ -798,6 +815,14 @@ the store, because an hourly flush is already large enough to amortise Parquet's
 costs. `spot-bars`'s 12.8x inflation is the counter-example that proves the mechanism: it is
 the one table whose files really are too small, and it is the one table where compaction
 pays in bytes.
+
+**#16 moved the flush to five minutes, and this paragraph is the measurement it lands on.**
+A flush is now about 3,440 rows rather than 41,280 — between run G's two measured points,
+1,260 and 41,280 — so the marginal cost of a file sits somewhere between the two curves
+above and compaction starts buying real bytes as well as file count. How many is **not
+measured**: run G was written against hourly files and the arithmetic above should not be
+divided by twelve and called a number. The section that needs re-running first is this one,
+against a real day at the new cadence.
 
 It also means **run F's 143.34 MB/day is within about 1.5% of a fully compacted day**, so
 the footprint above is a figure rather than a bound.

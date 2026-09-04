@@ -462,6 +462,108 @@ def test_the_writer_turns_bus_quotes_into_parquet_bars(tmp_path: Path) -> None:
     assert row["minute"] == datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
 
 
+def test_the_writer_flushes_on_the_default_five_minute_cadence(tmp_path: Path) -> None:
+    """The guard the interval needs, because its failure mode is silent.
+
+    Bars that are never written look exactly like bars that were: the aggregators keep
+    sealing, the counters keep moving, and nothing goes wrong until the process dies and
+    takes the whole unflushed stretch with it. So the interval is asserted rather than
+    observed, and it is asserted on the **default** — the engine constructs its writer
+    without passing `flush_seconds`, so a default left at an hour is the live regression.
+
+    Both edges are pinned. Nothing on disk at four minutes fifty-nine, everything on disk
+    a second past five minutes. The clock is a variable this test assigns, never a real
+    one it waits on: a test that slept for five minutes would be no test at all, and one
+    that read the wall clock would be the third time-bomb this suite has grown.
+    """
+
+    async def scenario():
+        started = MINUTE_US / 1e6
+        now = started
+
+        def clock() -> float:
+            return now
+
+        store = BarStore(tmp_path)
+        # No `flush_seconds`: the default is the thing under test.
+        writer = BarWriter(store, clock=clock, tick_seconds=0.01)
+        bus = FanOut()
+        writer.attach(bus)
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)  # the writer stamps `_last_flush` at `started`
+
+        bus.publish(
+            Quote(
+                symbol="C-BTC-77600-040926",
+                channel="ob_l2",
+                bid=70.0,
+                ask=72.0,
+                received_at=now,
+                frame={"sy": "C-BTC-77600-040926", "ts": MINUTE_US + 5_000_000},
+            )
+        )
+        now = started + 120.0  # past the boundary and the grace: the bar seals
+        await asyncio.sleep(0.05)
+        buffered = store.buffered
+
+        now = started + 299.0  # four minutes fifty-nine
+        await asyncio.sleep(0.05)
+        early = store.rows_written
+
+        now = started + 301.0  # a second past five minutes
+        await asyncio.sleep(0.05)
+        late = store.rows_written
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return buffered, early, late, store
+
+    buffered, early, late, store = asyncio.run(scenario())
+
+    assert buffered == 1, "the bar never reached the store's buffer"
+    assert early == 0, "the buffer was written before the interval elapsed"
+    assert late == 1, "five minutes passed and the buffer was still not written"
+    assert store.scan().collect().height == 1
+
+
+def test_a_flush_lands_every_buffered_bar_exactly_once(tmp_path: Path) -> None:
+    """What left the buffer is what is on disk: no bar written twice, none dropped.
+
+    Twelve flushes of ten bars — an hour at the five-minute cadence — because the denser
+    layout is where a duplicate or a drop would show. The assertion is on the identity of
+    each row, `(symbol, minute)`, and not on a count: a count matches just as happily if
+    one bar were written twice and another lost.
+    """
+    store = BarStore(tmp_path)
+    start = datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    expected: list[tuple[str, datetime]] = []
+
+    for window in range(12):
+        batch = [
+            bar(
+                symbol=f"C-BTC-{77600 + step}-040926",
+                strike=float(77600 + step),
+                minute=start + timedelta(minutes=5 * window + offset),
+            )
+            for offset in range(5)
+            for step in (0, 100)
+        ]
+        assert store.add(batch) == len(batch)
+        assert store.flush() == len(batch)
+        assert store.buffered == 0, "a bar was left behind in the buffer"
+        expected.extend((one.symbol, one.minute) for one in batch)
+
+    frame = store.scan().collect()
+    landed = sorted(
+        zip(frame["symbol"].to_list(), frame["minute"].to_list(), strict=True)
+    )
+
+    assert len(landed) == len(set(landed)), "a bar was written twice"
+    assert landed == sorted(expected), "disk does not match what left the buffer"
+    assert store.rows_written == len(expected)
+    assert len(list(store.path.rglob("*.parquet"))) == 12, "a flush wrote no file"
+
+
 def test_a_slow_flush_cannot_block_the_socket_reader(tmp_path: Path) -> None:
     """The failure this whole architecture exists to prevent.
 

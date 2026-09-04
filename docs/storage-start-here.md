@@ -60,6 +60,24 @@ Most of those messages repeat. Delta republishes a price whether or not it chang
 
 ---
 
+## The restart-loss window is five minutes
+
+**The engine has no graceful stop.** Whatever is sitting in the buffer when the process
+dies — a crash, a closed laptop, a `taskkill`, a restart to pick up a code change — is
+gone, and no restart can recover it. The flush interval *is* that window.
+
+It was an hour. That cost real data three times in one day, so [#16](https://github.com/lalitkarthik/delta-exchange-payoff/issues/16)
+made it **five minutes**.
+
+Two consequences worth carrying:
+
+- **Time a restart just after a flush.** Restarting five minutes into an interval throws
+  away the five minutes. There is no way to ask the engine to flush first.
+- **288 files per table per day** before compaction, not 24. Compaction folds them back
+  to one overnight — which means compaction now matters more than it did.
+
+---
+
 ## The one rule that matters
 
 **A minute with no data gets no line.**
@@ -92,7 +110,7 @@ Aggregation is compression. Forward-filling is fabrication.
 1. **A tick arrives.** One price message from Delta, on one of two channels.
 2. **It joins a minute.** Bucketed by *Delta's* clock, not ours — so our network cannot move a price into the wrong minute.
 3. **The minute seals.** We wait 8 seconds past the boundary for stragglers, then close it. Late arrivals are counted and dropped, never silently lost.
-4. **Bars flush to disk.** Once an hour. A crash costs at most 60 minutes.
+4. **Bars flush to disk.** Every five minutes. A crash costs at most 5 minutes.
 5. **A day compacts.** 24 files become 1. Verified by full read-back *before* anything is deleted.
 
 ---
@@ -106,10 +124,10 @@ Aggregation is compression. Forward-filling is fabrication.
 | **Parquet** | the file format. Stores columns apart, so it compresses well |
 | **partition** | a folder whose name is the filter — `date=…/underlying=…` |
 | **pruning** | skipping folders by name, without opening files |
-| **flush** | write buffered bars to disk. Hourly |
+| **flush** | write buffered bars to disk. Every five minutes |
 | **watermark** | how long we wait before sealing a minute. 8 seconds |
 | **seal** | close a minute. Nothing more goes in |
-| **compaction** | join 24 hourly files into one daily file |
+| **compaction** | join a day's 288 flush files into one daily file |
 | **forward-fill** | copy the last price into an empty minute. **We never do this** |
 
 ---
@@ -158,11 +176,16 @@ cd engine && ./.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.mai
 
 ## Still open
 
-1. No day compacted from 24 **real** hourly files. Bounded at ~1.5%; bounding is not doing.
-2. No lock stops two compactors running at once. Documented, not defended against.
-3. The aggregator is not yet checked against a raw frame capture.
-4. `lts`'s meaning is unverified. It is stored and decides nothing.
-5. Table C can lose a row to a ~1 ms boundary race. Always a **missing** row, never an invented one.
+1. No day compacted from a full day of **real** flush files — 24 hourly ones before
+   [#16](https://github.com/lalitkarthik/delta-exchange-payoff/issues/16), 288 five-minute
+   ones after it. Bounded at ~1.5% of bytes; bounding is not doing.
+2. **The whole-day read against the five-minute layout is not measured.** `derived` in #16
+   at roughly 88 ms, up from a measured 6.8 ms. It needs a real day at the new cadence
+   before it is a number.
+3. No lock stops two compactors running at once. Documented, not defended against.
+4. The aggregator is not yet checked against a raw frame capture.
+5. `lts`'s meaning is unverified. It is stored and decides nothing.
+6. Table C can lose a row to a ~1 ms boundary race. Always a **missing** row, never an invented one.
 
 ---
 

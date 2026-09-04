@@ -141,6 +141,42 @@ def test_a_days_hourly_files_become_one_file_per_table_per_partition(
     assert len(parquet_files(partition(store))) == 1
 
 
+def test_a_day_written_at_the_five_minute_cadence_still_compacts_to_one_file(
+    tmp_path: Path,
+) -> None:
+    """The layout compaction actually meets now: 288 files a day, not 24.
+
+    Nothing in `compact_partition` counts files, so this is a characterisation guard
+    rather than a change - it exists because the flush interval moved underneath it and
+    "still works at twelve times the density" is a claim worth being able to re-run. The
+    assertion is on identity, `(symbol, minute)` per row, because a row count alone
+    passes just as happily on a day that lost one bar and doubled another.
+    """
+    store = BarStore(tmp_path)
+    written = 0
+    for window in range(288):  # a full day at five minutes a flush
+        bars = [
+            quote_bar(
+                START + timedelta(minutes=5 * window + index), 77000.0 + index * 100
+            )
+            for index in range(5)
+        ]
+        store.add(bars)
+        written += store.flush()
+
+    assert len(parquet_files(partition(store))) == 288
+    before = rows_on_disk(store)
+
+    result = store.compact_partition(DAY, "BTC")
+
+    assert result.compacted is True
+    assert result.files_before == 288
+    assert result.files_after == 1
+    assert result.rows == written
+    assert len(parquet_files(partition(store))) == 1
+    assert rows_on_disk(store).equals(before), "the day changed on its way through"
+
+
 def test_the_compacted_file_holds_every_row_the_inputs_held_and_no_others(
     tmp_path: Path,
 ) -> None:
