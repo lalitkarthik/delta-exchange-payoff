@@ -23,3 +23,7 @@ tools/out/
 # 143 MB/day (docs/storage.md section 10, not the 50-100 MB/day originally
 # estimated) a year of it would be about 52 GB in a git history.
 data/
+
+# local dev server logs
+*.log
+*.log.err
