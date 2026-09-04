@@ -3,18 +3,22 @@
 Next.js App Router front end for the option chain. Two screens, listed by a rail down
 the left edge: the chain ladder at `/`, and the volatility screen at `/volatility`.
 
-The volatility screen is a **shell**. It has a title, a tab strip whose second tab is
-present and disabled, and an empty plot region; it holds no series and draws no chart.
-It exists so that the change which draws the smile is about drawing a smile and not
-about routing as well. `lib/screens.ts` is the one list of screens the rail renders —
-adding a screen is an entry there and a directory under `app/`.
+The volatility screen draws the smile for one expiry at one stored minute, and carries a
+scrubber that moves that minute through the whole stored day. `lib/screens.ts` is the one
+list of screens the rail renders — adding a screen is an entry there and a directory
+under `app/`.
 
-It renders `GET /chain` from the engine and **does no arithmetic**. The only number it
-touches is IV, which it multiplies by 100 to display as a percentage — the contract
-makes that the web app's job. Everything else is printed as it arrives.
+Its interface is [`docs/smile-contract.md`](../docs/smile-contract.md), which serves the
+**whole day in one response**. That is why scrubbing issues no request: moving through
+time is an index into `minutes`, not a fetch. Nothing on this screen polls.
 
-The interface is [`docs/chain-contract.md`](../docs/chain-contract.md). That file is the
-authority; `lib/contract.ts` mirrors it field for field.
+The chain ladder renders `GET /chain`, and its interface is
+[`docs/chain-contract.md`](../docs/chain-contract.md). Both contracts are the authority;
+`lib/contract.ts` mirrors them field for field.
+
+**Neither screen does arithmetic.** The only number either touches is IV, which it
+multiplies by 100 to display as a percentage — the contract makes that the web app's job.
+Everything else is printed as it arrives.
 
 ## Install and run
 
@@ -105,6 +109,37 @@ a different statement from a null field inside a quote, and gets a different mar
 **Data moves only on load and on Refresh.** There is no polling, no websocket, no
 revalidation and no auto-refresh anywhere in this app.
 
+**The volatility screen shows local time and stores UTC.** The scrubber's clock is the
+reader's own wall clock, labelled with the zone, because this market runs continuously and
+there is no session open to anchor to. It is produced at the moment of drawing and thrown
+away. No local time reaches a request, a stored value or a URL.
+
+**A minute the store never wrote renders empty.** The scrubber's positions are every
+minute between the first stored one and the last, holes included, and the holes are marked
+on the track before you reach them. Standing on one draws nothing — showing the
+neighbouring minute's curve there would be the same error as joining the line across a gap.
+
+## Linking to a curve
+
+`/volatility` carries its whole view in the query string, and the minute is **UTC**:
+
+```
+/volatility?underlying=BTC&expiry=05-09-2026&minute=2026-09-04T12:15:00Z
+```
+
+Opening that link restores exactly that underlying, expiry and minute, in any timezone —
+`measured` in Asia/Calcutta, America/New_York and Pacific/Auckland: same curve, same
+scrubber position, three different clocks on the control.
+
+Changing the view rewrites the URL with `history.replaceState`, so **a drag never adds a
+history entry** and the back button still goes where the reader came from. The rewrite is
+on a short trailing timer, because Firefox and Safari rate-limit the History API and a
+drag across a day is hundreds of calls.
+
+A parameter that is malformed is ignored rather than raised, and a minute outside what the
+store holds for that expiry lands on the most recent minute with a banner naming what was
+asked for — the nearest curve is not the one you asked for, so it is not offered as one.
+
 ## Layout notes
 
 The appearance is **ported from the sibling chain screen** at
@@ -148,20 +183,27 @@ OI  Δ  IV  Bid  Ask  |  STRIKE  |  Ask  Bid  IV  Δ  OI
 
 ```
 app/page.tsx             the chain screen: header figures, pickers, the live ladder
-app/volatility/page.tsx  the volatility screen, as a shell: title, tabs, empty plot
+app/volatility/page.tsx  the volatility route: metadata, and the link it opens on
 app/layout.tsx           document shell, the rail, and the anti-flash theme script
 app/globals.css          all styling, plain CSS, no framework — ported from the sibling
-components/ChainLadder.tsx   the ladder table
-components/ThemeToggle.tsx   Auto / Light / Dark, ported from the sibling
-components/ScreenRail.tsx    the rail, and which screen is current
+components/ChainLadder.tsx     the ladder table
+components/VolatilityScreen.tsx  the smile screen: selection, time, and what it admits
+components/SmileChart.tsx      the smile itself: dual x-axis, the curve, the breaks
+components/TimeScrubber.tsx    the day as a track, with the missing minutes marked
+components/ThemeToggle.tsx     Auto / Light / Dark, ported from the sibling
+components/ScreenRail.tsx      the rail, and which screen is current
 lib/contract.ts          types mirroring docs/chain-contract.md and docs/smile-contract.md
 lib/engine.ts            the only place that talks to the engine
-lib/format.ts            the only place a number becomes text
+lib/format.ts            the only place a number becomes text — UTC stamps and local clocks
+lib/smile.ts             a /smile minute as rows to draw, and the board's strike grid
+lib/timeline.ts          the day as positions in time, and where the store wrote nothing
+lib/scale.ts             axis domains and tick positions; pure
+lib/view.ts              the URL a curve has: underlying, expiry, minute — UTC only
 lib/theme.ts             what a stored theme means; pure, no DOM
 lib/screens.ts           which screens exist, and which one a path is on; pure
 lib/fixture.ts           fixture loading, and what it covers
 lib/fixture.chain.json   one committed /chain response
-lib/fixture.smile.json   one committed /smile response, built from the chain above
+lib/fixture.smile.json   one committed /smile response, one minute, built from the chain
 ```
 
 `AGENTS.md` and `CLAUDE.md` are generated by `next dev` and re-added if deleted.

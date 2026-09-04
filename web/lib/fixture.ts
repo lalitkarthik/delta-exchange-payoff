@@ -113,11 +113,29 @@ export function fixtureChain(underlying: Underlying, expiry: string): ChainRespo
  *   - **`iv_reason` is `null` where the chain fixture spells it `""`.** That is the
  *     store's spelling and the contract's, not a slip.
  *
- * **One minute, because one chain was captured.** Forward-filling it into a day of
- * identical curves would be fabrication of exactly the kind `docs/storage-start-here.md`
- * refuses, and a scrubber dragging across twenty copies of one shape would teach its
- * reader something false. In fixture mode the scrubber therefore has one position; the
- * rest of the day needs a real capture from a running engine.
+ * **One minute, because one chain was captured** — and it stays one minute, which was
+ * reconsidered when the scrubber arrived in #20 and deliberately left alone.
+ *
+ * Forward-filling it into a day of identical curves would be fabrication of exactly the
+ * kind `docs/storage-start-here.md` refuses. The live alternative — replacing this with a
+ * genuine window read out of the running store — was measured and declined on three
+ * counts. This file is **statically imported into the client bundle**, so every page load
+ * pays for it forever; the day the scrubber was built against is 2.0 MB on the wire and
+ * even a twenty-minute window of that expiry's 85 strikes is twenty-five times the 3.4 KB
+ * this fixture costs today. The capture would come from a different day than
+ * `fixture.chain.json`, whose forward is 77,646.88 against the store's 81,190 — and the
+ * one thing that makes this fixture worth trusting is that it is *the same capture* as the
+ * chain beside it, down to the leg flip. And a window is not a day either: twenty minutes
+ * of a thirteen-hour store demonstrates the control while teaching a false shape unless a
+ * label does the work, at which point the label is doing the work and the honest
+ * one-position degradation can do it instead.
+ *
+ * So in fixture mode the scrubber has one position and **says so**: the track is disabled,
+ * both step buttons are disabled, and the readout reads `1 / 1 · one minute — nothing to
+ * scrub`, with the fixture banner naming how many minutes the capture holds. `measured` by
+ * serving the live endpoint's newest minute alone into the running screen — the same shape
+ * this file has. The rest of the day needs a real capture from a running engine, and that
+ * is what the engine is for.
  */
 const rawSmile = smile satisfies Omit<SmileResponse, "underlying"> & { underlying: string };
 

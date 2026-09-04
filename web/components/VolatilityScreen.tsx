@@ -1,28 +1,49 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { SmileChart, type VolScale } from "@/components/SmileChart";
 import ThemeToggle from "@/components/ThemeToggle";
+import TimeScrubber from "@/components/TimeScrubber";
 import { UNDERLYINGS, type SmileResponse, type Underlying } from "@/lib/contract";
 import { ENGINE_URL, loadExpiries, loadSmile, type Source } from "@/lib/engine";
-import { formatFetchedClock, formatSpot } from "@/lib/format";
+import { formatFetchedClock, formatLocalClock, formatSpot, localZoneLabel } from "@/lib/format";
 import {
   formatTimeToExpiry,
   hoursToExpiry,
   isDying,
-  latestMinute,
   solvedPercents,
+  strikeGrid,
   toRows,
 } from "@/lib/smile";
+import {
+  buildTimeline,
+  clampIndex,
+  EMPTY_TIMELINE,
+  indexOfStamp,
+  lastIndex,
+} from "@/lib/timeline";
+import { viewQuery, type ViewRequest } from "@/lib/view";
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
 /**
- * The volatility screen: a smile, and everything a reader needs to know how far to trust
- * it.
+ * How long the URL waits behind the scrubber before it is rewritten.
+ *
+ * Not about history entries — `replaceState` never makes one, which is the acceptance
+ * criterion, and that is true at any frequency. It is about the browsers: Firefox and
+ * Safari both rate-limit the History API and throw once a page calls it too often in a
+ * short window, and a drag across a day is several hundred calls in a couple of seconds.
+ * A trailing timer means the URL is rewritten once the scrubber settles, which is also
+ * the only moment anyone is going to copy it.
+ */
+const URL_SETTLE_MS = 200;
+
+/**
+ * The volatility screen: a smile, a day to move it through, and everything a reader
+ * needs to know how far to trust what is on the axis.
  *
  * **Everything the header says is read from the response.** The forward, the minute, the
  * clock the volatility is quoted on, which forward method produced it and which model
@@ -37,21 +58,37 @@ function message(err: unknown): string {
  * maximum under 72% everywhere else on the board. That is vega collapsing, not our
  * arithmetic failing, and an unmarked 400% reads as the second thing.
  *
- * **The whole day arrives in one request.** `minutes` is the entire store for this
- * expiry; this screen shows the last of them. The scrubber that walks the rest is #20,
- * and it is an index into this same array rather than another fetch.
+ * **The whole day arrives in one request and the scrubber is an index into it.** No
+ * fetch is issued while time moves; `docs/smile-contract.md` sends the day precisely so
+ * that none has to be.
  *
- * A client component because it holds the selection, the scale toggle and the fetch. The
- * route around it stays a server component so the page keeps its metadata.
+ * **The view has an address.** Underlying, expiry and minute go into the URL in UTC, so
+ * a link means the same curve in every timezone, and they come back out of it on load.
+ * The clock on the scrubber is local because a control is read against a wall clock; the
+ * identity of the view is not. `lib/view.ts` holds that boundary.
+ *
+ * A client component because it holds the selection, the scale toggle, the position in
+ * time and the fetch. The route around it stays a server component, which is also what
+ * reads the URL and hands the initial view down.
  */
-export default function VolatilityScreen() {
-  const [underlying, setUnderlying] = useState<Underlying>("BTC");
+export default function VolatilityScreen({ initial }: { initial: ViewRequest }) {
+  const [underlying, setUnderlying] = useState<Underlying>(initial.underlying ?? "BTC");
   const [expiries, setExpiries] = useState<string[]>([]);
-  const [expiry, setExpiry] = useState<string>("");
+  const [expiry, setExpiry] = useState<string>(initial.expiry ?? "");
 
   const [smile, setSmile] = useState<SmileResponse | null>(null);
   const [source, setSource] = useState<Source>("engine");
   const [fallbackReason, setFallbackReason] = useState<string | null>(null);
+
+  /**
+   * The minute the reader has asked for, as the store's own UTC stamp — or `null`,
+   * which means "whatever the right edge is".
+   *
+   * The stamp rather than the index, because the stamp is what the URL carries and what
+   * the store calls it; an index is a fact about one particular response and would mean
+   * something different the moment the day grew by a minute.
+   */
+  const [wanted, setWanted] = useState<string | null>(initial.minute);
 
   /**
    * Linear, always, on first paint. The log axis is right on a dying contract and wrong
@@ -67,7 +104,7 @@ export default function VolatilityScreen() {
   const listRequest = useRef(0);
   const smileRequest = useRef(0);
 
-  const loadExpiryList = useCallback(async (next: Underlying, wanted: string | null) => {
+  const loadExpiryList = useCallback(async (next: Underlying, wantedExpiry: string | null) => {
     const id = ++listRequest.current;
     setBusy(true);
     setError(null);
@@ -82,7 +119,8 @@ export default function VolatilityScreen() {
         list.preferredExpiry && available.includes(list.preferredExpiry)
           ? list.preferredExpiry
           : (available[0] ?? "");
-      const chosen = wanted && available.includes(wanted) ? wanted : fallback;
+      const chosen =
+        wantedExpiry && available.includes(wantedExpiry) ? wantedExpiry : fallback;
       setExpiry(chosen);
       if (!chosen) setError(`No expiries listed for ${next}.`);
     } catch (err) {
@@ -123,11 +161,69 @@ export default function VolatilityScreen() {
     })();
   }, [underlying, expiry]);
 
-  const minute = smile ? latestMinute(smile) : null;
-  const rows = minute ? toRows(minute) : [];
+  /**
+   * The day laid out minute by minute, and the board's full strike list.
+   *
+   * Both are derived from the response and both are memoised on it, because both are
+   * walked on every drag step and neither can change while the reader is dragging.
+   */
+  const timeline = useMemo(() => (smile ? buildTimeline(smile) : EMPTY_TIMELINE), [smile]);
+  const grid = useMemo(() => (smile ? strikeGrid(smile) : []), [smile]);
+
+  const last = lastIndex(timeline);
+  const askedIndex = wanted === null ? -1 : indexOfStamp(timeline, wanted);
+  /** No answer for what was asked means the right edge, which is the newest minute. */
+  const index = askedIndex >= 0 ? askedIndex : last;
+
+  /**
+   * A link naming a minute this expiry's store does not reach at all — not a hole in the
+   * middle of the day, which is a position you can stand on, but a stamp outside it. It
+   * is said out loud rather than silently rounded to the nearest curve: quietly showing
+   * a different minute than the one in the address bar is the same class of error as
+   * drawing a line across a gap.
+   */
+  const unreachable = wanted !== null && askedIndex < 0 && last >= 0 ? wanted : null;
+
+  const stamp = index >= 0 ? (timeline.stamps[index] ?? null) : null;
+  const minute = index >= 0 ? (timeline.minutes[index] ?? null) : null;
+
+  const rows = useMemo(() => (minute ? toRows(minute, grid) : []), [minute, grid]);
   const solved = solvedPercents(rows);
   const hours = minute ? hoursToExpiry(minute) : null;
   const stamps = smile?.model_versions ?? [];
+
+  /**
+   * The address bar follows the view; it never drives it after the first render.
+   *
+   * `window.history.replaceState` rather than a router push, for the reason the ticket
+   * gives: a scrubber that filled the back button would be broken. Next's own docs make
+   * the native call the supported way to do this, and it syncs the router without a
+   * navigation. See `URL_SETTLE_MS` for why it waits.
+   */
+  useEffect(() => {
+    if (!expiry || !stamp) return;
+    const query = viewQuery(underlying, expiry, stamp);
+    if (window.location.search === query) return;
+    const timer = window.setTimeout(() => {
+      window.history.replaceState(null, "", query);
+    }, URL_SETTLE_MS);
+    return () => window.clearTimeout(timer);
+  }, [underlying, expiry, stamp]);
+
+  /** A different series is a different day; the position in the old one means nothing. */
+  const pickUnderlying = (next: Underlying) => {
+    setUnderlying(next);
+    setWanted(null);
+  };
+
+  const pickExpiry = (next: string) => {
+    setExpiry(next);
+    setWanted(null);
+  };
+
+  const pickIndex = (next: number) => {
+    setWanted(timeline.stamps[clampIndex(timeline, next)] ?? null);
+  };
 
   return (
     <div className="shell">
@@ -140,7 +236,7 @@ export default function VolatilityScreen() {
           <select
             className="picker-select"
             value={underlying}
-            onChange={(e) => setUnderlying(e.target.value as Underlying)}
+            onChange={(e) => pickUnderlying(e.target.value as Underlying)}
             disabled={busy}
           >
             {UNDERLYINGS.map((u) => (
@@ -156,7 +252,7 @@ export default function VolatilityScreen() {
           <select
             className="picker-select"
             value={expiry}
-            onChange={(e) => setExpiry(e.target.value)}
+            onChange={(e) => pickExpiry(e.target.value)}
             disabled={busy || expiries.length === 0}
           >
             {expiries.length === 0 ? <option value="">—</option> : null}
@@ -177,11 +273,13 @@ export default function VolatilityScreen() {
           </span>
         </div>
 
+        {/* The position, in UTC, and it stays UTC even when the position is empty — this
+            is the minute's identity and the thing the URL carries. The scrubber below
+            says the same instant in the reader's own zone. */}
         <div className="stat">
           <span className="stat-label">Minute</span>
           <span className="stat-value">
-            {minute ? formatFetchedClock(minute.minute) : "—"}{" "}
-            <span className="stat-note">UTC</span>
+            {stamp ? formatFetchedClock(stamp) : "—"} <span className="stat-note">UTC</span>
           </span>
         </div>
 
@@ -233,8 +331,20 @@ export default function VolatilityScreen() {
 
         {source === "fixture" && !error ? (
           <p className="notice warn">
-            Showing the committed smile fixture, not the store.{" "}
+            Showing the committed smile fixture, not the store — a real capture of{" "}
+            <strong>
+              {timeline.stamps.length} minute{timeline.stamps.length === 1 ? "" : "s"}
+            </strong>
+            , not a day.{" "}
             {fallbackReason ?? `Set NEXT_PUBLIC_USE_FIXTURE=0 and start the engine for stored data.`}
+          </p>
+        ) : null}
+
+        {unreachable ? (
+          <p className="notice warn">
+            The link asked for <strong>{unreachable}</strong>, which is outside the minutes
+            stored for {underlying} {expiry}. Showing the most recent minute instead — the
+            nearest curve is not the one you asked for, so it is not offered as one.
           </p>
         ) : null}
 
@@ -259,6 +369,12 @@ export default function VolatilityScreen() {
           </p>
         ) : null}
 
+        {/* The scrubber, above the plot: it changes which minute is drawn, so it sits
+            with the chart rather than in the header with the figures it changes. */}
+        {timeline.stamps.length > 0 && !error ? (
+          <TimeScrubber timeline={timeline} index={index} onChange={pickIndex} />
+        ) : null}
+
         {/* The axis control, on its own row above the plot rather than in the header:
             it changes how the chart is drawn and nothing about what the figures say. */}
         <div className="plot-controls">
@@ -281,15 +397,17 @@ export default function VolatilityScreen() {
         {renderPlot()}
 
         <p className="note">
-          One point per strike, one strike per listed contract, at the latest minute this
-          expiry was stored. <strong>Nothing here is fitted, smoothed or interpolated</strong>:
+          One point per strike, one strike per listed contract, at the minute the scrubber
+          is standing on. <strong>Nothing here is fitted, smoothed or interpolated</strong>:
           the dots are the volatilities the engine solved and the segments between them are
           straight, because a spline would put a number between two strikes in exactly the
           place a reader would take one off. A dotted vertical rule is a strike that arrived
-          with no solved volatility — the line breaks there and is never drawn through it.
+          with no solved volatility — the line breaks there and is never drawn through it,
+          and it breaks the same way at a strike this minute stored no row for at all.
           Both x-axes are one linear scale in strike, read once as a strike and once as an
-          offset from the forward, which is why their ticks are evenly spaced. Hover any
-          point for the strike, the volatility, its offset from the forward, the
+          offset from the forward, which is why their ticks are evenly spaced; the strike
+          axis is the whole day&rsquo;s board, so it holds still while the scrubber moves.
+          Hover any point for the strike, the volatility, its offset from the forward, the
           out-of-the-money leg it was solved on, and the solver&rsquo;s reason when there is
           no number.
         </p>
@@ -304,23 +422,45 @@ export default function VolatilityScreen() {
    * nobody has collected yet and a day nobody has lived through are both "nothing yet".
    * So the empty cases render as an explanation in the plot's own box, at the size the
    * chart would occupy, and the screen does not change shape when data arrives.
+   *
+   * **A position with no stored minute is one of those states, not an accident.** It
+   * renders empty. Drawing the neighbouring minute's curve there would be the same error
+   * as joining the line across a gap — a shape in a place where there is no shape — and
+   * it is the one thing a scrubber makes easy to do by mistake.
    */
   function renderPlot() {
     if (error) return null;
 
-    if (!smile || !minute) {
+    if (!smile || timeline.stamps.length === 0) {
       return (
         <section className="plot-empty" aria-label="Smile plot">
           <p>
             {busy || !smile
               ? "Reading the store…"
               : `No stored minutes for ${underlying} ${expiry}.`}
-            {smile && !minute ? (
+            {smile && timeline.stamps.length === 0 ? (
               <>
                 <br />
                 Nothing has gone wrong — the store is answering &ldquo;nothing yet&rdquo;.
               </>
             ) : null}
+          </p>
+        </section>
+      );
+    }
+
+    if (!minute) {
+      return (
+        <section className="plot-empty" aria-label="Smile plot">
+          <p>
+            No minute stored at{" "}
+            <strong>
+              {stamp ? formatLocalClock(stamp) : "—"} {stamp ? localZoneLabel(stamp) : ""}
+            </strong>{" "}
+            for {underlying} {expiry}.
+            <br />
+            {stamp} — the store wrote no bar here, so nothing is drawn. The curve either
+            side of it belongs to another minute.
           </p>
         </section>
       );
@@ -359,11 +499,15 @@ export default function VolatilityScreen() {
           </p>
         ) : null}
         <SmileChart
-          // Re-keyed per series and per scale: a different expiry is a different curve and
-          // a different axis is a different chart, and neither should animate out of the
-          // last one.
-          key={`${underlying}:${expiry}:${minute.minute}:${scale}`}
+          // Re-keyed per series and per scale, and deliberately **not** per minute. A
+          // different expiry is a different curve and a different axis is a different
+          // chart, so both remount; a different minute is new data on the same chart, and
+          // remounting the whole SVG on every drag step is the difference between a
+          // scrubber that feels like dragging and one that stutters. Nothing animates
+          // out of the last minute because nothing on this chart animates at all.
+          key={`${underlying}:${expiry}:${scale}`}
           minute={minute}
+          grid={grid}
           scale={scale}
           underlying={underlying}
           expiry={expiry}

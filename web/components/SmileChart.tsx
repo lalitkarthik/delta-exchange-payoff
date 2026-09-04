@@ -83,16 +83,27 @@ export type VolScale = "linear" | "log";
 
 export function SmileChart({
   minute,
+  grid,
   scale,
   underlying,
   expiry,
 }: {
   minute: SmileMinute;
+  /**
+   * Every strike this expiry listed anywhere in the response — see `strikeGrid`.
+   *
+   * Two things come out of drawing against the board rather than against the minute.
+   * A **thin** minute breaks its line at the strikes it does not hold, instead of
+   * drawing a segment straight across them; and the strike axis stops moving while the
+   * scrubber does, so two adjacent minutes are comparable by eye rather than being
+   * redrawn on two different scales.
+   */
+  grid?: readonly number[];
   scale: VolScale;
   underlying: string;
   expiry: string;
 }) {
-  const rows = useMemo(() => toRows(minute), [minute]);
+  const rows = useMemo(() => toRows(minute, grid), [minute, grid]);
   const forward = minute.forward;
 
   const model = useMemo(() => {
@@ -199,8 +210,16 @@ export function SmileChart({
       <div className="chart-tip">
         <div className="chart-tip-head">{formatStrike(row.strike)}</div>
         <dl className="chart-tip-list">
+          {/* Two different absences, and they are not interchangeable: the solver saw
+              this strike and refused it, or this minute holds no row for it at all. */}
           <dt>IV</dt>
-          <dd>{row.ivPct === null ? "not solved" : formatPercent(row.ivPct, 2)}</dd>
+          <dd>
+            {row.ivPct !== null
+              ? formatPercent(row.ivPct, 2)
+              : row.stored
+                ? "not solved"
+                : "not stored"}
+          </dd>
 
           <dt>Offset</dt>
           <dd>{row.offset === null ? "no forward" : `${formatOffset(row.offset)} USD`}</dd>

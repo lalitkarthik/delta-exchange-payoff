@@ -848,3 +848,234 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
    axis rules at 1.40:1 / 1.68:1. They sit in the band `--itm` (1.14:1) and `--row-hover`
    (1.33:1) are documented at further up this file. Every value a reader takes off this
    chart is carried by a tick or the tooltip, never by a grid line. */
+
+/* ---------------------------------------------- screens: the time scrubber
+ *
+ * The day, laid out as a channel with the minutes the store never wrote marked on it.
+ *
+ * It sits in a panel of `--surface` on the page's `--bg`, and the channel inside it is
+ * cut back to `--bg` so that it reads as a groove rather than as a second card. That
+ * makes the resolved ground for the marks and the thumb `--bg`, and every ratio below
+ * was measured against that, in both variants, at rest and hovered and focused.
+ *
+ * **The marks are not amber and the thumb is not amber.** This screen spends its accent
+ * on the forward, which is the reference the whole curve is read against; a second amber
+ * object in view would leave neither of them meaning anything. The thumb is `--ink`, the
+ * same token as the curve it moves, and the marks are `--ink-faint`, the same token as
+ * the dotted rule the chart draws at a strike it could not solve. That is not a
+ * coincidence being reused — it is the same statement in two places: nothing here.
+ *
+ * **A short mark is a marker, not a measure, and it is shaped so that it cannot be read
+ * as one.** A one-minute hole is sub-pixel on a day-wide track — `measured`, 1.42px at a
+ * 1,138px track and 0.39px at 318px — so it carries a 2px floor to be visible at all,
+ * and 171 of those drawn at full height covered 40.6% of the track where the truth was
+ * 31.1%, rising to **119.5% against 29.4%** once the window narrowed. So short holes are
+ * ticks along the floor of the groove and only a run of five minutes or more — the
+ * store's own flush interval — is drawn full height at its own width. The exact count is
+ * printed beside the track, and it is the measure.
+ *
+ * Drawing them at their true width instead would put a sub-pixel wash on the track, and
+ * this project has already shipped one of those at 1.077:1 and called it done. A feature
+ * nobody can see has been deleted, not toned down.
+ */
+
+.scrub {
+  margin: 12px var(--pad) 0;
+  padding: 8px 10px 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.scrub-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* One minute back, one minute forward — including onto an empty position, which is the
+   whole point of stepping rather than only dragging. */
+.scrub-step {
+  flex: none;
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--ink);               /* 12.72:1 dark, 14.90:1 light, on --bg */
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.scrub-step:hover:not(:disabled) {
+  background: var(--row-hover);
+  border-color: var(--accent);
+  color: var(--accent);            /* 8.05:1 dark, 4.87:1 light, on --row-hover */
+}
+
+.scrub-step:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* At an end of the day. Dimmed, not hidden - a control that vanished at the edge would
+   move every other control in the row. 4.76:1 dark, 4.70:1 light, on --bg. */
+.scrub-step:disabled { color: var(--ink-faint); cursor: default; }
+
+.scrub-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+}
+
+/* The groove. Cut back to the page ground so the panel around it stays a panel. */
+.scrub-track::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+/* Inset by half the thumb, because that is the width the thumb's centre actually
+   travels: without it a mark and the position it stands for drift apart by up to seven
+   pixels at the ends, which is six minutes at a day's width. */
+.scrub-gaps {
+  position: absolute;
+  left: 7px;
+  right: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 12px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* A dropped minute or four: a tick along the floor of the groove, 2px wide because at a
+   day's width it is otherwise sub-pixel. Ticks may run together where the store is
+   perforated, and that is the point - a hairline along the bottom reads as "holes all
+   through here" while the groove above it stays visibly open. Drawn full height they
+   read as "nothing here", which is a different and false statement: `measured` at a
+   620px window, full-height ticks covered 119.5% of the track against a true 29.4%. */
+.scrub-gap {
+  position: absolute;
+  bottom: 2px;
+  height: 3px;
+  min-width: 2px;
+  background: var(--ink-faint);    /* 4.76:1 dark, 4.70:1 light, on --bg */
+}
+
+/* Five minutes or more - a whole flush window with nothing in it. Wide enough to draw at
+   its own width, so this one is full height and is a block rather than a texture. */
+.scrub-gap-long {
+  top: 2px;
+  height: auto;
+}
+
+/* The control itself is a native range with everything of its own turned off. The
+   accessibility - arrows, Home, End, touch, click-to-jump - is the reason it is native,
+   and none of that is worth re-implementing on a div. */
+.scrub-range {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.scrub-range::-webkit-slider-runnable-track { height: 22px; background: transparent; }
+.scrub-range::-moz-range-track { height: 22px; background: transparent; }
+
+/* `--ink`, the curve's own token: this is the object that says which minute is drawn.
+   12.72:1 dark, 14.90:1 light, on the groove's --bg. The 1px --surface edge keeps it
+   readable where it passes over a run of marks. */
+.scrub-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 18px;
+  margin-top: 2px;
+  border: 1px solid var(--surface);
+  border-radius: 1px;
+  background: var(--ink);
+}
+
+.scrub-range::-moz-range-thumb {
+  width: 12px;
+  height: 16px;
+  border: 1px solid var(--surface);
+  border-radius: 1px;
+  background: var(--ink);
+}
+
+/* Hover moves the groove's edge, not the thumb: the thumb is already at the top of the
+   palette and has nowhere brighter to go. --line-strong is 1.40:1 dark and 1.68:1 light
+   and carries nothing; --ink-faint is 4.76:1 and 4.70:1 and is the cue. */
+.scrub-track:hover::before { border-color: var(--ink-faint); }
+
+.scrub-range:focus-visible { outline: none; }
+.scrub-range:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 2px var(--accent); }
+.scrub-range:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(--accent); }
+
+/* One stored minute and nothing to drag to. The control stays, and the readout beside
+   it says why - a scrubber that disappeared would be a screen that looked different
+   depending on whether an engine was running. */
+.scrub-range:disabled { cursor: default; }
+.scrub-range:disabled::-webkit-slider-thumb { background: var(--ink-soft); }
+.scrub-range:disabled::-moz-range-thumb { background: var(--ink-soft); }
+
+/* The clock. Local, and labelled - see `lib/format.ts` for why this one is not UTC. */
+.scrub-clock {
+  flex: none;
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 5px;
+  min-width: 96px;
+}
+
+.scrub-time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--ink);               /* 11.30:1 dark, 13.90:1 light, on --surface */
+}
+
+.scrub-zone {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);          /* 5.37:1 dark, 5.97:1 light, on --surface */
+}
+
+/* Both ends of the day, and what is between them. Padded clear of the step buttons so
+   the first and last stamps sit under the ends of the track rather than under the
+   arrows. */
+.scrub-ends {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 5px;
+  padding: 0 34px 0 34px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-faint);         /* 4.61:1 dark, 5.08:1 light, on --surface */
+}
+
+.scrub-count { color: var(--ink-soft); }
+
+/* The count of holes, in the ink the figures wear. It is the one number in this row a
+   reader acts on - it is what tells them the marks on the track are not a texture. */
+.scrub-count-missing { color: var(--ink); font-weight: 700; }
