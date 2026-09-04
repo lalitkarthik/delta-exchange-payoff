@@ -1262,3 +1262,133 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
 /* The count of holes, in the ink the figures wear. It is the one number in this row a
    reader acts on - it is what tells them the marks on the track are not a texture. */
 .scrub-count-missing { color: var(--ink); font-weight: 700; }
+
+/* ------------------------------------------ screens: the recording switch
+ *
+ * Whether the store is writing, and the one control on this header that changes
+ * something in the engine rather than something on the screen.
+ *
+ * It is shaped as a `.stat` — the label above, the value below — for the same reason the
+ * pickers are: it belongs among Spot, ATM and Fetched because it is a fact about the
+ * data, and a control styled as a control would pull the eye off the figures. The value
+ * happens to be a button.
+ *
+ * **The accent is not spent here.** Amber marks the wordmark, spot, the money row and the
+ * ATM rule, and a fifth amber object would leave none of them meaning anything. The two
+ * states are told apart by four things that are not hue — the word ON or OFF, a filled or
+ * hollow dot, the ground, and a warning that appears on its own line — so the pair
+ * survives a colour-vision deficiency and a monochrome printout. Amber appears on this
+ * control in one place only: the hover border and the focus ring, which are the same two
+ * cues every other control in this file uses.
+ *
+ * **The off state does not lose its ground when it is hovered.** That fault has shipped
+ * on this project once already, on the money row, where hovering swapped the wash out
+ * from under the text it was meant to sit behind. Hovering OFF moves `--itm` (1.14:1
+ * over the page) to `--row-hover` (1.33:1), which is brighter rather than absent, and the
+ * `--put` edge stays put so the state survives the pointer.
+ *
+ * Every pair below is `measured` in the browser on the rendered control against its
+ * **resolved** background — dark then light, at rest and hovered, in all three states —
+ * with the pointer really parked on the control rather than the tokens paired on paper.
+ * The numbers are recorded beside the rules they justify.
+ *
+ * The one pair under the bar is `--line-strong` as the resting edge, at 1.40:1 dark and
+ * 1.68:1 light on `--surface`. It carries nothing: the state is the word ON or OFF at
+ * 12.72:1 and the dot beside it in the same ink, and this is the identical edge
+ * `.theme` and `.refresh` wear elsewhere in this same header. The edge that does carry
+ * something — `--put` when recording is off — is 5.90:1 dark and 5.92:1 light.
+ */
+
+.rec { display: flex; flex-direction: column; line-height: 1.25; }
+
+.rec-value { display: inline-flex; align-items: center; gap: 8px; }
+
+.rec-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--ink);          /* 12.72:1 dark, 14.90:1 light, on --bg */
+  padding: 2px 9px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+}
+
+/* Filled when recording, hollow when not. It inherits `currentColor`, so it can never
+   drift away from the label beside it. */
+.rec-dot {
+  width: 8px;
+  height: 8px;
+  border: 2px solid currentColor;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+/* Off is the loud state and looks it: a wash, a red edge, a hollow dot and the word.
+   Ink on --itm is 11.16:1 dark and 13.57:1 light; the --put edge is 5.90:1 and 5.92:1
+   against the header it sits on. */
+.rec-toggle[data-state="off"] {
+  background: var(--itm);
+  border-color: var(--put);
+}
+.rec-toggle[data-state="off"] .rec-dot { background: transparent; }
+
+/* Not a state anyone can act on: the engine has not answered, so there is nothing to
+   toggle to. Dashed rather than dimmed alone, so it does not read as "off". */
+/* 4.76:1 dark, 4.70:1 light, on --bg. */
+.rec-toggle[data-state="unknown"] {
+  color: var(--ink-faint);
+  border-style: dashed;
+  cursor: default;
+}
+.rec-toggle[data-state="unknown"] .rec-dot { background: transparent; }
+
+/* Ground and text move together — `--ink-soft` over `--row-hover` is 4.18:1 dark, under
+   the bar, which is the trap the rail and the scale toggle both document. Ink on
+   --row-hover is 9.58:1 dark and 12.95:1 light; the amber edge is 9.64:1 and 6.05:1. */
+.rec-toggle:hover:not(:disabled) {
+  background: var(--row-hover);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+/* The off state keeps its own edge under the pointer: hovering brightens the ground
+   from --itm to --row-hover rather than replacing the state's colour. --put on
+   --row-hover is 4.59:1 dark and 4.76:1 light. */
+.rec-toggle[data-state="off"]:hover:not(:disabled) { border-color: var(--put); }
+
+.rec-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.rec-toggle:disabled { cursor: default; }
+
+/* The evidence that recording is a fact and not a label: a figure that climbs. */
+.rec-rows {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);          /* 5.37:1 dark, 5.97:1 light, on --surface */
+}
+
+/* `order: 1` puts this after every other child of the wrapping header however early it
+   appears in the markup, so it takes a line of its own beneath the figures and leaves
+   `.theme`'s `margin-left: auto` working on the line above. */
+.rec-warn {
+  order: 1;
+  flex-basis: 100%;
+  margin: 0;
+  padding: 6px 10px;
+  border-left: 3px solid var(--put);   /* 5.90:1 dark, 5.92:1 light, on --surface */
+  background: var(--itm);
+  color: var(--ink);                   /* 11.16:1 dark, 13.57:1 light, on --itm */
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* The same bar, dashed. Two warnings of one shape would be one warning: "recording is
+   off" is a fact about the store, and "the switch was not thrown" is an absence of one —
+   the dash is the same statement the unknown toggle's edge makes. */
+.rec-warn-failed { border-left-style: dashed; }
+
+.rec-warn strong { font-weight: 700; }

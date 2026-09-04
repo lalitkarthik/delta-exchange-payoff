@@ -1,9 +1,10 @@
-"""Response shapes. These are the contracts in `docs/chain-contract.md` and
-`docs/smile-contract.md`, in code. Those files are the authority and change first."""
+"""Response shapes. These are the contracts in `docs/chain-contract.md`,
+`docs/smile-contract.md` and `docs/recording-contract.md`, in code. Those files are the
+authority and change first."""
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StrictBool
 
 
 class ComputedLeg(BaseModel):
@@ -179,3 +180,40 @@ class SmileResponse(BaseModel):
     model_versions: list[str]
     #: Ascending by minute.
     minutes: list[SmileMinute]
+
+
+class RecordingState(BaseModel):
+    """`GET /recording`, and the body `POST /recording` answers with.
+    `docs/recording-contract.md`.
+
+    One shape for both, so a client that switched the state needs no second request and
+    cannot render a state that was never true: the POST answers with what is true
+    **after** the change.
+
+    The two counters are sums across the four tables rather than a per-table breakdown.
+    They are here so a reader can see that recording is a fact rather than a label —
+    `rows_written` climbing is the engine capturing, and `buffered_rows` falling to zero
+    the instant recording is switched off is the flush the contract promises, observed.
+    """
+
+    #: Whether the writer is aggregating and writing right now. True at start-up.
+    recording: bool
+    #: Sealed bars held in memory and not yet on disk, across all four tables.
+    buffered_rows: int
+    #: Rows this process has written to Parquet, across all four tables.
+    rows_written: int
+
+
+class RecordingRequest(BaseModel):
+    """The body of `POST /recording`. One field, required, and a **strict** boolean.
+
+    A default would let a malformed body silently stop the day's capture; FastAPI's 422
+    says what happened instead.
+
+    `StrictBool` rather than `bool` because Pydantic's lax mode reads `"off"`, `"no"` and
+    `"0"` as false. Guessing at a string is the wrong disposition for the one route in
+    this engine that changes anything: this is the same rule as `null` is not `0` and the
+    engine converting once at the boundary, applied to a request body.
+    """
+
+    recording: StrictBool

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ChainLadder } from "@/components/ChainLadder";
+import RecordingToggle from "@/components/RecordingToggle";
 import ThemeToggle from "@/components/ThemeToggle";
 import { UNDERLYINGS, type ChainResponse, type Underlying } from "@/lib/contract";
 import { ENGINE_URL, loadExpiries } from "@/lib/engine";
@@ -179,6 +180,11 @@ export default function Page() {
         <span className="chip" title={statusDetail ?? `Streaming from ${ENGINE_URL}.`}>
           {LIVE_STATUS_LABEL[status]}
         </span>
+
+        {/* Whether the day is being captured, read from the engine on every poll. It
+            belongs among the figures rather than off with the theme control: it is a
+            fact about the data, and the one fact on this row a reader can change. */}
+        <RecordingToggle />
 
         {/* Last, and pushed right by `margin-left: auto`: it changes how the figures look
             and never what they say, so it must not sit among them competing for the eye. */}

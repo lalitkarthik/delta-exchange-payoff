@@ -11,6 +11,7 @@ import {
   isEngineError,
   type ChainResponse,
   type ExpiriesResponse,
+  type RecordingState,
   type SmileResponse,
   type Underlying,
 } from "./contract";
@@ -259,4 +260,57 @@ export async function loadSmile(
     }
     throw err;
   }
+}
+
+/**
+ * The recording switch. `docs/recording-contract.md`.
+ *
+ * **Neither of these falls back to the fixture, and that is the point.** Everywhere else
+ * in this file an unreachable engine is a local condition a committed fixture can stand
+ * in for, because the fixture is real data that was really captured. There is no such
+ * thing as a fixture for "is the store writing right now": inventing an answer would tell
+ * a reader a day is being captured when nothing is running at all, which is the exact
+ * failure the whole control exists to prevent. So the error travels and the control says
+ * it does not know.
+ */
+export async function loadRecording(): Promise<RecordingState> {
+  return get<RecordingState>("/recording");
+}
+
+/**
+ * Stop or start the store. The engine's only mutating route.
+ *
+ * Answers with the state *after* the change, so the caller renders what came back rather
+ * than what it asked for — a control that painted its own optimistic guess would show
+ * "off" for a request the engine refused.
+ */
+export async function setRecording(recording: boolean): Promise<RecordingState> {
+  let res: Response;
+  try {
+    res = await fetch(`${ENGINE_URL}/recording`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ recording }),
+      cache: "no-store",
+    });
+  } catch (cause) {
+    // Also where a CORS preflight refusal lands: the browser reports it as a failed
+    // fetch and nothing distinguishes it from the engine being down. `allow_methods` in
+    // the engine's `main.py` carries `POST` for exactly this reason.
+    throw new EngineUnreachableError(cause);
+  }
+
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new EngineResponseError(res.status, `${res.status} ${res.statusText}: body was not JSON`);
+  }
+  if (!res.ok) {
+    throw new EngineResponseError(
+      res.status,
+      isEngineError(body) ? body.detail : `${res.status} ${res.statusText}`,
+    );
+  }
+  return body as RecordingState;
 }

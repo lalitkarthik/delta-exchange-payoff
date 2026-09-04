@@ -45,6 +45,14 @@ reference and spot bars. Spot's 350 bytes is below Parquet's own footer, which i
 harmless at 52 KB of table a day but is the first thing to look at if the small-file
 count ever bites: that one table can flush on a slower cadence on its own.
 
+**Recording can be switched off, and switching it off is not the same as stopping.**
+`BarWriter.recording` is `True` at start-up and `POST /recording` puts it down. A paused
+writer stops aggregating, sampling, sealing and writing — and **keeps draining its
+subscription**, because a lossless queue nobody empties grows without bound and backs the
+socket reader up behind it. Switching off flushes what is already sealed before it stops,
+so a pause never costs a minute the engine had already captured; the open minute is held
+in the aggregators and lands once, on the resume. `docs/recording-contract.md`.
+
 **And the write must never happen in the socket reader's path.** If it did, the reader
 would stop draining the connection while the disk worked, the operating system's receive
 buffer would fill, and **Delta would close us** — nobody having enforced a limit; we
@@ -948,6 +956,28 @@ class BarWriter:
         #: "the writer ignored most of the bus" should be a number and not a discovery.
         self.skipped = 0
         self.flush_errors = 0
+        #: Bus records drained and dropped because recording was off. Distinct from
+        #: `skipped`, which counts records the writer could make nothing of at all.
+        self.discarded = 0
+        #: Whether this writer is aggregating and writing. **True at start-up, always**
+        #: — a process that came up not recording would silently capture nothing, and
+        #: forgetting to switch it on is a worse failure than forgetting to switch it
+        #: off. It follows that a pause does not survive a restart.
+        #:
+        #: A paused writer still **drains** its subscription; see `ingest`. Only the
+        #: aggregating, the sampling, the sealing and the writing stop.
+        #: `docs/recording-contract.md` is the authority.
+        self.recording = True
+
+    @property
+    def stores(self) -> tuple[BarStore, ...]:
+        """The four tables, in one place. Flushed together and counted together."""
+        return (
+            self.store,
+            self.reference_store,
+            self.spot_store,
+            self.computed_store,
+        )
 
     def attach(self, fanout, maxsize: int = QUEUE_WATERMARK, name: str = "bar-writer"):
         """Take a lossless queue on the bus. `run` drains it."""
@@ -966,6 +996,15 @@ class BarWriter:
         `samples_from_ticker` refuses `ob_l2` — so no frame can be counted twice into
         one bar.
         """
+        if not self.recording:
+            # **Drained, then dropped — and this is the whole of the pause.** The record
+            # has already been taken off the queue by `run`; refusing it here is what
+            # stops the aggregating without stopping the draining. Counted, because a
+            # pause that silently ate the bus would be indistinguishable from a writer
+            # that had died.
+            self.discarded += 1
+            return
+
         tick = tick_from_quote(quote)
         if tick is not None:
             self.aggregator.add(tick)
@@ -1022,6 +1061,15 @@ class BarWriter:
                     break
 
             now = self.clock()
+            # **The drain above runs whether or not this writer is recording.** Only
+            # the three lines below stop. A paused writer that stopped taking messages
+            # off its lossless queue would let that queue grow without bound and back
+            # the socket reader up behind it, turning a pause of the *store* into a
+            # stall of the *feed* — and would then fold every one of those held
+            # messages into bars the moment it resumed, back-filling the minutes the
+            # pause was meant to leave empty.
+            if not self.recording:
+                continue
             self._sample_computed(now)
             self._seal(now)
             await self._maybe_flush()
@@ -1068,7 +1116,7 @@ class BarWriter:
         which is the defect this whole store exists to refuse — and it is the sabotage
         `test_a_minute_with_no_computed_chain_gets_no_computed_row` was verified against.
         """
-        if self.chains is None:
+        if self.chains is None or not self.recording:
             return 0
 
         minute_us = int(now * 1e6) - int(now * 1e6) % BUCKET_US
@@ -1144,6 +1192,45 @@ class BarWriter:
             + self.computed_store.flush()
         )
 
+    async def set_recording(self, recording: bool) -> bool:
+        """Stop or start aggregating and writing. `docs/recording-contract.md`.
+
+        **Switching off flushes what is buffered, then stops.** The buffer holds up to a
+        `FLUSH_SECONDS` interval of sealed bars, and dropping them would throw away data
+        the engine already has — the exact loss that interval was shortened to reduce.
+        So the flag goes down first, so nothing can be sealed underneath us while the
+        disk works, then everything eligible is sealed and all four tables are written.
+        The boundary in the store is where the reader put it.
+
+        **The open minute is deliberately not flushed.** A partial bar written at the
+        pause and a second row for the same minute written on resume would be two rows
+        for one `(symbol, minute)`, which is a duplicate every reader downstream would
+        have to know about. It stays in the aggregator, is sealed when recording resumes
+        or when the process stops, and carries its true tick counts either way.
+
+        **Off, this stops the aggregating and the writing and nothing else.** The
+        subscription keeps being drained — see `ingest` — and nothing upstream of the
+        writer is touched, so the live screens are unaffected.
+
+        Switching on invents nothing: no row appears for a minute that elapsed while
+        recording was off, because no tick was ever folded into one.
+
+        `async` because the flush is `asyncio.to_thread`, exactly as `_maybe_flush` is,
+        and for the same reason: a disk on the event loop is a socket reader that has
+        stopped draining.
+        """
+        if recording:
+            self.recording = True
+            return self.recording
+
+        self.recording = False
+        self._seal()
+        # The interval restarts from the pause rather than from the last flush before
+        # it, so a resume does not write again immediately for no reason.
+        self._last_flush = self.clock()
+        await asyncio.to_thread(self._flush_all)
+        return self.recording
+
     async def aclose(self) -> None:
         """Flush the partial bars from all three tables and write them out. For stop.
 
@@ -1171,7 +1258,9 @@ class BarWriter:
         """
         queued = 0 if self._subscription is None else self._subscription.queue.qsize()
         return {
+            "recording": self.recording,
             "skipped": self.skipped,
+            "discarded": self.discarded,
             "flush_errors": self.flush_errors,
             "flushes": self.store.flushes,
             "rows_written": self.store.rows_written,

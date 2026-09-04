@@ -6,6 +6,10 @@ fixed before either exists. Change it by changing this file first.
 > `/smile` — the stored volatility surface the smile screen reads — has its own file:
 > [smile-contract.md](smile-contract.md). This one covers `/expiries`, `/chain` and
 > `/ws/chain`, which all serve Delta **now**; that one serves what was already stored.
+>
+> `/recording` — the switch that decides whether anything is stored at all — has its own
+> file too: [recording-contract.md](recording-contract.md). It is the engine's only
+> mutating route, and the reason `allow_methods` here is no longer `["GET"]` alone.
 
 Delta has **no option-chain endpoint**. A chain is `GET /v2/tickers` filtered by underlying and
 expiry, with the rows pivoted so a call and a put sharing a strike land on one line. The engine

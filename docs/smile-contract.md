@@ -2,8 +2,10 @@
 
 The interface between the engine and the volatility screen. Sibling of
 [chain-contract.md](chain-contract.md), which is the authority for `/expiries`, `/chain` and
-`/ws/chain`. Both files are changed **first**, before the response models and before
-`web/lib/contract.ts`.
+`/ws/chain`, and of [recording-contract.md](recording-contract.md), which is the authority
+for the `/recording` switch deciding whether the minutes this endpoint serves are captured
+at all. Every one of these files is changed **first**, before the response models and
+before `web/lib/contract.ts`.
 
 **Why a second file rather than a section in the first.** [#15](https://github.com/lalitkarthik/delta-exchange-payoff/issues/15)
 preferred one document and carried a caveat: split if the smile section runs long. It ran

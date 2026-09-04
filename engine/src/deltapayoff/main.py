@@ -8,6 +8,13 @@ Two REST endpoints fixed by `docs/chain-contract.md`, one websocket that pushes 
 while it serves what was already computed and stored. It calls nothing, solves nothing and
 has no upstream to be unavailable, so it has no 502 and no 404. See `smile.py`.
 
+`/recording` is odder still, and it is the **only mutating route in this engine** — every
+other one is a `GET` or a websocket. It reports whether the store is writing and lets a
+reader stop and start it, which is why `allow_methods` below is no longer `["GET"]` alone:
+a `POST` against a `GET`-only allowance is refused at the preflight and surfaces in the
+browser as a network error indistinguishable from the engine being down. Who may call it
+is answered in `docs/recording-contract.md` rather than left unexamined.
+
 `/ws/chain` exists so the screen updates without anyone pressing anything. It sends the
 identical object `/chain` returns, so `web/components/ChainLadder.tsx` renders it
 unchanged — the transport moved, the contract did not.
@@ -63,7 +70,13 @@ from .compute import enrich
 from .delta_client import DeltaClient, DeltaUnavailable
 from .fanout import FanOut
 from .feed import DeltaFeed
-from .models import ChainResponse, ExpiriesResponse, SmileResponse
+from .models import (
+    ChainResponse,
+    ExpiriesResponse,
+    RecordingRequest,
+    RecordingState,
+    SmileResponse,
+)
 from .smile import read_smile
 from .store import COMPUTED_DATASET, COMPUTED_SCHEMA, BarStore, BarWriter
 from .stream import ChainStream, recompute_forever
@@ -193,11 +206,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+#: `GET` alone until `/recording` arrived. A `POST` from the browser against a `GET`-only
+#: allowance is refused at the **preflight**, which surfaces in the page as a network
+#: error indistinguishable from the engine being down — the most misleading failure shape
+#: available, because the one thing it does not look like is a CORS rule. The allowance
+#: moves with the route. It is not access control: it constrains browsers and nothing
+#: else, and `docs/recording-contract.md` says who may actually call the route.
+ALLOWED_METHODS = ["GET", "POST"]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=ALLOWED_METHODS,
     allow_headers=["*"],
 )
 
@@ -241,6 +262,25 @@ def get_computed_store() -> BarStore:
     if writer is not None:
         return writer.computed_store
     return BarStore(dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+
+
+def get_bar_writer() -> BarWriter:
+    """The writer `/recording` reports on and switches. Sibling of the store seam above.
+
+    **503 rather than a default when there is none.** A process without a writer is not
+    a process that is paused; it is one where the question has no answer, and reporting
+    `false` would tell a reader that recording is off and can be switched on when
+    neither is true. The lifespan builds the writer unconditionally — whether or not the
+    live feed runs — so the only process this can happen in is one whose lifespan never
+    ran, which is every test that does not enter `TestClient` as a context manager.
+    """
+    writer = getattr(app.state, "writer", None)
+    if writer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="the engine has no bar writer; recording state is unknown",
+        )
+    return writer
 
 
 def get_chain_stream() -> ChainStream:
@@ -330,6 +370,53 @@ def smile(
     symbol = _validated(normalise_underlying, underlying)
     date = _validated(validate_expiry, expiry)
     return read_smile(store, symbol, date)
+
+
+def _recording_state(writer: BarWriter) -> RecordingState:
+    """One shape, built once, so `GET` and `POST` cannot drift into two."""
+    return RecordingState(
+        recording=writer.recording,
+        buffered_rows=sum(store.buffered for store in writer.stores),
+        rows_written=sum(store.rows_written for store in writer.stores),
+    )
+
+
+@app.get("/recording", response_model=RecordingState)
+def recording_state(
+    writer: Annotated[BarWriter, Depends(get_bar_writer)],
+) -> RecordingState:
+    """Whether the store is writing, read from the engine. `docs/recording-contract.md`.
+
+    **The state lives here and nowhere else.** Not in the browser and not in
+    `localStorage`: two tabs must not be able to disagree about whether the store is
+    writing, and a reader arriving on a fresh page is told the truth rather than a
+    default.
+    """
+    return _recording_state(writer)
+
+
+@app.post("/recording", response_model=RecordingState)
+async def set_recording(
+    body: RecordingRequest,
+    writer: Annotated[BarWriter, Depends(get_bar_writer)],
+) -> RecordingState:
+    """Stop or start the store. **The engine's only mutating route.**
+
+    Answers with the state *after* the change, so a client needs no second request and
+    cannot render a state that was never true. Idempotent: posting `false` twice is not
+    an error, and the second one flushes an already empty buffer.
+
+    Switching off **flushes what is buffered before it stops** — the buffer holds up to
+    a five-minute interval of sealed bars, and discarding them would throw away data the
+    engine already has, which is the exact loss that interval exists to reduce. Switching
+    off does **not** stop the writer draining its subscription; see `BarWriter.ingest`.
+
+    Who may call it is answered deliberately in `docs/recording-contract.md` rather than
+    left unexamined: anything that can reach the port, and the port is loopback.
+    Authentication is named there and not built.
+    """
+    await writer.set_recording(body.recording)
+    return _recording_state(writer)
 
 
 @app.websocket("/ws/chain")

@@ -1,8 +1,9 @@
 /**
  * Types for the engine's HTTP interface.
  *
- * These mirror `docs/chain-contract.md` and `docs/smile-contract.md` field for field.
- * Those files are the authority; if this file and a contract disagree, this file is wrong.
+ * These mirror `docs/chain-contract.md`, `docs/smile-contract.md` and
+ * `docs/recording-contract.md` field for field. Those files are the authority; if this
+ * file and a contract disagree, this file is wrong.
  *
  * Two rules from the contract are load-bearing for every type here:
  *
@@ -222,4 +223,25 @@ export function isEngineError(value: unknown): value is EngineError {
     value !== null &&
     typeof (value as { detail?: unknown }).detail === "string"
   );
+}
+
+/**
+ * `GET /recording` and the body `POST /recording` answers with.
+ * `docs/recording-contract.md`.
+ *
+ * One shape for both, so the control that switched the state needs no second request and
+ * cannot render a state that was never true — the POST answers with what is true *after*
+ * the change.
+ *
+ * **This state lives in the engine.** It is never held in `localStorage` and never
+ * inferred: two tabs must not be able to disagree about whether the store is writing, and
+ * a reader arriving on a fresh page is told the truth rather than a default.
+ */
+export interface RecordingState {
+  /** Whether the writer is aggregating and writing right now. `true` at start-up. */
+  recording: boolean;
+  /** Sealed bars held in memory and not yet on disk, across all four tables. */
+  buffered_rows: number;
+  /** Rows this engine process has written to Parquet, across all four tables. */
+  rows_written: number;
 }
