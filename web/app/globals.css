@@ -1,11 +1,22 @@
 /*
  * One stylesheet, plain CSS. No Tailwind, no UI library.
  *
- * Ported from `payoff-project/web/app/globals.css` so the two projects read as one
- * product. Two things drive every choice here: the chain is a **dense numeric table**,
- * so figures are tabular-aligned and the row height is tight; and a trader reads it for
+ * The structure came from `payoff-project/web/app/globals.css`; the **palette,
+ * typography and branding are the Convex Hedge terminal's**, so this screen and
+ * `app.convexhedge.ai` read as one product. Amber on warm black, monospace throughout,
+ * uppercase letter-spaced labels, square corners.
+ *
+ * Two things drive every other choice: the chain is a **dense numeric table**, so
+ * figures are tabular-aligned and the row height is tight; and a trader reads it for
  * minutes at a time, so contrast is carried by weight and alignment rather than by
- * colour.
+ * colour. Amber is the one exception, and it is spent on four things only — the
+ * wordmark, spot, the money row, and the section a control acts on.
+ *
+ * **Every colour pair in here was measured in the browser, not judged by eye.** Four
+ * failed 4.5:1 on the first pass and were changed; the numbers are recorded beside the
+ * tokens they justify. The measurement that matters is of a *rendered element* against
+ * its *resolved* background — the cartesian product of tokens flags pairs that never
+ * meet, and misses that hovering the money row swaps the amber wash for `--row-hover`.
  *
  * Only the rules this page uses are kept. The sibling's Legs, presets, payoff chart,
  * tabs, time control and metrics panel have no counterpart here, so their rules are not
@@ -14,116 +25,153 @@
  */
 
 /*
- * The palette is declared three times, and the order is load-bearing.
+ * The palette is the Convex Hedge terminal's, and it is **dark first**.
  *
- * `:root` carries the complete light palette. The `@media` block redefines only the
- * colours, and only where the trader has not asked for light - so a system set to dark
- * wins over the default but never over an explicit choice. The `[data-theme="dark"]`
- * block repeats those colours last, so the toggle can reach dark from a light system
- * too. A colour defined *only* inside one of the lower blocks would have no value in
- * the other direction, which is why every token has a value here first.
+ * The terminal is amber on warm black and has no light mode, so `:root` carries the
+ * dark palette and the interface wears it by default. Light is a real setting a trader
+ * can choose, but it is the variant rather than the origin — the inverse of how this
+ * file read before, and the reason every token moved rather than a few.
+ *
+ * The order is still load-bearing. `:root` carries the complete **dark** palette. The
+ * `@media (prefers-color-scheme: light)` block redefines only the colours, and only
+ * where the trader has not asked for dark - so a system set to light wins over the
+ * default but never over an explicit choice. The `[data-theme="light"]` block repeats
+ * those colours last, so the toggle can reach light from a dark system too. A colour
+ * defined *only* inside one of the lower blocks would have no value in the other
+ * direction, which is why every token has a value here first.
  *
  * `auto` is spelled as the *absence* of `data-theme`, not as `data-theme="auto"`, so
- * the media query is what governs. See `lib/theme.ts`.
+ * the media query is what governs. See `lib/theme.ts`, which needed no change: it only
+ * ever set or removed the attribute, and that mechanism is symmetric.
  */
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
 
-  --bg: #f6f7f9;
-  --surface: #ffffff;
-  --line: #e3e6ea;
-  --line-strong: #cdd3da;
-  --ink: #16202b;
-  --ink-soft: #5b6773;
-  --ink-faint: #93a0ac;
+  /* Warm black, not blue-black. The terminal's ground has red in it, and a neutral
+     #0a0a0a beside it reads as a different product. */
+  --bg: #0a0908;
+  --surface: #100e0c;
+  --line: #221e1a;
+  --line-strong: #322c26;
+
+  /* Warm greys. A neutral grey on this ground looks blue by contrast. */
+  --ink: #d4cec4;
+  --ink-soft: #8f867a;
+  /* The terminal's labels are dim, and #6b6459 matched it at **3.40:1** on this ground -
+     under the 4.5:1 that ordinary text needs. Measured in the browser across every
+     token. #837b6e is the least change that clears it, at **4.76:1**, and still reads
+     as a caption rather than as data. */
+  --ink-faint: #837b6e;
 
   /* Calls green, puts red — the convention a desk reads without thinking. */
-  --call: #15803d;
-  --put: #b91c1c;
-  --accent: #4338ca;
+  --call: #4fb87c;
+  --put: #e8636b;
 
-  /* Price direction. Deep rather than bright: these paint whole cells on a table
-     that repaints every second, and a light tint reads as a highlight while a deep
-     one reads as a state. Kept as their own tokens even though they now share the
-     call/put hues, because the two mean different things and may diverge again. */
-  --up: #14532d;
-  --down: #7f1d1d;
-  --atm: #fff6d6;
-  --atm-line: #e0b400;
-  /* The in-the-money wash. A tint rather than an alpha, so it composes predictably with
-     the hatch on a blank cell and with the row hover that overrides it. */
-  --itm: #fbeff0;
+  /* Amber is the brand. It marks what the eye should land on first and nothing else:
+     the wordmark, the section heading, spot, the money row. Used for a fourth thing it
+     stops meaning any of them. */
+  --accent: #f2a93b;
 
-  /* Promoted out of the rules that used to hardcode them, because each is invisible
-     or wrong when the surface underneath it changes. */
-  --row-hover: #f0f4ff;
-  --hatch: #fafbfc;
+  /* Price direction. These now colour a **glyph**, never a fill — see the direction
+     section at the foot of this file. Their own tokens rather than the call/put hues
+     because the two mean different things and may diverge again. */
+  --up: #4fb87c;
+  --down: #e8636b;
 
-  --radius: 6px;
+  --atm: #3a2c10;
+  --atm-line: #f2a93b;
+  /* The in-the-money wash, and the row under the pointer.
+     Quiet, but not absent. The first value tried here was #17130f, which measured
+     **1.077:1** against a plain cell - a wash nobody can see is a feature that has been
+     deleted rather than toned down. These are 1.14:1 and 1.33:1 against the ground.
+     They are ordered on purpose: hover must read as louder than the wash, because
+     `tr:hover` outranks the wash in the cascade and the pointer has to keep telling you
+     which row it is on. */
+  --itm: #201815;
+
+  --row-hover: #2e2520;
+  --hatch: #121010;
+
+  /* Square. The terminal has no rounded corners anywhere. */
+  --radius: 2px;
   --pad: 12px;
-  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+  /* Monospace throughout, labels included. Every glyph on the terminal is fixed-width,
+     and a proportional label above a tabular column is the single change that stops it
+     reading as the same product. */
+  --font: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --mono: var(--font);
 }
 
 /*
- * Dark. Every semantic the light palette carries is preserved: `--surface` still sits
- * *above* `--bg` rather than below it, calls stay blue, puts stay red. Blue and indigo
- * are lifted, because #1f6feb and #4338ca are close to unreadable on a dark ground.
+ * Light. Amber on paper rather than a different design: every semantic the dark palette
+ * carries is preserved, and `--surface` still sits *above* `--bg`. The amber darkens to
+ * hold its contrast on a pale ground - #f2a93b on white is 1.9:1 and unreadable.
  */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
 
-    --bg: #0e1319;
-    --surface: #161d26;
-    --line: #232c38;
-    --line-strong: #33404f;
-    --ink: #e6edf3;
-    --ink-soft: #9aa7b4;
-    --ink-faint: #6b7885;
+    --bg: #f7f4ee;
+    --surface: #fffdf8;
+    --line: #e6dfd2;
+    --line-strong: #cfc5b4;
+    --ink: #241f18;
+    --ink-soft: #6b6154;
+    /* 3.49:1 at the dark theme's value; #756c60 is 4.70:1 here. */
+    --ink-faint: #756c60;
 
-    /* Headings stay legible on the dark ground, so these are lighter than the
-       light theme's - it is the tints below that carry the depth. */
-    --call: #3fb950;
-    --put: #ff6b6b;
-    --accent: #8b7cf6;
-    --up: #1a7f37;
-    --down: #a51d1d;
-    --atm: #3a3016;
-    --atm-line: #e0b400;
-    --itm: #241a1c;
+    --call: #177244;
+    --put: #b5342b;
+    /* The amber has to darken further on paper than it looks like it should: the
+       dark theme's #f2a93b is 1.9:1 here, and even a mid amber was 4.04:1. This is
+       4.68:1. */
+    /* Darker again than it looks like it should be. Hovering the money row replaces the
+       amber wash with `--row-hover` - `tr:hover td` outranks `tr.at-the-money td.strike`
+       in the cascade - so the amber has to hold on the hover ground too, where the
+       previous value fell to 4.07:1. This is 4.87:1 there and 5.60:1 on the page. */
+    --accent: #8a5607;
+    /* Measured against the row **hover**, not the row: hovering lightens the ground
+       under the arrow, so a green that passed at 4.62:1 on the plain row fell to
+       4.23:1 hovered. The worst ground is the one that decides. This is 5.02:1. */
+    --up: #177244;
+    --down: #b5342b;
 
-    --row-hover: #1d2733;
-    --hatch: #1b232d;
+    --atm: #fdf0cf;
+    --atm-line: #d99a1a;
+    --itm: #f1e9dc;
+
+    --row-hover: #ece4d5;
+    --hatch: #f4f0e7;
   }
 }
 
-:root[data-theme="dark"] {
-  color-scheme: dark;
+:root[data-theme="light"] {
+  color-scheme: light;
 
-  --bg: #0e1319;
-  --surface: #161d26;
-  --line: #232c38;
-  --line-strong: #33404f;
-  --ink: #e6edf3;
-  --ink-soft: #9aa7b4;
-  --ink-faint: #6b7885;
+  /* Must mirror the prefers-color-scheme block above. This one wins when the theme is
+     chosen explicitly rather than inherited, so a token missing here falls back to the
+     dark value and one cell ends up painted for the wrong ground. */
+  --bg: #f7f4ee;
+  --surface: #fffdf8;
+  --line: #e6dfd2;
+  --line-strong: #cfc5b4;
+  --ink: #241f18;
+  --ink-soft: #6b6154;
+  --ink-faint: #756c60;
 
-  /* Must mirror the prefers-color-scheme block above. This one wins when the theme
-     is chosen explicitly rather than inherited, so a token missing here falls back
-     to the light value and one cell ends up painted for the wrong ground. */
-  --call: #3fb950;
-  --put: #ff6b6b;
-  --accent: #8b7cf6;
-  --up: #1a7f37;
-  --down: #a51d1d;
-  --atm: #3a3016;
-  --atm-line: #e0b400;
-  --itm: #241a1c;
+  --call: #177244;
+  --put: #b5342b;
+  --accent: #8a5607;
+  --up: #177244;
+  --down: #b5342b;
 
-  --row-hover: #1d2733;
-  --hatch: #1b232d;
+  --atm: #fdf0cf;
+  --atm-line: #d99a1a;
+  --itm: #f1e9dc;
+
+  --row-hover: #ece4d5;
+  --hatch: #f4f0e7;
 }
 
 * { box-sizing: border-box; }
@@ -183,11 +231,20 @@ html, body {
   flex-wrap: wrap;
 }
 
-.brand { font-weight: 700; font-size: 15px; letter-spacing: 0.02em; }
+.brand {
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
 
 .stat { display: flex; flex-direction: column; line-height: 1.25; }
-.stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-faint); }
+.stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.11em; color: var(--ink-faint); }
 .stat-value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 600; }
+/* One figure wears the amber, and it is the one the eye should reach first. A second
+   would make the accent mean "a number" rather than "this number". */
+.stat.lead .stat-value { color: var(--accent); font-size: 15px; }
 .stat-note { font-size: 11px; color: var(--ink-soft); }
 
 .chip {
@@ -267,7 +324,7 @@ table.chain thead th {
   border-bottom: 1px solid var(--line-strong);
   font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.1em;
   color: var(--ink-faint);
   font-weight: 600;
   padding: 6px 6px;
@@ -277,7 +334,7 @@ table.chain thead th {
 table.chain thead th.side-head {
   text-align: center;
   font-size: 11px;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.18em;
   padding-bottom: 2px;
 }
 /*
@@ -320,7 +377,12 @@ td.strike {
   width: 104px;
 }
 
-tr.at-the-money td.strike { background: var(--atm); box-shadow: inset 0 0 0 1px var(--atm-line); }
+/* The money row, marked the terminal's way: a solid amber bar down the left edge of
+   the row and an amber wash on the strike itself. The bar is on the row's first cell
+   rather than an inset ring on the strike, so it stays visible when the table is
+   scrolled sideways and the strike column has left the viewport. */
+tr.at-the-money td:first-child { box-shadow: inset 3px 0 0 0 var(--atm-line); }
+tr.at-the-money td.strike { background: var(--atm); color: var(--accent); }
 
 /* An unquoted side renders empty. Never a zero, never a dash that reads as a price. */
 td.blank { background: repeating-linear-gradient(45deg, transparent, transparent 6px, var(--hatch) 6px, var(--hatch) 12px); }
@@ -371,58 +433,45 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
 .theme:hover { border-color: var(--accent); color: var(--accent); }
 .theme:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* ------------------------------------------------ price direction (T8)
+/* ------------------------------------------------ price direction (T8, restyled)
  *
- * Green up, red down, against the previous push. Deliberately quiet: the ladder
- * repaints every second and a saturated flash on every moving cell would make the
- * table harder to read rather than easier, which is the opposite of the point.
+ * **The arrow carries the direction. Nothing else does.**
  *
- * The arrow is a redundant encoding of the tint — it carries the direction for anyone
- * who cannot separate the two hues, and the tint carries it for anyone scanning the
- * table too fast to read a glyph. Neither is load-bearing alone.
+ * T8 shipped a deep fill on every moved cell, and it was asked for — "much darker" —
+ * and then seen running. On the front expiry nearly every quote moves each second, so
+ * the fill was not marking the exceptions, it was painting the table: a wall of green
+ * and red with the numbers inside it, which is the opposite of what a direction cue is
+ * for. The arrow was already there as a redundant encoding. It is now the only one.
  *
- * `--up` and `--down` are their own tokens rather than the call/put hues: those are
- * blue and red, and an uptick painted blue reads as a statement about the contract
- * rather than about the price.
+ * What this gives up, stated because it was a real argument for the fill: the fill was
+ * legible while scanning too fast to resolve a glyph, and the glyph is not. On a table
+ * where almost every cell moves, that reach was buying nothing — everything was lit.
+ *
+ * Colour alone still carries direction for a viewer who cannot separate the two hues,
+ * which the fill did not fix either; the glyph shape does. ▲ and ▼ differ in outline,
+ * so the encoding is now shape *and* colour where it used to be colour twice.
  */
-table.chain tbody td.moved-up { background: color-mix(in srgb, var(--up) 78%, transparent); }
-table.chain tbody td.moved-down { background: color-mix(in srgb, var(--down) 78%, transparent); }
-
-/* The in-the-money wash and a direction tint can land on the same cell. The tint wins,
- * because it is the thing that just changed; the wash is static context. */
-table.chain tbody td.itm.moved-up { background: color-mix(in srgb, var(--up) 82%, var(--itm)); }
-table.chain tbody td.itm.moved-down { background: color-mix(in srgb, var(--down) 82%, var(--itm)); }
 
 .arrow {
-  margin-left: 3px;
-  font-size: 0.72em;
+  margin-left: 4px;
+  font-size: 0.7em;
   /* Does not participate in the number's baseline: the arrow must not shift the digits,
    * or every price would jog by a pixel as it moved. */
   vertical-align: middle;
   line-height: 1;
 }
 
-/* The glyph sits ON the deep tint, so it cannot be the same colour as it. These are
-   the light ends of each hue, chosen for contrast against the fill rather than
-   against the page. */
-.arrow-up { color: #7ee2a0; }
-.arrow-down { color: #ff9f9f; }
+/* Straight off the palette now. The glyph sits on the ordinary row ground rather than
+   on a fill, so it needs contrast against the page and not against a tint - which is
+   what `--up` and `--down` already are, in both directions. */
+.arrow-up { color: var(--up); }
+.arrow-down { color: var(--down); }
 
-/* A price on a deep tint needs to lift off it too.
- *
- * The mix percentage is high enough that the tint stays dark against BOTH grounds.
- * That matters: `color-mix` with `transparent` composites over whatever is behind,
- * so the same percentage yields a much lighter result on the light theme's near-white
- * surface than on the dark one. Measured at 55%, white text on the light theme's
- * up-tint gave a contrast ratio of 3.6:1, below the 4.5:1 that ordinary text needs;
- * at 78% it clears it. Lower this and the light theme quietly becomes unreadable
- * while the dark theme still looks fine. */
-table.chain tbody td.moved-up,
-table.chain tbody td.moved-down { color: #ffffff; }
+/* A moved cell is no longer painted, so `.moved-up` / `.moved-down` set nothing here.
+   The classes stay on the cell: they are the state hook the arrow hangs off and the
+   thing to target if this is ever revisited, and removing them would mean touching the
+   component to re-add them. */
 
-/* Respect a reduced-motion preference by removing the tint rather than the glyph: the
- * colour is the part that reads as movement, and the arrow still carries the meaning. */
-@media (prefers-reduced-motion: reduce) {
-  table.chain tbody td.moved-up,
-  table.chain tbody td.moved-down { background: inherit; }
-}
+/* Nothing animates, so there is no motion to reduce. The former rule removed the fill
+   under `prefers-reduced-motion` and left the glyph; the glyph is all there is now, and
+   a static coloured character is not motion. */
