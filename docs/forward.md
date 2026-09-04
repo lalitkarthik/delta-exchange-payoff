@@ -18,6 +18,11 @@ anywhere in what follows. Implemented in `engine/src/deltapayoff/forward.py`, te
 
 ## How to read this
 
+**New to this? Read [maths-start-here.md](maths-start-here.md) first.** It is the
+one-page reference for all three calculations — forward, implied volatility, Greeks —
+with the formulas, the conventions and the trap in each. This document is the evidence
+behind it.
+
 **Measured** means the run is named and reproducible from a committed fixture. **Assumed**
 means borrowed and unverified — `r = 6.5%` is the only such number here, and F1 exists so it
 can be checked rather than trusted.

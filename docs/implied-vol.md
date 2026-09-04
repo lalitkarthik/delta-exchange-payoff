@@ -17,6 +17,11 @@ from it that belongs here.
 
 ## How to read this
 
+**New to this? Read [maths-start-here.md](maths-start-here.md) first.** It is the
+one-page reference for all three calculations — forward, implied volatility, Greeks —
+with the formulas, the conventions and the trap in each. This document is the evidence
+behind it.
+
 **Measured** names the fixture and the run. **Assumed** means borrowed and unverified — the
 6.5% rate feeding F2, F3 and M2 is the only such number, and F1 exists so it can be checked.
 

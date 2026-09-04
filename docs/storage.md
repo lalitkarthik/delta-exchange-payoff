@@ -36,6 +36,10 @@ into `main.py`'s lifespan. Measured by `tools/measure_arrival_lag.py`,
 
 ## How to read this
 
+**New to this? Read [storage-start-here.md](storage-start-here.md) first.** It is the
+one-page map: where the files are, what the four tables hold, and the commands to read a
+day back. This document is the detail behind it.
+
 **Measured** names the run. Every number below came from a live connection unless it says
 `derived`, which means arithmetic on a measured figure, or `assumed`, which appears
 nowhere in this document. §10 adds a third tag, **`synthetic-layout`**: real values off

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 
+from deltapayoff.chain import build_leg
 from deltapayoff.wire import (
     chain_from_frames,
     decode_ob_l2,
@@ -161,20 +162,24 @@ def test_a_chain_built_from_frames_has_the_same_shape_as_a_rest_chain(
         assert (wire_row.put is None) == (rest_row.put is None)
 
 
-def test_the_spot_comes_from_the_frame_not_from_the_greeks(ws_ticker_frames) -> None:
+def test_the_spot_comes_from_the_frame_not_from_the_greeks(
+    ws_ticker_frames, ws_captured_at
+) -> None:
     """`sp` at the top of the frame, never `greeks.spot`.
 
     The REST path already refuses `greeks.spot` because the two disagree. The websocket
     frame has no `greeks.spot` at all, so this asserts the value is the one Delta puts
     at the top level rather than something reconstructed.
     """
-    chain = chain_from_frames("BTC", EXPIRY, ws_ticker_frames, None)
+    chain = chain_from_frames(
+        "BTC", EXPIRY, ws_ticker_frames, None, fetched_at=ws_captured_at
+    )
 
     assert chain.spot == pytest.approx(77_651.9, abs=200.0)
 
 
 def test_a_websocket_chain_solves_with_the_untouched_forward_and_solver_code(
-    ws_ticker_frames, ws_book_frames
+    ws_ticker_frames, ws_book_frames, ws_captured_at
 ) -> None:
     """The payoff for #2's insistence on a transport-agnostic signature.
 
@@ -185,7 +190,9 @@ def test_a_websocket_chain_solves_with_the_untouched_forward_and_solver_code(
     from deltapayoff.forward import f1_parity_fit
     from deltapayoff.solvers import implied_vol_householder, solve_chain
 
-    chain = chain_from_frames("BTC", EXPIRY, ws_ticker_frames, ws_book_frames)
+    chain = chain_from_frames(
+        "BTC", EXPIRY, ws_ticker_frames, ws_book_frames, fetched_at=ws_captured_at
+    )
     forward = f1_parity_fit(chain)
     solved = solve_chain(chain, forward, solver=implied_vol_householder)
 
@@ -283,16 +290,13 @@ def test_turnover_is_the_first_element_and_the_second_is_its_usd_twin(
 def test_the_open_interest_second_element_is_a_six_hour_change_not_a_usd_notional(
     ws_ticker_frames, rest_snapshot
 ) -> None:
-    """**The mislabel this ticket found.** `wire.decode_ticker` calls `oi[1]`
-    `oi_value_usd`. It is not: on **all 136** captured symbols it equals REST's
-    `oi_change_usd_6h`, and it is *not* REST's `oi_value_usd` on 126 of them — it even
-    goes negative, which a notional cannot.
+    """**The mislabel, pinned at its source.** `wire.decode_ticker` called `oi[1]`
+    `oi_value_usd` from T4 until T5 measured it. It is not: on **all 136** captured
+    symbols it equals REST's `oi_change_usd_6h`, and it is *not* REST's `oi_value_usd`
+    on 126 of them — it even goes negative, which a notional cannot.
 
-    The value is left where it is because renaming `Leg.oi_value_usd` changes the chain
-    contract the web app reads, which is not this ticket's to change. What this test does
-    is stop the mistake being made twice: the reference bars store this number under the
-    name it actually has, and store no USD open interest at all, because the ticker
-    channel does not carry one.
+    This asserts the *fact about the wire*, independently of where the decoder puts the
+    number, so it keeps its value now that the field has been corrected.
     """
     rest = _rest_by_symbol(rest_snapshot)
     matches_change = 0
@@ -316,3 +320,75 @@ def test_the_open_interest_second_element_is_a_six_hour_change_not_a_usd_notiona
     assert matches_change == 136, "oi[1] stopped being the six-hour change"
     assert matches_notional <= 10, "oi[1] is the USD notional after all"
     assert negative > 0, "a USD notional cannot be negative; this one is"
+
+
+def test_the_websocket_path_reports_no_usd_open_interest_rather_than_a_wrong_one(
+    ws_ticker_frames,
+) -> None:
+    """`ticker` carries no USD open interest, so the field is **absent** on this path.
+
+    Position 1 of `oi` is the six-hour change, pinned on all 136 symbols by the test
+    above. Feeding it to `Leg.oi_value_usd` made one field name two different quantities
+    depending on which transport filled it, and the websocket is the transport the live
+    screen runs on.
+
+    Absent is `None`, never `0.0` and never a plausible substitute. The contract already
+    says a missing quote is `None` because rendering it as zero claims someone bid zero;
+    reporting a notional we were never sent is that error with more digits. Deriving one
+    from contracts x contract size x spot was rejected for the same reason it was
+    rejected for the bar store: it is a calculation, not an observation.
+    """
+    for symbol, frame in ws_ticker_frames.items():
+        _, leg = decode_ticker(frame)
+        assert leg.oi_value_usd is None, f"{symbol}: ticker carries no USD notional"
+        assert leg.oi is not None, f"{symbol}: it does carry contracts"
+
+
+def test_the_six_hour_change_travels_under_its_own_name(
+    ws_ticker_frames, rest_snapshot
+) -> None:
+    """The number is real and worth keeping - it just was not what it was called.
+
+    Dropping it would lose an observation in order to fix a label. It now has a field
+    whose name says what it is, so nothing downstream needs to know `oi[1]` was misread.
+    """
+    by_symbol = {row["symbol"]: row for row in rest_snapshot}
+
+    matched = 0
+    for symbol, frame in ws_ticker_frames.items():
+        _, leg = decode_ticker(frame)
+        row = by_symbol.get(symbol)
+        if row is None or leg.oi_change_usd_6h is None:
+            continue
+        if leg.oi_change_usd_6h == float(row["oi_change_usd_6h"]):
+            matched += 1
+
+    assert matched == 136, "oi[1] must arrive as the six-hour change it is"
+
+
+def test_the_two_transports_agree_on_what_each_open_interest_field_means(
+    ws_ticker_frames, rest_snapshot
+) -> None:
+    """The regression this fix exists to prevent, and the test nobody had written.
+
+    Before it, `oi_value_usd` held REST's notional on one path and the six-hour change on
+    the other, and nothing compared the two. A field that means different things
+    depending on how it arrived is worse than an absent field, because it reads as data.
+    """
+    by_symbol = {row["symbol"]: row for row in rest_snapshot}
+
+    compared = 0
+    for symbol, frame in ws_ticker_frames.items():
+        row = by_symbol.get(symbol)
+        if row is None:
+            continue
+        _, ws_leg = decode_ticker(frame)
+        rest_leg = build_leg(row)
+
+        assert ws_leg.oi == rest_leg.oi, f"{symbol}: contracts disagree"
+        assert ws_leg.oi_change_usd_6h == rest_leg.oi_change_usd_6h, f"{symbol}: change"
+        assert rest_leg.oi_value_usd is not None, f"{symbol}: REST does carry a notional"
+        assert ws_leg.oi_value_usd is None, f"{symbol}: the websocket does not"
+        compared += 1
+
+    assert compared == 136, "every captured symbol must be compared both ways"

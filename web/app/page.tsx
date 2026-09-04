@@ -162,7 +162,7 @@ export default function Page() {
           </select>
         </label>
 
-        <div className="stat">
+        <div className="stat lead">
           <span className="stat-label">Spot</span>
           <span className="stat-value">{chain ? formatSpot(chain.spot) : "—"}</span>
         </div>

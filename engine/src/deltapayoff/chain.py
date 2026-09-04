@@ -100,8 +100,13 @@ def build_leg(ticker: dict[str, Any]) -> Leg:
         theta=to_number(greeks.get("theta")),
         vega=to_number(greeks.get("vega")),
         rho=to_number(greeks.get("rho")),
-        oi=to_number(ticker.get("oi")),
+        # `oi_contracts`, not `oi`. REST's `oi` is the notional in BTC -
+        # `contract_value` is 0.001, and `oi_contracts == oi * 1000` on all 136
+        # captured symbols. The websocket sends contracts, the ladder header says
+        # OI, and open interest means contracts, so both transports report those.
+        oi=to_number(ticker.get("oi_contracts")),
         oi_value_usd=to_number(ticker.get("oi_value_usd")),
+        oi_change_usd_6h=to_number(ticker.get("oi_change_usd_6h")),
         tick_size=to_number(ticker.get("tick_size")),
     )
 

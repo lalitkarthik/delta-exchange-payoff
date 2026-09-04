@@ -58,8 +58,18 @@ class Leg(BaseModel):
     theta: float | None = None
     vega: float | None = None
     rho: float | None = None
+    #: Open interest in **contracts**, on both transports. REST's own `oi` field is
+    #: the notional in BTC and is deliberately not read; `oi_contracts` is.
     oi: float | None = None
+    #: Open interest as a **USD notional**. REST publishes it; the `ticker` websocket
+    #: channel does not, so it is `None` on the live path. Absent rather than derived:
+    #: contracts x contract size x spot is a calculation, and this field reports an
+    #: observation.
     oi_value_usd: float | None = None
+    #: How the USD notional moved over six hours. Both transports carry it. It can be
+    #: negative, which is what proves it is not the notional above - `wire.py` read it
+    #: into `oi_value_usd` from T4 until T5 measured the difference.
+    oi_change_usd_6h: float | None = None
     tick_size: float | None = None
     #: Ours. `None` until the chain has been through `compute.enrich`.
     computed: ComputedLeg | None = None
