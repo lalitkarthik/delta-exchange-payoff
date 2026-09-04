@@ -514,6 +514,9 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
  * nineteen-column table would push the rail off the left of the viewport instead of
  * scrolling inside its own pane.
  *
+ * Each entry carries the terminal's three parts, stacked: an icon, the three-letter
+ * code, and the full name in the platform's uppercase.
+ *
  * **Every pair below was measured on the rendered element against its resolved
  * background, in both variants**, which is the only measurement that catches a hover
  * state swapping the ground out from under the text. Two candidates were discarded on
@@ -526,9 +529,14 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
 .app { display: flex; height: 100vh; }
 .app > .shell { flex: 1; min-width: 0; }
 
+/* Wide enough for the longest name on one line. OPTION CHAIN renders **70px** at this
+   size and letter-spacing (`measured`: scrollWidth on the rendered span), and wrapping it
+   would make one entry two lines tall and the other one - a ragged column that reads as
+   a layout accident rather than a list. The ladder beside it already scrolls
+   horizontally, so the twenty pixels come out of scroll length, not out of legibility. */
 .rail {
   flex: none;
-  width: 68px;
+  width: 88px;
   display: flex;
   flex-direction: column;
   padding-top: 6px;
@@ -537,8 +545,8 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
   overflow-y: auto;
 }
 
-/* The whole entry is the target, not the three letters: a 68px-wide strip where only
-   the glyphs are clickable is a strip that gets clicked and does nothing. */
+/* The whole entry is the target, not the glyphs: a rail-width strip where only the
+   letters are clickable is a strip that gets clicked and does nothing. */
 .rail-item {
   display: flex;
   flex-direction: column;
@@ -547,6 +555,21 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
   padding: 9px 4px;
   text-decoration: none;
   color: var(--ink-soft);          /* 5.37:1 dark, 5.97:1 light, on --surface */
+}
+
+/* Stroked, never filled, and coloured by nothing: `currentColor` is what makes one
+   icon follow the entry through soft grey, hover ink and the current screen's amber
+   without a rule per state. `stroke-width` is in the 16-unit viewBox, so it scales with
+   the box rather than with the page. */
+.rail-icon {
+  width: 18px;
+  height: 18px;
+  margin-bottom: 3px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .rail-code { font-size: 12px; font-weight: 700; letter-spacing: 0.14em; }
@@ -559,9 +582,13 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
 
 /* Hover brightens the text as well as the ground. See the note above: keeping the two
    greys over `--row-hover` would have put 3.58:1 on screen. `--ink` there is 9.58:1
-   dark and 12.95:1 light.
+   dark and 12.95:1 light - `measured` on the rendered code, name and icon stroke, all
+   three of which land on the same figure because the icon takes `currentColor` and the
+   name is lifted to `--ink` here too.
    Excluded on the current screen deliberately - the amber wash has to survive being
-   hovered, and the cheapest way to guarantee that is to not swap it. */
+   hovered, and the cheapest way to guarantee that is to not swap it. Verified hovered
+   rather than read off the selector: the current entry's resolved ground is still
+   `--atm` while the pointer is on it, in both variants. */
 .rail-item:hover:not([aria-current="page"]) { background: var(--row-hover); color: var(--ink); }
 .rail-item:hover:not([aria-current="page"]) .rail-name { color: var(--ink); }
 
@@ -571,8 +598,10 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
    and an amber wash behind it. That is the fifth thing the accent is spent on, and it
    earns it on the same grounds as the other four - it is the one entry the eye should
    find without reading the list.
-   `--accent` on `--atm` is 6.79:1 dark and 5.43:1 light; the name under it is `--ink`
-   at 8.67:1 and 14.44:1. */
+   `--accent` on `--atm` is 6.79:1 dark and 5.43:1 light - the code and the icon stroke
+   both, since the icon inherits it; the name under it is `--ink` at 8.67:1 and 14.44:1.
+   The inset bar is the part that is not hue: it survives a colour-vision deficiency and
+   a monochrome printout, where the amber and the greys do not. */
 .rail-item[aria-current="page"] {
   background: var(--atm);
   color: var(--accent);
