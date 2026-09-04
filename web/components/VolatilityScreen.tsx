@@ -1,49 +1,34 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-import { SmileChart, type ChartOverlay, type VolScale } from "@/components/SmileChart";
-import ThemeToggle from "@/components/ThemeToggle";
+import PlotControls from "@/components/PlotControls";
+import SmileNote from "@/components/SmileNote";
+import SmileNotices from "@/components/SmileNotices";
+import SmilePlot from "@/components/SmilePlot";
 import TimeScrubber from "@/components/TimeScrubber";
-import {
-  UNDERLYINGS,
-  type ChainResponse,
-  type SmileResponse,
-  type Underlying,
-} from "@/lib/contract";
-import { ENGINE_URL, loadExpiries, loadSmile, type Source } from "@/lib/engine";
-import { formatFetchedClock, formatLocalClock, formatSpot, localZoneLabel } from "@/lib/format";
-import { LIVE_STATUS_LABEL, subscribeChain, type LiveStatus } from "@/lib/live";
-import { smileMinuteFromChain } from "@/lib/livesmile";
+import VolatilityHeader from "@/components/VolatilityHeader";
+import { useLiveSmile } from "@/hooks/useLiveSmile";
+import { useSmileDay } from "@/hooks/useSmileDay";
+import type { Underlying } from "@/lib/contract";
 import {
   NO_OVERLAYS,
-  OVERLAYS,
-  resolveOverlay,
+  resolveOverlays,
+  splitOverlays,
   type OverlayId,
   type OverlayState,
 } from "@/lib/overlay";
-import {
-  formatTimeToExpiry,
-  hoursToExpiry,
-  isDying,
-  mergeStrikes,
-  solvedPercents,
-  strikeGrid,
-  toRows,
-} from "@/lib/smile";
+import { positionOf } from "@/lib/position";
+import { hoursToExpiry, mergeStrikes, strikeGrid } from "@/lib/smile";
+import { type VolScale } from "@/lib/smilemodel";
 import {
   buildTimeline,
   clampIndex,
   EMPTY_TIMELINE,
-  indexOfStamp,
   lastIndex,
   withLiveMinute,
 } from "@/lib/timeline";
 import { viewQuery, type ViewRequest } from "@/lib/view";
-
-function message(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /**
  * How long the URL waits behind the scrubber before it is rewritten.
@@ -58,27 +43,14 @@ function message(err: unknown): string {
 const URL_SETTLE_MS = 200;
 
 /**
- * How often the live curve is allowed to be redrawn.
- *
- * **A ladder and a smile are read differently and that is the whole argument.** The
- * chain screen takes every push, and it is right to: a ladder is read one cell at a
- * time, so a cell that changes under the eye is a cell that has news. A smile is read as
- * a *shape* — the tilt of the wings against the middle — and a shape has to hold still
- * long enough to be seen. At the stream's own rate the curve shimmers and the skew is
- * unreadable; at about a second it still reads as live and the shape settles between
- * frames.
- *
- * The sampler below is trailing, not leading: it publishes the newest push it holds when
- * the tick comes round and drops everything older, so the curve is never more than one
- * interval behind the stream and never renders a frame it is about to throw away. The
- * cost is that the first curve after a subscription waits up to one interval, which is
- * invisible beside the round trip that preceded it.
- */
-const LIVE_REDRAW_MS = 1000;
-
-/**
  * The volatility screen: a smile, a day to move it through, and everything a reader
  * needs to know how far to trust what is on the axis.
+ *
+ * This file holds the state and the layout and nothing else. Each of the jobs it used to
+ * do in line has its own file now: `hooks/useSmileDay.ts` fetches the day,
+ * `hooks/useLiveSmile.ts` follows the stream, `lib/position.ts` turns the reader's
+ * request into a position, `lib/overlay.ts` resolves the comparisons, and
+ * `VolatilityHeader`, `SmileNotices`, `PlotControls` and `SmilePlot` draw the four parts.
  *
  * **Everything the header says is read from the response.** The forward, the minute, the
  * clock the volatility is quoted on, which forward method produced it and which model
@@ -101,7 +73,8 @@ const LIVE_REDRAW_MS = 1000;
  * **The right edge is live.** The store withholds the open minute by design, so the
  * newest sealed bar always trails the market. The chain stream fills that edge: the same
  * push the ladder renders, projected into a smile minute by `lib/livesmile.ts` and
- * sampled to about 1 Hz by `LIVE_REDRAW_MS`. Standing on the right edge follows it;
+ * sampled to about 1 Hz — see `hooks/useLiveSmile.ts`. Standing on the right edge
+ * follows it;
  * scrubbing off it pins a stored minute by stamp and stops following.
  *
  * **The view has an address.** Underlying, expiry and minute go into the URL in UTC, so
@@ -109,18 +82,18 @@ const LIVE_REDRAW_MS = 1000;
  * The clock on the scrubber is local because a control is read against a wall clock; the
  * identity of the view is not. `lib/view.ts` holds that boundary.
  *
- * A client component because it holds the selection, the scale toggle, the position in
- * time and the fetch. The route around it stays a server component, which is also what
- * reads the URL and hands the initial view down.
+ * A client component because it holds the selection, the scale toggle and the position
+ * in time. The route around it stays a server component, which is also what reads the
+ * URL and hands the initial view down.
  */
 export default function VolatilityScreen({ initial }: { initial: ViewRequest }) {
   const [underlying, setUnderlying] = useState<Underlying>(initial.underlying ?? "BTC");
-  const [expiries, setExpiries] = useState<string[]>([]);
-  const [expiry, setExpiry] = useState<string>(initial.expiry ?? "");
-
-  const [smile, setSmile] = useState<SmileResponse | null>(null);
-  const [source, setSource] = useState<Source>("engine");
-  const [fallbackReason, setFallbackReason] = useState<string | null>(null);
+  /**
+   * The stored day, and the expiry it belongs to. The list request is what settles which
+   * expiry is being read, so both live behind one hook — see `hooks/useSmileDay.ts`.
+   */
+  const day = useSmileDay(underlying, initial.expiry ?? "");
+  const { expiries, expiry, smile, source, fallbackReason, busy, error } = day;
 
   /**
    * The minute the reader has asked for, as the store's own UTC stamp — or `null`,
@@ -151,129 +124,8 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
    */
   const [overlayOn, setOverlayOn] = useState<OverlayState>(NO_OVERLAYS);
 
-  /** The newest push the sampler has published. See `LIVE_REDRAW_MS`. */
-  const [liveChain, setLiveChain] = useState<ChainResponse | null>(null);
-  const [liveStatus, setLiveStatus] = useState<LiveStatus>("connecting");
-  const [liveDetail, setLiveDetail] = useState<string | null>(null);
-
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // Guards against a slow earlier request landing after a newer one.
-  const listRequest = useRef(0);
-  const smileRequest = useRef(0);
-
-  const loadExpiryList = useCallback(async (next: Underlying, wantedExpiry: string | null) => {
-    const id = ++listRequest.current;
-    setBusy(true);
-    setError(null);
-    try {
-      const list = await loadExpiries(next);
-      if (id !== listRequest.current) return;
-
-      const available = list.data.expiries;
-      setExpiries(available);
-
-      const fallback =
-        list.preferredExpiry && available.includes(list.preferredExpiry)
-          ? list.preferredExpiry
-          : (available[0] ?? "");
-      const chosen =
-        wantedExpiry && available.includes(wantedExpiry) ? wantedExpiry : fallback;
-      setExpiry(chosen);
-      if (!chosen) setError(`No expiries listed for ${next}.`);
-    } catch (err) {
-      if (id !== listRequest.current) return;
-      setError(message(err));
-    } finally {
-      if (id === listRequest.current) setBusy(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadExpiryList(underlying, expiry || null);
-    // Keyed on the underlying alone: re-running this when the expiry changes would
-    // refetch a list that cannot have changed and reset the dropdown under the reader.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [underlying, loadExpiryList]);
-
-  useEffect(() => {
-    if (!expiry) return;
-    const id = ++smileRequest.current;
-    setSmile(null);
-    setError(null);
-    setBusy(true);
-
-    void (async () => {
-      try {
-        const loaded = await loadSmile(underlying, expiry);
-        if (id !== smileRequest.current) return;
-        setSmile(loaded.data);
-        setSource(loaded.source);
-        setFallbackReason(loaded.fallbackReason ?? null);
-      } catch (err) {
-        if (id !== smileRequest.current) return;
-        setError(message(err));
-      } finally {
-        if (id === smileRequest.current) setBusy(false);
-      }
-    })();
-  }, [underlying, expiry]);
-
-  /**
-   * One live subscription per series, sampled down to `LIVE_REDRAW_MS`.
-   *
-   * **The same socket the chain screen reads, and the same object off it.** The stream
-   * carries a chain; this screen draws a smile; `lib/livesmile.ts` is the projection
-   * between them and carries the argument for doing it here rather than asking the
-   * engine for a second payload or polling `/smile` on a timer. Nothing is recomputed —
-   * the volatility this chart plots is the identical field of the identical push the
-   * ladder prints.
-   *
-   * `latest` is a plain local rather than a ref because it belongs to this
-   * subscription: it is created with the socket and dies with it, so a push that
-   * arrived for the old expiry can never be published against the new one.
-   */
-  useEffect(() => {
-    if (!expiry) return;
-    setLiveChain(null);
-
-    let latest: ChainResponse | null = null;
-    const sampler = window.setInterval(() => {
-      if (latest === null) return;
-      setLiveChain(latest);
-      latest = null;
-    }, LIVE_REDRAW_MS);
-
-    const stop = subscribeChain(underlying, expiry, {
-      onChain: (chain) => {
-        latest = chain;
-      },
-      onStatus: (next, detail) => {
-        setLiveStatus(next);
-        setLiveDetail(detail ?? null);
-      },
-    });
-
-    return () => {
-      window.clearInterval(sampler);
-      stop();
-    };
-  }, [underlying, expiry]);
-
-  /**
-   * The live push as a minute of the smile, or `null`.
-   *
-   * The series is checked rather than assumed. The subscription is torn down and rebuilt
-   * on every change of underlying or expiry, so a mismatch should be impossible — and
-   * this screen puts two sources of the same expiry's curve on one axis, which is
-   * exactly the place where "should be impossible" is worth one comparison.
-   */
-  const liveMinute = useMemo(() => {
-    if (!liveChain) return null;
-    if (liveChain.underlying !== underlying || liveChain.expiry !== expiry) return null;
-    return smileMinuteFromChain(liveChain);
-  }, [liveChain, underlying, expiry]);
+  const live = useLiveSmile(underlying, expiry);
+  const liveMinute = live.minute;
 
   /**
    * The day laid out minute by minute, and the board's full strike list.
@@ -297,28 +149,8 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
     [storedGrid, liveMinute],
   );
 
-  const last = lastIndex(timeline);
-  const askedIndex = wanted === null ? -1 : indexOfStamp(timeline, wanted);
-  /** No answer for what was asked means the right edge, which is the newest minute. */
-  const index = askedIndex >= 0 ? askedIndex : last;
+  const { index, stamp, minute, unreachable } = positionOf(timeline, wanted);
 
-  /**
-   * A link naming a minute this expiry's store does not reach at all — not a hole in the
-   * middle of the day, which is a position you can stand on, but a stamp outside it. It
-   * is said out loud rather than silently rounded to the nearest curve: quietly showing
-   * a different minute than the one in the address bar is the same class of error as
-   * drawing a line across a gap.
-   */
-  const unreachable = wanted !== null && askedIndex < 0 && last >= 0 ? wanted : null;
-
-  const stamp = index >= 0 ? (timeline.stamps[index] ?? null) : null;
-  const minute = index >= 0 ? (timeline.minutes[index] ?? null) : null;
-
-  /** Standing on the live position — the right edge, following the stream. */
-  const onLive = index >= 0 && index === timeline.liveIndex;
-
-  const rows = useMemo(() => (minute ? toRows(minute, grid) : []), [minute, grid]);
-  const solved = solvedPercents(rows);
   const hours = minute ? hoursToExpiry(minute) : null;
   const stamps = smile?.model_versions ?? [];
 
@@ -329,16 +161,11 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
    * below it**: an overlay is a second index into the day the client already holds.
    */
   const resolved = useMemo(
-    () => OVERLAYS.filter((spec) => overlayOn[spec.id]).map((spec) => resolveOverlay(spec, stamp, timeline)),
+    () => resolveOverlays(overlayOn, stamp, timeline),
     [overlayOn, stamp, timeline],
   );
 
-  const drawn: ChartOverlay[] = [];
-  const absent: typeof resolved = [];
-  for (const overlay of resolved) {
-    if (overlay.minute) drawn.push({ id: overlay.spec.id, label: overlay.spec.label, minute: overlay.minute });
-    else absent.push(overlay);
-  }
+  const { drawn, absent } = splitOverlays(resolved);
 
   const toggleOverlay = (id: OverlayId) =>
     setOverlayOn((current) => ({ ...current, [id]: !current[id] }));
@@ -368,7 +195,7 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
   };
 
   const pickExpiry = (next: string) => {
-    setExpiry(next);
+    day.setExpiry(next);
     setWanted(null);
   };
 
@@ -396,98 +223,22 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
 
   return (
     <div className="shell">
-      <header className="header">
-        <div className="brand">DELTA</div>
-        <h1 className="screen-title">Volatility</h1>
-
-        <label className="picker">
-          <span className="stat-label">Underlying</span>
-          <select
-            className="picker-select"
-            value={underlying}
-            onChange={(e) => pickUnderlying(e.target.value as Underlying)}
-            disabled={busy}
-          >
-            {UNDERLYINGS.map((u) => (
-              <option key={u} value={u}>
-                {u}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="picker">
-          <span className="stat-label">Expiry</span>
-          <select
-            className="picker-select"
-            value={expiry}
-            onChange={(e) => pickExpiry(e.target.value)}
-            disabled={busy || expiries.length === 0}
-          >
-            {expiries.length === 0 ? <option value="">—</option> : null}
-            {expiries.map((e) => (
-              <option key={e} value={e}>
-                {e}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        {/* The one amber figure. The forward is what the offset axis and the reference
-            line are both read off, so it is this screen's spot. */}
-        <div className="stat lead">
-          <span className="stat-label">Forward</span>
-          <span className="stat-value">
-            {minute?.forward != null ? formatSpot(minute.forward) : "—"}
-          </span>
-        </div>
-
-        {/* The position, in UTC, and it stays UTC even when the position is empty — this
-            is the minute's identity and the thing the URL carries. The scrubber below
-            says the same instant in the reader's own zone. */}
-        <div className="stat">
-          <span className="stat-label">Minute</span>
-          <span className="stat-value">
-            {stamp ? formatFetchedClock(stamp) : "—"} <span className="stat-note">UTC</span>
-          </span>
-        </div>
-
-        <div className="stat">
-          <span className="stat-label">To expiry</span>
-          <span className="stat-value">{hours === null ? "—" : formatTimeToExpiry(hours)}</span>
-        </div>
-
-        <div className="stat">
-          <span className="stat-label">Forward method</span>
-          <span className="stat-value stat-small">{minute?.forward_method ?? "—"}</span>
-        </div>
-
-        {/* Read from the response, never hardcoded — and reported as a count when the
-            response spans more than one, because picking one would be a claim the data
-            does not support. The banner below names both. */}
-        <div className="stat">
-          <span className="stat-label">Model</span>
-          <span className="stat-value stat-small" title={stamps.join("  ·  ") || undefined}>
-            {stamps.length === 0 ? "—" : stamps.length === 1 ? stamps[0] : `${stamps.length} stamps`}
-          </span>
-        </div>
-
-        {/* Two chips, because this screen has two sources and they fail separately: the
-            stored day arrived over HTTP and does not change, the live edge arrives over
-            a socket and can stop without the figures on screen looking any different. */}
-        <span className="chip" title={fallbackReason ?? `Read from ${ENGINE_URL}/smile.`}>
-          {source === "fixture" ? "fixture" : "stored"}
-        </span>
-
-        <span
-          className="chip"
-          title={liveDetail ?? `Streaming from ${ENGINE_URL}/ws/chain, sampled at ${LIVE_REDRAW_MS} ms.`}
-        >
-          {LIVE_STATUS_LABEL[liveStatus]}
-        </span>
-
-        <ThemeToggle />
-      </header>
+      <VolatilityHeader
+        underlying={underlying}
+        onPickUnderlying={pickUnderlying}
+        expiries={expiries}
+        expiry={expiry}
+        onPickExpiry={pickExpiry}
+        busy={busy}
+        minute={minute}
+        stamp={stamp}
+        hours={hours}
+        stamps={stamps}
+        source={source}
+        fallbackReason={fallbackReason}
+        liveStatus={live.status}
+        liveDetail={live.detail}
+      />
 
       <main className="main">
         <div className="tabs" role="tablist" aria-label="Volatility views">
@@ -506,62 +257,20 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
           </button>
         </div>
 
-        {error ? <p className="notice error">{error}</p> : null}
-
-        {liveStatus === "error" ? (
-          <p className="notice error">
-            {liveDetail ?? "The live stream reported an error."} The stored day below is
-            unaffected; only the right edge has stopped moving.
-          </p>
-        ) : null}
-
-        {liveStatus === "closed" ? (
-          <p className="notice warn">
-            Lost the connection to the engine at <code>{ENGINE_URL}</code>. Retrying — the
-            curve is the last minute that arrived and it is not moving.
-          </p>
-        ) : null}
-
-        {source === "fixture" && !error ? (
-          <p className="notice warn">
-            Showing the committed smile fixture, not the store — a real capture of{" "}
-            <strong>
-              {storedTimeline.stamps.length} minute
-              {storedTimeline.stamps.length === 1 ? "" : "s"}
-            </strong>
-            , not a day.{" "}
-            {fallbackReason ?? `Set NEXT_PUBLIC_USE_FIXTURE=0 and start the engine for stored data.`}
-          </p>
-        ) : null}
-
-        {unreachable ? (
-          <p className="notice warn">
-            The link asked for <strong>{unreachable}</strong>, which is outside the minutes
-            stored for {underlying} {expiry}. Showing the most recent minute instead — the
-            nearest curve is not the one you asked for, so it is not offered as one.
-          </p>
-        ) : null}
-
-        {stamps.length > 1 ? (
-          <p className="notice warn">
-            This response spans <strong>{stamps.length} model stamps</strong> — the curves
-            in this day were not all computed the same way. {stamps.join(" · ")}. The
-            forward convention alone is worth up to 3.9 volatility points, and this screen
-            plots nothing but volatility points.
-          </p>
-        ) : null}
-
-        {minute && isDying(minute) && hours !== null ? (
-          <p className="notice warn">
-            <strong>Under a day to settlement — {formatTimeToExpiry(hours)}.</strong> Vega
-            collapses as time to expiry goes to zero, so a one-tick price change moves the
-            implied volatility by tens of points. A spike here is a{" "}
-            <strong>dying contract, not a computation error</strong>. Measured at 07:38Z on
-            the front expiry: median 62.5%, maximum 400.5% at 4.4 hours out, against a
-            median near 40% and a maximum under 72% everywhere else on the board. Switch
-            the volatility axis to LOG to read the at-the-money region.
-          </p>
-        ) : null}
+        <SmileNotices
+          error={error}
+          liveStatus={live.status}
+          liveDetail={live.detail}
+          source={source}
+          fallbackReason={fallbackReason}
+          storedMinutes={storedTimeline.stamps.length}
+          unreachable={unreachable}
+          underlying={underlying}
+          expiry={expiry}
+          stamps={stamps}
+          minute={minute}
+          hours={hours}
+        />
 
         {/* The scrubber, above the plot: it changes which minute is drawn, so it sits
             with the chart rather than in the header with the figures it changes. */}
@@ -569,47 +278,12 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
           <TimeScrubber timeline={timeline} index={index} onChange={pickIndex} />
         ) : null}
 
-        {/* The chart's own controls, on their own row above the plot rather than in the
-            header: they change how the chart is drawn and nothing about what the figures
-            say. The overlay buttons carry their own swatch, so the control *is* the key
-            — a legend under the plot would be the same information twice, in the place a
-            reader looks last. */}
-        <div className="plot-controls">
-          <span className="stat-label">Compare</span>
-          <div className="overlay-toggle" role="group" aria-label="Comparison overlays">
-            {OVERLAYS.map((spec) => (
-              <button
-                key={spec.id}
-                type="button"
-                className="overlay-option"
-                data-overlay={spec.id}
-                aria-pressed={overlayOn[spec.id]}
-                title={spec.title}
-                onClick={() => toggleOverlay(spec.id)}
-              >
-                <span className="overlay-swatch" aria-hidden="true" />
-                {spec.label}
-              </button>
-            ))}
-          </div>
-
-          <span className="plot-controls-gap" />
-
-          <span className="stat-label">Vol axis</span>
-          <div className="scale-toggle" role="group" aria-label="Volatility axis scale">
-            {(["linear", "log"] as const).map((option) => (
-              <button
-                key={option}
-                type="button"
-                className="scale-option"
-                aria-pressed={scale === option}
-                onClick={() => setScale(option)}
-              >
-                {option === "linear" ? "LIN" : "LOG"}
-              </button>
-            ))}
-          </div>
-        </div>
+        <PlotControls
+          overlayOn={overlayOn}
+          onToggleOverlay={toggleOverlay}
+          scale={scale}
+          onPickScale={setScale}
+        />
 
         {/* An overlay that is on and has nothing to draw. Said in words, at the size of
             every other admission on this screen, because a series that renders as
@@ -625,136 +299,22 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
           </p>
         ))}
 
-        {renderPlot()}
-
-        <p className="note">
-          One point per strike, one strike per listed contract, at the minute the scrubber
-          is standing on. <strong>Nothing here is fitted, smoothed or interpolated</strong>:
-          the dots are the volatilities the engine solved and the segments between them are
-          straight, because a spline would put a number between two strikes in exactly the
-          place a reader would take one off. A dotted vertical rule is a strike that arrived
-          with no solved volatility — the line breaks there and is never drawn through it,
-          and it breaks the same way at a strike this minute stored no row for at all.
-          Both x-axes are one linear scale in strike, read once as a strike and once as an
-          offset from the forward, which is why their ticks are evenly spaced; the strike
-          axis is the whole day&rsquo;s board, so it holds still while the scrubber moves.
-          Hover any point for the strike, the volatility, its offset from the forward, the
-          out-of-the-money leg it was solved on, the solver&rsquo;s reason when there is no
-          number, and the same strike on any overlay that is switched on.{" "}
-          <strong>
-            The right edge is live and redraws about once a second
-          </strong>{" "}
-          — the same push the chain screen&rsquo;s ladder renders, sampled down because a
-          shape has to hold still to be read while a ladder does not. Everything left of
-          it is a sealed minute out of the store. The overlays are the same expiry an hour
-          and a day earlier, anchored to the minute the scrubber is on rather than to the
-          clock, drawn from minutes already in this response &mdash; switching one on asks
-          the engine for nothing. An anchor the store holds no bar for draws no line and
-          says so above.
-        </p>
-      </main>
-    </div>
-  );
-
-  /**
-   * Every state the store can legitimately be in, and none of them is an error page.
-   *
-   * `docs/smile-contract.md` makes absence a 200 with an empty `minutes`: an underlying
-   * nobody has collected yet and a day nobody has lived through are both "nothing yet".
-   * So the empty cases render as an explanation in the plot's own box, at the size the
-   * chart would occupy, and the screen does not change shape when data arrives.
-   *
-   * **A position with no stored minute is one of those states, not an accident.** It
-   * renders empty. Drawing the neighbouring minute's curve there would be the same error
-   * as joining the line across a gap — a shape in a place where there is no shape — and
-   * it is the one thing a scrubber makes easy to do by mistake.
-   */
-  function renderPlot() {
-    if (error) return null;
-
-    if (timeline.stamps.length === 0) {
-      return (
-        <section className="plot-empty" aria-label="Smile plot">
-          <p>
-            {busy || !smile
-              ? "Reading the store…"
-              : `No stored minutes for ${underlying} ${expiry}, and nothing on the stream yet.`}
-            {smile && timeline.stamps.length === 0 ? (
-              <>
-                <br />
-                Nothing has gone wrong — the store is answering &ldquo;nothing yet&rdquo;.
-              </>
-            ) : null}
-          </p>
-        </section>
-      );
-    }
-
-    if (!minute) {
-      return (
-        <section className="plot-empty" aria-label="Smile plot">
-          <p>
-            No minute stored at{" "}
-            <strong>
-              {stamp ? formatLocalClock(stamp) : "—"} {stamp ? localZoneLabel(stamp) : ""}
-            </strong>{" "}
-            for {underlying} {expiry}.
-            <br />
-            {stamp} — the store wrote no bar here, so nothing is drawn. The curve either
-            side of it belongs to another minute.
-          </p>
-        </section>
-      );
-    }
-
-    if (rows.length === 0) {
-      return (
-        <section className="plot-empty" aria-label="Smile plot">
-          <p>
-            {underlying} {expiry} has a stored minute at{" "}
-            {formatFetchedClock(minute.minute)} UTC with no strikes on it.
-          </p>
-        </section>
-      );
-    }
-
-    if (solved.length === 0) {
-      return (
-        <section className="plot-empty" aria-label="Smile plot">
-          <p>
-            {rows.length} strikes at {formatFetchedClock(minute.minute)} UTC, and not one of
-            them solved.
-            <br />
-            Every point carries a reason; there is no curve to draw.
-          </p>
-        </section>
-      );
-    }
-
-    return (
-      <>
-        {minute.forward === null ? (
-          <p className="notice warn">
-            This minute has no fitted forward, so there is no offset axis and no reference
-            line. The strikes and their volatilities are unchanged.
-          </p>
-        ) : null}
-        <SmileChart
-          // Re-keyed per series and per scale, and deliberately **not** per minute. A
-          // different expiry is a different curve and a different axis is a different
-          // chart, so both remount; a different minute is new data on the same chart, and
-          // remounting the whole SVG on every drag step is the difference between a
-          // scrubber that feels like dragging and one that stutters. Nothing animates
-          // out of the last minute because nothing on this chart animates at all.
-          key={`${underlying}:${expiry}:${scale}`}
+        <SmilePlot
+          error={error}
+          busy={busy}
+          hasResponse={smile !== null}
+          timeline={timeline}
+          underlying={underlying}
+          expiry={expiry}
+          stamp={stamp}
           minute={minute}
           grid={grid}
           scale={scale}
-          underlying={underlying}
-          expiry={expiry}
           overlays={drawn}
         />
-      </>
-    );
-  }
+
+        <SmileNote />
+      </main>
+    </div>
+  );
 }

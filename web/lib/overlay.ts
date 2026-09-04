@@ -50,6 +50,34 @@ import { indexOfStamp, shiftStamp, storedThrough, type Timeline } from "./timeli
 
 export type OverlayId = "h1" | "d1";
 
+/**
+ * The second channel each overlay is identified by, after hue.
+ *
+ * Deliberately not close to the forward line's `5 4`: that rule is amber and horizontal
+ * to the eye's reading of the chart, and a dash pattern shared with it would invite the
+ * two to be read as one family. Long dash for the hour, dotted for the day — the further
+ * back in time, the more broken the line, which is a mnemonic rather than a rule.
+ */
+export const OVERLAY_DASH: Record<OverlayId, string> = { h1: "8 4", d1: "2 4" };
+
+/**
+ * Stroke width per overlay, and it is not the same number twice.
+ *
+ * A dash pattern is a duty cycle: `8 4` paints two thirds of its length and `2 4` paints
+ * one third. At an equal width the dotted series lays down half the ink of the dashed
+ * one and reads as the fainter of the two — which would say "less important", a claim
+ * about a day ago that nothing supports. The extra half pixel on the dotted series
+ * equalises the presence rather than the number. `measured` on the rendered chart at
+ * 1.5px both, the dotted line was legible but visibly the weaker of the two.
+ */
+export const OVERLAY_WIDTH: Record<OverlayId, number> = { h1: 1.5, d1: 2 };
+
+/** The stroke token per overlay. Defined in `globals.css`, measured in both variants. */
+export const OVERLAY_STROKE: Record<OverlayId, string> = {
+  h1: "var(--overlay-1h)",
+  d1: "var(--overlay-24h)",
+};
+
 export interface OverlaySpec {
   id: OverlayId;
   /** What the control says. U+2212, not a hyphen: this is a minus sign. */
@@ -151,4 +179,38 @@ export function resolveOverlay(
   }
 
   return { spec, anchor, minute: null, absence: `The store wrote no bar at ${anchor}.` };
+}
+
+/** One historical curve to draw beside the primary. */
+export interface ChartOverlay {
+  id: OverlayId;
+  /** `−1h` / `−24h`, as the control spells it. */
+  label: string;
+  minute: SmileMinute;
+}
+
+/** Every overlay that is switched on, resolved against the minute the scrubber is on. */
+export function resolveOverlays(
+  on: OverlayState,
+  stamp: string | null,
+  timeline: Timeline,
+): ResolvedOverlay[] {
+  return OVERLAYS.filter((spec) => on[spec.id]).map((spec) => resolveOverlay(spec, stamp, timeline));
+}
+
+/**
+ * The two piles a resolved overlay can land in, and they are rendered in two different
+ * places: a curve goes to the chart, an absence goes into words above it.
+ */
+export function splitOverlays(resolved: readonly ResolvedOverlay[]): {
+  drawn: ChartOverlay[];
+  absent: ResolvedOverlay[];
+} {
+  const drawn: ChartOverlay[] = [];
+  const absent: ResolvedOverlay[] = [];
+  for (const overlay of resolved) {
+    if (overlay.minute) drawn.push({ id: overlay.spec.id, label: overlay.spec.label, minute: overlay.minute });
+    else absent.push(overlay);
+  }
+  return { drawn, absent };
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useMemo } from "react";
+import { useMemo } from "react";
 import {
   CartesianGrid,
   Label,
@@ -11,32 +11,20 @@ import {
   Tooltip,
   XAxis,
   YAxis,
-  type TooltipContentProps,
-  type XAxisTickContentProps,
-  type YAxisTickContentProps,
 } from "recharts";
 
+import { ivTickFor, offsetTickFor, strikeTick } from "@/components/SmileAxisTicks";
+import { SmileTooltip } from "@/components/SmileTooltip";
 import type { SmileMinute } from "@/lib/contract";
 import { formatStrike } from "@/lib/format";
-import type { OverlayId } from "@/lib/overlay";
 import {
-  linearTicks,
-  logDomain,
-  logTicks,
-  offsetTicks,
-  paddedDomain,
-  tickDecimals,
-} from "@/lib/scale";
-import {
-  formatOffset,
-  formatPercent,
-  formatSignedPoints,
-  OVERLAY_COLUMN,
-  solvedPercents,
-  toChartRows,
-  unsolvedStrikes,
-  type SmileRow,
-} from "@/lib/smile";
+  OVERLAY_DASH,
+  OVERLAY_STROKE,
+  OVERLAY_WIDTH,
+  type ChartOverlay,
+} from "@/lib/overlay";
+import { smileChartModel, type VolScale } from "@/lib/smilemodel";
+import { OVERLAY_COLUMN, toChartRows } from "@/lib/smile";
 
 /**
  * The smile: implied volatility against strike, for one expiry at one minute.
@@ -60,8 +48,8 @@ import {
  * so the break reads as a strike we could not solve rather than as a strike that does not
  * exist. Joining across would invent a number in the one place someone would read one.
  *
- * **Nothing wears Recharts' own styling.** Every tick is a custom component, the tooltip
- * is replaced outright, the grid and axis lines take palette tokens, and there is no
+ * **Nothing wears Recharts' own styling.** Every tick is a custom component
+ * (`SmileAxisTicks`), the tooltip is replaced outright (`SmileTooltip`), the grid and axis lines take palette tokens, and there is no
  * legend — one series needs no key, and the library's default one is grey Helvetica.
  * Where Recharts writes a colour of its own as an SVG presentation attribute — `#808080`
  * on every `Label`, `#ccc` on every `ReferenceLine` — the token is passed as a prop as
@@ -79,8 +67,17 @@ import {
  * They are told apart from the primary and from each other by **hue and by dash
  * together**, never by hue alone — the primary is solid, `−1h` is long-dashed and `−24h`
  * is dotted, so the three remain separable where hue does not survive, which includes
- * every red-green deficiency and a printout. `OVERLAY_DASH` below carries the patterns
- * and `--overlay-1h` / `--overlay-24h` in `globals.css` carry the measured ratios.
+ * every red-green deficiency and a printout. `OVERLAY_DASH` in `lib/overlay.ts` carries
+ * the patterns and `--overlay-1h` / `--overlay-24h` in `globals.css` carry the measured
+ * ratios.
+ *
+ * **The Recharts children below are not split into components of their own.** Recharts
+ * finds its axes, its reference lines and its series by inspecting the *type* of each
+ * direct child of `LineChart`; a wrapper component in between is not recognised and the
+ * axis silently does not exist. So what could leave this file has — the layout
+ * arithmetic to `lib/smilemodel.ts`, the ticks and the hover to their own components —
+ * and the JSX tree stays whole because splitting it would break the chart rather than
+ * clarify it.
  *
  * **Overlays get no dots.** The dots are what says "this is a data point you may read a
  * number off", and the number this screen is for is the one on the curve for the minute
@@ -88,53 +85,6 @@ import {
  * line and nothing else. Their values are still in the hover, where a reader who wants
  * one asks for it.
  */
-
-/** Roughly how many ticks each axis wants. Chosen for a 900-ish pixel plot. */
-const STRIKE_TICK_TARGET = 8;
-const OFFSET_TICK_TARGET = 8;
-const IV_TICK_TARGET = 8;
-
-/** A little air, so a point never sits on the frame. */
-const X_PAD = 0.02;
-const Y_PAD = 0.08;
-
-/**
- * The second channel each overlay is identified by, after hue.
- *
- * Deliberately not close to the forward line's `5 4`: that rule is amber and horizontal
- * to the eye's reading of the chart, and a dash pattern shared with it would invite the
- * two to be read as one family. Long dash for the hour, dotted for the day — the further
- * back in time, the more broken the line, which is a mnemonic rather than a rule.
- */
-const OVERLAY_DASH: Record<OverlayId, string> = { h1: "8 4", d1: "2 4" };
-
-/**
- * Stroke width per overlay, and it is not the same number twice.
- *
- * A dash pattern is a duty cycle: `8 4` paints two thirds of its length and `2 4` paints
- * one third. At an equal width the dotted series lays down half the ink of the dashed
- * one and reads as the fainter of the two — which would say "less important", a claim
- * about a day ago that nothing supports. The extra half pixel on the dotted series
- * equalises the presence rather than the number. `measured` on the rendered chart at
- * 1.5px both, the dotted line was legible but visibly the weaker of the two.
- */
-const OVERLAY_WIDTH: Record<OverlayId, number> = { h1: 1.5, d1: 2 };
-
-/** The stroke token per overlay. Defined in `globals.css`, measured in both variants. */
-const OVERLAY_STROKE: Record<OverlayId, string> = {
-  h1: "var(--overlay-1h)",
-  d1: "var(--overlay-24h)",
-};
-
-export type VolScale = "linear" | "log";
-
-/** One historical curve to draw beside the primary. Resolved by `lib/overlay.ts`. */
-export interface ChartOverlay {
-  id: OverlayId;
-  /** `−1h` / `−24h`, as the control spells it. */
-  label: string;
-  minute: SmileMinute;
-}
 
 export function SmileChart({
   minute,
@@ -176,183 +126,18 @@ export function SmileChart({
   );
   const forward = minute.forward;
 
-  const model = useMemo(() => {
-    const strikes = rows.map((row) => row.strike);
-    const solved = solvedPercents(rows);
-
-    // The vertical domain has to hold every curve on the axis, not just the primary —
-    // an overlay clipped at the frame would read as a curve that flattens out there.
-    const spanning = [...solved];
-    for (const overlay of overlays) {
-      for (const row of rows) {
-        const value = row[OVERLAY_COLUMN[overlay.id]];
-        if (value !== null) spanning.push(value);
-      }
-    }
-
-    const xDomain = paddedDomain(
-      Math.min(...strikes),
-      Math.max(...strikes),
-      X_PAD,
-    );
-    const strikeTicks = linearTicks(xDomain[0], xDomain[1], STRIKE_TICK_TARGET);
-
-    // Only meaningful when the minute has a forward. A minute whose parity regression
-    // failed carries `forward: null`, and then there is no offset to label and no
-    // reference to draw — the bottom axis stands alone rather than a zero being invented.
-    const offsetPositions =
-      forward === null ? [] : offsetTicks(xDomain[0], xDomain[1], forward, OFFSET_TICK_TARGET);
-
-    // The log branch drops any non-positive volatility, which the solver does not
-    // produce — but a log axis given a zero silently renders nothing at all, and a blank
-    // chart is the worst failure mode on this screen.
-    const positives = spanning.filter((v) => v > 0);
-    const useLog = scale === "log" && positives.length > 0;
-
-    const yDomain: [number, number] = useLog
-      ? logDomain(Math.min(...positives), Math.max(...positives), Y_PAD)
-      : spanning.length > 0
-        ? paddedDomain(Math.min(...spanning), Math.max(...spanning), Y_PAD)
-        : [0, 1];
-    const ivTicks = useLog
-      ? logTicks(yDomain[0], yDomain[1], IV_TICK_TARGET)
-      : linearTicks(yDomain[0], yDomain[1], IV_TICK_TARGET);
-
-    return {
-      xDomain,
-      strikeTicks,
-      offsetPositions,
-      yDomain,
-      ivTicks,
-      useLog,
-      ivDecimals: tickDecimals(ivTicks),
-      // A dotted rule is a claim about **this** minute's solver, so it is read off the
-      // primary curve alone. An overlay's own refusals belong to another minute and
-      // marking them here would put that minute's failures on this one's axis.
-      unsolved: unsolvedStrikes(rows),
-      byStrike: new Map(rows.map((row) => [row.strike, row])),
-    };
-    // `overlays` is read above but is not a dependency, because it cannot change without
-    // `rows` changing: the memo below is keyed on the overlay set, so a switched overlay
-    // hands this one a new array. Listing it as well would recompute the whole model on
-    // every live tick, since the screen rebuilds the array each render.
+  const model = useMemo(
+    () => smileChartModel(rows, forward, scale, overlays),
+    // `overlays` is read by the model but is not a dependency, because it cannot change
+    // without `rows` changing: the memo above is keyed on the overlay set, so a switched
+    // overlay hands this one a new array. Listing it as well would recompute the whole
+    // model on every live tick, since the screen rebuilds the array each render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, forward, scale]);
-
-  const strikeTick = (props: XAxisTickContentProps) => (
-    <text
-      className="chart-tick"
-      x={Number(props.x)}
-      y={Number(props.y)}
-      dy={12}
-      textAnchor="middle"
-    >
-      {formatStrike(Number(props.payload.value))}
-    </text>
+    [rows, forward, scale],
   );
 
-  const offsetTick = (props: XAxisTickContentProps) => (
-    <text
-      className="chart-tick"
-      x={Number(props.x)}
-      y={Number(props.y)}
-      dy={-5}
-      textAnchor="middle"
-    >
-      {forward === null ? "" : formatOffset(Number(props.payload.value) - forward)}
-    </text>
-  );
-
-  const ivTick = (props: YAxisTickContentProps) => (
-    <text
-      className="chart-tick"
-      x={Number(props.x)}
-      y={Number(props.y)}
-      dx={-8}
-      dy={4}
-      textAnchor="end"
-    >
-      {formatPercent(Number(props.payload.value), model.ivDecimals)}
-    </text>
-  );
-
-  /**
-   * The whole readout, and the reason the hover exists.
-   *
-   * `iv_leg` is the field that earns its place here: it flips from put to call across the
-   * forward because the volatility is always solved on the out-of-the-money side, and a
-   * reader who does not know that reads the change in the curve's character as a break in
-   * our arithmetic rather than as the convention working.
-   *
-   * The row is found by strike rather than taken from the payload, because Recharts drops
-   * a series entry whose value is null — and the unsolved strike is precisely the point
-   * whose tooltip has the most to say.
-   */
-  const tooltip = (props: TooltipContentProps) => {
-    if (!props.active) return null;
-    const fromPayload = props.payload?.[0]?.payload as SmileRow | undefined;
-    const row = fromPayload ?? model.byStrike.get(Number(props.label));
-    if (!row) return null;
-
-    return (
-      <div className="chart-tip">
-        <div className="chart-tip-head">{formatStrike(row.strike)}</div>
-        <dl className="chart-tip-list">
-          {/* Two different absences, and they are not interchangeable: the solver saw
-              this strike and refused it, or this minute holds no row for it at all. */}
-          <dt>IV</dt>
-          <dd>
-            {row.ivPct !== null
-              ? formatPercent(row.ivPct, 2)
-              : row.stored
-                ? "not solved"
-                : "not stored"}
-          </dd>
-
-          <dt>Offset</dt>
-          <dd>{row.offset === null ? "no forward" : `${formatOffset(row.offset)} USD`}</dd>
-
-          <dt>Leg</dt>
-          <dd>{row.leg ?? "none"}</dd>
-
-          {row.reason ? (
-            <>
-              <dt>Why</dt>
-              <dd>{row.reason}</dd>
-            </>
-          ) : null}
-
-          {/* One line per overlay on screen, in the overlay's own colour so the row and
-              the curve are the same thing. The signed figure beside it is this minute
-              minus that one — the subtraction of two numbers already on the readout,
-              which is the comparison the overlay exists to make. */}
-          {overlays.map((overlay) => {
-            const value = row[OVERLAY_COLUMN[overlay.id]];
-            return (
-              <Fragment key={overlay.id}>
-                <dt style={{ color: OVERLAY_STROKE[overlay.id] }}>{overlay.label}</dt>
-                <dd>
-                  {value === null ? (
-                    "—"
-                  ) : (
-                    <>
-                      {formatPercent(value, 2)}
-                      {row.ivPct === null ? null : (
-                        <span className="chart-tip-diff">
-                          {" "}
-                          {formatSignedPoints(row.ivPct - value)}
-                        </span>
-                      )}
-                    </>
-                  )}
-                </dd>
-              </Fragment>
-            );
-          })}
-        </dl>
-      </div>
-    );
-  };
+  const offsetTick = offsetTickFor(forward);
+  const ivTick = ivTickFor(model.ivDecimals);
 
   return (
     <div className="plot">
@@ -489,7 +274,9 @@ export function SmileChart({
             has something to say, and `iv_reason` is the thing it says.
           */}
           <Tooltip
-            content={tooltip}
+            content={(props) => (
+              <SmileTooltip {...props} overlays={overlays} byStrike={model.byStrike} />
+            )}
             filterNull={false}
             // `--line-strong` measured 1.40:1 dark against the plot - a pointer cue nobody
             // can see is a pointer cue that was deleted. `--ink-faint` is 4.61:1 / 5.08:1.
