@@ -170,10 +170,14 @@ The docs are the record, but four of them have fallen behind the code:
   storage layer has since landed (four commits through `d164ba2`), `docs/storage.md` is its
   findings document and is not in handoff's reading list.
 
-**State of `main` as measured 2026-09-04:** `ruff` clean, **464 passed / 2 failed** under
-Python 3.12. `test_solvers.py::test_every_solver_round_trips_or_declines[70000.0-0.05-S3]` —
-S3 returns 0.625 for a price that underflowed to exactly 0.0, where the contract says it must
-decline. `test_wire.py::test_a_websocket_chain_solves_with_the_untouched_forward_and_solver_code`
-— `ForwardResult.trusted` is `False` where the test expects `True`, on an implied rate of
-30.1%. Both may be genuine or may be the 3.12/3.13 and NumPy/SciPy version gap; nobody has
-checked. Diagnose before building on top of either.
+**State of `main` as measured 2026-09-04, after `a018fb3`:** `ruff` clean, **468 passed /
+1 failed** under Python 3.12. The one failure is
+`test_solvers.py::test_every_solver_round_trips_or_declines[70000.0-0.05-S3]` — S3 returns
+0.625 for a price that underflowed to exactly 0.0, where the contract says it must decline.
+It may be genuine or may be the 3.12/3.13 and NumPy/SciPy version gap; nobody has checked.
+Diagnose before building on top of it.
+
+The second failure recorded here earlier —
+`test_wire.py::test_a_websocket_chain_solves_with_the_untouched_forward_and_solver_code`,
+`ForwardResult.trusted` false on an implied rate of 30.1% — **passes as of `2725da7`**,
+which regenerated the websocket fixtures alongside the open-interest fix.

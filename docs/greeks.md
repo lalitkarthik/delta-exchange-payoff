@@ -33,6 +33,11 @@ greeks}.py` unchanged; nothing in the engine was modified for this study.
 
 ## How to read this
 
+**New to this? Read [maths-start-here.md](maths-start-here.md) first.** It is the
+one-page reference for all three calculations — forward, implied volatility, Greeks —
+with the formulas, the conventions and the trap in each. This document is the evidence
+behind its Greeks section.
+
 **Measured** names the fixture and the run. Every number here comes from a committed
 fixture and reproduces from the repo:
 

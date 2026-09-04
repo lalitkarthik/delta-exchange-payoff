@@ -569,10 +569,17 @@ curve through it or evaluate a position against it.
 
 **ETH is half-connected.** REST serves it; the live feed and the store do not.
 
-**Compaction has no lock, and `Leg.oi_value_usd` is mislabelled** on the websocket path —
-it is fed from `oi_change_usd_6h`, so the live screen shows a six-hour change under a
-USD-open-interest label. Left alone deliberately: renaming the field changes the chain
-contract the web app reads, and it wants its own ticket.
+**Compaction has no lock.** Two compactors on one partition would race on a manifest
+name, stated rather than defended against because the nightly job is one process.
+
+**The three open-interest fields now mean three different things**, which they did not
+until `2725da7`. `oi` is contracts and is read from Delta's `oi_contracts`, not from its
+`oi` — that one is a BTC notional, and `oi_contracts == oi * 1000` across all 136 captured
+symbols. `oi_value_usd` is the USD notional, published over REST and **absent on the
+websocket**, left `None` there rather than derived, because contracts x size x spot is a
+calculation and the field reports an observation. `oi_change_usd_6h` is a six-hour change,
+carried on both transports, and it can go negative — which is what proved `wire.py` had
+been feeding it into `oi_value_usd` since T4.
 
 **Three things nobody has measured**, carried forward as open questions: mid against mark
 (every implied vol here inverts a midpoint, and nobody has measured how far Delta's own

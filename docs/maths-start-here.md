@@ -221,6 +221,8 @@ Live cross-check: our theta's median **−76.05** against Delta's **−77.84** �
 
 **The Greeks raise at expiry rather than returning zero.** At `T ≤ 0` gamma divides by a time scaling that has gone to zero, and theta is the change over a day that no longer exists. The *price* there is well defined; the exposures are not.
 
+**Deeper:** [greeks.md](greeks.md)
+
 ---
 
 ## Word list
