@@ -11,9 +11,10 @@ import {
   isEngineError,
   type ChainResponse,
   type ExpiriesResponse,
+  type SmileResponse,
   type Underlying,
 } from "./contract";
-import { FIXTURE_CHAIN, fixtureChain, fixtureExpiries } from "./fixture";
+import { FIXTURE_CHAIN, fixtureChain, fixtureExpiries, fixtureSmile } from "./fixture";
 
 export const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL ?? "http://localhost:8000";
 
@@ -190,6 +191,68 @@ export async function loadChain(
     if (err instanceof EngineUnreachableError) {
       return {
         data: fixtureChain(underlying, expiry),
+        source: "fixture",
+        fallbackReason: `Engine at ${ENGINE_URL} is unreachable (${err.message}).`,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Rule 3 again, for the smile. `strike` and `iv` are the only decimals in the payload,
+ * and `iv` is the one the whole screen plots — a string arriving there would sort and
+ * scale as text and draw a plausible, wrong curve rather than fail.
+ */
+function assertSmileNumeric(smile: SmileResponse): void {
+  const bad: string[] = [];
+  for (const minute of smile.minutes) {
+    for (const field of ["forward", "discount", "years_to_expiry"] as const) {
+      if (typeof minute[field] === "string") bad.push(`${minute.minute}.${field}`);
+    }
+    for (const point of minute.points) {
+      if (typeof point.strike === "string") bad.push(`${minute.minute}[?].strike`);
+      if (typeof point.iv === "string") bad.push(`${minute.minute}[${point.strike}].iv`);
+    }
+  }
+  if (bad.length > 0) {
+    throw new ContractViolationError(
+      `Engine sent decimals as strings, which docs/smile-contract.md forbids. ` +
+        `The web app will not parse them. Offending fields: ${bad.slice(0, 6).join(", ")}` +
+        (bad.length > 6 ? ` (+${bad.length - 6} more)` : ""),
+    );
+  }
+}
+
+/**
+ * The whole stored day for one expiry, in one request.
+ *
+ * Same fallback rule as `loadChain`, and for the same reason: an engine that is not
+ * running is a local condition the fixture can stand in for, while an engine that
+ * answered 400 or 422 gave a real answer and that answer is surfaced rather than
+ * papered over with a fixture that would look like a working screen.
+ *
+ * There is deliberately no 404 case. `docs/smile-contract.md` makes absence a 200 with
+ * an empty `minutes`, so a 404 from this route means the engine is not the engine this
+ * contract describes — and saying that out loud is more useful than a silent fixture.
+ */
+export async function loadSmile(
+  underlying: Underlying,
+  expiry: string,
+): Promise<Loaded<SmileResponse>> {
+  if (FORCE_FIXTURE) {
+    return { data: fixtureSmile(underlying, expiry), source: "fixture" };
+  }
+  try {
+    const data = await get<SmileResponse>(
+      `/smile?underlying=${underlying}&expiry=${encodeURIComponent(expiry)}`,
+    );
+    assertSmileNumeric(data);
+    return { data, source: "engine" };
+  } catch (err) {
+    if (err instanceof EngineUnreachableError) {
+      return {
+        data: fixtureSmile(underlying, expiry),
         source: "fixture",
         fallbackReason: `Engine at ${ENGINE_URL} is unreachable (${err.message}).`,
       };
