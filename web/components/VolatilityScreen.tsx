@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import IvRvPanel from "@/components/IvRvPanel";
 import PlotControls from "@/components/PlotControls";
 import SmileNote from "@/components/SmileNote";
 import SmileNotices from "@/components/SmileNotices";
@@ -28,7 +29,7 @@ import {
   lastIndex,
   withLiveMinute,
 } from "@/lib/timeline";
-import { viewQuery, type ViewRequest } from "@/lib/view";
+import { viewQuery, type Tab, type ViewRequest } from "@/lib/view";
 
 /**
  * How long the URL waits behind the scrubber before it is rewritten.
@@ -88,6 +89,16 @@ const URL_SETTLE_MS = 200;
  */
 export default function VolatilityScreen({ initial }: { initial: ViewRequest }) {
   const [underlying, setUnderlying] = useState<Underlying>(initial.underlying ?? "BTC");
+
+  /**
+   * Which of the section's two views is on screen.
+   *
+   * **The smile's day keeps loading behind the other tab, and that is deliberate.** The
+   * hooks below are not conditional — React forbids that — and the day is one request
+   * that the reader has already paid for. Switching back is instant rather than a
+   * reload, and the scrubber is still standing where they left it.
+   */
+  const [tab, setTab] = useState<Tab>(initial.tab ?? "smile");
   /**
    * The stored day, and the expiry it belongs to. The list request is what settles which
    * expiry is being read, so both live behind one hook — see `hooks/useSmileDay.ts`.
@@ -180,13 +191,13 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
    */
   useEffect(() => {
     if (!expiry || !stamp) return;
-    const query = viewQuery(underlying, expiry, stamp);
+    const query = viewQuery(underlying, expiry, stamp, tab);
     if (window.location.search === query) return;
     const timer = window.setTimeout(() => {
       window.history.replaceState(null, "", query);
     }, URL_SETTLE_MS);
     return () => window.clearTimeout(timer);
-  }, [underlying, expiry, stamp]);
+  }, [underlying, expiry, stamp, tab]);
 
   /** A different series is a different day; the position in the old one means nothing. */
   const pickUnderlying = (next: Underlying) => {
@@ -238,25 +249,39 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
         fallbackReason={fallbackReason}
         liveStatus={live.status}
         liveDetail={live.detail}
+        tab={tab}
       />
 
       <main className="main">
         <div className="tabs" role="tablist" aria-label="Volatility views">
-          <button type="button" role="tab" className="tab" aria-selected="true">
+          <button
+            type="button"
+            role="tab"
+            className="tab"
+            aria-selected={tab === "smile"}
+            onClick={() => setTab("smile")}
+          >
             Smile
           </button>
           <button
             type="button"
             role="tab"
             className="tab"
-            aria-selected="false"
-            aria-disabled="true"
-            disabled
+            aria-selected={tab === "iv-rv"}
+            onClick={() => setTab("iv-rv")}
           >
-            IV vs RV <span className="tab-soon">soon</span>
+            IV vs RV
           </button>
         </div>
 
+        {tab === "iv-rv" ? <IvRvPanel underlying={underlying} /> : null}
+
+        {/* Hidden rather than unmounted, so the scrubber comes back where it was left
+            rather than snapping to the right edge on every tab switch. `hidden` also
+            takes the subtree out of the accessibility tree and out of tab order, so a
+            keyboard cannot reach a control on a tab that is not on screen — which a
+            `display: none` class would have got right and a `visibility` one would not. */}
+        <div hidden={tab !== "smile"}>
         <SmileNotices
           error={error}
           liveStatus={live.status}
@@ -314,6 +339,7 @@ export default function VolatilityScreen({ initial }: { initial: ViewRequest }) 
         />
 
         <SmileNote />
+        </div>
       </main>
     </div>
   );

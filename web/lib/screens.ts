@@ -58,13 +58,6 @@ export const SCREENS: readonly Screen[] = [
     // A pulse: a flat line that moves and settles, which is what the screen shows.
     icon: "M1.5 9 L4.25 9 L6.25 3.75 L9.5 12.25 L11.5 9 L14.5 9",
   },
-  {
-    code: "IVR",
-    name: "IMPLIED VS REALISED",
-    href: "/iv-vs-rv",
-    // Two curves crossing: a forecast and what arrived, which is the whole screen.
-    icon: "M1.5 12.5 C5 12.5 5.5 3.5 9 3.5 C12.5 3.5 13 8 14.5 8 M1.5 5.5 C5 5.5 5.5 12 9 12 C12.5 12 13 9 14.5 9",
-  },
 ];
 
 /**

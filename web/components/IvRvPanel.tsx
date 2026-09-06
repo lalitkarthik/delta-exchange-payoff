@@ -2,9 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import ThemeToggle from "@/components/ThemeToggle";
 import { LINE_LABEL, SERIES_COLOUR, IvRvChart } from "@/components/IvRvChart";
-import { UNDERLYINGS, type Underlying } from "@/lib/contract";
+import { type Underlying } from "@/lib/contract";
 import { ENGINE_URL } from "@/lib/engine";
 import {
   ESTIMATORS,
@@ -40,7 +39,13 @@ const ALIGNMENT_NOTE: Record<Alignment, string> = {
 };
 
 /**
- * Implied against realised, on one axis, at one lookback.
+ * Implied against realised, on one axis, at one lookback. The volatility section's
+ * second tab.
+ *
+ * **The underlying is the section's, not this panel's.** The smile and this chart are two
+ * views of the same series, so the picker lives once in `VolatilityHeader` and both tabs
+ * read it. A second picker here could disagree with the first, and a reader switching
+ * tabs would find the underlying had changed under them.
  *
  * **One control drives both sides.** The lookback sets the realised window *and* the
  * implied tenor, so the two lines always ask about the same length of time. Two controls
@@ -56,8 +61,7 @@ const ALIGNMENT_NOTE: Record<Alignment, string> = {
  * **This screen does no arithmetic.** Both series arrive scaled to the window and
  * aligned; the chart turns numbers into coordinates and this file turns them into text.
  */
-export default function VolatilityPage() {
-  const [underlying, setUnderlying] = useState<Underlying>("BTC");
+export default function IvRvPanel({ underlying }: { underlying: Underlying }) {
   const [interval, setInterval] = useState("1m");
   const [alignment, setAlignment] = useState<Alignment>("contemporaneous");
   const [lookback, setLookback] = useState<number | null>(null);
@@ -163,67 +167,27 @@ export default function VolatilityPage() {
   })();
 
   return (
-    <div className="shell">
-      <header className="header">
-        <span className="brand">IV vs RV</span>
-
-        <label className="picker">
-          <span className="stat-label">Underlying</span>
-          <select
-            className="picker-select"
-            value={underlying}
-            onChange={(e) => setUnderlying(e.target.value as Underlying)}
-          >
-            {UNDERLYINGS.map((u) => (
-              <option key={u} value={u}>
-                {u}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="picker">
-          <span className="stat-label">Sampling</span>
-          <select
-            className="picker-select"
-            value={interval}
-            onChange={(e) => setInterval(e.target.value)}
-          >
-            {offered.map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <div className="stat lead">
-          <span className="stat-label">Lookback N</span>
-          <span className="stat-value">
-            {lookback === null ? "—" : `${lookback} d`}
-          </span>
-        </div>
-
-        <button
-          type="button"
-          className="refresh"
-          onClick={() =>
-            setAlignment((current) => (current === "lag" ? "contemporaneous" : "lag"))
-          }
-          title={ALIGNMENT_NOTE[alignment]}
-        >
-          {ALIGNMENT_LABEL[alignment]}
-        </button>
-
-        <span className="chip" title={`Reading ${ENGINE_URL}.`}>
-          {busy ? "loading…" : provenance ? "ready" : "no data"}
-        </span>
-
-        <ThemeToggle />
-      </header>
-
-      <main className="main">
+    <>
+        {/* One row, and it holds every decision the chart rests on: the lookback that
+            drives both series, the sampling interval, the alignment, and which of the
+            six lines are drawn. The underlying is not here — it is the section's, set
+            once in the header and read by both tabs. */}
         <section className="ivr-controls">
+          <label className="picker">
+            <span className="stat-label">Sampling</span>
+            <select
+              className="picker-select"
+              value={interval}
+              onChange={(e) => setInterval(e.target.value)}
+            >
+              {offered.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </label>
+
           <div className="ivr-slider">
             <input
               type="range"
@@ -251,6 +215,21 @@ export default function VolatilityPage() {
             />
             <span className="stat-note">days — drives the RV window and the IV tenor</span>
           </div>
+
+          <button
+            type="button"
+            className="refresh"
+            onClick={() =>
+              setAlignment((current) => (current === "lag" ? "contemporaneous" : "lag"))
+            }
+            title={ALIGNMENT_NOTE[alignment]}
+          >
+            {ALIGNMENT_LABEL[alignment]}
+          </button>
+
+          <span className="chip" title={`Reading ${ENGINE_URL}/volatility.`}>
+            {busy ? "loading…" : provenance ? "ready" : "no data"}
+          </span>
 
           <fieldset className="ivr-legend">
             <legend className="sr-only">Lines to draw</legend>
@@ -314,7 +293,6 @@ export default function VolatilityPage() {
           published DVOL print, because DVOL integrates the whole strike range and this
           tracks the level alone.
         </p>
-      </main>
-    </div>
+    </>
   );
 }

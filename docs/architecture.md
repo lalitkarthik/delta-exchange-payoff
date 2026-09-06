@@ -509,7 +509,7 @@ reported, not worked around.
 | `lib/direction.ts` | Which way a price moved since the last push |
 | `lib/format.ts` | The only place a number becomes text |
 | `components/ChainLadder.tsx` | The table |
-| `app/iv-vs-rv/page.tsx` | Implied against realised: one chart, one slider, six checkboxes |
+| `components/IvRvPanel.tsx` | The volatility section's second tab: implied against realised, one chart, one slider, six checkboxes |
 | `lib/ivrv.ts` | The `/volatility` endpoints' half of the contract, mirrored field for field |
 | `components/IvRvChart.tsx` | Hand-rolled SVG. Written before `recharts` landed with the smile screen; **worth porting**, since recharts breaks on a null by default too |
 

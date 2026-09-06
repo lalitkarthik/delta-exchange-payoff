@@ -32,7 +32,13 @@ against this venue's data.
 | R2 | `engine/src/deltapayoff/realised_vol.py` | Five estimators, the window scaler, the roll-up, and a rolling form |
 | R3 | `engine/src/deltapayoff/iv_index.py` | Constant-maturity ATM implied volatility |
 | R4 | `engine/src/deltapayoff/volatility.py` | The two series joined, plus `GET /volatility` and `/volatility/bounds` |
-| R5 | `web/app/iv-vs-rv/page.tsx` | The screen: one chart, one slider, six checkboxes |
+| R5 | `web/components/IvRvPanel.tsx` | The volatility section's second tab: one chart, one slider, six checkboxes |
+
+**It is a tab, not a screen of its own.** The rail's VOL entry already carried a disabled
+`IV vs RV — soon` tab beside `Smile`; this fills it. The two are views of one subject and
+the underlying picker lives once, in `VolatilityHeader`, so they cannot disagree about
+which series is on screen. The tab is in the URL as `?tab=iv-rv`, because a tab is part of
+what someone means when they send a link.
 
 All of R2, R3 and R4's core are pure — data in, data out, no socket, no clock, no
 filesystem — in the manner of `forward.py` and `bars.py`. `store.py` gained the read path
