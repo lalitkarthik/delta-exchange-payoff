@@ -79,6 +79,23 @@
   --up: #4fb87c;
   --down: #e8636b;
 
+  /*
+   * The two comparison overlays on the smile.
+   *
+   * Every other role in this palette is taken: amber is the forward, the warm greys are
+   * the live curve and the type, and green/red are call and put on the ladder. Reusing
+   * any of them would make a time offset look like a side, or like the reference the
+   * curve is read against. So the overlays get the two hues nothing else on this product
+   * uses, and they are told apart from each other by a dash pattern as well as by hue -
+   * `OVERLAY_DASH` in `SmileChart.tsx` - so the pair survives a red-green deficiency and
+   * a monochrome printout, where hue alone would not.
+   *
+   * `measured` in the browser on the rendered chart, stroke against resolved background;
+   * the numbers are recorded in full beside the `.overlay-option` rules below.
+   */
+  --overlay-1h: #5ec8e0;
+  --overlay-24h: #b09cf0;
+
   --atm: #3a2c10;
   --atm-line: #f2a93b;
   /* The in-the-money wash, and the row under the pointer.
@@ -148,6 +165,11 @@
     --up: #177244;
     --down: #b5342b;
 
+    /* Darker than they look like they should be, for the same reason the accent is:
+       the dark values are 1.4:1 and 1.9:1 on paper. */
+    --overlay-1h: #0f6a86;
+    --overlay-24h: #6b4bb8;
+
     --atm: #fdf0cf;
     --atm-line: #d99a1a;
     --itm: #f1e9dc;
@@ -182,6 +204,9 @@
   --accent: #8a5607;
   --up: #177244;
   --down: #b5342b;
+
+  --overlay-1h: #0f6a86;
+  --overlay-24h: #6b4bb8;
 
   --atm: #fdf0cf;
   --atm-line: #d99a1a;
@@ -499,11 +524,11 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
    under `prefers-reduced-motion` and left the glyph; the glyph is all there is now, and
    a static coloured character is not motion. */
 
-/* ------------------------------------------------------ volatility screen */
+/* --------------------------------------------- implied vs realised screen */
 
 /* The controls sit above the chart rather than beside it: the chart wants the full
    width, and a lookback that changes both series is not a side panel's job to hold. */
-.vol-controls {
+.ivr-controls {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -513,7 +538,7 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
   background: var(--surface);
 }
 
-.vol-slider {
+.ivr-slider {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -521,10 +546,10 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
   min-width: 260px;
 }
 
-.vol-slider input[type="range"] { flex: 1 1 auto; accent-color: var(--accent); min-width: 120px; }
-.vol-slider input[type="range"]:disabled { opacity: 0.35; }
+.ivr-slider input[type="range"] { flex: 1 1 auto; accent-color: var(--accent); min-width: 120px; }
+.ivr-slider input[type="range"]:disabled { opacity: 0.35; }
 
-.vol-number {
+.ivr-number {
   width: 84px;
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
@@ -536,12 +561,12 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
   border-radius: var(--radius);
   padding: 3px 6px;
 }
-.vol-number:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.vol-number:disabled { opacity: 0.35; cursor: default; }
+.ivr-number:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ivr-number:disabled { opacity: 0.35; cursor: default; }
 
 /* The legend *is* the checkbox set. A separate legend would be a second thing naming the
    same six lines, and the two would eventually disagree about a colour. */
-.vol-legend {
+.ivr-legend {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -551,7 +576,7 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
   padding: 0;
 }
 
-.vol-check {
+.ivr-check {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -560,37 +585,928 @@ td.blank { background: repeating-linear-gradient(45deg, transparent, transparent
   cursor: pointer;
   white-space: nowrap;
 }
-.vol-check input { accent-color: var(--accent); cursor: pointer; }
+.ivr-check input { accent-color: var(--accent); cursor: pointer; }
 
-.vol-swatch {
+.ivr-swatch {
   width: 14px;
   height: 3px;
   border-radius: 2px;
   display: inline-block;
 }
 
-.vol-chart-wrap { padding: 16px var(--pad) 0; }
+.ivr-chart-wrap { padding: 16px var(--pad) 0; }
 
 /* `height` fixed and `width: 100%` with a non-uniform `preserveAspectRatio`: the chart
    gets wider on a wider screen without getting taller. The y axis is a volatility, and
    stretching it vertically changes how big the gap between the two lines looks. */
-.vol-chart {
+.ivr-chart {
   width: 100%;
   height: 420px;
   display: block;
 }
 
-.vol-grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.ivr-grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
 
-.vol-axis {
+.ivr-axis {
   fill: var(--ink-faint);
   font-family: var(--mono);
   font-size: 11px;
 }
-.vol-axis-y { text-anchor: end; }
-.vol-axis-x { text-anchor: middle; }
+.ivr-axis-y { text-anchor: end; }
+.ivr-axis-x { text-anchor: middle; }
 
-.vol-provenance {
+.ivr-provenance {
   font-family: var(--mono);
   color: var(--ink-soft);
 }
+/* --------------------------------------------------------- screens: the rail
+ *
+ * The app is more than one screen, so it has a rail down the left edge listing them.
+ * It sits in the root layout beside the page, which is why `.app` is a flex row a
+ * viewport tall: the rail is the fixed column and the screen takes the rest. `.shell`
+ * still declares its own `height: 100vh` and is unchanged - inside a container that is
+ * itself exactly that tall, it resolves to the same box it always did.
+ *
+ * `min-width: 0` on the screen is the same rule the ladder already relies on vertically:
+ * a flex item's `min-width: auto` is the width of its widest content, so without it the
+ * nineteen-column table would push the rail off the left of the viewport instead of
+ * scrolling inside its own pane.
+ *
+ * Each entry carries the terminal's three parts, stacked: an icon, the three-letter
+ * code, and the full name in the platform's uppercase.
+ *
+ * **Every pair below was measured on the rendered element against its resolved
+ * background, in both variants**, which is the only measurement that catches a hover
+ * state swapping the ground out from under the text. Two candidates were discarded on
+ * those numbers: `--ink-faint` on `--row-hover` is 3.58:1 dark and 4.08:1 light, and
+ * `--ink-soft` on the same ground is 4.18:1 dark - so a rail entry that only brightened
+ * its background on hover would have been *less* readable hovered than at rest. The
+ * whole entry brightens to `--ink` instead.
+ */
+
+.app { display: flex; height: 100vh; }
+.app > .shell { flex: 1; min-width: 0; }
+
+/* Wide enough for the longest name on one line. OPTION CHAIN renders **70px** at this
+   size and letter-spacing (`measured`: scrollWidth on the rendered span), and wrapping it
+   would make one entry two lines tall and the other one - a ragged column that reads as
+   a layout accident rather than a list. The ladder beside it already scrolls
+   horizontally, so the twenty pixels come out of scroll length, not out of legibility. */
+.rail {
+  flex: none;
+  width: 88px;
+  display: flex;
+  flex-direction: column;
+  padding-top: 6px;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+}
+
+/* The whole entry is the target, not the glyphs: a rail-width strip where only the
+   letters are clickable is a strip that gets clicked and does nothing. */
+.rail-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 9px 4px;
+  text-decoration: none;
+  color: var(--ink-soft);          /* 5.37:1 dark, 5.97:1 light, on --surface */
+}
+
+/* Stroked, never filled, and coloured by nothing: `currentColor` is what makes one
+   icon follow the entry through soft grey, hover ink and the current screen's amber
+   without a rule per state. `stroke-width` is in the 16-unit viewBox, so it scales with
+   the box rather than with the page. */
+.rail-icon {
+  width: 18px;
+  height: 18px;
+  margin-bottom: 3px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.rail-code { font-size: 12px; font-weight: 700; letter-spacing: 0.14em; }
+.rail-name {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);         /* 4.61:1 dark, 5.08:1 light, on --surface */
+}
+
+/* Hover brightens the text as well as the ground. See the note above: keeping the two
+   greys over `--row-hover` would have put 3.58:1 on screen. `--ink` there is 9.58:1
+   dark and 12.95:1 light - `measured` on the rendered code, name and icon stroke, all
+   three of which land on the same figure because the icon takes `currentColor` and the
+   name is lifted to `--ink` here too.
+   Excluded on the current screen deliberately - the amber wash has to survive being
+   hovered, and the cheapest way to guarantee that is to not swap it. Verified hovered
+   rather than read off the selector: the current entry's resolved ground is still
+   `--atm` while the pointer is on it, in both variants. */
+.rail-item:hover:not([aria-current="page"]) { background: var(--row-hover); color: var(--ink); }
+.rail-item:hover:not([aria-current="page"]) .rail-name { color: var(--ink); }
+
+.rail-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* The current screen, marked the way the money row is: an amber bar down the left edge
+   and an amber wash behind it. That is the fifth thing the accent is spent on, and it
+   earns it on the same grounds as the other four - it is the one entry the eye should
+   find without reading the list.
+   `--accent` on `--atm` is 6.79:1 dark and 5.43:1 light - the code and the icon stroke
+   both, since the icon inherits it; the name under it is `--ink` at 8.67:1 and 14.44:1.
+   The inset bar is the part that is not hue: it survives a colour-vision deficiency and
+   a monochrome printout, where the amber and the greys do not. */
+.rail-item[aria-current="page"] {
+  background: var(--atm);
+  color: var(--accent);
+  box-shadow: inset 3px 0 0 0 var(--atm-line);
+}
+.rail-item[aria-current="page"] .rail-name { color: var(--ink); }
+
+/* ------------------------------------------------------- screens: the title */
+
+/* The screen's own name, beside the wordmark. Not amber: the wordmark next to it is,
+   and two amber words in one row means neither of them is the one to read first. */
+.screen-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+
+/* --------------------------------------------------------- screens: the tabs
+ *
+ * The strip sits on the page ground rather than on `--surface`, so the resolved
+ * background behind every label here is `--bg`.
+ */
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 var(--pad);
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.tab {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-soft);          /* 5.55:1 dark, 5.52:1 light, on --bg */
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;             /* the underline sits on the strip's own rule */
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+/* The selected tab wears the accent, because the strip is a control and this is the
+   part of it that is acting. 9.96:1 dark, 5.60:1 light, on --bg. */
+.tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+
+/*
+ * The tab that is not built yet.
+ *
+ * It keeps `--ink-soft` - the same grey it would have unselected - because a disabled
+ * control still has to be read, and dimming it to the point where it obviously cannot
+ * be pressed is dimming it to the point where it cannot be identified. The state is
+ * carried by three things that are not contrast: the cursor, a dotted rule where the
+ * selected tab has a solid one, and the badge beside the label.
+ */
+.tab:disabled { cursor: not-allowed; border-bottom-style: dotted; border-bottom-color: var(--line-strong); }
+/* No hover rule for it, on purpose: a ground that lights up under the pointer says
+   "press me", which is the opposite of what this tab means. */
+
+.tab-soon {
+  margin-left: 7px;
+  padding: 0 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--ink-faint);         /* 4.76:1 dark, 4.70:1 light, on --bg */
+}
+
+/* ------------------------------------------------- screens: the plot region */
+
+/* The chart's box, standing empty. It is drawn at the size the chart will occupy rather
+   than collapsed to its message, so the screen does not change shape when the series
+   arrives. */
+.plot-empty {
+  margin: var(--pad);
+  min-height: 340px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink-faint);         /* 4.61:1 dark, 5.08:1 light, on --surface */
+  font-size: 11px;
+  text-align: center;
+  line-height: 1.7;
+}
+
+.plot-empty p { margin: 0; }
+
+/* --------------------------------------------------- screens: the smile chart
+ *
+ * Recharts draws the smile, and **none of its styling survives**. That was a condition
+ * of choosing it rather than an afterthought: its defaults are 12px Helvetica in #666 on
+ * a white card, and a chart wearing them beside this table reads as an embed from another
+ * product. So every tick is a custom SVG `<text>` styled from here, the tooltip is a
+ * replaced component, the grid and axis rules take palette tokens, and there is no
+ * legend at all — one series needs no key.
+ *
+ * Where a Recharts element writes a colour of its own as an SVG presentation attribute -
+ * `#808080` on every `Label`, `#ccc` on every `ReferenceLine` - the token is passed as a
+ * prop in `SmileChart.tsx` as well as being set here. The rule below would win in the
+ * cascade on its own, but the prop is what keeps the wrong grey out of the markup for
+ * the next person to copy. The classes here carry the face, the size and the spacing.
+ *
+ * **Every pair below was measured on the rendered chart against its resolved background,
+ * in both variants** - the numbers are recorded beside each token. The chart's resolved
+ * ground is `--surface` throughout; the tooltip's is `--bg`, because it floats over the
+ * plot and needs to separate from it.
+ */
+
+/* The plot's box. Same recipe as `.plot-empty`, which it replaces once there is a curve,
+   so the screen does not change shape when the series arrives. */
+.plot {
+  margin: var(--pad);
+  padding: 6px 4px 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+/* Axis ticks. `--ink-soft` rather than `--ink-faint`: these are figures a reader takes
+   values off, not captions. 5.37:1 dark, 5.97:1 light, on --surface. */
+.chart-tick {
+  fill: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* What each axis is. A caption, and dimmer than the figures on purpose.
+   `--ink-faint` is 4.61:1 dark and 5.08:1 light on --surface. */
+.chart-axis-title {
+  fill: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+}
+
+/* The forward's label, in the amber. This is the screen's money row: the accent marks
+   the one reference the whole curve is read against, and the curve itself is deliberately
+   `--ink` so that the two cannot be confused. The dashed rule beside it takes the same
+   token, set as a prop in `SmileChart.tsx`: `--atm-line` measured **2.41:1** on this
+   ground in light, under the 3:1 a graphical object needs.
+   `measured` on the rendered chart: --accent on --surface is 9.64:1 dark, 6.05:1 light. */
+.chart-forward-label {
+  fill: var(--accent);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+/* ------------------------------------------------------------ the tooltip
+ *
+ * On `--bg` rather than on `--surface`, which is what the plot behind it is: a panel the
+ * same colour as its ground is a panel with no edge, and the border alone was not enough
+ * to separate them at 1px. The shadow does the rest.
+ */
+.chart-tip {
+  background: var(--bg);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 7px 9px;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 0.35);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  min-width: 168px;
+}
+
+/* The strike, which is what the reader pointed at. `measured` on the rendered tooltip:
+   12.72:1 dark, 14.90:1 light, on the tooltip's own --bg ground. */
+.chart-tip-head {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 4px;
+  margin-bottom: 5px;
+}
+
+/* Label left, figure right. A definition list because that is what it is - five names
+   and their values for one strike - and it keeps the figures in one column. */
+.chart-tip-list {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1px 12px;
+  margin: 0;
+}
+
+.chart-tip-list dt {
+  color: var(--ink-faint);        /* 4.76:1 dark, 4.70:1 light, on --bg */
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  align-self: center;
+}
+
+.chart-tip-list dd {
+  margin: 0;
+  color: var(--ink);              /* 12.72:1 dark, 14.90:1 light, on --bg */
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Recharts wraps custom tooltip content in a positioned div and gives it a focus
+   outline. The content is ours; the wrapper should carry nothing at all. */
+.recharts-tooltip-wrapper { outline: none; }
+
+/* ------------------------------------------------- the volatility axis toggle
+ *
+ * Linear or log, and the default is linear. It sits above the plot on the page ground,
+ * so every pair here resolves against `--bg`.
+ *
+ * **The selected option is not amber.** The accent on this screen is spent on the
+ * forward, and a second amber thing in view would leave neither of them meaning
+ * anything. Selection is carried by a solid bar under the label plus the brighter ink,
+ * which is shape and weight rather than hue - and it stays distinguishable from hover,
+ * which brightens the ground but draws no bar.
+ */
+.plot-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px var(--pad) 0;
+}
+
+.scale-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.scale-option {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  padding: 4px 13px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);          /* 5.55:1 dark, 5.52:1 light, on --bg */
+  cursor: pointer;
+}
+
+.scale-option + .scale-option { border-left: 1px solid var(--line-strong); }
+
+/* The whole entry brightens, ground and text together. `--ink-soft` over `--row-hover`
+   is 4.18:1 dark - under the bar - which is the same trap the rail documents, so the
+   text has to move to `--ink` whenever the ground does. 9.58:1 dark, 12.95:1 light. */
+.scale-option:hover { background: var(--row-hover); color: var(--ink); }
+
+.scale-option[aria-pressed="true"] {
+  background: var(--row-hover);
+  color: var(--ink);
+  font-weight: 700;
+  box-shadow: inset 0 -2px 0 0 var(--ink);
+}
+
+.scale-option:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* ------------------------------------------------ the comparison overlays
+ *
+ * Two toggles that put the same expiry an hour and a day earlier on the same axis, and
+ * the buttons carry their own swatch so the control is the key. A legend under the plot
+ * would be the same information twice, in the place a reader looks last.
+ *
+ * They sit on the page ground beside the axis toggle, so every pair here resolves
+ * against `--bg`, and the strokes they stand for are measured against `--surface`, which
+ * is what the plot is.
+ *
+ * `measured` in the browser on the rendered chart, 2026-09-04, BTC 25-09-2026 at
+ * 12:47Z, each stroke read off its own SVG element and each ground resolved by walking
+ * up to the first ancestor that actually paints one:
+ *   -1h stroke   on div.plot (--surface)      9.92:1 dark / 6.03:1 light
+ *   -24h stroke  on div.plot (--surface)      8.13:1 dark / 6.22:1 light
+ *   -1h swatch   on the pressed button        7.72:1 dark / 4.85:1 light
+ *   -24h swatch  on the pressed button        6.32:1 dark / 5.00:1 light
+ *   -1h swatch   hovered (same ground)        7.72:1 dark / 4.85:1 light
+ *   button label at rest / pressed            5.55 / 9.58 dark, 5.52 / 12.95 light
+ * For reference, taken in the same run: the primary curve is 12.31:1 dark / 16.09:1
+ * light and the forward rule is 9.64:1 / 6.05:1, so nothing here is the brightest thing
+ * on the chart. Every value clears 4.5:1, let alone the 3:1 a graphical object needs.
+ * The previous ticket shipped a reference line at 2.41:1 and a hover cursor at 1.40:1 by
+ * measuring tokens against tokens instead of elements against grounds; these were taken
+ * the other way.
+ *
+ * **The pressed state is not carried by colour.** The swatch is the overlay's hue
+ * whether the button is on or off - it has to be, because it is the key - so pressing is
+ * said with the same solid bar and brighter ink the axis toggle uses, plus the swatch
+ * going from a hairline to full opacity. Three channels, none of them hue.
+ */
+
+.overlay-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.overlay-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  padding: 4px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);          /* 5.55:1 dark, 5.52:1 light, on --bg */
+  cursor: pointer;
+}
+
+.overlay-option + .overlay-option { border-left: 1px solid var(--line-strong); }
+
+.overlay-option:hover { background: var(--row-hover); color: var(--ink); }
+
+.overlay-option[aria-pressed="true"] {
+  background: var(--row-hover);
+  color: var(--ink);
+  font-weight: 700;
+  box-shadow: inset 0 -2px 0 0 var(--ink);
+}
+
+.overlay-option:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* The swatch is the dash pattern, drawn at the size a legend key would be. Built from a
+   repeating gradient rather than a border so it can show the same broken line the curve
+   does - `8 4` for the hour, `2 4` for the day - because the dash is half of what tells
+   the two apart and a solid chip would drop that half. */
+.overlay-swatch {
+  display: inline-block;
+  width: 20px;
+  height: 2px;
+  vertical-align: middle;
+  opacity: 0.55;
+}
+
+.overlay-option[aria-pressed="true"] .overlay-swatch { opacity: 1; }
+
+.overlay-swatch[data-overlay="h1"],
+.overlay-option[data-overlay="h1"] .overlay-swatch {
+  background: repeating-linear-gradient(
+    to right,
+    var(--overlay-1h) 0 8px,
+    transparent 8px 12px
+  );
+}
+
+/* Three pixels tall rather than two, matching `OVERLAY_WIDTH` in `SmileChart.tsx`: the
+   dotted series is drawn heavier on the chart for the duty-cycle reason given there, and
+   a key that did not carry that difference would be a key to a different line. */
+.overlay-swatch[data-overlay="d1"],
+.overlay-option[data-overlay="d1"] .overlay-swatch {
+  height: 3px;
+  background: repeating-linear-gradient(
+    to right,
+    var(--overlay-24h) 0 2px,
+    transparent 2px 6px
+  );
+}
+
+/* A swatch standing on its own in a warning - full strength, since there is no pressed
+   state to distinguish it from. */
+.notice .overlay-swatch { opacity: 1; }
+
+/* Pushes the axis toggle to the right of the row so the two control groups read as two
+   groups rather than as one strip of four buttons. */
+.plot-controls-gap { flex: 1 1 auto; }
+
+/* The overlay's own colour on its line of the hover readout, and the signed difference
+   beside the figure. The difference is dimmer than the figure because it is derived from
+   two numbers already on the card rather than being a third measurement.
+   `--ink-faint` is 4.76:1 dark and 4.70:1 light on the tooltip's --bg. */
+.chart-tip-diff {
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+
+/* The right end of the scrubber's track when the stream is filling it. Brighter than the
+   stamp it replaces because it is a state rather than a label.
+   `--ink` is 12.72:1 dark, 14.90:1 light, on --bg. */
+.scrub-live-end {
+  color: var(--ink);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+/* A header figure that is a stamp rather than a number - the model version and the
+   forward method. It has to fit in a row sized for six-digit prices, so it drops a
+   couple of points and gives up the bold.
+   `46ch` because today's stamp is 44 characters and the whole of it has to be readable
+   without a hover - the ticket's requirement is that the header *carries* the stamp. A
+   longer one still truncates rather than reflowing the row, and the `title` carries the
+   full text. */
+.stat-value.stat-small {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink);
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* `measured` in the browser on the rendered chart, both variants, pointer parked over a
+   point so the tooltip and the hover cursor were live:
+   ticks 5.37 / 5.97, axis titles 4.61 / 5.08, curve 12.31 / 16.09, dots 12.31 / 16.09,
+   forward rule and label 9.64 / 6.05, gap break rule 4.61 / 5.08, hover cursor
+   4.61 / 5.08, tooltip heading and values 12.72 / 14.90, tooltip labels 4.76 / 4.70,
+   scale toggle 5.55 / 5.52 at rest and 9.58 / 12.95 hovered or selected.
+   The two pairs left below the bar carry no information and are the same tokens the
+   ladder already uses for the same job - the grid at 1.16:1 dark, 1.30:1 light, and the
+   axis rules at 1.40:1 / 1.68:1. They sit in the band `--itm` (1.14:1) and `--row-hover`
+   (1.33:1) are documented at further up this file. Every value a reader takes off this
+   chart is carried by a tick or the tooltip, never by a grid line. */
+
+/* ---------------------------------------------- screens: the time scrubber
+ *
+ * The day, laid out as a channel with the minutes the store never wrote marked on it.
+ *
+ * It sits in a panel of `--surface` on the page's `--bg`, and the channel inside it is
+ * cut back to `--bg` so that it reads as a groove rather than as a second card. That
+ * makes the resolved ground for the marks and the thumb `--bg`, and every ratio below
+ * was measured against that, in both variants, at rest and hovered and focused.
+ *
+ * **The marks are not amber and the thumb is not amber.** This screen spends its accent
+ * on the forward, which is the reference the whole curve is read against; a second amber
+ * object in view would leave neither of them meaning anything. The thumb is `--ink`, the
+ * same token as the curve it moves, and the marks are `--ink-faint`, the same token as
+ * the dotted rule the chart draws at a strike it could not solve. That is not a
+ * coincidence being reused — it is the same statement in two places: nothing here.
+ *
+ * **A short mark is a marker, not a measure, and it is shaped so that it cannot be read
+ * as one.** A one-minute hole is sub-pixel on a day-wide track — `measured`, 1.42px at a
+ * 1,138px track and 0.39px at 318px — so it carries a 2px floor to be visible at all,
+ * and 171 of those drawn at full height covered 40.6% of the track where the truth was
+ * 31.1%, rising to **119.5% against 29.4%** once the window narrowed. So short holes are
+ * ticks along the floor of the groove and only a run of five minutes or more — the
+ * store's own flush interval — is drawn full height at its own width. The exact count is
+ * printed beside the track, and it is the measure.
+ *
+ * Drawing them at their true width instead would put a sub-pixel wash on the track, and
+ * this project has already shipped one of those at 1.077:1 and called it done. A feature
+ * nobody can see has been deleted, not toned down.
+ */
+
+.scrub {
+  margin: 12px var(--pad) 0;
+  padding: 8px 10px 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.scrub-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* One minute back, one minute forward — including onto an empty position, which is the
+   whole point of stepping rather than only dragging. */
+.scrub-step {
+  flex: none;
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--ink);               /* 12.72:1 dark, 14.90:1 light, on --bg */
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.scrub-step:hover:not(:disabled) {
+  background: var(--row-hover);
+  border-color: var(--accent);
+  color: var(--accent);            /* 8.05:1 dark, 4.87:1 light, on --row-hover */
+}
+
+.scrub-step:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* At an end of the day. Dimmed, not hidden - a control that vanished at the edge would
+   move every other control in the row. 4.76:1 dark, 4.70:1 light, on --bg. */
+.scrub-step:disabled { color: var(--ink-faint); cursor: default; }
+
+.scrub-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+}
+
+/* The groove. Cut back to the page ground so the panel around it stays a panel. */
+.scrub-track::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+/* Inset by half the thumb, because that is the width the thumb's centre actually
+   travels: without it a mark and the position it stands for drift apart by up to seven
+   pixels at the ends, which is six minutes at a day's width. */
+.scrub-gaps {
+  position: absolute;
+  left: 7px;
+  right: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 12px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* A dropped minute or four: a tick along the floor of the groove, 2px wide because at a
+   day's width it is otherwise sub-pixel. Ticks may run together where the store is
+   perforated, and that is the point - a hairline along the bottom reads as "holes all
+   through here" while the groove above it stays visibly open. Drawn full height they
+   read as "nothing here", which is a different and false statement: `measured` at a
+   620px window, full-height ticks covered 119.5% of the track against a true 29.4%. */
+.scrub-gap {
+  position: absolute;
+  bottom: 2px;
+  height: 3px;
+  min-width: 2px;
+  background: var(--ink-faint);    /* 4.76:1 dark, 4.70:1 light, on --bg */
+}
+
+/* Five minutes or more - a whole flush window with nothing in it. Wide enough to draw at
+   its own width, so this one is full height and is a block rather than a texture. */
+.scrub-gap-long {
+  top: 2px;
+  height: auto;
+}
+
+/* The control itself is a native range with everything of its own turned off. The
+   accessibility - arrows, Home, End, touch, click-to-jump - is the reason it is native,
+   and none of that is worth re-implementing on a div. */
+.scrub-range {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.scrub-range::-webkit-slider-runnable-track { height: 22px; background: transparent; }
+.scrub-range::-moz-range-track { height: 22px; background: transparent; }
+
+/* `--ink`, the curve's own token: this is the object that says which minute is drawn.
+   12.72:1 dark, 14.90:1 light, on the groove's --bg. The 1px --surface edge keeps it
+   readable where it passes over a run of marks. */
+.scrub-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 18px;
+  margin-top: 2px;
+  border: 1px solid var(--surface);
+  border-radius: 1px;
+  background: var(--ink);
+}
+
+.scrub-range::-moz-range-thumb {
+  width: 12px;
+  height: 16px;
+  border: 1px solid var(--surface);
+  border-radius: 1px;
+  background: var(--ink);
+}
+
+/* Hover moves the groove's edge, not the thumb: the thumb is already at the top of the
+   palette and has nowhere brighter to go. --line-strong is 1.40:1 dark and 1.68:1 light
+   and carries nothing; --ink-faint is 4.76:1 and 4.70:1 and is the cue. */
+.scrub-track:hover::before { border-color: var(--ink-faint); }
+
+.scrub-range:focus-visible { outline: none; }
+.scrub-range:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 2px var(--accent); }
+.scrub-range:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(--accent); }
+
+/* One stored minute and nothing to drag to. The control stays, and the readout beside
+   it says why - a scrubber that disappeared would be a screen that looked different
+   depending on whether an engine was running. */
+.scrub-range:disabled { cursor: default; }
+.scrub-range:disabled::-webkit-slider-thumb { background: var(--ink-soft); }
+.scrub-range:disabled::-moz-range-thumb { background: var(--ink-soft); }
+
+/* The clock. Local, and labelled - see `lib/format.ts` for why this one is not UTC. */
+.scrub-clock {
+  flex: none;
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 5px;
+  min-width: 96px;
+}
+
+.scrub-time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--ink);               /* 11.30:1 dark, 13.90:1 light, on --surface */
+}
+
+.scrub-zone {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);          /* 5.37:1 dark, 5.97:1 light, on --surface */
+}
+
+/* Both ends of the day, and what is between them. Padded clear of the step buttons so
+   the first and last stamps sit under the ends of the track rather than under the
+   arrows. */
+.scrub-ends {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 5px;
+  padding: 0 34px 0 34px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-faint);         /* 4.61:1 dark, 5.08:1 light, on --surface */
+}
+
+.scrub-count { color: var(--ink-soft); }
+
+/* The count of holes, in the ink the figures wear. It is the one number in this row a
+   reader acts on - it is what tells them the marks on the track are not a texture. */
+.scrub-count-missing { color: var(--ink); font-weight: 700; }
+
+/* ------------------------------------------ screens: the recording switch
+ *
+ * Whether the store is writing, and the one control on this header that changes
+ * something in the engine rather than something on the screen.
+ *
+ * It is shaped as a `.stat` — the label above, the value below — for the same reason the
+ * pickers are: it belongs among Spot, ATM and Fetched because it is a fact about the
+ * data, and a control styled as a control would pull the eye off the figures. The value
+ * happens to be a button.
+ *
+ * **The accent is not spent here.** Amber marks the wordmark, spot, the money row and the
+ * ATM rule, and a fifth amber object would leave none of them meaning anything. The two
+ * states are told apart by four things that are not hue — the word ON or OFF, a filled or
+ * hollow dot, the ground, and a warning that appears on its own line — so the pair
+ * survives a colour-vision deficiency and a monochrome printout. Amber appears on this
+ * control in one place only: the hover border and the focus ring, which are the same two
+ * cues every other control in this file uses.
+ *
+ * **The off state does not lose its ground when it is hovered.** That fault has shipped
+ * on this project once already, on the money row, where hovering swapped the wash out
+ * from under the text it was meant to sit behind. Hovering OFF moves `--itm` (1.14:1
+ * over the page) to `--row-hover` (1.33:1), which is brighter rather than absent, and the
+ * `--put` edge stays put so the state survives the pointer.
+ *
+ * Every pair below is `measured` in the browser on the rendered control against its
+ * **resolved** background — dark then light, at rest and hovered, in all three states —
+ * with the pointer really parked on the control rather than the tokens paired on paper.
+ * The numbers are recorded beside the rules they justify.
+ *
+ * The one pair under the bar is `--line-strong` as the resting edge, at 1.40:1 dark and
+ * 1.68:1 light on `--surface`. It carries nothing: the state is the word ON or OFF at
+ * 12.72:1 and the dot beside it in the same ink, and this is the identical edge
+ * `.theme` and `.refresh` wear elsewhere in this same header. The edge that does carry
+ * something — `--put` when recording is off — is 5.90:1 dark and 5.92:1 light.
+ */
+
+.rec { display: flex; flex-direction: column; line-height: 1.25; }
+
+.rec-value { display: inline-flex; align-items: center; gap: 8px; }
+
+.rec-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--ink);          /* 12.72:1 dark, 14.90:1 light, on --bg */
+  padding: 2px 9px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+}
+
+/* Filled when recording, hollow when not. It inherits `currentColor`, so it can never
+   drift away from the label beside it. */
+.rec-dot {
+  width: 8px;
+  height: 8px;
+  border: 2px solid currentColor;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+/* Off is the loud state and looks it: a wash, a red edge, a hollow dot and the word.
+   Ink on --itm is 11.16:1 dark and 13.57:1 light; the --put edge is 5.90:1 and 5.92:1
+   against the header it sits on. */
+.rec-toggle[data-state="off"] {
+  background: var(--itm);
+  border-color: var(--put);
+}
+.rec-toggle[data-state="off"] .rec-dot { background: transparent; }
+
+/* Not a state anyone can act on: the engine has not answered, so there is nothing to
+   toggle to. Dashed rather than dimmed alone, so it does not read as "off". */
+/* 4.76:1 dark, 4.70:1 light, on --bg. */
+.rec-toggle[data-state="unknown"] {
+  color: var(--ink-faint);
+  border-style: dashed;
+  cursor: default;
+}
+.rec-toggle[data-state="unknown"] .rec-dot { background: transparent; }
+
+/* Ground and text move together — `--ink-soft` over `--row-hover` is 4.18:1 dark, under
+   the bar, which is the trap the rail and the scale toggle both document. Ink on
+   --row-hover is 9.58:1 dark and 12.95:1 light; the amber edge is 9.64:1 and 6.05:1. */
+.rec-toggle:hover:not(:disabled) {
+  background: var(--row-hover);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+/* The off state keeps its own edge under the pointer: hovering brightens the ground
+   from --itm to --row-hover rather than replacing the state's colour. --put on
+   --row-hover is 4.59:1 dark and 4.76:1 light. */
+.rec-toggle[data-state="off"]:hover:not(:disabled) { border-color: var(--put); }
+
+.rec-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.rec-toggle:disabled { cursor: default; }
+
+/* The evidence that recording is a fact and not a label: a figure that climbs. */
+.rec-rows {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);          /* 5.37:1 dark, 5.97:1 light, on --surface */
+}
+
+/* `order: 1` puts this after every other child of the wrapping header however early it
+   appears in the markup, so it takes a line of its own beneath the figures and leaves
+   `.theme`'s `margin-left: auto` working on the line above. */
+.rec-warn {
+  order: 1;
+  flex-basis: 100%;
+  margin: 0;
+  padding: 6px 10px;
+  border-left: 3px solid var(--put);   /* 5.90:1 dark, 5.92:1 light, on --surface */
+  background: var(--itm);
+  color: var(--ink);                   /* 11.16:1 dark, 13.57:1 light, on --itm */
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* The same bar, dashed. Two warnings of one shape would be one warning: "recording is
+   off" is a fact about the store, and "the switch was not thrown" is an absence of one —
+   the dash is the same statement the unknown toggle's edge makes. */
+.rec-warn-failed { border-left-style: dashed; }
+
+.rec-warn strong { font-weight: 700; }

@@ -139,3 +139,64 @@ export function formatFetchedClock(iso: string): string {
   if (Number.isNaN(d.getTime())) return iso;
   return `${PAD(d.getUTCHours())}:${PAD(d.getUTCMinutes())}:${PAD(d.getUTCSeconds())}`;
 }
+
+/*
+ * Local time, and why it is allowed here when the two functions above insist on UTC.
+ *
+ * They stamp a **fact**: when the data was taken. A fact rendered in the reader's zone
+ * makes two people reading one screenshot disagree about it, so it stays in UTC.
+ *
+ * The scrubber is a **control**. Its clock has one job, which is to match the wall clock
+ * of the person dragging it — this market runs continuously, so there is no session open
+ * or close to anchor to, and a reader asking "what did the skew look like an hour ago"
+ * is asking in their own time. So the control below the plot reads local and is labelled
+ * with the zone, exactly as the sibling terminal's own time control labels its `IST`;
+ * the header keeps the UTC minute beside it, and the URL carries UTC and only UTC.
+ *
+ * **None of this ever reaches the store, a request or a URL.** It is produced at the
+ * moment of drawing from the UTC stamp and thrown away. See `lib/view.ts`.
+ */
+
+/** `17:20` in the reader's zone. Twenty-four hour, because every other clock here is. */
+export function formatLocalClock(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(d);
+}
+
+/** `04 Sep, 17:20` — the clock with enough date to place it, for the ends of the track. */
+export function formatLocalStamp(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return new Intl.DateTimeFormat(undefined, {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(d);
+}
+
+/**
+ * The zone's short name **at that instant** — `IST`, `BST`, `GMT+5:30`.
+ *
+ * Taken at the displayed minute rather than at "now" on purpose: a reader in London
+ * scrubbing back across the last Sunday in October would otherwise see every minute
+ * labelled with the zone they happen to be in today, and an hour of the day would be
+ * labelled wrongly. Falls back to the IANA name if the runtime offers no short form.
+ */
+export function localZoneLabel(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return localZoneName();
+  const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" }).formatToParts(d);
+  return parts.find((part) => part.type === "timeZoneName")?.value ?? localZoneName();
+}
+
+/** The IANA zone the browser is in — `Asia/Calcutta`. For the control's `title`. */
+export function localZoneName(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}

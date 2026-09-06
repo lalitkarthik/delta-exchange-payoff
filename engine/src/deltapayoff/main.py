@@ -1,7 +1,19 @@
 """The FastAPI app.
 
-Two REST endpoints fixed by `docs/chain-contract.md`, and one websocket that pushes the
-same `ChainResponse` live.
+Two REST endpoints fixed by `docs/chain-contract.md`, one websocket that pushes the same
+`ChainResponse` live, and one more REST endpoint — `/smile` — fixed by
+`docs/smile-contract.md`.
+
+`/smile` is the odd one out and deliberately so: the other three serve **Delta, now**,
+while it serves what was already computed and stored. It calls nothing, solves nothing and
+has no upstream to be unavailable, so it has no 502 and no 404. See `smile.py`.
+
+`/recording` is odder still, and it is the **only mutating route in this engine** — every
+other one is a `GET` or a websocket. It reports whether the store is writing and lets a
+reader stop and start it, which is why `allow_methods` below is no longer `["GET"]` alone:
+a `POST` against a `GET`-only allowance is refused at the preflight and surfaces in the
+browser as a network error indistinguishable from the engine being down. Who may call it
+is answered in `docs/recording-contract.md` rather than left unexamined.
 
 `/ws/chain` exists so the screen updates without anyone pressing anything. It sends the
 identical object `/chain` returns, so `web/components/ChainLadder.tsx` renders it
@@ -59,8 +71,15 @@ from .compute import enrich
 from .delta_client import DeltaClient, DeltaUnavailable
 from .fanout import FanOut
 from .feed import DeltaFeed
-from .models import ChainResponse, ExpiriesResponse
+from .models import (
+    ChainResponse,
+    ExpiriesResponse,
+    RecordingRequest,
+    RecordingState,
+    SmileResponse,
+)
 from .realised_vol import ESTIMATORS
+from .smile import read_smile
 from .store import (
     COMPUTED_DATASET,
     COMPUTED_SCHEMA,
@@ -216,11 +235,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+#: `GET` alone until `/recording` arrived. A `POST` from the browser against a `GET`-only
+#: allowance is refused at the **preflight**, which surfaces in the page as a network
+#: error indistinguishable from the engine being down — the most misleading failure shape
+#: available, because the one thing it does not look like is a CORS rule. The allowance
+#: moves with the route. It is not access control: it constrains browsers and nothing
+#: else, and `docs/recording-contract.md` says who may actually call the route.
+ALLOWED_METHODS = ["GET", "POST"]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=ALLOWED_METHODS,
     allow_headers=["*"],
 )
 
@@ -246,6 +273,43 @@ def _report_finished_task(task: asyncio.Task) -> None:
         task.get_name(),
         task.exception() or "returned without raising",
     )
+
+
+def get_computed_store() -> BarStore:
+    """The table-C store `/smile` reads. Overridden in tests, which build their own.
+
+    The **writer's** store, not a fresh one, and that is the whole point of the seam:
+    the writer's buffer holds every minute sealed since the last five-minute flush, and
+    a `/smile` that read only the files would hand the screen a right edge up to a full
+    interval behind the live curve.
+
+    A process with no writer — the lifespan has not run, which is every test that does
+    not override this — still gets a reader over whatever is on disk, because "the
+    engine is not collecting" and "the endpoint is broken" are different facts.
+    """
+    writer = getattr(app.state, "writer", None)
+    if writer is not None:
+        return writer.computed_store
+    return BarStore(dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+
+
+def get_bar_writer() -> BarWriter:
+    """The writer `/recording` reports on and switches. Sibling of the store seam above.
+
+    **503 rather than a default when there is none.** A process without a writer is not
+    a process that is paused; it is one where the question has no answer, and reporting
+    `false` would tell a reader that recording is off and can be switched on when
+    neither is true. The lifespan builds the writer unconditionally — whether or not the
+    live feed runs — so the only process this can happen in is one whose lifespan never
+    ran, which is every test that does not enter `TestClient` as a context manager.
+    """
+    writer = getattr(app.state, "writer", None)
+    if writer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="the engine has no bar writer; recording state is unknown",
+        )
+    return writer
 
 
 def get_chain_stream() -> ChainStream:
@@ -482,6 +546,79 @@ async def _fetch(
         return await delta.tickers(underlying, expiry)
     except DeltaUnavailable as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/smile", response_model=SmileResponse)
+def smile(
+    underlying: Annotated[str, Query(description="BTC or ETH")],
+    expiry: Annotated[str, Query(description="DD-MM-YYYY, as Delta spells it")],
+    store: Annotated[BarStore, Depends(get_computed_store)],
+) -> SmileResponse:
+    """Every stored minute of implied volatility for one expiry. `docs/smile-contract.md`.
+
+    Reads the local store and never Delta, so there is no 502 and no 404 here: an
+    underlying nobody has collected and an expiry nobody has stored both answer 200 with
+    an empty series.
+
+    **`def`, not `async def`, and that is the whole reason this route looks different
+    from the two above it.** Those await a network client and yield the loop while they
+    wait; this one opens Parquet files, which blocks. FastAPI runs a plain `def` route in
+    a worker thread, so the read stays off the event loop the Delta feed's socket reader
+    lives on — the same rule `BarWriter` follows for its flush, and for the same reason: a
+    blocked reader fills the receive buffer and gets the process disconnected. The read is
+    `measured` at 6.8 ms for a day of one expiry and `derived` at roughly 88 ms against
+    the five-minute flush layout, which is far too long to hold the loop.
+    """
+    symbol = _validated(normalise_underlying, underlying)
+    date = _validated(validate_expiry, expiry)
+    return read_smile(store, symbol, date)
+
+
+def _recording_state(writer: BarWriter) -> RecordingState:
+    """One shape, built once, so `GET` and `POST` cannot drift into two."""
+    return RecordingState(
+        recording=writer.recording,
+        buffered_rows=sum(store.buffered for store in writer.stores),
+        rows_written=sum(store.rows_written for store in writer.stores),
+    )
+
+
+@app.get("/recording", response_model=RecordingState)
+def recording_state(
+    writer: Annotated[BarWriter, Depends(get_bar_writer)],
+) -> RecordingState:
+    """Whether the store is writing, read from the engine. `docs/recording-contract.md`.
+
+    **The state lives here and nowhere else.** Not in the browser and not in
+    `localStorage`: two tabs must not be able to disagree about whether the store is
+    writing, and a reader arriving on a fresh page is told the truth rather than a
+    default.
+    """
+    return _recording_state(writer)
+
+
+@app.post("/recording", response_model=RecordingState)
+async def set_recording(
+    body: RecordingRequest,
+    writer: Annotated[BarWriter, Depends(get_bar_writer)],
+) -> RecordingState:
+    """Stop or start the store. **The engine's only mutating route.**
+
+    Answers with the state *after* the change, so a client needs no second request and
+    cannot render a state that was never true. Idempotent: posting `false` twice is not
+    an error, and the second one flushes an already empty buffer.
+
+    Switching off **flushes what is buffered before it stops** — the buffer holds up to
+    a five-minute interval of sealed bars, and discarding them would throw away data the
+    engine already has, which is the exact loss that interval exists to reduce. Switching
+    off does **not** stop the writer draining its subscription; see `BarWriter.ingest`.
+
+    Who may call it is answered deliberately in `docs/recording-contract.md` rather than
+    left unexamined: anything that can reach the port, and the port is loopback.
+    Authentication is named there and not built.
+    """
+    await writer.set_recording(body.recording)
+    return _recording_state(writer)
 
 
 @app.websocket("/ws/chain")

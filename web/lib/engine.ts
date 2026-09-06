@@ -11,9 +11,11 @@ import {
   isEngineError,
   type ChainResponse,
   type ExpiriesResponse,
+  type RecordingState,
+  type SmileResponse,
   type Underlying,
 } from "./contract";
-import { FIXTURE_CHAIN, fixtureChain, fixtureExpiries } from "./fixture";
+import { FIXTURE_CHAIN, fixtureChain, fixtureExpiries, fixtureSmile } from "./fixture";
 
 export const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL ?? "http://localhost:8000";
 
@@ -196,4 +198,119 @@ export async function loadChain(
     }
     throw err;
   }
+}
+
+/**
+ * Rule 3 again, for the smile. `strike` and `iv` are the only decimals in the payload,
+ * and `iv` is the one the whole screen plots — a string arriving there would sort and
+ * scale as text and draw a plausible, wrong curve rather than fail.
+ */
+function assertSmileNumeric(smile: SmileResponse): void {
+  const bad: string[] = [];
+  for (const minute of smile.minutes) {
+    for (const field of ["forward", "discount", "years_to_expiry"] as const) {
+      if (typeof minute[field] === "string") bad.push(`${minute.minute}.${field}`);
+    }
+    for (const point of minute.points) {
+      if (typeof point.strike === "string") bad.push(`${minute.minute}[?].strike`);
+      if (typeof point.iv === "string") bad.push(`${minute.minute}[${point.strike}].iv`);
+    }
+  }
+  if (bad.length > 0) {
+    throw new ContractViolationError(
+      `Engine sent decimals as strings, which docs/smile-contract.md forbids. ` +
+        `The web app will not parse them. Offending fields: ${bad.slice(0, 6).join(", ")}` +
+        (bad.length > 6 ? ` (+${bad.length - 6} more)` : ""),
+    );
+  }
+}
+
+/**
+ * The whole stored day for one expiry, in one request.
+ *
+ * Same fallback rule as `loadChain`, and for the same reason: an engine that is not
+ * running is a local condition the fixture can stand in for, while an engine that
+ * answered 400 or 422 gave a real answer and that answer is surfaced rather than
+ * papered over with a fixture that would look like a working screen.
+ *
+ * There is deliberately no 404 case. `docs/smile-contract.md` makes absence a 200 with
+ * an empty `minutes`, so a 404 from this route means the engine is not the engine this
+ * contract describes — and saying that out loud is more useful than a silent fixture.
+ */
+export async function loadSmile(
+  underlying: Underlying,
+  expiry: string,
+): Promise<Loaded<SmileResponse>> {
+  if (FORCE_FIXTURE) {
+    return { data: fixtureSmile(underlying, expiry), source: "fixture" };
+  }
+  try {
+    const data = await get<SmileResponse>(
+      `/smile?underlying=${underlying}&expiry=${encodeURIComponent(expiry)}`,
+    );
+    assertSmileNumeric(data);
+    return { data, source: "engine" };
+  } catch (err) {
+    if (err instanceof EngineUnreachableError) {
+      return {
+        data: fixtureSmile(underlying, expiry),
+        source: "fixture",
+        fallbackReason: `Engine at ${ENGINE_URL} is unreachable (${err.message}).`,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * The recording switch. `docs/recording-contract.md`.
+ *
+ * **Neither of these falls back to the fixture, and that is the point.** Everywhere else
+ * in this file an unreachable engine is a local condition a committed fixture can stand
+ * in for, because the fixture is real data that was really captured. There is no such
+ * thing as a fixture for "is the store writing right now": inventing an answer would tell
+ * a reader a day is being captured when nothing is running at all, which is the exact
+ * failure the whole control exists to prevent. So the error travels and the control says
+ * it does not know.
+ */
+export async function loadRecording(): Promise<RecordingState> {
+  return get<RecordingState>("/recording");
+}
+
+/**
+ * Stop or start the store. The engine's only mutating route.
+ *
+ * Answers with the state *after* the change, so the caller renders what came back rather
+ * than what it asked for — a control that painted its own optimistic guess would show
+ * "off" for a request the engine refused.
+ */
+export async function setRecording(recording: boolean): Promise<RecordingState> {
+  let res: Response;
+  try {
+    res = await fetch(`${ENGINE_URL}/recording`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ recording }),
+      cache: "no-store",
+    });
+  } catch (cause) {
+    // Also where a CORS preflight refusal lands: the browser reports it as a failed
+    // fetch and nothing distinguishes it from the engine being down. `allow_methods` in
+    // the engine's `main.py` carries `POST` for exactly this reason.
+    throw new EngineUnreachableError(cause);
+  }
+
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new EngineResponseError(res.status, `${res.status} ${res.statusText}: body was not JSON`);
+  }
+  if (!res.ok) {
+    throw new EngineResponseError(
+      res.status,
+      isEngineError(body) ? body.detail : `${res.status} ${res.statusText}`,
+    );
+  }
+  return body as RecordingState;
 }

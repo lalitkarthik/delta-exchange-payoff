@@ -10,10 +10,11 @@ a reader joins spot to quotes to our volatility on `date` and `underlying` with 
 translation.
 
 **And the fourth one is filled differently.** Tables A, B and D are folded from ticks the
-writer drains off the bus. Table C is **sampled** from `ChainStream`'s recompute cache at
-each minute boundary, because our implied volatility and Greeks are produced there rather
-than arriving on the wire. That is `BarWriter._sample_computed`, and it is the one place
-in this module that reads something other than its own queue.
+writer drains off the bus. Table C is **sampled** from `ChainStream`'s recompute cache —
+every ten seconds and again at each minute boundary — because our implied volatility and
+Greeks are produced there rather than arriving on the wire. That is
+`BarWriter._sample_computed`, and it is the one place in this module that reads something
+other than its own queue.
 
 **Why columnar.** A CSV stores row by row, so reading one column of a billion rows means
 reading all of them. Parquet stores column by column: every mid together, every strike
@@ -31,12 +32,26 @@ thousands of directories holding a handful of rows each, and Parquet performs ba
 many small files — every one carries header and footer overhead and a reader has to open
 all of them. Strike and option type are columns for the same reason, more so.
 
-**Why hourly, and where the flush runs.** A file per bar would produce hundreds of tiny
-files an hour. So sealed bars accumulate in memory and are written on a timer: hourly
-caps crash loss at sixty minutes and produces files usable before any compaction runs.
-A whole-day buffer was rejected — a crash at 23:00 loses the day. Fifteen minutes was
-rejected as producing files small enough that the design would be leaning on compaction
-to rescue a choice made on purpose.
+**Why every five minutes, and where the flush runs.** A file per bar would produce
+hundreds of tiny files an hour. So sealed bars accumulate in memory and are written on a
+timer, and the timer's period *is* the crash-loss budget, because the engine has no
+graceful stop. It was hourly, on the argument that fifteen minutes would produce files
+small enough to be leaning on compaction. That argument lost to what an hour actually
+cost: three unrecoverable stretches in one day, up to sixty minutes each. Five minutes
+caps the loss at five, at 288 files per table per day before compaction folds them back
+to one. File sizes at that cadence are `derived` in #16 by dividing the measured hourly
+files by twelve — about 81 KB, 84 KB, 276 KB and 350 bytes for quote, computed,
+reference and spot bars. Spot's 350 bytes is below Parquet's own footer, which is
+harmless at 52 KB of table a day but is the first thing to look at if the small-file
+count ever bites: that one table can flush on a slower cadence on its own.
+
+**Recording can be switched off, and switching it off is not the same as stopping.**
+`BarWriter.recording` is `True` at start-up and `POST /recording` puts it down. A paused
+writer stops aggregating, sampling, sealing and writing — and **keeps draining its
+subscription**, because a lossless queue nobody empties grows without bound and backs the
+socket reader up behind it. Switching off flushes what is already sealed before it stops,
+so a pause never costs a minute the engine had already captured; the open minute is held
+in the aggregators and lands once, on the resume. `docs/recording-contract.md`.
 
 **And the write must never happen in the socket reader's path.** If it did, the reader
 would stop draining the connection while the disk worked, the operating system's receive
@@ -113,8 +128,38 @@ REFERENCE_DATASET = "reference-bars"
 SPOT_DATASET = "spot-bars"
 COMPUTED_DATASET = "computed-bars"
 
-#: Hourly. Sixty minutes is the crash-loss budget, stated as a number rather than implied.
-FLUSH_SECONDS = 3600.0
+#: Every five minutes. This number **is** the crash-loss budget: the engine has no
+#: graceful stop, so whatever sits in the buffer when the process dies is gone. Five
+#: minutes rather than sixty because that loss has been paid three times in one day —
+#: 2h52m to a closed laptop and about 62 minutes to a teardown, each ending in an
+#: unflushed stretch no restart could recover. Paid for in files: 288 per table per day
+#: before compaction rather than 24, which compaction folds back to one overnight.
+FLUSH_SECONDS = 300.0
+
+#: How often table C's chain cache is sampled, on top of the sample the minute boundary
+#: still takes. Roughly six observations of a minute rather than one.
+#:
+#: **One sample per minute lost a quarter of them.** `measured` on the live store on
+#: 2026-09-04 for expiry 25-09-2026: 217 of 904 minutes held quote bars and no computed
+#: bar, and every single gap was exactly one minute long — `run lengths: [(1, 217)]`.
+#: With one edge-triggered sample and a grace of zero, a cached chain whose stamp fell a
+#: hair on the wrong side of the boundary refused the whole minute. More observations of
+#: the same cache is the entire change: the same stamps, the same refusal rule.
+#:
+#: **Ten seconds is chosen against a measured cost, not picked.** The drain loop spins on
+#: every message — `measured`, both channels together, 1,322.9 a second — and flattening
+#: every listed contract on every pass is the one piece of this writer capable of
+#: starving the socket reader. Six passes a minute is three orders of magnitude below
+#: that. `measured` 2026-09-04, 690 legs across five cached expiries flattened and folded
+#: on this machine's Python 3.12: **2.69 ms per pass, 16.1 ms of loop time a minute**.
+#: Lower the interval and that margin is what is being spent — and the ceiling is the
+#: 508 ms book refresh, not the sample.
+#:
+#: **It narrows the window; it does not close it.** A minute is now lost only if the
+#: cache was stale for the whole of it rather than for one unlucky instant. The residual
+#: rate is a number to re-measure with `tools/measure_computed_gaps.py` after this has
+#: run a day, not one to predict.
+COMPUTED_SAMPLE_SECONDS = 10.0
 
 #: How often the writer wakes to seal bars when the bus is quiet. Well under the grace
 #: period, so a bar is written within a second or so of becoming eligible — and it costs
@@ -445,9 +490,9 @@ class BarStore:
 
         One file per `(date, underlying)` per flush, named from the flush ordinal and the
         earliest minute in it so a directory listing sorts chronologically and two flushes
-        can never collide. An empty buffer writes nothing at all — an hourly flush over a
-        quiet hour must not leave an empty file behind, which would be all overhead and no
-        rows.
+        can never collide. An empty buffer writes nothing at all — a flush over a quiet
+        five minutes must not leave an empty file behind, which would be all overhead and
+        no rows.
         """
         if not self._buffer:
             return 0
@@ -506,6 +551,45 @@ class BarStore:
             self.path / "**" / "*.parquet",
             hive_partitioning=True,
             hive_schema=HIVE_SCHEMA,
+        )
+
+    def pending(self) -> pl.LazyFrame:
+        """The **unflushed** buffer, shaped exactly like `scan()`. Never touches a file.
+
+        `scan()` is the disk and only the disk, so any reader that wants everything this
+        store holds has to ask for both. That is not a convenience: the flush interval is
+        five minutes, so at any instant up to five minutes of sealed bars exist only here,
+        and a reader that skipped them would report a right edge behind the live data with
+        nothing to signal it. `/smile` is the first such reader — see `smile.read_smile`.
+
+        The partition columns are rebuilt from the bars, because `_frame` deliberately
+        omits them: on disk they are the directory names, and here they have to be
+        materialised so the two halves of a union have one schema. They are derived from
+        the same two attributes `flush` files a bar under, so the buffered row lands in
+        the partition it will land in.
+
+        **The copy is the concurrency story.** `BarWriter` flushes from a worker thread
+        while this may be called from the event loop, and `list()` over a list is a single
+        C-level copy — so a caller sees the buffer as it was, never a half-flushed one.
+        `flush` empties by rebinding, so a flush that lands mid-read costs this reader
+        nothing: those rows are on disk by then and the next read finds them there.
+        """
+        buffered = list(self._buffer)
+        if not buffered:
+            return pl.LazyFrame(schema={**self.schema, **HIVE_SCHEMA})
+        return (
+            self._frame(buffered)
+            .with_columns(
+                pl.Series(
+                    "date", [bar.minute.date() for bar in buffered], dtype=pl.Date
+                ),
+                pl.Series(
+                    "underlying",
+                    [bar.underlying for bar in buffered],
+                    dtype=pl.Categorical,
+                ),
+            )
+            .lazy()
         )
 
     # -- compaction --------------------------------------------------------------------
@@ -813,12 +897,13 @@ class BarWriter:
     messages and two watermarks drifting apart on two clocks. The four aggregators seal
     independently — they have different graces and different grains — but they are driven
     from one drain loop and flushed in one thread hop, so the socket reader waits on one
-    disk trip an hour rather than four.
+    disk trip an interval rather than four.
 
     **Table C does not come off that queue at all.** Our implied volatility and Greeks
     are made by `ChainStream`'s recompute loop, so the writer *samples* that loop's cache
-    once a minute through the `chains` callable. A callable rather than the stream itself:
-    this module has no business knowing a chain cache exists, and a test hands it a list.
+    through the `chains` callable — every `COMPUTED_SAMPLE_SECONDS` and again at each
+    minute edge. A callable rather than the stream itself: this module has no business
+    knowing a chain cache exists, and a test hands it a list.
 
     The other three stores are **derived from the quote store's root** rather than
     defaulted separately. A test that hands this a temporary directory must not have three
@@ -859,9 +944,11 @@ class BarWriter:
         #: hand it a list. `None` means there is nothing to sample and table C stays
         #: empty, which is what the three-table tests and the REST-only app want.
         self.chains = chains
-        #: The minute this last sampled in. Sampling is edge-triggered on the boundary
-        #: rather than done every pass — see `_sample_computed`.
+        #: The minute this last sampled in, and the clock reading it last sampled at.
+        #: Sampling is on a timer plus the minute edge rather than done every pass —
+        #: see `_sample_computed`.
         self._sampled_minute_us: int | None = None
+        self._sampled_at: float | None = None
         self.clock = clock
         self.flush_seconds = flush_seconds
         self.tick_seconds = tick_seconds
@@ -871,6 +958,28 @@ class BarWriter:
         #: "the writer ignored most of the bus" should be a number and not a discovery.
         self.skipped = 0
         self.flush_errors = 0
+        #: Bus records drained and dropped because recording was off. Distinct from
+        #: `skipped`, which counts records the writer could make nothing of at all.
+        self.discarded = 0
+        #: Whether this writer is aggregating and writing. **True at start-up, always**
+        #: — a process that came up not recording would silently capture nothing, and
+        #: forgetting to switch it on is a worse failure than forgetting to switch it
+        #: off. It follows that a pause does not survive a restart.
+        #:
+        #: A paused writer still **drains** its subscription; see `ingest`. Only the
+        #: aggregating, the sampling, the sealing and the writing stop.
+        #: `docs/recording-contract.md` is the authority.
+        self.recording = True
+
+    @property
+    def stores(self) -> tuple[BarStore, ...]:
+        """The four tables, in one place. Flushed together and counted together."""
+        return (
+            self.store,
+            self.reference_store,
+            self.spot_store,
+            self.computed_store,
+        )
 
     def attach(self, fanout, maxsize: int = QUEUE_WATERMARK, name: str = "bar-writer"):
         """Take a lossless queue on the bus. `run` drains it."""
@@ -889,6 +998,15 @@ class BarWriter:
         `samples_from_ticker` refuses `ob_l2` — so no frame can be counted twice into
         one bar.
         """
+        if not self.recording:
+            # **Drained, then dropped — and this is the whole of the pause.** The record
+            # has already been taken off the queue by `run`; refusing it here is what
+            # stops the aggregating without stopping the draining. Counted, because a
+            # pause that silently ate the bus would be indistinguishable from a writer
+            # that had died.
+            self.discarded += 1
+            return
+
         tick = tick_from_quote(quote)
         if tick is not None:
             self.aggregator.add(tick)
@@ -945,12 +1063,22 @@ class BarWriter:
                     break
 
             now = self.clock()
+            # **The drain above runs whether or not this writer is recording.** Only
+            # the three lines below stop. A paused writer that stopped taking messages
+            # off its lossless queue would let that queue grow without bound and back
+            # the socket reader up behind it, turning a pause of the *store* into a
+            # stall of the *feed* — and would then fold every one of those held
+            # messages into bars the moment it resumed, back-filling the minutes the
+            # pause was meant to leave empty.
+            if not self.recording:
+                continue
             self._sample_computed(now)
             self._seal(now)
             await self._maybe_flush()
 
     def _sample_computed(self, now: float, *, force: bool = False) -> int:
-        """Read the chain cache once, as a minute closes. Returns samples taken.
+        """Read the chain cache every ten seconds, and at each minute edge. Returns
+        samples taken.
 
         **This is the one table that is sampled rather than folded.** Tables A, B and D
         are built from ticks arriving on the bus; our implied volatility and Greeks are
@@ -958,11 +1086,24 @@ class BarWriter:
         the writer reads that cache instead of the queue. That also makes table C
         independent of the ticker work: it needs no new subscription and no new frame.
 
-        **Edge-triggered on the minute boundary, and that is a cost decision.** The drain
-        loop below spins on every message — measured, 1,322.9 a second — and flattening
-        every listed contract on every pass would be the one piece of this writer capable
-        of starving the socket reader. Once a minute it is a few hundred dataclasses on a
-        task that is already awake.
+        **On a timer, and the interval is a cost decision.** The drain loop below spins
+        on every message — measured, 1,322.9 a second — and flattening every listed
+        contract on every pass would be the one piece of this writer capable of starving
+        the socket reader. Six passes a minute is three orders of magnitude below that:
+        a few hundred dataclasses on a task that is already awake. See
+        `COMPUTED_SAMPLE_SECONDS` for the numbers behind the ten.
+
+        **The minute edge still takes a sample of its own**, so the state as the minute
+        closes is always observed however the timer happens to have fallen.
+
+        **Six samples a minute is what the aggregator was built for.**
+        `ComputedAggregator` folds `_Last` on the chain's own clock and its docstring
+        describes exactly this — a handful of samples of a surface recomputed every
+        100 ms, of which the freshest in the minute wins. With one sample per minute that
+        fold never had anything to choose between, and a chain stamped a hair past the
+        boundary refused the whole minute: `measured`, 217 of 904 minutes on 2026-09-04.
+        Nothing else about the path moves. **This narrows the window from one instant to
+        ten seconds; it does not remove it**, and it recovers nothing already lost.
 
         **It reads the cache and never asks it to recompute.** `ChainStream.chain()`
         recomputes a dirty expiry synchronously; calling it from here would move that
@@ -977,18 +1118,23 @@ class BarWriter:
         which is the defect this whole store exists to refuse — and it is the sabotage
         `test_a_minute_with_no_computed_chain_gets_no_computed_row` was verified against.
         """
-        if self.chains is None:
+        if self.chains is None or not self.recording:
             return 0
 
         minute_us = int(now * 1e6) - int(now * 1e6) % BUCKET_US
         if not force:
-            if self._sampled_minute_us is None or minute_us == self._sampled_minute_us:
-                # The first pass only learns which minute it started in. Sampling here
-                # would attribute a chain to a minute still open, and the boundary that
-                # follows collects that same chain anyway.
-                self._sampled_minute_us = minute_us
+            due = (
+                self._sampled_at is None
+                or now - self._sampled_at >= COMPUTED_SAMPLE_SECONDS
+                # The minute edge, kept as a trigger of its own: the timer alone would
+                # leave the last observation of a minute up to ten seconds short of its
+                # close, and this table's row is meant to be the state at the boundary.
+                or minute_us != self._sampled_minute_us
+            )
+            if not due:
                 return 0
         self._sampled_minute_us = minute_us
+        self._sampled_at = now
 
         taken = 0
         for chain in self.chains():
@@ -1020,7 +1166,7 @@ class BarWriter:
         would close a connection we simply failed to drain.
 
         A failed flush must not kill the writer: the buffer is already emptied by then, so
-        that flush's rows are lost, but a task that dies takes every later hour with it.
+        that flush's rows are lost, but a task that dies takes every later flush with it.
         Counted, because a silent loss is the lie this project keeps refusing.
         """
         now = self.clock()
@@ -1038,7 +1184,7 @@ class BarWriter:
         """Write all three tables. **Blocking IO, and always on a worker thread.**
 
         One thread hop for three files rather than three: the hop is what keeps the disk
-        off the event loop, and three of them an hour would be three chances for the
+        off the event loop, and three of them per interval would be three chances for the
         socket reader to be descheduled instead of one.
         """
         return (
@@ -1047,6 +1193,45 @@ class BarWriter:
             + self.spot_store.flush()
             + self.computed_store.flush()
         )
+
+    async def set_recording(self, recording: bool) -> bool:
+        """Stop or start aggregating and writing. `docs/recording-contract.md`.
+
+        **Switching off flushes what is buffered, then stops.** The buffer holds up to a
+        `FLUSH_SECONDS` interval of sealed bars, and dropping them would throw away data
+        the engine already has — the exact loss that interval was shortened to reduce.
+        So the flag goes down first, so nothing can be sealed underneath us while the
+        disk works, then everything eligible is sealed and all four tables are written.
+        The boundary in the store is where the reader put it.
+
+        **The open minute is deliberately not flushed.** A partial bar written at the
+        pause and a second row for the same minute written on resume would be two rows
+        for one `(symbol, minute)`, which is a duplicate every reader downstream would
+        have to know about. It stays in the aggregator, is sealed when recording resumes
+        or when the process stops, and carries its true tick counts either way.
+
+        **Off, this stops the aggregating and the writing and nothing else.** The
+        subscription keeps being drained — see `ingest` — and nothing upstream of the
+        writer is touched, so the live screens are unaffected.
+
+        Switching on invents nothing: no row appears for a minute that elapsed while
+        recording was off, because no tick was ever folded into one.
+
+        `async` because the flush is `asyncio.to_thread`, exactly as `_maybe_flush` is,
+        and for the same reason: a disk on the event loop is a socket reader that has
+        stopped draining.
+        """
+        if recording:
+            self.recording = True
+            return self.recording
+
+        self.recording = False
+        self._seal()
+        # The interval restarts from the pause rather than from the last flush before
+        # it, so a resume does not write again immediately for no reason.
+        self._last_flush = self.clock()
+        await asyncio.to_thread(self._flush_all)
+        return self.recording
 
     async def aclose(self) -> None:
         """Flush the partial bars from all three tables and write them out. For stop.
@@ -1075,7 +1260,9 @@ class BarWriter:
         """
         queued = 0 if self._subscription is None else self._subscription.queue.qsize()
         return {
+            "recording": self.recording,
             "skipped": self.skipped,
+            "discarded": self.discarded,
             "flush_errors": self.flush_errors,
             "flushes": self.store.flushes,
             "rows_written": self.store.rows_written,

@@ -1,8 +1,10 @@
-"""Response shapes. These are the contract in `docs/chain-contract.md`, in code."""
+"""Response shapes. These are the contracts in `docs/chain-contract.md`,
+`docs/smile-contract.md` and `docs/recording-contract.md`, in code. Those files are the
+authority and change first."""
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, StrictBool
 
 
 class ComputedLeg(BaseModel):
@@ -104,3 +106,114 @@ class ChainResponse(BaseModel):
 class ExpiriesResponse(BaseModel):
     underlying: str
     expiries: list[str]
+
+
+class SmilePoint(BaseModel):
+    """One strike's volatility at one minute. `docs/smile-contract.md`.
+
+    **One point per strike, not per leg.** Table C stores a row per contract, so a paired
+    strike holds two rows carrying the same number; put-call parity gives the strike one
+    volatility and `compute.enrich` writes it to both sides. `iv_leg` names the side it
+    was solved on, which is why the pair is not two independent solves.
+
+    **An unsolved strike is a point with a null `iv`, never a missing point.** The screen
+    has to tell a strike that was not solved from a strike that does not exist, and the
+    only way it can is if the null arrives. `iv_leg` is null exactly when `iv` is.
+
+    No Greeks. They are stored beside these rows; the smile plots volatility, and five
+    figures nothing on the screen reads would be five more chances to drift.
+    """
+
+    strike: float
+    #: Decimal fraction, as everywhere else. `null` when the strike could not be solved.
+    iv: float | None = None
+    iv_leg: str | None = None
+    #: `null` when solved — the store's spelling, not `/chain`'s empty string. A field
+    #: holding both spellings for one fact is one every reader has to guess at.
+    iv_reason: str | None = None
+
+
+class SmileMinute(BaseModel):
+    """One sealed minute of one expiry: the chain-level numbers, then the curve.
+
+    `forward` and its three companions are per **chain** and are repeated down every
+    stored row of the minute; they are lifted to this level rather than copied onto each
+    point, because the offset axis and the reference line need one value per curve and a
+    per-point copy is a per-point chance to disagree.
+    """
+
+    #: ISO 8601 UTC, second precision, `Z`-suffixed. Never a local time.
+    minute: str
+    forward: float | None = None
+    discount: float | None = None
+    #: ACT/365. The clock this minute's volatility is quoted on.
+    years_to_expiry: float | None = None
+    #: `F1`, `F1+assumed-rate` or `F2`. See `docs/chain-contract.md`.
+    forward_method: str | None = None
+    #: The stamp on this minute's rows. Read from the data, never hardcoded.
+    model_version: str | None = None
+    #: Ascending by strike.
+    points: list[SmilePoint]
+
+
+class SmileResponse(BaseModel):
+    """`GET /smile?underlying=BTC&expiry=04-09-2026`.
+
+    `model_versions` is a **list** because the model can change mid-day and every stored
+    row says which one made it. A response spanning two stamps reports both rather than
+    silently choosing one — the forward convention alone is worth up to 3.9 vol points,
+    and this screen plots nothing but vol points.
+
+    Absence is an empty `minutes`, not a 404. An underlying nobody has collected yet and
+    a day nobody has lived through are both "nothing yet", which is the same answer the
+    store gives a minute with no bar.
+    """
+
+    #: Pydantic reserves the `model_` prefix. The store's column is `model_version` and
+    #: the contract carries that name unchanged rather than inventing a synonym that
+    #: every reader would have to map back.
+    model_config = ConfigDict(protected_namespaces=())
+
+    underlying: str
+    expiry: str
+    #: Every distinct stamp in this response, ascending. Empty when there are no rows.
+    model_versions: list[str]
+    #: Ascending by minute.
+    minutes: list[SmileMinute]
+
+
+class RecordingState(BaseModel):
+    """`GET /recording`, and the body `POST /recording` answers with.
+    `docs/recording-contract.md`.
+
+    One shape for both, so a client that switched the state needs no second request and
+    cannot render a state that was never true: the POST answers with what is true
+    **after** the change.
+
+    The two counters are sums across the four tables rather than a per-table breakdown.
+    They are here so a reader can see that recording is a fact rather than a label —
+    `rows_written` climbing is the engine capturing, and `buffered_rows` falling to zero
+    the instant recording is switched off is the flush the contract promises, observed.
+    """
+
+    #: Whether the writer is aggregating and writing right now. True at start-up.
+    recording: bool
+    #: Sealed bars held in memory and not yet on disk, across all four tables.
+    buffered_rows: int
+    #: Rows this process has written to Parquet, across all four tables.
+    rows_written: int
+
+
+class RecordingRequest(BaseModel):
+    """The body of `POST /recording`. One field, required, and a **strict** boolean.
+
+    A default would let a malformed body silently stop the day's capture; FastAPI's 422
+    says what happened instead.
+
+    `StrictBool` rather than `bool` because Pydantic's lax mode reads `"off"`, `"no"` and
+    `"0"` as false. Guessing at a string is the wrong disposition for the one route in
+    this engine that changes anything: this is the same rule as `null` is not `0` and the
+    engine converting once at the boundary, applied to a request body.
+    """
+
+    recording: StrictBool

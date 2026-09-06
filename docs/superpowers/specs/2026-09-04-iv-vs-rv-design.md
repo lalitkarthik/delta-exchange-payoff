@@ -226,7 +226,7 @@ Parent: **#24**.
 | **R2** | [#26](https://github.com/lalitkarthik/delta-exchange-payoff/issues/26) | The five estimators, pure and test-first | `engine/src/deltapayoff/realised_vol.py` |
 | **R3** | [#27](https://github.com/lalitkarthik/delta-exchange-payoff/issues/27) | The constant-maturity ATM IV index | `engine/src/deltapayoff/iv_index.py` |
 | **R4** | [#28](https://github.com/lalitkarthik/delta-exchange-payoff/issues/28) | The endpoint that serves both series at one N | `engine/src/deltapayoff/volatility.py`, `GET /volatility` and `/volatility/bounds` |
-| **R5** | [#29](https://github.com/lalitkarthik/delta-exchange-payoff/issues/29) | The screen: one chart, one slider, six checkboxes | `web/app/volatility/page.tsx`, `web/components/VolatilityChart.tsx` |
+| **R5** | [#29](https://github.com/lalitkarthik/delta-exchange-payoff/issues/29) | The screen: one chart, one slider, six checkboxes | `web/app/iv-vs-rv/page.tsx`, `web/components/IvRvChart.tsx` |
 
 Findings from building them: [`docs/iv-vs-rv.md`](../../iv-vs-rv.md).
 

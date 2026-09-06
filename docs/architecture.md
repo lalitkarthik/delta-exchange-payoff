@@ -509,9 +509,9 @@ reported, not worked around.
 | `lib/direction.ts` | Which way a price moved since the last push |
 | `lib/format.ts` | The only place a number becomes text |
 | `components/ChainLadder.tsx` | The table |
-| `app/volatility/page.tsx` | Implied against realised: one chart, one slider, six checkboxes |
-| `lib/volatility.ts` | The `/volatility` half of the contract, mirrored field for field |
-| `components/VolatilityChart.tsx` | Hand-rolled SVG, **because the line must break across a gap** and every library defaults to joining |
+| `app/iv-vs-rv/page.tsx` | Implied against realised: one chart, one slider, six checkboxes |
+| `lib/ivrv.ts` | The `/volatility` endpoints' half of the contract, mirrored field for field |
+| `components/IvRvChart.tsx` | Hand-rolled SVG. Written before `recharts` landed with the smile screen; **worth porting**, since recharts breaks on a null by default too |
 
 **One subscription, torn down and rebuilt when the series changes.** Without the cleanup,
 the old socket keeps pushing the old expiry's chain and the two interleave on screen.

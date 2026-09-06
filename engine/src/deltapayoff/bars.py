@@ -985,8 +985,9 @@ def samples_from_ticker(quote: Any) -> TickerSample | None:
 #: observation still arrive?" — a quote is an event the venue timed and we discovered
 #: some milliseconds later, so a bar has to wait for the stragglers. Table C has no
 #: stragglers to wait for. The row is a *sample of a cache we own*, taken synchronously
-#: at the minute boundary; nothing can turn up afterwards claiming to belong to the
-#: minute just closed. Waiting would delay the row and admit nothing.
+#: every ten seconds and again as the minute closes; nothing can turn up afterwards
+#: claiming to belong to the minute just closed. Waiting would delay the row and admit
+#: nothing.
 #:
 #: It is also what makes the no-invention rule enforce itself. Sealing minute M the
 #: instant M ends means a chain still stamped inside M when M+1 closes is **late** by

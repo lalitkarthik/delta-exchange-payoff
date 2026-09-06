@@ -32,7 +32,7 @@ against this venue's data.
 | R2 | `engine/src/deltapayoff/realised_vol.py` | Five estimators, the window scaler, the roll-up, and a rolling form |
 | R3 | `engine/src/deltapayoff/iv_index.py` | Constant-maturity ATM implied volatility |
 | R4 | `engine/src/deltapayoff/volatility.py` | The two series joined, plus `GET /volatility` and `/volatility/bounds` |
-| R5 | `web/app/volatility/page.tsx` | The screen: one chart, one slider, six checkboxes |
+| R5 | `web/app/iv-vs-rv/page.tsx` | The screen: one chart, one slider, six checkboxes |
 
 All of R2, R3 and R4's core are pure — data in, data out, no socket, no clock, no
 filesystem — in the manner of `forward.py` and `bars.py`. `store.py` gained the read path
@@ -275,6 +275,10 @@ than rendering an empty chart.
   wedge sits inside the premium unlabelled.
 - **Historical IV cannot be backfilled.** Delta's history carries no IV and no bid/ask, so
   the implied side accumulates forward from 2026-09-03 and no earlier.
+- **The chart is hand-rolled SVG while the smile screen uses `recharts`.** Two charting
+  approaches in one app is a real cost. This one was finished before `recharts` landed, and
+  the argument that justified it — that a library would join across a gap — does not hold:
+  recharts defaults `connectNulls` to false. Porting it is worth doing.
 - **The optimal sampling interval has not been measured here.** The literature puts the
   bias/variance optimum near five minutes for equities; our series is a computed index rather
   than a traded price, so the number should be measured on this data. Until it is, the

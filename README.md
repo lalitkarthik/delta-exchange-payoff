@@ -10,6 +10,7 @@ right, implied vol and Greeks straight off the venue. No calculation of our own 
 | | |
 |---|---|
 | The engine/web interface | [`docs/chain-contract.md`](./docs/chain-contract.md) |
+| The stored volatility surface | [`docs/smile-contract.md`](./docs/smile-contract.md) |
 | What the API actually gives you | `docs/delta-api-scope.md` *(in progress)* |
 | What the forward costs, paid in Greeks | [`docs/greeks.md`](./docs/greeks.md) |
 | Implied against realised, and what building it measured | [`docs/iv-vs-rv.md`](./docs/iv-vs-rv.md) |

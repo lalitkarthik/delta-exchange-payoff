@@ -9,18 +9,25 @@ import {
   type LineKey,
   type VolatilitySeries,
   type VolPoint,
-} from "@/lib/volatility";
+} from "@/lib/ivrv";
 
 /**
  * Implied against realised volatility, drawn by hand in SVG.
  *
- * **No charting library, deliberately.** The one behaviour this chart must get right is
- * the one every library gets wrong by default: it has to *break* across a gap rather than
- * joining over it. A missing minute produces no row — never-forward-fill is the project's
- * moral as well as its rule — so a line drawn straight through a hole would be asserting
- * a value nobody measured, in the one place the reader has no way to tell. Every library
- * offers a "connect nulls" flag and every library defaults it to on. Sixty lines of path
- * arithmetic buys the correct default and no dependency.
+ * **The one behaviour it must get right is breaking across a gap.** A missing minute
+ * produces no row — never-forward-fill is the project's moral as well as its rule — so a
+ * line drawn straight through a hole asserts a value nobody measured, in the one place
+ * the reader has no way to tell.
+ *
+ * **This was hand-rolled when the app had no charting library, and it no longer has to
+ * be.** `recharts` arrived with the smile screen, and its `<Line>` defaults
+ * `connectNulls` to **false** — checked, `recharts/lib/cartesian/Line.js` — so it breaks
+ * on a gap out of the box and the original argument for hand-rolling does not survive
+ * contact with it. What is left is smaller: a zero-based axis, six independently toggled
+ * series, and sixty lines that are already written and already verified against a
+ * rendered page. **Porting this to `recharts` for consistency with `SmileChart` is worth
+ * doing and is not done here** — two charting approaches in one app is a real cost, and
+ * the reason this one stayed is that it was finished before the other landed.
  *
  * **Nothing here is domain arithmetic.** The engine sends both series already scaled to
  * the window and already aligned; this file turns numbers into coordinates, which is
@@ -73,7 +80,7 @@ function plottable(value: number | null | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-export function VolatilityChart({ series, visible }: Props) {
+export function IvRvChart({ series, visible }: Props) {
   const drawn = useMemo(() => {
     const points = series.points;
     if (points.length === 0) return null;
@@ -152,7 +159,7 @@ export function VolatilityChart({ series, visible }: Props) {
 
   return (
     <svg
-      className="vol-chart"
+      className="ivr-chart"
       viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
       role="img"
       aria-label={`Implied and realised volatility over ${series.lookback_days} days`}
@@ -165,16 +172,16 @@ export function VolatilityChart({ series, visible }: Props) {
             x2={WIDTH - PAD.right}
             y1={tick.y}
             y2={tick.y}
-            className="vol-grid"
+            className="ivr-grid"
           />
-          <text x={PAD.left - 8} y={tick.y + 4} className="vol-axis vol-axis-y">
+          <text x={PAD.left - 8} y={tick.y + 4} className="ivr-axis ivr-axis-y">
             {(tick.value * 100).toFixed(1)}%
           </text>
         </g>
       ))}
 
       {drawn.timeTicks.map((tick) => (
-        <text key={tick.x} x={tick.x} y={HEIGHT - 10} className="vol-axis vol-axis-x">
+        <text key={tick.x} x={tick.x} y={HEIGHT - 10} className="ivr-axis ivr-axis-x">
           {new Date(tick.at).toISOString().slice(0, 16).replace("T", " ")}
         </text>
       ))}

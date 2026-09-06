@@ -27,3 +27,7 @@ data/
 # Windows download metadata. `curl`-ing a file into WSL from a browser leaves one of
 # these beside every download; they are not part of the repository.
 *:Zone.Identifier
+
+# local dev server logs
+*.log
+*.log.err

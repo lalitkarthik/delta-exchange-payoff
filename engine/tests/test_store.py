@@ -462,6 +462,108 @@ def test_the_writer_turns_bus_quotes_into_parquet_bars(tmp_path: Path) -> None:
     assert row["minute"] == datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
 
 
+def test_the_writer_flushes_on_the_default_five_minute_cadence(tmp_path: Path) -> None:
+    """The guard the interval needs, because its failure mode is silent.
+
+    Bars that are never written look exactly like bars that were: the aggregators keep
+    sealing, the counters keep moving, and nothing goes wrong until the process dies and
+    takes the whole unflushed stretch with it. So the interval is asserted rather than
+    observed, and it is asserted on the **default** — the engine constructs its writer
+    without passing `flush_seconds`, so a default left at an hour is the live regression.
+
+    Both edges are pinned. Nothing on disk at four minutes fifty-nine, everything on disk
+    a second past five minutes. The clock is a variable this test assigns, never a real
+    one it waits on: a test that slept for five minutes would be no test at all, and one
+    that read the wall clock would be the third time-bomb this suite has grown.
+    """
+
+    async def scenario():
+        started = MINUTE_US / 1e6
+        now = started
+
+        def clock() -> float:
+            return now
+
+        store = BarStore(tmp_path)
+        # No `flush_seconds`: the default is the thing under test.
+        writer = BarWriter(store, clock=clock, tick_seconds=0.01)
+        bus = FanOut()
+        writer.attach(bus)
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)  # the writer stamps `_last_flush` at `started`
+
+        bus.publish(
+            Quote(
+                symbol="C-BTC-77600-040926",
+                channel="ob_l2",
+                bid=70.0,
+                ask=72.0,
+                received_at=now,
+                frame={"sy": "C-BTC-77600-040926", "ts": MINUTE_US + 5_000_000},
+            )
+        )
+        now = started + 120.0  # past the boundary and the grace: the bar seals
+        await asyncio.sleep(0.05)
+        buffered = store.buffered
+
+        now = started + 299.0  # four minutes fifty-nine
+        await asyncio.sleep(0.05)
+        early = store.rows_written
+
+        now = started + 301.0  # a second past five minutes
+        await asyncio.sleep(0.05)
+        late = store.rows_written
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return buffered, early, late, store
+
+    buffered, early, late, store = asyncio.run(scenario())
+
+    assert buffered == 1, "the bar never reached the store's buffer"
+    assert early == 0, "the buffer was written before the interval elapsed"
+    assert late == 1, "five minutes passed and the buffer was still not written"
+    assert store.scan().collect().height == 1
+
+
+def test_a_flush_lands_every_buffered_bar_exactly_once(tmp_path: Path) -> None:
+    """What left the buffer is what is on disk: no bar written twice, none dropped.
+
+    Twelve flushes of ten bars — an hour at the five-minute cadence — because the denser
+    layout is where a duplicate or a drop would show. The assertion is on the identity of
+    each row, `(symbol, minute)`, and not on a count: a count matches just as happily if
+    one bar were written twice and another lost.
+    """
+    store = BarStore(tmp_path)
+    start = datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    expected: list[tuple[str, datetime]] = []
+
+    for window in range(12):
+        batch = [
+            bar(
+                symbol=f"C-BTC-{77600 + step}-040926",
+                strike=float(77600 + step),
+                minute=start + timedelta(minutes=5 * window + offset),
+            )
+            for offset in range(5)
+            for step in (0, 100)
+        ]
+        assert store.add(batch) == len(batch)
+        assert store.flush() == len(batch)
+        assert store.buffered == 0, "a bar was left behind in the buffer"
+        expected.extend((one.symbol, one.minute) for one in batch)
+
+    frame = store.scan().collect()
+    landed = sorted(
+        zip(frame["symbol"].to_list(), frame["minute"].to_list(), strict=True)
+    )
+
+    assert len(landed) == len(set(landed)), "a bar was written twice"
+    assert landed == sorted(expected), "disk does not match what left the buffer"
+    assert store.rows_written == len(expected)
+    assert len(list(store.path.rglob("*.parquet"))) == 12, "a flush wrote no file"
+
+
 def test_a_slow_flush_cannot_block_the_socket_reader(tmp_path: Path) -> None:
     """The failure this whole architecture exists to prevent.
 
@@ -1456,6 +1558,52 @@ def computed_bar(
     )
 
 
+def test_the_unflushed_buffer_reads_back_with_the_same_schema_as_the_disk(
+    tmp_path: Path,
+) -> None:
+    """`pending()` is `scan()`'s twin for the rows that are not on disk yet.
+
+    The two are concatenated by `smile.read_smile`, so a column present on one and absent
+    from the other — or typed differently — would break the union rather than degrade it.
+    The partition columns are the risk: `_frame` deliberately omits them because on disk
+    they are directory names, so `pending` has to rebuild them from the bars.
+    """
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add([computed_bar(minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc))])
+
+    pending = store.pending().collect()
+
+    assert pending.height == 1
+    assert pending.collect_schema() == store.scan().collect_schema()
+    assert pending.row(0, named=True)["date"] == date(2026, 9, 4)
+    assert pending.row(0, named=True)["underlying"] == "BTC"
+    assert store.scan().collect().height == 0, "nothing has been written"
+
+
+def test_a_flush_empties_what_pending_reports(tmp_path: Path) -> None:
+    """The two halves of the union must never both hold a row: a bar is buffered or it is
+    filed, and one counted twice would draw a strike twice on the curve."""
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add([computed_bar()])
+    assert store.pending().collect().height == 1
+
+    store.flush()
+
+    assert store.pending().collect().height == 0
+    assert store.scan().collect().height == 1
+
+
+def test_an_empty_buffer_still_reports_the_full_schema(tmp_path: Path) -> None:
+    """An empty frame with the real schema, not a frame with no columns. The union is
+    built before anything is known about whether either side holds rows."""
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+
+    empty = store.pending().collect()
+
+    assert empty.height == 0
+    assert set(empty.collect_schema()) == set(COMPUTED_SCHEMA) | {"date", "underlying"}
+
+
 def test_a_computed_bar_round_trips_through_parquet_with_its_values_and_its_types(
     tmp_path: Path,
 ) -> None:
@@ -1707,6 +1855,163 @@ def test_the_writer_samples_the_chain_cache_at_each_minute_boundary(
         "C-BTC-77600-040926",
         "P-BTC-77600-040926",
     }
+
+
+def test_the_chain_cache_is_sampled_several_times_within_one_minute(
+    tmp_path: Path,
+) -> None:
+    """Six observations of the minute, not one.
+
+    One sample per minute is a single instant deciding a whole minute: if the cache's
+    stamp falls a hair on the wrong side of the boundary the minute is refused outright,
+    which is `measured` at 217 of 904 minutes on the live store for expiry 25-09-2026 on
+    2026-09-04. `ComputedAggregator`'s own docstring describes "a handful of samples"
+    being folded; this is what makes the handful exist.
+
+    The clock is driven, never waited on. Six ten-second steps across one minute, with
+    the cache recomputed at each, must reach the aggregator as six samples per contract.
+    """
+    held: list[ChainResponse] = []
+
+    async def scenario():
+        # Five seconds before the minute opens, so the boundary itself is one of the
+        # steps below rather than something the first pass consumed.
+        now = MINUTE_US / 1e6 - 5.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: list(held),
+        )
+        writer.attach(FanOut())
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)
+
+        for second in (0, 10, 20, 30, 40, 50):
+            held[:] = [sampled_chain(0, second, iv=0.40)]
+            now = MINUTE_US / 1e6 + second
+            await asyncio.sleep(0.03)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return writer
+
+    writer = asyncio.run(scenario())
+
+    assert writer.stats()["computed"]["ticks"] == 12, (
+        "six samples of a two-leg chain, one every ten seconds"
+    )
+
+
+def test_a_minute_keeps_the_freshest_sample_taken_inside_it(tmp_path: Path) -> None:
+    """The gap, reproduced: the cache moves on a fraction after the boundary.
+
+    The recompute loop runs every 100 ms, so by the time the writer's pass notices the
+    minute has turned, the cache commonly holds a chain stamped in the **new** minute.
+    Sampling only at the boundary then attributes nothing to the minute that just
+    closed — every one of those losses is exactly one minute long, which is what
+    `run lengths: [(1, 217)]` says on the live store.
+
+    Sampling inside the minute means the minute keeps the freshest observation taken
+    while it was open: `_Last` on the chain's own clock, the fold the aggregator already
+    documents. Nothing is invented — 0.47 is a chain that really was computed at 09:00:45.
+    """
+    held: list[ChainResponse] = []
+
+    async def scenario():
+        # Five seconds into the minute, which is where a writer that has been running
+        # all day always is: the minute it is closing is one it was already inside.
+        now = MINUTE_US / 1e6 + 5.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: list(held),
+        )
+        writer.attach(FanOut())
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)
+
+        for second, iv in ((20, 0.41), (45, 0.47)):
+            held[:] = [sampled_chain(0, second, iv=iv)]
+            now = MINUTE_US / 1e6 + second
+            await asyncio.sleep(0.03)
+
+        # 09:01:00.2 — the recompute that lands just past the boundary. The writer's
+        # pass at 09:01:00.5 now finds a chain belonging to minute 1, and minute 0 has
+        # nothing left in the cache to be sampled from.
+        held[:] = [sampled_chain(1, 0, iv=0.52)]
+        now = (MINUTE_US + MINUTE) / 1e6 + 0.5
+        await asyncio.sleep(0.05)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await writer.aclose()
+        return writer
+
+    writer = asyncio.run(scenario())
+    frame = writer.computed_store.scan().collect()
+    opening = frame.filter(
+        pl.col("minute") == datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    )
+
+    assert opening.height == 2, "the minute whose quotes were captured has no curve"
+    assert set(opening["iv"].to_list()) == {0.47}, "not the freshest sample in the minute"
+
+
+def test_a_sample_refused_as_late_is_counted_where_an_operator_can_read_it(
+    tmp_path: Path,
+) -> None:
+    """Sampling six times a minute refuses six times as often, so the refusals have to
+    be readable rather than inferred from two tables compared by hand months later.
+
+    `_Watermarked.late` already counts them and `BarWriter.stats()` already nests the
+    aggregator's own dictionary under `computed`; this pins that path so the number
+    cannot quietly stop being reachable. No new counter, no new mechanism.
+    """
+    frozen = sampled_chain(0, 50, iv=0.40)
+
+    async def scenario():
+        now = MINUTE_US / 1e6 - 5.0
+
+        def clock() -> float:
+            return now
+
+        writer = BarWriter(
+            BarStore(tmp_path),
+            clock=clock,
+            flush_seconds=3600.0,
+            tick_seconds=0.01,
+            chains=lambda: [frozen],
+        )
+        writer.attach(FanOut())
+        task = asyncio.create_task(writer.run())
+        await asyncio.sleep(0.05)
+
+        for minute in (1, 2):
+            for second in (0, 20, 40):
+                now = (MINUTE_US + minute * MINUTE) / 1e6 + second
+                await asyncio.sleep(0.03)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return writer
+
+    writer = asyncio.run(scenario())
+    computed = writer.stats()["computed"]
+
+    assert computed["late"] > 0, "a refused sample was discarded silently"
+    assert computed["late"] == writer.computed.late
 
 
 def test_a_minute_with_no_computed_chain_gets_no_computed_row(tmp_path: Path) -> None:

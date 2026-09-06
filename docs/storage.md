@@ -90,7 +90,7 @@ mistakes:
 - **Too short discards real observations.** Every late tick is a quote that happened and
   is now gone, and because congestion is what makes ticks late, the ticks lost are
   disproportionately the ones from fast-moving minutes.
-- **Too long delays a bar by two seconds inside an hourly flush.** Nothing downstream can
+- **Too long delays a bar by two seconds inside a five-minute flush.** Nothing downstream can
   notice.
 
 Two properties of the number stop it being a network latency, and both argue for headroom
@@ -145,7 +145,7 @@ be dead code, and `from_book` would be a constant `True` — a column storing no
 Sealing on the larger of the two watermarks is the only choice that makes the fallback
 reachable.
 
-The cost is that a quote bar is written six seconds later, inside an hourly flush;
+The cost is that a quote bar is written six seconds later, inside a five-minute flush;
 nothing downstream can notice. `tests/test_bars.py::test_the_quote_bars_wait_long_enough
 _for_a_fallback_to_arrive` fails when the grace is put back to 2.0 s — sabotage-verified.
 
@@ -356,9 +356,11 @@ implied volatility and Greeks never arrive on the wire: they are made by `ChainS
 100 ms recompute loop, and until #12 they lived exactly as long as the process did.
 Restart, and there was no way to answer what the screen had said at a given minute.
 
-So the writer **samples** rather than folds. Once a minute, as the boundary passes, it
-reads `ChainStream.computed_chains()` — the chains the loop has *already* built — and
-flattens each into one row per listed leg. Three consequences follow, and each is a
+So the writer **samples** rather than folds. Every ten seconds, and again as each minute
+boundary passes, it reads `ChainStream.computed_chains()` — the chains the loop has
+*already* built — and flattens each into one row per listed leg. The minute keeps the
+freshest of those samples, which is the `_Last` fold on the chain's own clock that
+`ComputedAggregator` has always documented. Three consequences follow, and each is a
 decision rather than an accident:
 
 **It is bucketed on our clock.** There is no venue timestamp on a number we computed. The
@@ -370,13 +372,24 @@ of it. Every other table would be wrong to do this; this one has no alternative 
 chain contract carries no venue stamp, and 136 contracts each with their own `ts` do not
 have one answer between them.
 
-**The same boundary has a second, smaller effect and it errs toward absence.** The writer
-detects the crossing within about a millisecond, because its drain loop wakes on every
-message and they arrive 1,323 a second. If the recompute loop happens to fire inside that
-millisecond, the chain it hands over is stamped in the *new* minute and the minute just
-closed gets no row for that expiry — roughly one minute in a hundred, per expiry. It is a
-missing row rather than an invented one, which is the direction this design chooses
-everywhere else, and the row is not lost so much as attributed to the following minute.
+**The same boundary had a second effect, and it was estimated at one minute in a hundred
+and measured at one in four.** The writer detects the crossing within about a millisecond,
+because its drain loop wakes on every message and they arrive 1,323 a second. If the
+recompute loop had fired inside that window, the chain handed over was stamped in the
+*new* minute and the minute just closed got no row for that expiry. That was written up
+above as "roughly one minute in a hundred". `measured` on the live store on 2026-09-04 for
+expiry 25-09-2026: **217 of 904 minutes had quote bars and no computed bar — 24%**, and
+every single gap was exactly one minute long, `run lengths: [(1, 217)]`. A separate 62
+minutes had no quote bars at all, which is the engine having been down and is not this.
+
+One sample per minute and a grace of zero are individually correct and together refuse a
+whole minute for one unlucky instant. **#23 samples every ten seconds instead**, keeping
+the boundary sample as well — `store.COMPUTED_SAMPLE_SECONDS` carries the cost argument.
+Nothing else about the path moved: the same cache, the same stamps, the same zero grace,
+the same refusal. **It narrows the window from one instant to ten seconds; it does not
+close it**, and the minutes already lost stay lost. What remains is a number to measure
+with `tools/measure_computed_gaps.py` once the change has run a day, not to predict — and
+that probe is how the 24% above was taken, so the before and after are the same query.
 
 **Its grace is zero**, and that is what enforces the no-invention rule rather than merely
 stating it. `ChainStream._computed` keeps answering after the socket dies — it holds the
@@ -389,12 +402,19 @@ was computed makes `test_a_minute_with_no_computed_chain_gets_no_computed_row` g
 invented minutes and `test_a_cache_that_stops_being_recomputed_stops_producing_rows`
 write ten rows where two are true.
 
-**The sampling is edge-triggered on the boundary and reads the cache without touching
-it.** The drain loop spins on every message, measured at 1,322.9 a second, so flattening
-600 contracts on every pass would be the one piece of the writer capable of starving the
-socket reader. And it deliberately does not call `ChainStream.chain()`, which recomputes
-a dirty expiry synchronously — that would move a chain build onto the writer's pass and
-duplicate work the recompute task is already doing.
+**The sampling is on a ten-second timer plus the minute edge, and reads the cache without
+touching it.** The drain loop spins on every message, measured at 1,322.9 a second, so
+flattening 600 contracts on every pass would be the one piece of the writer capable of
+starving the socket reader. Six passes a minute is three orders of magnitude below that,
+which is why ten seconds was affordable and why anything much smaller is where the margin
+starts being spent. And it deliberately does not call `ChainStream.chain()`, which
+recomputes a dirty expiry synchronously — that would move a chain build onto the writer's
+pass and duplicate work the recompute task is already doing.
+
+**Refusals are counted where they can be read**: `_Watermarked.late` reaches an operator
+through `BarWriter.stats()["computed"]["late"]`, and sampling six times a minute refuses
+six times as often, so it needs to be a number rather than an inference. Nothing serves
+that dictionary over HTTP yet.
 
 **A row with no volatility carries no Greeks**, matching `compute.py` on the live path.
 Greeks at some default volatility would be five plausible numbers describing nothing.
@@ -463,12 +483,29 @@ trivially derivable be stored. The test inverts it rather than assuming it.
 
 ## 9. Compaction, and the ordering that keeps a day
 
-**Hourly flushing buys a sixty-minute crash budget and pays for it in files.** Twenty-four
-per table per partition per day is roughly **26,000 a year** across the four tables, and
-Parquet is bad at that: every file carries its own header and footer, its own dictionary
-pages and its own row-group statistics, and a reader has to open every one of them before
-it can decide it wants none. Folding a closed day into one file per table per partition
-takes the year to about **a thousand**.
+**Flushing every five minutes buys a five-minute crash budget and pays for it in files.**
+The engine has no graceful stop, so the flush interval *is* the restart-loss window:
+whatever sits in the buffer when the process dies is gone, and a restart cannot recover
+it. #16 moved that window from sixty minutes to five, after an hour's worth was lost three
+times in one day. The price is 288 files per table per partition per day — twelve times
+the file count, so roughly **312,000 a year** across the four tables against the 26,000
+this section was written for — and Parquet is bad at that:
+every file carries its own header and footer, its own dictionary pages and its own
+row-group statistics, and a reader has to open every one of them before it can decide it
+wants none. Folding a closed day into one file per table per partition takes the year back
+to about **a thousand**, so compaction is now carrying more of the design than it was.
+
+`derived`, #16, from run F's measured hourly files divided by twelve: a five-minute flush
+writes roughly 81 KB of quote bars, 84 KB of computed, 276 KB of reference and **350 bytes**
+of spot. Spot's file is smaller than Parquet's own footer. Harmless at 52 KB of table a
+day, but it is the first thing to look at if the file count ever bites — that one table can
+be given a slower cadence without touching the others.
+
+**The whole-day read cost against this layout is not yet measured.** `derived` in #16 from
+run G's per-file scan cost (1.83 ms for the first file, about 0.30 ms for each after it), a
+read of the current uncompacted day rises from about 6.8 ms to roughly **88 ms**. That is an
+extrapolation, and #16 leaves it open deliberately: it needs a real day written at the new
+cadence before it can be replaced by a measurement.
 
 `BarStore.compact_partition` does it; `tools/compact_store.py` is the nightly entry point;
 `compact_all()` is the same thing as a function, because a scheduler is the operator's
@@ -484,7 +521,7 @@ that asymmetry.
 
 1. **Recover** any run already in flight (below).
 2. **List** the partition's `*.parquet`. The list *includes* an earlier compacted file, so
-   a partition that gained late hourly files after being compacted folds back to one file
+   a partition that gained late flush files after being compacted folds back to one file
    rather than to two. "Already compacted" is therefore `len(inputs) <= 1` — a property of
    the directory, not of a filename.
 3. **Write** the concatenation to `compact-NNNNNN.parquet.tmp`.
@@ -571,7 +608,7 @@ straight to its final name, which is not atomic, so compacting the partition the
 still flushing into races a half-written file. A torn read raises before anything is
 deleted, so it is survivable rather than dangerous — but waiting one day removes it. A file
 that appears *after* the input list is taken is never deleted, because only the names in
-the manifest are, so an hourly flush landing mid-compaction survives and is folded in next
+the manifest are, so a flush landing mid-compaction survives and is folded in next
 time. Pinned by `test_a_flush_that_lands_mid_compaction_is_not_deleted_by_it`.
 
 ### The regression compaction uncovered
@@ -722,7 +759,9 @@ row.
 
 The one table under its ceiling is `computed-bars`, at 81.8% — 562.6 rows a minute against
 688 listed contracts. That is not silence either: it is legs whose expiry had no computed
-chain in that minute, plus §8's boundary effect, which errs toward absence by design.
+chain in that minute, plus §8's boundary effect — which was assumed small here and was
+later `measured` at 24% of minutes per expiry, and is what #23 addresses. This ratio was
+taken before that change and should be re-taken after it.
 
 **And the total is 109.9% of #5's stated ceiling**, which is not a contradiction: #5's
 846,720 is 588 contracts × 1,440 minutes, and the listing was **688** in this window. The
@@ -799,6 +838,14 @@ costs. `spot-bars`'s 12.8x inflation is the counter-example that proves the mech
 the one table whose files really are too small, and it is the one table where compaction
 pays in bytes.
 
+**#16 moved the flush to five minutes, and this paragraph is the measurement it lands on.**
+A flush is now about 3,440 rows rather than 41,280 — between run G's two measured points,
+1,260 and 41,280 — so the marginal cost of a file sits somewhere between the two curves
+above and compaction starts buying real bytes as well as file count. How many is **not
+measured**: run G was written against hourly files and the arithmetic above should not be
+divided by twelve and called a number. The section that needs re-running first is this one,
+against a real day at the new cadence.
+
 It also means **run F's 143.34 MB/day is within about 1.5% of a fully compacted day**, so
 the footprint above is a figure rather than a bound.
 
@@ -857,9 +904,13 @@ skipped, so 4.7x at sixteen is a floor for a year at 730.
   engine has to run a full day, and then `tools/compact_store.py` followed by
   `tools/measure_store.py --skip-raw --skip-day` gives the number with no projection in
   it at all.
-- **The boundary attribution has not been measured against a live feed.** §8 argues that a
-  computed sample taken within one transit lag of a boundary can land on the wrong side of
-  it. How often that actually happens is a number nobody has taken.
+- **The boundary attribution has now been measured, and the residual has not.** §8's
+  estimate of one minute in a hundred was `measured` at 24% on 2026-09-04 by
+  `tools/measure_computed_gaps.py`, and #23 answered it by sampling every ten seconds.
+  The rate that survives that change needs the same probe run over a day the new
+  sampling recorded; until then it is unknown, not zero. The transit-lag half of §8 —
+  a sample within ~200 ms of a boundary attributed to the wrong side — is untouched by
+  #23 and still unmeasured.
 - **`Leg.oi_value_usd` is fed from `oi_change_usd_6h` on the websocket path**, so the live
   screen shows a six-hour change under a USD-open-interest label. Left alone deliberately
   — renaming the field changes the chain contract the web app reads — and wanting its own

@@ -39,6 +39,21 @@ export type LiveMessage =
  */
 export type LiveStatus = "connecting" | "live" | "waiting" | "closed" | "error";
 
+/**
+ * What the header chip says, in one place.
+ *
+ * Two screens read the same socket and the connection means the same thing on both, so
+ * it is spelled once. Two copies of this map is two vocabularies for one state, and the
+ * one that drifts is always the one nobody is looking at.
+ */
+export const LIVE_STATUS_LABEL: Record<LiveStatus, string> = {
+  connecting: "connecting…",
+  live: "live",
+  waiting: "waiting for quotes…",
+  closed: "reconnecting…",
+  error: "error",
+};
+
 export interface LiveHandlers {
   onChain: (chain: ChainResponse) => void;
   onStatus: (status: LiveStatus, detail?: string) => void;

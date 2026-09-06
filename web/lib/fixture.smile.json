@@ -1,0 +1,145 @@
+{
+  "underlying": "BTC",
+  "expiry": "04-09-2026",
+  "model_versions": [
+    "F1+assumed-6.5 / S1-newton / ACT365 / mid-OTM"
+  ],
+  "minutes": [
+    {
+      "minute": "2026-09-03T10:28:00Z",
+      "forward": 77646.88319610324,
+      "discount": 0.9998404856711465,
+      "years_to_expiry": 0.002913812785388128,
+      "forward_method": "F1",
+      "model_version": "F1+assumed-6.5 / S1-newton / ACT365 / mid-OTM",
+      "points": [
+        {
+          "strike": 76000.0,
+          "iv": 0.3188593972242271,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 76200.0,
+          "iv": 0.30978935353525955,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 76400.0,
+          "iv": 0.3010300158808696,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 76500.0,
+          "iv": 0.29811871663822714,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 76600.0,
+          "iv": 0.2946198704003304,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 76800.0,
+          "iv": 0.2895978573463173,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 77000.0,
+          "iv": 0.2884251670169763,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 77200.0,
+          "iv": 0.28998550224382913,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 77400.0,
+          "iv": 0.29390170749132094,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 77500.0,
+          "iv": 0.2963437759629067,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 77600.0,
+          "iv": 0.29891804319320264,
+          "iv_leg": "put",
+          "iv_reason": null
+        },
+        {
+          "strike": 77800.0,
+          "iv": 0.30378861211739894,
+          "iv_leg": "call",
+          "iv_reason": null
+        },
+        {
+          "strike": 78000.0,
+          "iv": 0.30789868462010606,
+          "iv_leg": "call",
+          "iv_reason": null
+        },
+        {
+          "strike": 78200.0,
+          "iv": 0.3134531756750945,
+          "iv_leg": "call",
+          "iv_reason": null
+        },
+        {
+          "strike": 78400.0,
+          "iv": 0.3186829040503181,
+          "iv_leg": "call",
+          "iv_reason": null
+        },
+        {
+          "strike": 78500.0,
+          "iv": 0.32209693085940017,
+          "iv_leg": "call",
+          "iv_reason": null
+        },
+        {
+          "strike": 78600.0,
+          "iv": 0.32590584103132875,
+          "iv_leg": "call",
+          "iv_reason": null
+        },
+        {
+          "strike": 78800.0,
+          "iv": 0.3337637264707682,
+          "iv_leg": "call",
+          "iv_reason": null
+        },
+        {
+          "strike": 79000.0,
+          "iv": 0.3430141696876259,
+          "iv_leg": "call",
+          "iv_reason": null
+        },
+        {
+          "strike": 79200.0,
+          "iv": 0.35308231822646285,
+          "iv_leg": "call",
+          "iv_reason": null
+        },
+        {
+          "strike": 79400.0,
+          "iv": null,
+          "iv_leg": null,
+          "iv_reason": "no two-sided quote"
+        }
+      ]
+    }
+  ]
+}
