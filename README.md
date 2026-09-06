@@ -12,6 +12,8 @@ right, implied vol and Greeks straight off the venue. No calculation of our own 
 | The engine/web interface | [`docs/chain-contract.md`](./docs/chain-contract.md) |
 | What the API actually gives you | `docs/delta-api-scope.md` *(in progress)* |
 | What the forward costs, paid in Greeks | [`docs/greeks.md`](./docs/greeks.md) |
+| Implied against realised, and what building it measured | [`docs/iv-vs-rv.md`](./docs/iv-vs-rv.md) |
+| Whether Delta serves index price history at all | [`docs/index-history.md`](./docs/index-history.md) |
 
 State lives in the issues, not in files. If an issue and a file disagree, the issue wins.
 

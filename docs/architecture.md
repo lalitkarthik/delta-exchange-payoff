@@ -86,6 +86,7 @@ Nine parts, and the table is the whole inventory:
 | **Store** | `bars.py`, `store.py` | Ticks folded into sealed one-minute bars, written as hive-partitioned Parquet |
 | **Public surface** | `main.py`, `models.py`, `chain.py`, `convert.py` | Two REST routes, one websocket, and the pivot and type conversion behind them |
 | **Comparison harness** | `agreement.py`, `timing.py` | How far apart two methods land, and how long each took |
+| **Volatility study** | `realised_vol.py`, `iv_index.py`, `volatility.py` | Five realised estimators, the constant-maturity ATM implied index, and the two joined at one lookback. Pure |
 | **Web app** | `web/` | One page, one ladder, streaming |
 | **Probes** | `tools/` | Measurement scripts. Not engine code |
 
@@ -454,6 +455,8 @@ Four routes, and `docs/chain-contract.md` is the authority over three of them.
 | `GET /expiries?underlying=BTC` | Every listed expiry, ascending **by parsed date** — sorted as text, `30-10-2026` would land after `27-11-2026` |
 | `GET /chain?underlying=BTC&expiry=04-09-2026` | The pivoted ladder, **enriched** |
 | `WS /ws/chain?underlying=…&expiry=…` | The same object, pushed once a second |
+| `GET /volatility/bounds?underlying=BTC&interval=1m` | What `N` may be, and which constraint binds. 200 with `usable: false` when nothing works |
+| `GET /volatility?underlying=BTC&lookback_days=30&…` | Implied and realised over one lookback, both expressed **over the window** and neither annualised |
 
 **Both transports return the same populated shape.** The REST path enriches too — a reader
 that got null Greeks over REST where the websocket sends real ones would be reading a
@@ -506,6 +509,9 @@ reported, not worked around.
 | `lib/direction.ts` | Which way a price moved since the last push |
 | `lib/format.ts` | The only place a number becomes text |
 | `components/ChainLadder.tsx` | The table |
+| `app/volatility/page.tsx` | Implied against realised: one chart, one slider, six checkboxes |
+| `lib/volatility.ts` | The `/volatility` half of the contract, mirrored field for field |
+| `components/VolatilityChart.tsx` | Hand-rolled SVG, **because the line must break across a gap** and every library defaults to joining |
 
 **One subscription, torn down and rebuilt when the series changes.** Without the cleanup,
 the old socket keeps pushing the old expiry's chain and the two interleave on screen.
@@ -552,6 +558,7 @@ quoted figure.
 | `measure_store.py` | Footprint and compression, because #5's estimates were arithmetic |
 | `compact_store.py` | The nightly compaction job |
 | `capture_ws.py` | Real frames plus the matching REST snapshot, as test fixtures |
+| `probe_index_history.py` | Whether the venue serves BTC **index** candles, and whether they pad |
 
 ---
 
@@ -599,6 +606,8 @@ This document quotes; those documents measure.
 | Four forwards, and why the discount is the fragile half | `forward.md` |
 | Two models, four solvers, and where they agree | `implied-vol.md` |
 | What the forward choice costs each Greek, and what it saves | `greeks.md` |
+| Implied against realised: the five estimators, the ATM index, the screen | `iv-vs-rv.md` |
+| Whether the venue serves index candles, and whether they pad | `index-history.md` |
 | One socket, the fan-out, and what it costs | `ingestion.md` |
 | Bars, watermarks, the four tables, compaction, footprint | `storage.md` |
 | The engine ↔ web interface | `chain-contract.md` |
