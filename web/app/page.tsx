@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ChainLadder } from "@/components/ChainLadder";
@@ -192,6 +193,10 @@ export default function Page() {
         <span className="chip" title={statusDetail ?? `Streaming from ${ENGINE_URL}.`}>
           {STATUS_LABEL[status]}
         </span>
+
+        <Link className="refresh" href="/volatility">
+          IV vs RV &rarr;
+        </Link>
 
         {/* Last, and pushed right by `margin-left: auto`: it changes how the figures look
             and never what they say, so it must not sit among them competing for the eye. */}
