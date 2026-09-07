@@ -41,8 +41,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from deltapayoff.adapters.delta_socket import BOOK_CHANNEL, TICKER_CHANNEL, DeltaFeed
+
+from _window import run_window  # noqa: E402
+from deltapayoff.adapters.delta_socket import (  # noqa: E402
+    BOOK_CHANNEL,
+    TICKER_CHANNEL,
+    DeltaFeed,
+)
 
 REST = "https://api.india.delta.exchange"
 DEFAULT_SECONDS = 3600.0
@@ -150,20 +157,20 @@ async def main() -> None:
     feed.subscribe(BOOK_CHANNEL, names)
 
     started_at = datetime.now(UTC)
-    task = asyncio.create_task(feed.run())
     started = time.monotonic()
-    try:
-        await asyncio.sleep(seconds)
-    finally:
-        feed.stop()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-    elapsed = time.monotonic() - started
+    # **Redials for the whole window.** Before this the tool started `feed.run()` as a
+    # task and slept out the window; since #39 that task ends at the first drop, and the
+    # summary still reported the full hour. See `tools/_window.py`.
+    window = await run_window(feed, seconds)
+    elapsed = window.elapsed_seconds
 
     summary = {
         "run": "tools/measure_quiet_gap.py",
         "started_at": started_at.isoformat(),
+        # Measured, not requested. `window.complete` is false when the run ended
+        # early, and the gaps below then cover only what was observed.
         "elapsed_seconds": round(elapsed, 1),
+        "window": window.summary(),
         "symbols_subscribed": len(names),
         "channels": ["ticker", "ob_l2"],
         "messages": recorder.messages,
@@ -201,6 +208,7 @@ async def main() -> None:
     out = Path(__file__).resolve().parent / "out"
     out.mkdir(exist_ok=True)
     body = json.dumps(summary, indent=2)
+    window.warn_if_truncated()
     (out / f"measure_quiet_gap-{stamp}-{int(elapsed)}s.json").write_text(
         body, encoding="utf-8"
     )
