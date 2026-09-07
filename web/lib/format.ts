@@ -43,8 +43,12 @@ export function formatStrike(value: number): string {
   });
 }
 
-/** Spot, same shape as a strike but with cents when the venue gives them. */
-export function formatSpot(value: number): string {
+/** Spot, same shape as a strike but with cents when the venue gives them.
+ *  `null` on the historical route when `spot-bars` has no row for the minute — #47 —
+ *  and renders as `DASH`, matching `ChainScreen.tsx`'s own `chain ? ... : "—"` fallback
+ *  for when there is no chain at all. */
+export function formatSpot(value: number | null): string {
+  if (value === null) return DASH;
   return value.toLocaleString("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
