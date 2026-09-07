@@ -455,9 +455,14 @@ def test_the_writer_turns_bus_quotes_into_parquet_bars(tmp_path: Path) -> None:
             ticker_frame("C-BTC-77600-040926", MINUTE_US + 30_000_000),
         )
 
-        await asyncio.sleep(0.05)
-        now = (MINUTE_US + 2 * MINUTE) / 1e6  # past the boundary and the grace period
-        await asyncio.sleep(0.05)
+        # All three events are already queued before the writer task gets a turn, so
+        # one full drain pass is guaranteed to have ingested every one of them.
+        await wait_until(lambda: writer.loops >= 1)
+        # No clock advance here: `aclose()` flushes whatever is still open in the
+        # aggregator unconditionally (see `_Watermarked.flush`), so whether `_seal`
+        # ever gets to see a boundary crossing makes no difference to the bar this
+        # test reads back. `_seal`'s own boundary and grace logic is pinned directly,
+        # without a clock or a sleep, in `test_bars.py`.
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -529,7 +534,7 @@ def test_the_writer_flushes_on_the_default_five_minute_cadence(tmp_path: Path) -
         # this clock reading", not a guess at how long seeing it takes.
         passes = writer.loops
         now = started + 299.0  # four minutes fifty-nine
-        await wait_until(lambda: writer.loops > passes)
+        await wait_until(lambda passes=passes: writer.loops > passes)
         early = store.rows_written
 
         now = started + 301.0  # a second past five minutes
@@ -1274,9 +1279,13 @@ def test_the_writer_fills_all_three_tables_from_one_bus(tmp_path: Path) -> None:
         for symbol in (booked, quiet):
             publish(bus, "ticker", ticker_frame(symbol, MINUTE_US + 30_000_000))
 
-        await asyncio.sleep(0.05)
-        now = (MINUTE_US + 2 * MINUTE) / 1e6  # past the boundary and the grace period
-        await asyncio.sleep(0.05)
+        # Everything above is already queued before the writer task gets a turn, so
+        # one full drain pass is guaranteed to have ingested all of it.
+        await wait_until(lambda: writer.loops >= 1)
+        # No clock advance: see the identical note in
+        # test_the_writer_turns_bus_quotes_into_parquet_bars — `aclose()` flushes the
+        # aggregators' open bars unconditionally, so the boundary crossing this used to
+        # wait on made no difference to what lands on disk.
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -1843,13 +1852,18 @@ def test_the_writer_samples_the_chain_cache_at_each_minute_boundary(
         task = asyncio.create_task(writer.run())
 
         held.append(sampled_chain(0, 50, iv=0.40))
-        await asyncio.sleep(0.05)
+        # The first pass always samples — `_sampled_at` starts `None` — so one full
+        # loop pass is the condition, not a guess at how long that pass takes.
+        await wait_until(lambda: writer.loops >= 1)
+
+        passes = writer.loops
         now = (MINUTE_US + MINUTE) / 1e6 + 0.5
-        await asyncio.sleep(0.05)
+        await wait_until(lambda passes=passes: writer.loops > passes)
 
         held[:] = [sampled_chain(1, 50, iv=0.44)]
+        passes = writer.loops
         now = (MINUTE_US + 2 * MINUTE) / 1e6 + 0.5
-        await asyncio.sleep(0.05)
+        await wait_until(lambda passes=passes: writer.loops > passes)
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -1907,12 +1921,13 @@ def test_the_chain_cache_is_sampled_several_times_within_one_minute(
         )
         writer.attach(FanOut())
         task = asyncio.create_task(writer.run())
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: writer.loops >= 1)
 
         for second in (0, 10, 20, 30, 40, 50):
             held[:] = [sampled_chain(0, second, iv=0.40)]
+            passes = writer.loops
             now = MINUTE_US / 1e6 + second
-            await asyncio.sleep(0.03)
+            await wait_until(lambda passes=passes: writer.loops > passes)
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -1957,19 +1972,21 @@ def test_a_minute_keeps_the_freshest_sample_taken_inside_it(tmp_path: Path) -> N
         )
         writer.attach(FanOut())
         task = asyncio.create_task(writer.run())
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: writer.loops >= 1)
 
         for second, iv in ((20, 0.41), (45, 0.47)):
             held[:] = [sampled_chain(0, second, iv=iv)]
+            passes = writer.loops
             now = MINUTE_US / 1e6 + second
-            await asyncio.sleep(0.03)
+            await wait_until(lambda passes=passes: writer.loops > passes)
 
         # 09:01:00.2 — the recompute that lands just past the boundary. The writer's
         # pass at 09:01:00.5 now finds a chain belonging to minute 1, and minute 0 has
         # nothing left in the cache to be sampled from.
         held[:] = [sampled_chain(1, 0, iv=0.52)]
+        passes = writer.loops
         now = (MINUTE_US + MINUTE) / 1e6 + 0.5
-        await asyncio.sleep(0.05)
+        await wait_until(lambda passes=passes: writer.loops > passes)
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -2013,12 +2030,13 @@ def test_a_sample_refused_as_late_is_counted_where_an_operator_can_read_it(
         )
         writer.attach(FanOut())
         task = asyncio.create_task(writer.run())
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: writer.loops >= 1)
 
         for minute in (1, 2):
             for second in (0, 20, 40):
+                passes = writer.loops
                 now = (MINUTE_US + minute * MINUTE) / 1e6 + second
-                await asyncio.sleep(0.03)
+                await wait_until(lambda passes=passes: writer.loops > passes)
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -2066,19 +2084,21 @@ def test_a_minute_with_no_computed_chain_gets_no_computed_row(tmp_path: Path) ->
         )
         writer.attach(FanOut())
         task = asyncio.create_task(writer.run())
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: writer.loops >= 1)
 
         # Minutes 0 and 1 close with nothing computed at all.
         for minute in (1, 2):
+            passes = writer.loops
             now = (MINUTE_US + minute * MINUTE) / 1e6 + 0.5
-            await asyncio.sleep(0.03)
+            await wait_until(lambda passes=passes: writer.loops > passes)
 
         # Minute 2 is computed, and then the feed stops: the cache goes on holding this
         # one chain while minutes 3 and 4 close over it.
         held.append(sampled_chain(2, 50, iv=0.48))
         for minute in (3, 4, 5):
+            passes = writer.loops
             now = (MINUTE_US + minute * MINUTE) / 1e6 + 0.5
-            await asyncio.sleep(0.03)
+            await wait_until(lambda passes=passes: writer.loops > passes)
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -2125,11 +2145,12 @@ def test_a_cache_that_stops_being_recomputed_stops_producing_rows(
         )
         writer.attach(FanOut())
         task = asyncio.create_task(writer.run())
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: writer.loops >= 1)
 
         for minute in (1, 2, 3, 4, 5):
+            passes = writer.loops
             now = (MINUTE_US + minute * MINUTE) / 1e6 + 0.5
-            await asyncio.sleep(0.03)
+            await wait_until(lambda passes=passes: writer.loops > passes)
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -2274,7 +2295,9 @@ def test_a_stored_row_reproduces_offline_from_the_quote_bar_beside_it(
         bus = FanOut()
         writer.attach(bus)
         task = asyncio.create_task(writer.run())
-        await asyncio.sleep(0.05)
+        # `chains=[live]` is constant from the start, and `_sampled_at` begins `None`,
+        # so the first full pass always samples it — this is table C's data landing.
+        await wait_until(lambda: writer.loops >= 1)
 
         stamp = MINUTE_US + 50_000_000
         for frame in ws_ticker_frames.values():
@@ -2282,9 +2305,16 @@ def test_a_stored_row_reproduces_offline_from_the_quote_bar_beside_it(
         for frame in ws_book_frames.values():
             publish(bus, "ob_l2", {**frame, "ts": stamp})
 
-        await asyncio.sleep(0.1)
+        # Every frame above is already queued before the writer's next turn, and one
+        # pass drains a queue to empty regardless of how many messages are on it.
+        passes = writer.loops
+        await wait_until(lambda passes=passes: writer.loops > passes)
+        # No wait after this: the run loop never gets another turn before `cancel()`
+        # below, so nothing here needs `_seal` to see it. `aclose()` still reads it
+        # through `self.clock()` for its own forced re-sample — a no-op given a
+        # constant `chains` callable, since `_bucket` keys on the tick's own
+        # `exchange_us`, not on this reading, and the entry it updates already exists.
         now = (MINUTE_US + MINUTE) / 1e6 + 10.0  # past every grace period
-        await asyncio.sleep(0.1)
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
