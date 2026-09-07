@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from deltapayoff.bars import (
     REFERENCE_SOURCE,
     BarAggregator,
@@ -25,12 +27,15 @@ from deltapayoff.bars import (
     SpotAggregator,
     SpotTick,
     Tick,
+    _parse_symbol,
+    _to_utc,
     computed_ticks_from_chain,
     samples_from_reference,
     spot_from_index,
     tick_from_option_quote,
 )
 from deltapayoff.compute import MODEL_VERSION, NO_QUOTE
+from deltapayoff.events import IndexQuote, Instrument, OptionQuote, OptionReference
 from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
 from fakes.decoder import events_from_frame
 
@@ -1347,3 +1352,52 @@ def test_the_computed_bar_carries_the_partition_and_filter_columns() -> None:
     assert put.expiry == "04-09-2026"
     assert put.strike == 75600.0
     assert put.option_type == "P"
+
+
+# --- the row identity the store still needs ----------------------------------------
+
+
+def instrument_without_a_venue_symbol():
+    """A canonical instrument with no venue spelling — what `Instrument.from_canonical`
+    gives back, because the canonical string does not carry one."""
+    return Instrument.from_canonical("DELTA-BTC-20260904-77600-C")
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda i, t: OptionQuote(source="DELTA", instrument=i, ts_venue=t,
+                                 ts_received=t, bid=70.0, ask=72.0),
+        lambda i, t: OptionReference(source="DELTA", instrument=i, ts_venue=t,
+                                     ts_received=t, mark=71.0),
+    ],
+)
+def test_an_instrument_with_no_venue_symbol_is_refused_rather_than_guessed(build) -> None:
+    """**This table's row identity is still the venue's symbol**, and the converters say
+    so instead of manufacturing one.
+
+    Falling back to the canonical string was tried and is a trap: `_parse_symbol` refuses
+    that string, so the row would be dropped one layer down as `unparseable` while the
+    fallback read like a working venue-neutral path. `docs/design/lld/store.md` §6 names
+    this as the remaining venue-shaped dependency and whose ticket it is. A requirement
+    that is visible can be removed; one that is disguised cannot.
+    """
+    instrument = instrument_without_a_venue_symbol()
+    stamp = _to_utc(MINUTE_US)
+    event = build(instrument, stamp)
+
+    assert _parse_symbol(instrument.canonical()) is None, "the trap closed itself"
+    assert tick_from_option_quote(event) is None
+    assert samples_from_reference(event) is None
+
+
+def test_a_spot_tick_needs_no_symbol_at_all() -> None:
+    """The one table that already made the move: `md.index_quote` names its underlying,
+    so there is no messenger to parse and nothing to refuse."""
+    stamp = _to_utc(MINUTE_US)
+    index = IndexQuote(source="DELTA", ts_venue=stamp, ts_received=stamp,
+                       underlying="BTC", spot=77_650.0)
+
+    tick = spot_from_index(index)
+
+    assert tick is not None and tick.underlying == "BTC"

@@ -27,7 +27,7 @@ from math import isfinite
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .instrument import Instrument
 
@@ -102,6 +102,29 @@ class Event(BaseModel):
     ts_received: datetime
     #: The contract this is about, or `null` for events that are not about one.
     instrument: Instrument | None = None
+
+    @field_validator("ts_venue", "ts_received")
+    @classmethod
+    def _refuse_a_naive_stamp(cls, value: datetime | None) -> datetime | None:
+        """**A stamp with no timezone is refused, not assumed to be UTC.**
+
+        Pydantic parses an ISO string carrying no offset into a naive `datetime`, and a
+        naive one cannot be subtracted from an aware one: `bars._micros` raises
+        `TypeError` on it, inside `BarWriter.ingest`, inside a drain loop that does not
+        guard — so the writer task dies and all four tables stop, with one log line as
+        the only symptom. Refusing here turns that into a `ValidationError` at the
+        boundary, naming the producer.
+
+        **Assuming UTC was the alternative and it is worse.** The gap between the two
+        stamps is this project's arrival-lag column; inventing a zone for a producer that
+        did not state one would put a number in that column that nobody measured.
+        """
+        if value is not None and value.tzinfo is None:
+            raise ValueError(
+                f"{value.isoformat()} carries no timezone; a stamp is aware or it is "
+                "not a stamp, and no zone is assumed for it"
+            )
+        return value
 
     @model_validator(mode="after")
     def _refuse_non_finite_numbers(self) -> Event:

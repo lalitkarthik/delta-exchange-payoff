@@ -166,6 +166,15 @@ def decode_ticker_extras(frame: dict[str, Any]) -> TickerExtras:
     not an index. `turnover` keeps `to_number`, because a contract really can have turned
     over nothing and `0` is the true answer for it.
 
+    **The last trade is the half that touches stored columns**, and the consequence is
+    named here rather than discovered: a frame spelling `ohlc[3]` as `"0"` now leaves
+    `ltp_open`, `ltp_high`, `ltp_low` and `ltp_close` null and `ltp_ticks` at zero, where
+    it used to store four zeroes and a tick. A frame whose *only* readable value was that
+    zero therefore opens no reference bar at all, which is the no-invention rule working:
+    a bar with nothing observed behind it is a row nobody measured. Not reachable in the
+    committed captures — 0 of 136 spell it `"0"`, and the 16 that never traded send
+    `null`.
+
     #36 read `sp` with `to_number` here and in the adapter's `md.index_quote`, and
     `docs/design/lld/adapter.md` §6 recorded the pair as one gap rather than fixing half
     of it: changing the event path alone would have made the event and the stored spot

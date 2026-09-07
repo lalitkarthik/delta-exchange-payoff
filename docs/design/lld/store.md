@@ -49,6 +49,13 @@ not have to diff two schemas to find it:
 `oi_value_usd` and `tick_size` reach no table on this path: the reference frame carries
 neither, and absent is not derived.
 
+**Two things about table B changed with the events and neither is a rename.** A `NaN` or
+`Infinity` from the venue used to reach Parquet as itself, because the old converter read
+`wire` directly; every one of these columns now passes the adapter's non-finite guard, so
+it arrives `null` and `adapter.non_finite` counts it. And a last trade spelled `"0"` is now
+absent rather than four zeroes and a tick — `wire.decode_ticker_extras` reads it with
+`to_quote_number`, for the same reason spot does.
+
 ## 3. Provenance, without a channel
 
 Table A stores `from_book`. It says whether a minute's prices came from the order book or
@@ -102,7 +109,11 @@ symbol, which arrives on the instrument as `venue_symbol`. Those four are typed 
 
 It was **not** done in #37, deliberately: the store's row identity would have changed shape
 in the same commit that changed its input, and the point of a contract step is that the
-stored bytes do not move. It is the obvious next simplification and it belongs to whichever
+stored bytes do not move. So the converters **refuse** an instrument carrying no
+`venue_symbol`, and are counted in `skipped`, rather than falling back to the canonical
+string: `_parse_symbol` refuses that string, so a fallback would drop the row one layer
+down as `unparseable` while reading like a working venue-neutral path. A requirement that
+is visible can be removed; one that is disguised cannot. It is the obvious next simplification and it belongs to whichever
 ticket next opens this table. The spot bars already made the move — `SpotTick` names its
 underlying rather than the messenger's symbol — because `md.index_quote` carries no
 instrument to parse in the first place.
