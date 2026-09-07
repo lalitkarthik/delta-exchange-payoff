@@ -1,9 +1,14 @@
-"""The live chain cache: latest frame per symbol, rebuilt into a chain on demand.
+"""The live chain cache: latest events per instrument, rebuilt into a chain on demand.
 
-This computes nothing. It keeps the most recent frame each contract sent and hands the
-collection to `wire.chain_from_frames`, which is the same decoder the REST path's tests
-already cover. What it adds is *which* frames belong to the chain a browser asked for,
-and the answer that there is no chain yet.
+This computes nothing. It keeps the most recent `md.option_quote` and the most recent
+`md.option_reference` each contract sent, and the latest spot per underlying, and folds
+them into the same `ChainResponse` the REST path returns. What it adds is *which* events
+belong to the chain a browser asked for, and the answer that there is no chain yet.
+
+**The events are the producer's, not this file's.** Captured frames go through the real
+`DeltaAdapter.events_from_frame`, so a cache test cannot pass against a catalogue the
+adapter has stopped filling. Since #37 nothing here names a venue channel except as the
+argument that selects which decode to run.
 
 No network. Frames come from the captured fixtures, or are built inline where the test is
 about the cache rather than the decoding.
@@ -17,8 +22,8 @@ from datetime import datetime, timezone
 
 from deltapayoff.black76 import call_price, put_price
 from deltapayoff.fanout import FanOut
-from deltapayoff.feed import Quote
 from deltapayoff.stream import ChainStream
+from fakes.decoder import events_from_frame
 
 EXPIRY = "04-09-2026"
 OTHER_EXPIRY = "11-09-2026"
@@ -62,10 +67,14 @@ def book(symbol, bid, ask):
     }
 
 
-def quote(frame, channel):
-    return Quote(
-        symbol=frame["sy"], channel=channel, received_at=0.0, frame=frame
-    )
+def feed(stream, frame, channel):
+    """Decode one frame the way the live path does and apply every event it produced.
+
+    A ticker frame is two events — the contract's reference and the underlying's spot —
+    and both reach the cache, which is exactly what the running engine publishes.
+    """
+    for event in events_from_frame(channel, frame):
+        stream.apply(event)
 
 
 def test_a_chain_is_none_until_something_has_arrived() -> None:
@@ -81,8 +90,8 @@ def test_a_chain_is_none_until_something_has_arrived() -> None:
 
 def test_applying_frames_builds_the_chain_they_describe() -> None:
     stream = ChainStream()
-    stream.apply(quote(ticker("C-BTC-77600-040926", 579, 584), "ticker"))
-    stream.apply(quote(ticker("P-BTC-77600-040926", 120, 125), "ticker"))
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, ticker("P-BTC-77600-040926", 120, 125), "ticker")
 
     chain = stream.chain("BTC", EXPIRY)
 
@@ -100,8 +109,8 @@ def test_only_the_requested_expiry_is_included() -> None:
     ladder by strike, silently mixing contracts that settle weeks apart.
     """
     stream = ChainStream()
-    stream.apply(quote(ticker("C-BTC-77600-040926", 579, 584), "ticker"))
-    stream.apply(quote(ticker("C-BTC-80000-110926", 200, 210), "ticker"))
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, ticker("C-BTC-80000-110926", 200, 210), "ticker")
 
     front = stream.chain("BTC", EXPIRY)
     later = stream.chain("BTC", OTHER_EXPIRY)
@@ -114,8 +123,8 @@ def test_only_the_requested_underlying_is_included() -> None:
     """ETH strikes are three orders of magnitude below BTC's, so a leak here would not
     look like an error — it would look like a chain with a very wide ladder."""
     stream = ChainStream()
-    stream.apply(quote(ticker("C-BTC-77600-040926", 579, 584), "ticker"))
-    stream.apply(quote(ticker("C-ETH-4000-040926", 12, 14), "ticker"))
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, ticker("C-ETH-4000-040926", 12, 14), "ticker")
 
     chain = stream.chain("BTC", EXPIRY)
 
@@ -127,8 +136,8 @@ def test_the_latest_frame_wins() -> None:
     """The cache holds one frame per contract, not a history. A quote that arrived two
     seconds ago is not evidence of anything once a newer one exists."""
     stream = ChainStream()
-    stream.apply(quote(ticker("C-BTC-77600-040926", 579, 584), "ticker"))
-    stream.apply(quote(ticker("C-BTC-77600-040926", 601, 607), "ticker"))
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, ticker("C-BTC-77600-040926", 601, 607), "ticker")
 
     chain = stream.chain("BTC", EXPIRY)
 
@@ -136,12 +145,13 @@ def test_the_latest_frame_wins() -> None:
     assert chain.rows[0].call.ask == 607.0
 
 
-def test_the_book_overrides_the_ticker_quote() -> None:
-    """Both channels carry the top of book; `ob_l2` refreshes every 508 ms against
-    `ticker`'s 5001 ms. Taking the book's copy is where the freshness comes from."""
+def test_the_book_quote_overrides_the_reference_quote() -> None:
+    """Both events carry the top of book; the book's refreshes every 508 ms against the
+    reference's 5001 ms. Taking the book's copy is where the freshness comes from, and it
+    is taken **wholesale** — one side from each would be a spread nobody quoted."""
     stream = ChainStream()
-    stream.apply(quote(ticker("C-BTC-77600-040926", 579, 584), "ticker"))
-    stream.apply(quote(book("C-BTC-77600-040926", 601, 607), "ob_l2"))
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, book("C-BTC-77600-040926", 601, 607), "ob_l2")
 
     chain = stream.chain("BTC", EXPIRY)
 
@@ -151,11 +161,11 @@ def test_the_book_overrides_the_ticker_quote() -> None:
     assert chain.rows[0].call.oi == 100.0
 
 
-def test_a_book_frame_alone_is_not_a_chain_row() -> None:
-    """`ob_l2` carries no spot, no Greeks and no open interest. A row built from it
-    alone would render as a mostly empty line rather than as a quote."""
+def test_a_quote_event_alone_is_not_a_chain_row() -> None:
+    """`md.option_quote` carries no mark, no Greeks and no open interest. A row built from
+    it alone would render as a mostly empty line rather than as a quote."""
     stream = ChainStream()
-    stream.apply(quote(book("C-BTC-77600-040926", 601, 607), "ob_l2"))
+    feed(stream, book("C-BTC-77600-040926", 601, 607), "ob_l2")
 
     assert stream.chain("BTC", EXPIRY) is None
 
@@ -168,8 +178,12 @@ def test_the_stream_drains_the_bus_it_subscribes_to() -> None:
         stream = ChainStream()
         stream.attach(bus, maxsize=100)
 
-        bus.publish(quote(ticker("C-BTC-77600-040926", 579, 584), "ticker"))
-        bus.publish(quote(ticker("P-BTC-77600-040926", 120, 125), "ticker"))
+        for frame in (
+            ticker("C-BTC-77600-040926", 579, 584),
+            ticker("P-BTC-77600-040926", 120, 125),
+        ):
+            for event in events_from_frame("ticker", frame):
+                bus.publish(event)
 
         task = asyncio.create_task(stream.run())
         await asyncio.sleep(0.05)
@@ -184,14 +198,18 @@ def test_the_stream_drains_the_bus_it_subscribes_to() -> None:
     assert chain.rows[0].put is not None
 
 
-def test_symbols_for_an_expiry_are_reported_for_subscribing() -> None:
-    """The feed needs a symbol list to subscribe. It comes from REST at start-up, but
-    the stream knows what it has actually seen, which is what the screen can show."""
-    stream = ChainStream()
-    stream.apply(quote(ticker("C-BTC-77600-040926", 579, 584), "ticker"))
-    stream.apply(quote(ticker("C-BTC-80000-110926", 200, 210), "ticker"))
+def test_instruments_for_an_expiry_are_reported_for_subscribing() -> None:
+    """The feed needs a contract list to subscribe. It comes from REST at start-up, but
+    the stream knows what it has actually seen, which is what the screen can show.
 
-    assert stream.symbols("BTC", EXPIRY) == ["C-BTC-77600-040926"]
+    **Canonical strings and not the venue's symbols**, since #37: this is the cache's own
+    key, and a second venue's ladder is enumerated by the same call.
+    """
+    stream = ChainStream()
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, ticker("C-BTC-80000-110926", 200, 210), "ticker")
+
+    assert stream.instruments("BTC", EXPIRY) == ["DELTA-BTC-20260904-77600-C"]
 
 
 def test_a_real_captured_chain_rebuilds_from_the_cache(
@@ -200,9 +218,9 @@ def test_a_real_captured_chain_rebuilds_from_the_cache(
     """End to end on the 136-symbol capture: every frame in, one full chain out."""
     stream = ChainStream()
     for frame in ws_ticker_frames.values():
-        stream.apply(quote(frame, "ticker"))
+        feed(stream, frame, "ticker")
     for frame in ws_book_frames.values():
-        stream.apply(quote(frame, "ob_l2"))
+        feed(stream, frame, "ob_l2")
 
     chain = stream.chain("BTC", EXPIRY)
 
@@ -243,8 +261,8 @@ def two_sided(stream: ChainStream, expiry_suffix: str = FITTABLE_SUFFIX) -> None
         put = put_price(FITTABLE_FORWARD, strike, years, 0.40, discount)
         call_frame = ticker(f"C-BTC-{strike}-{expiry_suffix}", call - 0.5, call + 0.5)
         put_frame = ticker(f"P-BTC-{strike}-{expiry_suffix}", put - 0.5, put + 0.5)
-        stream.apply(quote(call_frame, "ticker"))
-        stream.apply(quote(put_frame, "ticker"))
+        feed(stream, call_frame, "ticker")
+        feed(stream, put_frame, "ticker")
 
 
 def test_an_arriving_quote_marks_its_expiry_dirty() -> None:
@@ -252,7 +270,7 @@ def test_an_arriving_quote_marks_its_expiry_dirty() -> None:
     stream = ChainStream()
     assert stream.dirty == set()
 
-    stream.apply(quote(ticker("C-BTC-77600-040926", 579, 584), "ticker"))
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
 
     assert stream.dirty == {("BTC", EXPIRY)}
 
@@ -286,7 +304,7 @@ def test_only_dirty_expiries_are_recomputed() -> None:
     two_sided(stream, "110926")
     stream.recompute_dirty()
 
-    stream.apply(quote(ticker("C-BTC-77600-040926", 590, 595), "ticker"))
+    feed(stream, ticker("C-BTC-77600-040926", 590, 595), "ticker")
 
     assert stream.dirty == {("BTC", EXPIRY)}
     assert stream.recompute_dirty() == 1
@@ -402,7 +420,7 @@ def test_the_computed_chains_are_offered_for_sampling_without_recomputing() -> N
     assert [chain.expiry for chain in chains] == [FITTABLE_EXPIRY]
     assert chains[0].rows[0].call.computed is not None
     # A dirty expiry stays dirty: sampling must not pretend the loop has run.
-    stream.apply(quote(ticker("C-BTC-77600-040927", 590, 595), "ticker"))
+    feed(stream, ticker("C-BTC-77600-040927", 590, 595), "ticker")
     assert stream.computed_chains() != []
     assert stream.dirty == {("BTC", FITTABLE_EXPIRY)}
 
@@ -415,7 +433,7 @@ def test_the_offered_chains_are_a_snapshot_the_loop_cannot_change_underneath() -
     stream.recompute_dirty()
 
     held = stream.computed_chains()
-    stream.apply(quote(ticker("C-BTC-77600-040926", 590, 595), "ticker"))
+    feed(stream, ticker("C-BTC-77600-040926", 590, 595), "ticker")
     stream.recompute_dirty()
 
     assert len(held) == 1, "the sampler's snapshot grew under it"

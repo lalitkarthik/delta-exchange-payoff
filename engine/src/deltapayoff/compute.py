@@ -5,8 +5,8 @@ no network, no state. Every rule this feature has is reachable and testable here
 is why it is a function rather than a method on the thing that happens to call it.
 
 **Why we compute at all, when Delta publishes both.** Two reasons, and the first is the
-project's whole thesis. Delta republishes its `ticker` every **5001 ms** while the order
-book underneath moves every **508 ms** (both measured on a live connection), so the
+project's whole thesis. Delta republishes its reference frame every **5001 ms** while
+the order book underneath moves every **508 ms** (both measured live), so the
 venue's implied volatility is derived from prices that have already moved — up to 9.8x
 stale. And Delta fits its volatility to its own `mark_price`, which is its model's
 output, so reading it back is reading Delta's opinion of Delta's opinion. Inverting the

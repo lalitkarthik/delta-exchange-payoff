@@ -1,4 +1,11 @@
-"""The two endpoints and the error table, with Delta stubbed out entirely."""
+"""The two endpoints and the error table, with the venue stubbed out entirely.
+
+**The routes reach the venue through the adapter since #37**, so the stub goes in behind a
+real `DeltaAdapter` rather than in place of a client the route holds itself. That is one
+more real layer under test than before — the adapter's `expiries` and `chain_snapshot` are
+the code that turns a ticker list into the two response shapes — and it is what makes the
+error table below assert about the boundary the browser actually talks to.
+"""
 
 from __future__ import annotations
 
@@ -9,8 +16,9 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from deltapayoff.adapters import DeltaAdapter
 from deltapayoff.delta_client import DeltaUnavailable, parse_envelope
-from deltapayoff.main import app, get_delta_client
+from deltapayoff.main import app, get_adapter
 
 
 class StubDelta:
@@ -34,16 +42,35 @@ class StubDelta:
         return self.rows
 
 
+class StubSocket:
+    """Stands in for the socket owner, so building an adapter opens nothing."""
+
+    def __init__(self, sink, **_kwargs) -> None:
+        self.sink = sink
+        self.registry: dict[str, list[str]] = {}
+
+    def subscribe(self, channel: str, symbols) -> None:
+        self.registry.setdefault(channel, []).extend(symbols)
+
+    async def run(self) -> None:  # pragma: no cover - never started here
+        raise AssertionError("the REST routes must not start a socket")
+
+    def stop(self) -> None:  # pragma: no cover - never started here
+        pass
+
+
 @pytest.fixture
 def make_client() -> Iterator[Callable[[StubDelta], TestClient]]:
-    """A TestClient whose Delta dependency is the given stub.
+    """A TestClient whose adapter is a real one wrapped around the given stub client.
 
     TestClient is not entered as a context manager, so the app lifespan never runs and
-    no real httpx client is ever constructed.
+    no real httpx client is ever constructed; `StubSocket` makes sure building the
+    adapter does not dial out either.
     """
 
     def factory(stub: StubDelta) -> TestClient:
-        app.dependency_overrides[get_delta_client] = lambda: stub
+        adapter = DeltaAdapter(client=stub, feed_factory=StubSocket)
+        app.dependency_overrides[get_adapter] = lambda: adapter
         return TestClient(app)
 
     yield factory
@@ -108,7 +135,7 @@ def test_underlying_is_case_insensitive(make_client, all_expiry_tickers) -> None
     response = make_client(stub).get("/expiries", params={"underlying": "btc"})
     assert response.status_code == 200
     assert response.json()["underlying"] == "BTC"
-    assert stub.calls == [("BTC", None)], "Delta is queried with the normalised symbol"
+    assert stub.calls == [("BTC", None)], "the normalised symbol is what is queried"
 
 
 def test_cors_allows_the_next_dev_server(make_client, all_expiry_tickers) -> None:
@@ -129,7 +156,7 @@ def test_bad_underlying_is_400(make_client, underlying: str) -> None:
     response = make_client(stub).get("/expiries", params={"underlying": underlying})
     assert response.status_code == 400
     assert "detail" in response.json()
-    assert stub.calls == [], "a bad parameter never reaches Delta"
+    assert stub.calls == [], "a bad parameter never reaches the venue"
 
 
 @pytest.mark.parametrize("expiry", ["2026-09-04", "4-9-2026", "32-09-2026", "nonsense"])

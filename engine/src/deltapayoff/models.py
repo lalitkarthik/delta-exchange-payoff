@@ -63,8 +63,8 @@ class Leg(BaseModel):
     #: Open interest in **contracts**, on both transports. REST's own `oi` field is
     #: the notional in BTC and is deliberately not read; `oi_contracts` is.
     oi: float | None = None
-    #: Open interest as a **USD notional**. REST publishes it; the `ticker` websocket
-    #: channel does not, so it is `None` on the live path. Absent rather than derived:
+    #: Open interest as a **USD notional**. REST publishes it; `md.option_reference`
+    #: does not, so it is `None` on the live path. Absent rather than derived:
     #: contracts x contract size x spot is a calculation, and this field reports an
     #: observation.
     oi_value_usd: float | None = None

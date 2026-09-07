@@ -22,7 +22,6 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from deltapayoff.feed import Quote
 from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
 from deltapayoff.store import COMPUTED_DATASET, COMPUTED_SCHEMA, BarStore
 
@@ -124,14 +123,21 @@ def clock(monkeypatch, tmp_path: Path) -> _Clock:
 
 @pytest.fixture
 def stub_delta(chain_tickers):
-    """Delta's REST answers, from the committed fixture. Nothing dials out."""
+    """The venue's REST answers, from the committed fixture. Nothing dials out.
+
+    A real `DeltaAdapter` around a stub client, because since #37 the routes ask the
+    adapter rather than a client of their own.
+    """
     from deltapayoff import main
+    from deltapayoff.adapters import DeltaAdapter
+    from fakes.decoder import NoSocket
 
     class _Stub:
         async def tickers(self, underlying: str, expiry=None):
             return chain_tickers
 
-    main.app.dependency_overrides[main.get_delta_client] = _Stub
+    adapter = DeltaAdapter(client=_Stub(), feed_factory=NoSocket)
+    main.app.dependency_overrides[main.get_adapter] = lambda: adapter
     yield
     main.app.dependency_overrides.clear()
 
@@ -145,16 +151,22 @@ def client(clock: _Clock):
         yield running
 
 
-def quote(symbol: str, at_us: int, bid: float = 70.0) -> Quote:
-    """One book frame, stamped at an instant this file chose."""
-    return Quote(
-        symbol=symbol,
-        channel="ob_l2",
-        bid=bid,
-        ask=bid + 2.0,
-        received_at=at_us / 1e6,
-        frame={"sy": symbol, "ts": at_us, "lts": at_us - 300_000},
-    )
+def quote(symbol: str, at_us: int, bid: float = 70.0):
+    """One `md.option_quote`, stamped at an instant this file chose.
+
+    Built by decoding a book frame through the real adapter rather than by hand, so a
+    test about the writer cannot pass against events the producer no longer emits.
+    """
+    from fakes.decoder import events_from_frame
+
+    frame = {
+        "sy": symbol,
+        "ts": at_us,
+        "lts": at_us - 300_000,
+        "b": [[str(bid), "10"]],
+        "a": [[str(bid + 2.0), "10"]],
+    }
+    return events_from_frame("ob_l2", frame, at_us / 1e6)[0]
 
 
 # --- the state at start-up -------------------------------------------------------
@@ -209,7 +221,7 @@ def test_switching_off_writes_the_buffered_minutes_before_it_stops(
     from deltapayoff import main
 
     for offset, bid in ((0, 70.0), (1, 80.0)):
-        main.app.state.fanout.publish(
+        main.app.state.events.publish(
             quote(SYMBOL, MINUTE_US + offset * MINUTE + 1_000, bid=bid)
         )
     # 09:03:20 by the writer's clock: both minutes are past their eight-second grace.
@@ -249,8 +261,8 @@ def test_switching_off_stops_rows_being_written_for_subsequent_minutes(
     """
     from deltapayoff import main
 
-    fanout = main.app.state.fanout
-    fanout.publish(quote(SYMBOL, MINUTE_US + 1_000, bid=70.0))
+    bus = main.app.state.events
+    bus.publish(quote(SYMBOL, MINUTE_US + 1_000, bid=70.0))
     clock.set((MINUTE_US + 2 * MINUTE) / 1e6 + 20.0)
     time.sleep(LET_THE_LOOP_TURN)
 
@@ -259,7 +271,7 @@ def test_switching_off_stops_rows_being_written_for_subsequent_minutes(
 
     # Off. Four minutes of a second contract arrive on the bus and must vanish.
     for offset in (5, 6, 7, 8):
-        fanout.publish(quote(PAUSED_SYMBOL, MINUTE_US + offset * MINUTE + 1_000))
+        bus.publish(quote(PAUSED_SYMBOL, MINUTE_US + offset * MINUTE + 1_000))
     clock.set((MINUTE_US + 10 * MINUTE) / 1e6 + 20.0)
     time.sleep(LET_THE_LOOP_TURN)
 
@@ -305,7 +317,7 @@ def test_a_paused_writer_still_drains_its_subscription(client, clock: _Clock) ->
     time.sleep(LET_THE_LOOP_TURN)
 
     for offset in range(200):
-        main.app.state.fanout.publish(
+        main.app.state.events.publish(
             quote(PAUSED_SYMBOL, MINUTE_US + 5 * MINUTE + offset * 1_000)
         )
     time.sleep(LET_THE_LOOP_TURN)
@@ -330,11 +342,11 @@ def test_switching_recording_back_on_resumes_writing(
     """
     from deltapayoff import main
 
-    fanout = main.app.state.fanout
+    bus = main.app.state.events
     client.post("/recording", json={"recording": False})
     time.sleep(LET_THE_LOOP_TURN)
 
-    fanout.publish(quote(PAUSED_SYMBOL, MINUTE_US + 5 * MINUTE + 1_000))
+    bus.publish(quote(PAUSED_SYMBOL, MINUTE_US + 5 * MINUTE + 1_000))
     clock.set((MINUTE_US + 7 * MINUTE) / 1e6 + 20.0)
     time.sleep(LET_THE_LOOP_TURN)
 
@@ -342,7 +354,7 @@ def test_switching_recording_back_on_resumes_writing(
     assert resumed["recording"] is True
     time.sleep(LET_THE_LOOP_TURN)
 
-    fanout.publish(quote(SYMBOL, MINUTE_US + 10 * MINUTE + 1_000, bid=91.0))
+    bus.publish(quote(SYMBOL, MINUTE_US + 10 * MINUTE + 1_000, bid=91.0))
     clock.set((MINUTE_US + 12 * MINUTE) / 1e6 + 20.0)
     time.sleep(LET_THE_LOOP_TURN)
 
@@ -532,7 +544,7 @@ def test_the_open_minute_is_held_through_the_pause_rather_than_split_across_it(
     """
     from deltapayoff import main
 
-    main.app.state.fanout.publish(quote(SYMBOL, MINUTE_US + 1_000, bid=64.0))
+    main.app.state.events.publish(quote(SYMBOL, MINUTE_US + 1_000, bid=64.0))
     # Half a minute in: minute 09:00 is still open, eight seconds of grace away from
     # sealing even once it closes.
     clock.set(MINUTE_US / 1e6 + 30.0)
