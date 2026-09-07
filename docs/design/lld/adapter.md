@@ -1,13 +1,13 @@
 # Low-level design: the broker adapter
 
 **What is built inside `engine/src/deltapayoff/adapters/`.** The parts are
-[../hld.md](../hld.md); what crosses out of one is [../events.md](../events.md), the
-authority on the names. Numbers carry the run that produced them.
+[../hld.md](../hld.md); what crosses out is [../events.md](../events.md). Numbers carry
+the run that produced them.
 
 **Landed by #36, completed by #37.** #36 was the expand half of an expand–contract: the
-adapter emitted canonical events while a shim rebuilt the old quote record for two consumers
-that had not moved. #37 moved them, deleted the shim and the record, and added the four
-fields the shim existed to carry. #38 and #39 lift reconnect into a controller.
+adapter emitted canonical events while a shim rebuilt the old quote record for two
+consumers that had not moved. #37 moved them, deleted the shim and the record, and added
+the four fields it existed to carry. #38 and #39 lifted reconnect into a controller.
 
 ## 1. The files
 
@@ -40,10 +40,9 @@ publishes and returns — the rule `fanout.py` exists to keep — and a generato
 bridging queue to invert it.
 
 **Reconnect is not on the interface, and since #39 not below it either.** `stream` is
-**one connection**: dial, replay every subscription, publish until the socket ends,
-return. Backoff, the lifetime budget and the decision to redial are
-[reconnect.md](reconnect.md)'s; the registry replay and the reason a connection ended stay
-in `DeltaFeed`, because both need a socket.
+**one connection**: dial, replay, publish until the socket ends, return. Backoff, the
+budget and the decision to redial are [reconnect.md](reconnect.md)'s; the replay and the
+reason a connection ended stay in `DeltaFeed`, because both need a socket.
 
 **Conformance is structural**, for the reason `events/bus.py` records: an explicit subclass
 would inherit `...`-bodied stubs and pass. A test pins that the check can still fail.
@@ -185,10 +184,10 @@ itself**; there is none today, by design.
 `events_from_frame(channel, frame, received_at)` — three plain values, no socket, no bus, no
 clock. Every captured frame in `tests/fixtures/ws-*.json` runs through it, so the boundary is
 asserted against 136 real contracts on both channels. `tests/test_feed.py` drives the whole
-loop, a scripted connection at one end and `md.option_quote` at the other;
-`tests/test_composition.py` is the tracer bullet from a scripted socket to a rendered ladder
-and to the bar writer's counters. Every consumer test decodes through this same function, via
-`tests/fakes/decoder.py`, so none hand-builds an event and drifts from the producer.
+loop, a scripted connection at one end and `md.option_quote` at the other, and
+`tests/test_composition.py` is the tracer bullet from a scripted socket to a rendered
+ladder and the bar writer's counters. Every consumer test decodes through this same
+function via `tests/fakes/decoder.py`, so none drifts from the producer.
 
 ## 10. Numbers
 
