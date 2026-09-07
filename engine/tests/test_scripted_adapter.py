@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from deltapayoff.adapters import Adapter, instrument_from_symbol
 from deltapayoff.events import OptionQuote
 from fakes.scripted_adapter import Close, Frames, Resume, ScriptedAdapter, Silence
@@ -21,6 +23,23 @@ BOOK_FRAME = {
     "lts": 1_788_430_765_000_000,
     "a": [["125", "12"]],
     "b": [["120", "10"]],
+}
+TICKER_FRAME = {
+    "type": "ticker",
+    "sy": SYMBOL,
+    "sp": "77651.9",
+    "ts": 1_788_430_765_832_299,
+    "d": [
+        {
+            "s": SYMBOL,
+            "i": 1,
+            "m": "580.6",
+            "q": ["584", "100", "579", "200", None],
+            "qiv": ["0.31", "0.29", "0.30"],
+            "g": ["0.55", "0.0003", "1.23", "-234.2", "16.58"],
+            "oi": ["100", "200"],
+        }
+    ],
 }
 
 
@@ -69,6 +88,29 @@ def test_frames_then_close_then_silence_then_resume() -> None:
     assert isinstance(again, OptionQuote)
     assert (again.bid, again.ask) == (first.bid, first.ask)
     assert again.event_id != first.event_id
+
+
+def test_resume_replays_a_ticker_script_whole() -> None:
+    """**The promise has to hold on both channels, not just the one the test above uses.**
+
+    The real adapter emits `md.index_quote` only when spot *changes*, so replaying the
+    same ticker frames through one decoder would give the references again and no index
+    quote — `Resume` would look right for `ob_l2` and be quietly wrong for `ticker`. A
+    scripted reconnect therefore starts the decoder afresh.
+    """
+    published: list = []
+    frames = Frames("ticker", [TICKER_FRAME])
+
+    asyncio.run(
+        ScriptedAdapter(script=[frames, Close(), Resume()]).stream(published.append)
+    )
+
+    assert [event.type for event in published] == [
+        "md.option_reference",
+        "md.index_quote",
+        "md.option_reference",
+        "md.index_quote",
+    ]
 
 
 def test_a_close_replays_every_subscription() -> None:
@@ -152,16 +194,13 @@ def test_the_scripted_adapter_satisfies_the_protocol() -> None:
 def test_the_rest_reads_refuse_rather_than_invent_an_empty_answer() -> None:
     """A `ChainResponse` with no rows renders as a blank ladder and reads as "the venue
     lists nothing". A double that answered one by default would let a test assert against
-    a shape nobody set up."""
-    adapter = ScriptedAdapter()
+    a shape nobody set up.
 
-    for call in (adapter.expiries("BTC"), adapter.chain_snapshot("BTC", "04-09-2026")):
-        try:
-            asyncio.run(_await(call))
-        except NotImplementedError:
-            continue
-        raise AssertionError("an unconfigured REST read answered instead of refusing")
+    Each coroutine is built inside its own `asyncio.run`, so a read that stops refusing
+    fails this test cleanly instead of leaving an un-awaited coroutine behind it.
+    """
+    with pytest.raises(NotImplementedError):
+        asyncio.run(ScriptedAdapter().expiries("BTC"))
 
-
-async def _await(awaitable):
-    return await awaitable
+    with pytest.raises(NotImplementedError):
+        asyncio.run(ScriptedAdapter().chain_snapshot("BTC", "04-09-2026"))

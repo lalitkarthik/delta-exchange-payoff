@@ -45,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -279,15 +279,19 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     )
 
 
-async def start_feed_stack(stack: FeedStack, underlyings: Sequence[str]) -> None:
+async def start_feed_stack(stack: FeedStack) -> None:
     """Subscribe every listed contract and start the four background tasks.
+
+    **Which underlyings is the adapter's own answer**, not a second argument: the adapter
+    was built with the configured set and `underlyings` is on the protocol precisely so
+    there is one place to ask.
 
     Raises `DeltaUnavailable` if the venue cannot be asked what it lists — the caller
     decides whether that is fatal. Nothing is started when it raises, because the
     subscriptions happen first: a feed that connected with an empty registry is the
     silent failure `feed.py` exists to prevent.
     """
-    for underlying in underlyings:
+    for underlying in stack.adapter.underlyings:
         stack.adapter.subscribe(await stack.adapter.instruments(underlying))
 
     stack.tasks = [
@@ -350,7 +354,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     if live_feed_enabled():
         try:
-            await start_feed_stack(stack, stack.adapter.underlyings)
+            await start_feed_stack(stack)
             app.state.tasks = stack.tasks
         except DeltaUnavailable:
             # The REST endpoints still work and the websocket reports "waiting". A

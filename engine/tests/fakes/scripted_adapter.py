@@ -19,7 +19,8 @@ A script is a sequence of steps, walked in order by `stream`. Four verbs:
 * **`Silence(seconds)`** — nothing arrives for this long. `silences` and `silent_seconds`
   grow and the clock advances; **nothing is published**.
 * **`Resume()`** — the feed comes back with the book it went away with. The most recent
-  `Frames` step is published again.
+  `Frames` step is published again, through a **fresh decoder**, so a ticker replay
+  produces its `md.index_quote` again rather than deduplicating it into silence.
 
 So the ticket's own sentence — *frames, close, silence 20 s, resume* — is:
 
@@ -103,6 +104,12 @@ class Resume:
 Step = Frames | Close | Silence | Resume
 
 
+def _delta_decoder():
+    """A frame decoder with no socket behind it. Fresh state, so nothing leaks between
+    scripted connections."""
+    return DeltaAdapter(feed_factory=_NoFeed).events_from_frame
+
+
 class _NoFeed:
     """A socket owner that owns no socket. The scripted adapter has no use for one."""
 
@@ -136,15 +143,16 @@ class ScriptedAdapter:
     #: asking raises rather than returning an empty shape that reads as a real answer.
     expiries_response: Any = None
     chain_response: Any = None
-    #: `(frames, channel, received_at) -> list[Event]`. The real Delta decoder by
+    #: `(channel, frame, received_at) -> list[Event]`. The real Delta decoder by
     #: default, so captured fixtures produce genuine events.
     decode: Callable[[str, dict[str, Any], float], list[Event]] | None = None
     #: Injected so a twenty-second silence costs a test nothing.
     sleep: Callable[[float], Any] = asyncio.sleep
 
     def __post_init__(self) -> None:
+        self._own_decoder = self.decode is None
         if self.decode is None:
-            self.decode = DeltaAdapter(feed_factory=_NoFeed).events_from_frame
+            self.decode = _delta_decoder()
 
         #: Channel to symbols, exactly as `feed.DeltaFeed` keys it. **Never cleared**,
         #: because that is what a reconnect replays.
@@ -210,6 +218,7 @@ class ScriptedAdapter:
             self._emit(step, publish)
         elif isinstance(step, Close):
             self.closes += 1
+            self._forget_decoder_state()
             self._open_connection()
         elif isinstance(step, Silence):
             self.silences += 1
@@ -217,6 +226,7 @@ class ScriptedAdapter:
             await self.sleep(step.seconds)
         elif isinstance(step, Resume):
             if self._last_frames is not None:
+                self._forget_decoder_state()
                 self._emit(self._last_frames, publish)
         else:  # pragma: no cover - a step nobody defined is a test's own bug
             raise TypeError(f"{step!r} is not one of the four verbs")
@@ -228,6 +238,22 @@ class ScriptedAdapter:
             for event in self.decode(step.channel, frame, step.received_at):
                 self.published += 1
                 publish(event)
+
+    def _forget_decoder_state(self) -> None:
+        """Drop what the decoder remembers between frames, so a replay really replays.
+
+        **The real Delta adapter emits `md.index_quote` only when spot *changes***, so
+        replaying the same ticker frames through one decoder yields the references again
+        and no index quote — and `Resume`'s promise, "the events again", would be false
+        for a ticker script while looking true for a book one. A double whose promise
+        holds for one channel and not the other is worse than no double.
+
+        So a scripted reconnect starts the decoder afresh, which is also what a second
+        process attaching to the feed would see. Only the decoder this class built is
+        replaced; a `decode=` a caller supplied is theirs to manage.
+        """
+        if self._own_decoder:
+            self.decode = _delta_decoder()
 
     def _open_connection(self) -> None:
         """A fresh socket has forgotten every subscription, so the registry is replayed.
