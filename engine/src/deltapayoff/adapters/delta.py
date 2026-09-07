@@ -317,6 +317,11 @@ class DeltaAdapter:
         The top of book is returned beside the events because the shim needs it and this
         is the only decode: computing it twice would read Delta's array offsets twice, in
         two places, which is the hazard `wire.py` exists to concentrate.
+
+        **The bid and ask handed back are the same values the event carries**, non-finite
+        guard included. Returning the raw pair would let one frame become an event saying
+        the bid is absent and a `Quote` saying it is `NaN` — two forms of one fact
+        disagreeing, which is the whole thing an expand–contract pair must not do.
         """
         frame = message.frame or {}
         instrument = instrument_from_symbol(message.symbol)
@@ -330,26 +335,28 @@ class DeltaAdapter:
 
         if message.channel == BOOK_CHANNEL:
             _, top = decode_ob_l2_top(frame)
+            bid, ask = self._finite(top.bid), self._finite(top.ask)
             if instrument is None:
-                return [], top.bid, top.ask
+                return [], bid, ask
             quote = OptionQuote(
                 source=VENUE,
                 instrument=instrument,
-                bid=self._finite(top.bid),
+                bid=bid,
                 bid_size=self._finite(top.bid_size),
-                ask=self._finite(top.ask),
+                ask=ask,
                 ask_size=self._finite(top.ask_size),
                 **stamps,
             )
-            return [quote], top.bid, top.ask
+            return [quote], bid, ask
 
         if message.channel != TICKER_CHANNEL:
             return [], None, None
 
         _, leg = decode_ticker(frame)
         extras = decode_ticker_extras(frame)
+        bid, ask = self._finite(leg.bid), self._finite(leg.ask)
         if instrument is None:
-            return [], leg.bid, leg.ask
+            return [], bid, ask
 
         events: list[Event] = [
             OptionReference(
@@ -380,7 +387,7 @@ class DeltaAdapter:
         index = self._index_quote(instrument.underlying, frame, stamps)
         if index is not None:
             events.append(index)
-        return events, leg.bid, leg.ask
+        return events, bid, ask
 
     def _index_quote(
         self, underlying: str, frame: dict[str, Any], stamps: dict[str, Any]
