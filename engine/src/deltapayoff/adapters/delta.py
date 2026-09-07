@@ -165,8 +165,9 @@ class DeltaAdapter:
         #: used to carry before the decode moved here. Never zero-by-omission: a frame
         #: that raises anywhere in the decode lands here and is dropped whole.
         self.undecodable = 0
-        #: Frames whose `sy` is not a Delta option symbol. They still reach the shim, so
-        #: nothing that worked before stops working; they produce no events, because an
+        #: Symbols that are not Delta option symbols, from a frame's `sy` or from a row
+        #: of the venue's listing. A frame carrying one still reaches the shim, so
+        #: nothing that worked before stops working; it produces no events, because an
         #: event with no instrument would be a quote about nothing.
         self.unparseable_symbols = 0
         #: Numbers that arrived as `NaN` or `Infinity` and were carried as absent.
