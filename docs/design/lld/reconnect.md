@@ -54,6 +54,15 @@ that did not sets it.
 third drop is the one that stops. Any other reading makes the number a person configures
 mean something other than what they typed.
 
+**Spent on the drop, not on the transition,** and the two are not the same event. The
+staleness watchdog reaches `reconnecting` on its own, over a socket the venue has not
+closed yet; when that socket then really dies, the close arrives at a machine already in
+`reconnecting` and no transition happens. A budget spent on the transition would not be
+spent at all — an unbounded reconnect loop in exactly the case the budget exists for,
+with a full budget on the books throughout. Written the wrong way first in #39, found by
+re-reading the loop, and pinned by
+`test_a_socket_that_dies_after_going_silent_still_spends_the_budget` — red-green verified.
+
 ## 3. Giving up is loud
 
 Budget exhausted produces, in this order and exactly once each:
