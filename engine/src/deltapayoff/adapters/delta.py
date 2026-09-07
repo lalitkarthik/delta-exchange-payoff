@@ -38,6 +38,7 @@ Moving them early would mean writing the state machine twice.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -54,6 +55,8 @@ from ..feed import BOOK_CHANNEL, TICKER_CHANNEL, DeltaFeed, VenueMessage
 from ..models import ChainResponse, ExpiriesResponse
 from ..wire import decode_ob_l2_top, decode_ticker, decode_ticker_extras
 from .base import Publish
+
+logger = logging.getLogger(__name__)
 
 #: The venue's short name. Every `Instrument` this adapter builds carries it, and it is
 #: the `source` on every event, so a log line and a cache key agree without a lookup.
@@ -276,15 +279,28 @@ class DeltaAdapter:
             events, bid, ask = self._decode(message)
         except Exception:
             self.undecodable += 1
+            if self.undecodable == 1:
+                # **The first one only.** A systematic decode bug would otherwise zero
+                # the whole event stream while `feed.messages` kept climbing, and
+                # `undecodable` is not on `/health` until #39 — a silent failure with a
+                # counter nobody reads. Logging every frame would flood at 1,323 msg/s,
+                # so the first says what happened and the counter carries the rest.
+                logger.warning(
+                    "the first undecodable %s frame for %r; the count carries the rest",
+                    message.channel,
+                    message.symbol,
+                    exc_info=True,
+                )
             return
 
         if self._legacy is not None:
             self._legacy.republish(message, bid=bid, ask=ask)
 
+        if self._publish is None:
+            return
         for event in events:
             self.emitted += 1
-            if self._publish is not None:
-                self._publish(event)
+            self._publish(event)
 
     def events_from_frame(
         self, channel: str, frame: dict[str, Any], received_at: float
@@ -336,16 +352,21 @@ class DeltaAdapter:
 
         if message.channel == BOOK_CHANNEL:
             _, top = decode_ob_l2_top(frame)
-            bid, ask = self._finite(top.bid), self._finite(top.ask)
+            # **A size without its price is not a quote**, and the guard has to be
+            # applied after the non-finite check as well as inside `decode_ob_l2_top`:
+            # a `NaN` bid that became `None` here would otherwise keep its size and
+            # describe an order at no price.
+            bid, bid_size = self._finite_quote(top.bid, top.bid_size)
+            ask, ask_size = self._finite_quote(top.ask, top.ask_size)
             if instrument is None:
                 return [], bid, ask
             quote = OptionQuote(
                 source=VENUE,
                 instrument=instrument,
                 bid=bid,
-                bid_size=self._finite(top.bid_size),
+                bid_size=bid_size,
                 ask=ask,
-                ask_size=self._finite(top.ask_size),
+                ask_size=ask_size,
                 **stamps,
             )
             return [quote], bid, ask
@@ -422,6 +443,13 @@ class DeltaAdapter:
             self.non_finite += 1
             return None
         return value
+
+    def _finite_quote(
+        self, price: float | None, size: float | None
+    ) -> tuple[float | None, float | None]:
+        """One book level, guarded as a pair. A size outlives its price nowhere."""
+        checked = self._finite(price)
+        return checked, None if checked is None else self._finite(size)
 
 
 def _venue_time(stamp: Any) -> datetime | None:

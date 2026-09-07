@@ -140,14 +140,17 @@ class DeltaFeed:
 
     def __init__(
         self,
-        fanout,
+        sink,
         connect: Callable[[str], Any] | None = None,
         url: str = PUBLIC_WS,
         heartbeat_seconds: float = HEARTBEAT_SECONDS,
         retry_delay: float = RETRY_DELAY_SECONDS,
         max_retries: int = MAX_RETRIES,
     ) -> None:
-        self.fanout = fanout
+        #: Anything with a non-blocking `publish`. Named `sink` rather than `fanout`
+        #: since #36: the running engine passes the adapter's frame sink, and only
+        #: `tests/test_feed.py` still hands this a `FanOut`.
+        self.sink = sink
         self.url = url
         self.heartbeat_seconds = heartbeat_seconds
         self.retry_delay = retry_delay
@@ -251,7 +254,7 @@ class DeltaFeed:
                     self.malformed += 1
                     continue
                 if venue_message is not None:
-                    self.fanout.publish(venue_message)
+                    self.sink.publish(venue_message)
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)

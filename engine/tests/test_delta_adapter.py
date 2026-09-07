@@ -244,6 +244,11 @@ def test_the_three_absent_spellings_become_null_and_a_real_zero_survives(
     A real `0` in open interest and in a greek stays `0.0`, because zero is a true value
     for those: the ladder that shows `0` open interest is reporting a fact, and a `null`
     there would read as "we do not know".
+
+    The ticker frame's own `q` bid and ask are asserted **through the shim**, because
+    `md.option_reference` carries no bid or ask — putting the spellings in `q` and only
+    looking at the event would decode them and throw them away, which would assert
+    nothing.
     """
     by_symbol = {row["symbol"]: row for row in absent_quote_tickers}
     row = by_symbol["C-BTC-59000-040926"]
@@ -293,6 +298,18 @@ def test_the_three_absent_spellings_become_null_and_a_real_zero_survives(
     assert book.ask is None, 'a best_ask spelled "" is nobody offering'
     assert book.bid_size is None, "a size without its price is not a quote"
     assert book.ask_size is None
+
+    # The same two spellings on the ticker channel, where the quote reaches the old
+    # record rather than an event.
+    carried: list = []
+
+    class _Bridge:
+        def republish(self, message, *, bid, ask) -> None:
+            carried.append((bid, ask))
+
+    adapter(legacy=_Bridge()).feed.sink.publish(_message(TICKER_CHANNEL, frame))
+
+    assert carried == [(None, None)], 'a ticker `q` spelling "0"/"" is nobody quoting'
 
 
 def test_a_zero_that_is_really_zero_survives_on_a_second_fixture_row(
@@ -409,7 +426,8 @@ def test_a_non_finite_price_is_carried_as_absent_rather_than_raising() -> None:
     quote = delta.events_from_frame(BOOK_CHANNEL, frame, ARRIVED_AT)[0]
 
     assert quote.bid is None
-    assert quote.ask == 125.0
+    assert quote.bid_size is None, "a size outlived the price it belonged to"
+    assert (quote.ask, quote.ask_size) == (125.0, 12.0)
     assert delta.non_finite >= 1
 
 

@@ -207,9 +207,9 @@ def decode_ob_l2_top(frame: dict[str, Any]) -> tuple[str, BookTop]:
 def decode_ob_l2(frame: dict[str, Any]) -> tuple[str, float | None, float | None]:
     """One `ob_l2` frame to `(symbol, best_bid, best_ask)`.
 
-    The prices alone, which is what the chain cache and the bar tables want. Kept as its
-    own name rather than folded into `decode_ob_l2_top` because three call sites read it
-    and none of them has a use for a size.
+    The prices alone, which is what `chain_from_frames` wants. Kept as its own name rather
+    than folded into `decode_ob_l2_top` because its caller has no use for a size, and
+    because `tests/test_wire.py` and `tests/test_store.py` pin this signature.
     """
     symbol, top = decode_ob_l2_top(frame)
     return symbol, top.bid, top.ask
