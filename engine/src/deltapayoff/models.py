@@ -4,7 +4,11 @@ authority and change first."""
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, StrictBool
+
+from .events import ConnectionState
 
 
 class ComputedLeg(BaseModel):
@@ -246,3 +250,65 @@ class RecordingRequest(BaseModel):
     """
 
     recording: StrictBool
+
+
+class AdapterHealth(BaseModel):
+    """One adapter's line of `GET /health`. **Facts, never a verdict.**
+
+    Whether a state is acceptable is the reader's judgement — #40 draws a badge from it,
+    #42 alerts on it, an operator reads it — and a field called `healthy` here would fix
+    one of those readings for all three. Every field is either a fact the controller
+    holds or `null` because it is genuinely unknown; none is a default standing in for
+    one.
+    """
+
+    #: The venue's short name, `DELTA`. The same string every `Instrument` from this
+    #: adapter carries, so a log line and this report agree without a lookup.
+    adapter: str
+    #: One of the five. `stopped` for a controller that was never started, because a
+    #: connection nobody started is not running and `null` would be a sixth state.
+    state: ConnectionState
+    #: When the last message arrived, wall clock, or `null` if none ever has. **Derived
+    #: from the age at request time**, because the controller measures on a monotonic
+    #: clock — the only kind a staleness bound can be measured on.
+    last_message_at: datetime | None = None
+    #: Seconds since that message, or `null`. An unknown age, not an age of zero.
+    last_message_age_seconds: float | None = None
+    #: Times this connection has entered `reconnecting` since the process started.
+    reconnects: int
+    #: Reconnects left before the connection gives up for good. Restored in full by any
+    #: message arriving, so a healthy feed sits at the configured budget.
+    budget_remaining: int
+    #: Every state change since the process started, including the ones that came back.
+    #: A connection flapping between `connected` and `degraded` shows up here and in no
+    #: other field of this report.
+    transitions: int
+    #: Sockets that opened with **nothing subscribed** — a connection guaranteed to
+    #: deliver nothing, which is the failure with no error. `null` when the adapter has
+    #: no socket owner to ask, because an absent count is not a count of zero.
+    empty_opens: int | None = None
+
+
+class HealthReport(BaseModel):
+    """`GET /health`. **Liveness and readiness, side by side and not confused.**
+
+    `status` is what this route has always answered and means the same thing it always
+    did: the process is up and served you. It is kept because things read it — two tests
+    in this repo, and any script or probe outside it — and because a route that removes a
+    field to add three is a breaking change dressed as an improvement.
+
+    `feed` is the question people were actually asking when they read `status`: is market
+    data flowing? It is the **worst** state among the adapters, by the order in
+    `supervisor.SEVERITY`, so a process with one venue connected and one stopped does not
+    report green about the half of itself that works.
+
+    `adapters` is a **list and not a map keyed by name**, so that a later ticket adding a
+    field — #44's watched set — extends a record rather than changing what a key means,
+    and so the order is the configured one rather than whatever a dictionary gives back.
+    """
+
+    #: Liveness. Always `"ok"`: a route that answered is a process that is alive.
+    status: str = "ok"
+    #: Readiness. The worst state among the adapters; `stopped` when there are none.
+    feed: ConnectionState
+    adapters: list[AdapterHealth] = []

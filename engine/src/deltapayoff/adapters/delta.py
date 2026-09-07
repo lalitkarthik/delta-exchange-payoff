@@ -139,9 +139,9 @@ class DeltaAdapter:
 
         It is a parameter rather than a hard reference so the application module keeps the
         seam its lifespan tests already drive — they replace `main.DeltaFeed` with a stub
-        that registers subscriptions and never dials out. `connect=` and the retry
-        settings pass through in `feed_kwargs`, which is the seam `tests/test_feed.py`
-        drives.
+        that registers subscriptions and never dials out. `connect=` passes through in
+        `feed_kwargs`, which is the seam `tests/test_feed.py` drives. The retry settings
+        are no longer among them: #39 moved them to the controller.
         """
         self._client = client if client is not None else DeltaClient()
         self._underlyings = tuple(name.strip().upper() for name in underlyings if name)
@@ -261,7 +261,11 @@ class DeltaAdapter:
                 return
 
     async def stream(self, publish: Publish) -> None:
-        """Run the socket until stopped, publishing canonical events.
+        """**One connection**, publishing canonical events until it ends.
+
+        Since #39 this returns when the socket closes rather than reconnecting behind the
+        caller's back: backoff, the lifetime budget and the decision to redial belong to
+        `controller.ConnectionController`. The values did not change, only who runs them.
 
         `publish` is held for the duration and cleared on the way out, so an adapter that
         has returned cannot publish into a bus the caller has finished with.
