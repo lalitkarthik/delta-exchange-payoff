@@ -47,6 +47,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import date as Date
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
@@ -61,7 +62,9 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 
+from .adapters import DeltaAdapter, LegacyQuoteBridge
 from .chain import (
+    UNDERLYINGS,
     ValidationError,
     build_chain,
     build_expiries,
@@ -136,11 +139,21 @@ PUSH_INTERVAL_SECONDS = 1.0
 #: data; it would not be if either changed.
 MIN_PUSH_INTERVAL_SECONDS = 0.02
 
-#: Underlyings the live feed subscribes at start-up. Every listed BTC option, both
-#: channels — about 600 messages and 300 KB a second, measured. That buys instant expiry
-#: switching with no subscribe round trip. Narrowing `ob_l2` to the watched expiry would
-#: cut it to roughly a third; see `docs/ingestion.md`.
+#: Underlyings the live feed subscribes at start-up **when nothing says otherwise**.
+#: Every listed BTC option, both channels — about 600 messages and 300 KB a second,
+#: measured. That buys instant expiry switching with no subscribe round trip. Narrowing
+#: `ob_l2` to the watched expiry would cut it to roughly a third; see
+#: `docs/ingestion.md`.
+#:
+#: **BTC alone, deliberately.** ETH is #43's ticket and the cost of adding it has not been
+#: measured — #33 requires the feed's rate and bandwidth measured for sixty seconds after
+#: ETH is enabled before it is called fine, and `docs/design/hld.md` §5 records that the
+#: BTC-only figure is itself contested between two runs.
 LIVE_UNDERLYINGS = ("BTC",)
+
+#: Comma-separated, e.g. `BTC,ETH`. Read at start-up rather than at import, so which
+#: assets are recorded is a deployment decision and not a code change.
+LIVE_UNDERLYINGS_ENV = "DELTA_LIVE_UNDERLYINGS"
 
 #: The most points `/volatility` will put in one response unless asked for fewer.
 #:
@@ -162,6 +175,163 @@ def live_feed_enabled() -> bool:
     return os.environ.get(LIVE_FEED_ENV, "1") != "0"
 
 
+def live_underlyings() -> tuple[str, ...]:
+    """Which underlyings to record, from the environment, defaulting to BTC alone.
+
+    **An unknown name is dropped and logged at error rather than subscribed.** Delta
+    answers a request for an underlying it does not list with an empty ticker list, so a
+    typo would otherwise produce a feed that connects, subscribes nothing and records
+    nothing, with no error anywhere — the silent failure this whole component exists to
+    refuse. If nothing valid is left, the default stands, because recording BTC is a
+    better answer to a bad config line than recording nothing.
+    """
+    raw = os.environ.get(LIVE_UNDERLYINGS_ENV, "")
+    wanted = [name.strip().upper() for name in raw.split(",") if name.strip()]
+    if not wanted:
+        return LIVE_UNDERLYINGS
+
+    known = [name for name in wanted if name in UNDERLYINGS]
+    unknown = [name for name in wanted if name not in UNDERLYINGS]
+    if unknown:
+        logger.error(
+            "%s names %s, which Delta does not list; recording %s",
+            LIVE_UNDERLYINGS_ENV,
+            ", ".join(unknown),
+            ", ".join(known) or ", ".join(LIVE_UNDERLYINGS),
+        )
+    return tuple(known) or LIVE_UNDERLYINGS
+
+
+@dataclass
+class FeedStack:
+    """Every moving part of the live feed, wired to the bus and to each other.
+
+    **A named record rather than five loose `app.state` attributes**, so that what the
+    engine is made of can be built, started and stopped by three functions a reader can
+    follow, and so that swapping one part is a change in one place. `app.state` still
+    carries the same five names afterwards, because the tests and the route dependencies
+    reach for them and this is a refactor, not a rename.
+    """
+
+    #: **The canonical bus.** The adapter publishes `md.option_quote`,
+    #: `md.option_reference` and `md.index_quote` here. Nothing subscribes to it yet:
+    #: #37 moves the chain cache and the bar writer onto it, #38 the controller. It is
+    #: separate from `quotes` because an `Event` and a `feed.Quote` share no attribute,
+    #: and either consumer would raise on the other's records.
+    events: FanOut
+    #: The bus the chain cache and the bar writer read, carrying today's `feed.Quote`.
+    #: Both subscribe to this one and their queue policies differ; see `fanout.py`.
+    #: **Retired by #37**, along with the shim that fills it.
+    quotes: FanOut
+    stream: ChainStream
+    writer: BarWriter
+    #: The venue, behind `adapters.base.Adapter`. Everything venue-specific is inside it.
+    adapter: Any
+    #: The expand half of the expand–contract. #37 deletes it. See `adapters/shim.py`.
+    shim: Any
+    #: The background tasks, empty until `start_feed_stack` runs. Cancelled on shutdown.
+    tasks: list[asyncio.Task] = field(default_factory=list)
+
+    @property
+    def feed(self) -> Any:
+        """The socket owner inside the adapter, for the counters #39's `/health` reads."""
+        return self.adapter.feed
+
+
+def build_feed_stack(client: DeltaClient) -> FeedStack:
+    """Wire the two buses, the chain cache, the bar writer and the adapter together.
+
+    **Nothing here starts, connects or awaits.** Building is separated from starting so
+    that a process with no live feed — every test, and any run with `DELTA_LIVE_FEED=0`
+    — still has the whole structure present and introspectable.
+
+    The writer is attached whether or not the feed runs, so `/health`-adjacent
+    introspection and the tests can see the subscription exists and is lossless. With no
+    feed nothing is published, so an undrained queue costs nothing.
+
+    Table C is **sampled from the chain cache**, not folded from the bus, because our
+    implied volatility and Greeks are produced by the recompute loop rather than arriving
+    on the wire. The writer is handed the stream's reader, not the stream, so the store
+    never learns that a chain cache exists.
+
+    `BarStore()` names the quote table only; the writer derives the other two roots from
+    it, so there is exactly one place that decides where market data lands.
+
+    Every collaborator is looked up in this module's globals **at call time**, which is
+    what lets a test replace `DeltaClient`, `DeltaFeed`, `BarStore` or `BarWriter` with a
+    stub and get a stack that never opens a socket. `DeltaFeed` reaches the adapter as a
+    factory for exactly that reason: the adapter builds the socket owner around its own
+    sink, and the name it builds is still this module's.
+    """
+    quotes = FanOut()
+    stream = ChainStream()
+    stream.attach(quotes)
+    writer = BarWriter(BarStore(), chains=stream.computed_chains)
+    writer.attach(quotes)
+    shim = LegacyQuoteBridge(quotes)
+    return FeedStack(
+        events=FanOut(),
+        quotes=quotes,
+        stream=stream,
+        writer=writer,
+        adapter=DeltaAdapter(
+            client=client,
+            underlyings=live_underlyings(),
+            feed_factory=DeltaFeed,
+            legacy=shim,
+        ),
+        shim=shim,
+    )
+
+
+async def start_feed_stack(stack: FeedStack) -> None:
+    """Subscribe every listed contract and start the four background tasks.
+
+    **Which underlyings is the adapter's own answer**, not a second argument: the adapter
+    was built with the configured set and `underlyings` is on the protocol precisely so
+    there is one place to ask.
+
+    Raises `DeltaUnavailable` if the venue cannot be asked what it lists — the caller
+    decides whether that is fatal. Nothing is started when it raises, because the
+    subscriptions happen first: a feed that connected with an empty registry is the
+    silent failure `feed.py` exists to prevent.
+    """
+    for underlying in stack.adapter.underlyings:
+        stack.adapter.subscribe(await stack.adapter.instruments(underlying))
+
+    stack.tasks = [
+        asyncio.create_task(
+            stack.adapter.stream(stack.events.publish), name="delta-feed"
+        ),
+        asyncio.create_task(stack.stream.run(), name="chain-stream"),
+        asyncio.create_task(recompute_forever(stack.stream), name="chain-recompute"),
+        asyncio.create_task(stack.writer.run(), name="bar-writer"),
+    ]
+    for task in stack.tasks:
+        task.add_done_callback(_report_finished_task)
+
+
+async def stop_feed_stack(stack: FeedStack) -> None:
+    """Cancel the tasks, then flush the open minute. Order matters and is the point.
+
+    The final flush runs **after** the cancellations and not inside them. The open minute
+    is a real observation and is written with its true tick counts rather than discarded
+    for tidiness; doing it here rather than from inside the cancelled task means the
+    flush is not itself racing a cancellation.
+    """
+    for task in stack.tasks:
+        task.cancel()
+    if not stack.tasks:
+        return
+    await asyncio.gather(*stack.tasks, return_exceptions=True)
+    try:
+        await stack.writer.aclose()
+    except Exception:
+        # A failed final flush costs the open minute and nothing else. It must not take
+        # the shutdown with it and leave the HTTP client unclosed.
+        logger.exception("the final bar flush failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """One HTTP client, one websocket to Delta, one chain cache, for the whole process.
@@ -169,44 +339,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     The feed is started here rather than per request for the reason #3 gives: three
     consumers each opening their own connection would burn the 150-per-5-minutes budget
     and give three inconsistent views of one market.
+
+    What is wired to what is `build_feed_stack`; this function owns only the process's
+    lifetime and the decision to run live or not.
     """
     client = DeltaClient()
     await client.__aenter__()
     app.state.delta = client
 
-    app.state.fanout = FanOut()
-    app.state.stream = ChainStream()
-    app.state.stream.attach(app.state.fanout)
-    # The writer is attached whether or not the feed runs, so `/health`-adjacent
-    # introspection and the tests can see the subscription exists and is lossless. With
-    # no feed nothing is published, so an undrained queue costs nothing.
-    # Table C is **sampled from the chain cache**, not folded from the bus, because our
-    # implied volatility and Greeks are produced by the recompute loop rather than
-    # arriving on the wire. The writer is handed the stream's reader, not the stream, so
-    # the store never learns that a chain cache exists.
-    app.state.writer = BarWriter(BarStore(), chains=app.state.stream.computed_chains)
-    app.state.writer.attach(app.state.fanout)
-    app.state.feed = DeltaFeed(app.state.fanout)
-    app.state.tasks = []
+    stack = build_feed_stack(client)
+    app.state.stack = stack
+    app.state.fanout = stack.quotes
+    app.state.events = stack.events
+    app.state.adapter = stack.adapter
+    app.state.stream = stack.stream
+    app.state.writer = stack.writer
+    app.state.feed = stack.feed
+    app.state.tasks = stack.tasks
 
     if live_feed_enabled():
         try:
-            for underlying in LIVE_UNDERLYINGS:
-                symbols = [
-                    row["symbol"] for row in await client.tickers(underlying, None)
-                ]
-                app.state.feed.subscribe("ticker", symbols)
-                app.state.feed.subscribe("ob_l2", symbols)
-            app.state.tasks = [
-                asyncio.create_task(app.state.feed.run(), name="delta-feed"),
-                asyncio.create_task(app.state.stream.run(), name="chain-stream"),
-                asyncio.create_task(
-                    recompute_forever(app.state.stream), name="chain-recompute"
-                ),
-                asyncio.create_task(app.state.writer.run(), name="bar-writer"),
-            ]
-            for task in app.state.tasks:
-                task.add_done_callback(_report_finished_task)
+            await start_feed_stack(stack)
+            app.state.tasks = stack.tasks
         except DeltaUnavailable:
             # The REST endpoints still work and the websocket reports "waiting". A
             # start-up that dies because Delta was briefly unreachable is worse than one
@@ -216,20 +370,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        for task in app.state.tasks:
-            task.cancel()
-        if app.state.tasks:
-            await asyncio.gather(*app.state.tasks, return_exceptions=True)
-            # After the cancellations, not inside them. The open minute is a real
-            # observation and is written with its true tick counts rather than
-            # discarded for tidiness; doing it here rather than from inside the
-            # cancelled task means the flush is not itself racing a cancellation.
-            try:
-                await app.state.writer.aclose()
-            except Exception:
-                # A failed final flush costs the open minute and nothing else. It must
-                # not take the shutdown with it and leave the HTTP client unclosed.
-                logger.exception("the final bar flush failed")
+        await stop_feed_stack(stack)
         await client.aclose()
 
 
