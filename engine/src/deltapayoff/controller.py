@@ -626,7 +626,7 @@ class ConnectionController:
         never closed and merely stopped speaking on — is a state, not a dead socket, and
         redialling it would be dialling over a connection that is still open. Forcing
         that one down needs a member the protocol does not have; it is #41's `reconnect`
-        command, and `docs/design/lld/controller.md` §9 records the gap.
+        command, and `docs/design/lld/reconnect.md` §4 records the gap.
         """
         while True:
             await self._adapter.stream(self.sink)
@@ -635,7 +635,10 @@ class ConnectionController:
             # The wait grows per consecutive failed attempt and is restored in full by
             # the first message off a connection, which is the same rule the budget
             # follows and for the same reason.
-            await self._sleep(self._delay)
+            # The delay actually waited, kept before it is doubled, so the log line
+            # and the event's detail say what happened rather than what will happen next.
+            waited = self._delay
+            await self._sleep(waited)
             self._delay = min(self._delay * 2, MAX_RETRY_DELAY_SECONDS)
             if self._state is State.STOPPED:
                 return
@@ -646,7 +649,7 @@ class ConnectionController:
                 # thirty-second outage and never showed a try in progress is the
                 # difference.
                 self.transition(
-                    State.CONNECTING, REASON_BACKOFF, f"redialling, {self._delay:.0f}s"
+                    State.CONNECTING, REASON_BACKOFF, f"redialling after {waited:.1f}s"
                 )
 
     async def _tick_forever(self) -> None:
