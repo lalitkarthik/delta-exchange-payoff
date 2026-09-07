@@ -549,18 +549,68 @@ def test_a_listener_that_raises_cannot_take_the_feed_down() -> None:
 
 def test_a_stop_is_not_reported_as_a_drop() -> None:
     """Stopping on purpose is not the connection failing, and a badge that flashed
-    `reconnecting` on every clean shutdown would teach a person to ignore it."""
+    `reconnecting` on every clean shutdown would teach a person to ignore it.
+
+    **The attempt has to end with the stop already asked for**, which is the only way
+    through `run`'s `if not self._stopping` guard. An earlier version of this test idled
+    a socket in `recv` and cancelled the task instead: `run` re-raised the
+    `CancelledError` before ever reaching the guard, so the assertion held just as well
+    with the guard deleted, and the test could not fail.
+    """
     closed: list[str] = []
-    feed = DeltaFeed(FanOut(), connect=connector([FakeSocket([])]))
+
+    class StopThenDrop(FakeSocket):
+        """The shutdown as it really happens: `stop()` is asked for, and the socket the
+        reader is sitting on ends the attempt a moment later."""
+
+        async def recv(self):
+            feed.stop()
+            raise ConnectionResetError("the socket went with the stop")
+
+    feed = DeltaFeed(FanOut(), connect=connector([StopThenDrop([])]))
+    feed.subscribe("ob_l2", CHAIN)
     feed.on_close(closed.append)
 
-    async def run_then_stop() -> None:
-        task = asyncio.create_task(feed.run())
-        await asyncio.sleep(0.05)
-        feed.stop()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(feed.run())
 
-    asyncio.run(run_then_stop())
-
+    assert feed._stopping is True
+    assert feed.last_error == "ConnectionResetError: the socket went with the stop"
     assert closed == []
+
+
+def test_an_open_with_nothing_subscribed_is_not_announced_as_open() -> None:
+    """`OPENED` promises a socket that has been **resubscribed**, and an empty registry
+    sends no subscribe at all — so announcing it would put a green badge on a socket
+    that is guaranteed to deliver nothing, which is the healthy-connection-zero-messages
+    failure this module exists to prevent.
+
+    Unreachable from `main.py` today only because it subscribes before it streams;
+    nothing enforces that ordering, and #39's supervisor takes over the start sequence.
+    Not announcing it leaves the controller in `connecting`, which reaches
+    `reconnecting` at its own bound rather than sitting green forever.
+    """
+    opened: list[str] = []
+    socket = FakeSocket([], close_after=0)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]), retry_delay=0.01)
+    feed.on_open(opened.append)
+
+    asyncio.run(drive(feed))
+
+    assert opened == []
+    assert socket.sent == []
+    assert feed.empty_opens >= 1
+
+
+def test_an_open_with_something_subscribed_is_announced_as_before() -> None:
+    """The other half of the guard: a registry with symbols in it sends its subscribe
+    and reports the open, which is every real connection."""
+    opened: list[str] = []
+    socket = FakeSocket([], close_after=0)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]), retry_delay=0.01)
+    feed.subscribe("ob_l2", CHAIN)
+    feed.on_open(opened.append)
+
+    asyncio.run(drive(feed))
+
+    assert opened
+    assert feed.empty_opens == 0

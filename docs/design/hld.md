@@ -176,7 +176,7 @@ Fields, emitters, consumers and timing are in [events.md](events.md).
 | Number | Tag | Run |
 |---|---|---|
 | `ob_l2` refreshes every 508 ms per contract, `ticker` every 5,001 ms; both channels on BTC alone carry 1,322.9 msg/s at 636.5 KB/s | `measured` | `tools/measure_feed.py`, 2026-09-03 |
-| Staleness before `degraded` 15 s (three ticker refreshes); grace after the last viewer leaves an expiry 30 s | `assumed` | #33; both re-measured against the live feed before they are trusted |
+| Staleness before `degraded` 15 s (three ticker refreshes); grace after the last viewer leaves an expiry 30 s | `assumed` | #33. The staleness half is now measured against a live hour and stands — longest quiet gap 44.785 s, `design/quiet-gap.md`. The grace half is still untested |
 | Store gap 2026-09-04 09:38Z to 2026-09-07 09:45Z, unnoticed | `measured` | store file timestamps |
 
 **Two numbers are deliberately absent:** the live cost of one expiry's solve, which #33 requires

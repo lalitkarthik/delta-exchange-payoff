@@ -51,6 +51,14 @@ class _StubFeed:
     def on_close(self, listener) -> None:
         self.close_listeners.append(listener)
 
+    def off_open(self, listener) -> None:
+        if listener in self.open_listeners:
+            self.open_listeners.remove(listener)
+
+    def off_close(self, listener) -> None:
+        if listener in self.close_listeners:
+            self.close_listeners.remove(listener)
+
     async def run(self) -> None:
         self.ran = True
 
@@ -493,6 +501,9 @@ def test_the_protocol_check_can_actually_fail() -> None:
         def on_connection(self, listener):
             return None
 
+        def off_connection(self, listener):
+            return None
+
         def stop(self):
             return None
 
@@ -716,3 +727,58 @@ def test_the_signal_is_a_register_and_not_a_slot() -> None:
 
     assert first == [ConnectionSignal.OPENED]
     assert second == [ConnectionSignal.OPENED]
+
+
+def test_a_connection_listener_can_be_taken_off_again() -> None:
+    """`on_connection` appends **two** closures per call, and there was no way to remove
+    either — so a discarded controller stayed strongly referenced and kept being told
+    about a socket it no longer owned. `off_connection` removes the pair it registered,
+    which is why the pair is remembered against the listener that asked for it."""
+    delta = adapter()
+    seen: list = []
+
+    def listener(signal, detail):
+        seen.append(signal)
+
+    delta.on_connection(listener)
+    assert len(delta.feed.open_listeners) == 1
+    assert len(delta.feed.close_listeners) == 1
+
+    delta.off_connection(listener)
+
+    assert delta.feed.open_listeners == []
+    assert delta.feed.close_listeners == []
+    assert seen == []
+
+
+def test_removing_one_listener_leaves_the_others_registered() -> None:
+    """The register keeps being a register. Removing the controller must not deafen the
+    recorder beside it."""
+    delta = adapter()
+    kept: list = []
+    dropped: list = []
+
+    def goes(signal, detail):
+        dropped.append(signal)
+
+    def stays(signal, detail):
+        kept.append(signal)
+
+    delta.on_connection(goes)
+    delta.on_connection(stays)
+    delta.off_connection(goes)
+    for listener in delta.feed.open_listeners:
+        listener("up")
+
+    assert kept == [ConnectionSignal.OPENED]
+    assert dropped == []
+
+
+def test_removing_a_listener_that_was_never_registered_is_not_an_error() -> None:
+    """A supervisor tidying up on both the normal and the failed path calls this twice.
+    `DeltaFeed.off_open` and `off_close` are the same: quiet about what is not there."""
+    delta = adapter()
+
+    delta.off_connection(lambda signal, detail: None)
+
+    assert delta.feed.open_listeners == []

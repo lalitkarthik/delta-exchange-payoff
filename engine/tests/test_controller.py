@@ -14,8 +14,9 @@ from typing import Any
 import pytest
 
 from deltapayoff.adapters import instrument_from_symbol
+from deltapayoff.adapters.base import ConnectionSignal
 from deltapayoff.controller import ConnectionController, IllegalTransition
-from deltapayoff.events import ConnectionState, FeedConnection, Heartbeat
+from deltapayoff.events import Alert, ConnectionState, FeedConnection, Heartbeat
 from fakes.scripted_adapter import Close, Frames, ScriptedAdapter, Silence
 
 
@@ -634,3 +635,305 @@ def test_a_reconnect_keeps_the_age_because_that_gap_was_the_venues() -> None:
     controller.connection_opened()
 
     assert controller.last_message_age() == 30.0
+
+
+def test_a_reopened_socket_gets_the_grace_a_fresh_start_gets() -> None:
+    """The rule "a reconnect keeps its age" is right while reconnecting and wrong the
+    instant the replay completes.
+
+    Every outage longer than `reconnect_after` ends with a socket that is open and
+    resubscribed but has not yet delivered a frame. Measuring that socket's staleness
+    from a message that predates the drop demotes it on the very next poll, and the
+    machine flaps `connected -> reconnecting -> connecting -> connected` for as long as
+    the market stays quiet — three spurious `feed.connection` events per second, on the
+    badge #40 draws, during the exact incident an operator is watching.
+    """
+    clock = FakeClock()
+    published: list = []
+    controller = ConnectionController(
+        ScriptedAdapter(),
+        published.append,
+        clock=clock.read,
+        degraded_after=15.0,
+        reconnect_after=45.0,
+        heartbeat_every=1_000.0,
+    )
+    controller.start()
+    controller.connection_opened()
+    controller.message_arrived()
+
+    clock.now = 45.0
+    controller.poll()  # degraded -> reconnecting, the drop the bound exists to catch
+    clock.now = 46.0
+    controller.connection_opened()  # the socket is back and resubscribed
+    published.clear()
+
+    for tick in (47.0, 48.0, 49.0, 55.0, 60.0):
+        clock.now = tick
+        controller.poll()
+
+    assert controller.state is ConnectionState.CONNECTED
+    assert [(e.from_state, e.to_state, e.reason) for e in published] == []
+
+
+def test_a_reopened_socket_that_delivers_nothing_still_goes_stale_on_its_own_clock() -> (
+    None
+):
+    """The grace is a rebase, not an exemption. A replayed socket that stays silent
+    reaches `degraded` one `degraded_after` after the open and `reconnecting` one
+    `reconnect_after` after it — measured from the open, because that is when this
+    socket's silence began."""
+    clock = FakeClock()
+    published: list = []
+    controller = ConnectionController(
+        ScriptedAdapter(),
+        published.append,
+        clock=clock.read,
+        degraded_after=15.0,
+        reconnect_after=45.0,
+        heartbeat_every=1_000.0,
+    )
+    controller.start()
+    controller.connection_opened()
+    controller.message_arrived()
+    clock.now = 45.0
+    controller.poll()
+    clock.now = 46.0
+    controller.connection_opened()
+    published.clear()
+
+    clock.now = 61.0
+    controller.poll()
+    assert controller.state is ConnectionState.DEGRADED
+
+    clock.now = 91.0
+    controller.poll()
+    assert controller.state is ConnectionState.RECONNECTING
+    assert [
+        (e.to_state, e.reason) for e in published if isinstance(e, FeedConnection)
+    ] == [
+        (ConnectionState.DEGRADED, "stale"),
+        (ConnectionState.RECONNECTING, "silent"),
+    ]
+
+
+def test_the_heartbeat_still_reports_the_venues_own_silence_across_a_reconnect() -> None:
+    """The grace moves what staleness is measured from. It does not move what the
+    heartbeat reports: a badge that said "0 s since the last message" one second after a
+    socket reopened would be the plausible-and-wrong answer again, one layer up."""
+    clock = FakeClock()
+    published: list = []
+    controller = ConnectionController(
+        ScriptedAdapter(),
+        published.append,
+        clock=clock.read,
+        degraded_after=15.0,
+        reconnect_after=45.0,
+        heartbeat_every=1.0,
+    )
+    controller.start()
+    controller.connection_opened()
+    controller.message_arrived()
+    clock.now = 45.0
+    controller.poll()
+    clock.now = 46.0
+    controller.connection_opened()
+    published.clear()
+
+    clock.now = 47.0
+    controller.poll()
+
+    (beat,) = [e for e in published if isinstance(e, Heartbeat)]
+    assert beat.state is ConnectionState.CONNECTED
+    assert beat.last_message_age_seconds == 47.0
+
+
+def _reasons(published: list) -> list[str]:
+    return [e.reason for e in published if isinstance(e, FeedConnection)]
+
+
+def test_a_raising_consumer_does_not_kill_the_staleness_watchdog() -> None:
+    """This module's own thesis, reintroduced one layer up.
+
+    `poll()` calls `_publish`, which is the bus and, from #39, a consumer's code. An
+    exception out of it takes the timer task down; `gather(..., return_exceptions=True)`
+    retrieves it, so asyncio never warns either. The watchdog dies with no log, no event
+    and no symptom, `run()` returns cleanly, and the connection sits in `connected`
+    through a silence five times past the reconnect bound — a healthy badge over a dead
+    feed, which is the failure this file exists to refuse.
+    """
+    published: list = []
+
+    def publish(event: Any) -> None:
+        if isinstance(event, Heartbeat):
+            raise RuntimeError("a consumer's own bug")
+        published.append(event)
+
+    adapter = ScriptedAdapter(script=[Silence(0.5)])
+    controller = ConnectionController(
+        adapter,
+        publish,
+        degraded_after=0.05,
+        reconnect_after=0.2,
+        heartbeat_every=0.05,
+        poll_seconds=0.02,
+    )
+
+    asyncio.run(controller.run())
+
+    assert _reasons(published) == ["start", "open", "stale", "silent", "stopped"]
+
+
+def test_a_watchdog_that_keeps_failing_says_so_out_loud() -> None:
+    """Logging forever is what a broken consumer would get away with. Three consecutive
+    failures is not a blip, and an `alert` is the event a person is meant to see —
+    `events.md` says the controller emits one, and this is the first place it does."""
+    published: list = []
+
+    def publish(event: Any) -> None:
+        if isinstance(event, Heartbeat):
+            raise RuntimeError("a consumer's own bug")
+        published.append(event)
+
+    adapter = ScriptedAdapter(script=[Silence(0.3)])
+    controller = ConnectionController(
+        adapter,
+        publish,
+        degraded_after=10.0,
+        reconnect_after=10.0,
+        heartbeat_every=0.01,
+        poll_seconds=0.02,
+    )
+
+    asyncio.run(controller.run())
+
+    alerts = [e for e in published if isinstance(e, Alert)]
+    assert [(a.code, a.severity, a.adapter) for a in alerts] == [
+        ("poll_failing", "error", "SCRIPT")
+    ]
+
+
+def test_a_connection_gone_silent_is_an_alert_and_not_only_a_badge() -> None:
+    """`events.md` lists "a connection has gone stale" among the things an `alert` is
+    for. `degraded` is not it — fifteen quiet seconds is a badge, and an alert per quiet
+    minute is the flood an alert exists to stand out from. Silence past the reconnect
+    bound is."""
+    clock = FakeClock()
+    published: list = []
+    controller = ConnectionController(
+        ScriptedAdapter(),
+        published.append,
+        clock=clock.read,
+        degraded_after=15.0,
+        reconnect_after=45.0,
+        heartbeat_every=1_000.0,
+    )
+    controller.start()
+    controller.connection_opened()
+    controller.message_arrived()
+
+    clock.now = 20.0
+    controller.poll()
+    assert [e for e in published if isinstance(e, Alert)] == []
+
+    clock.now = 45.0
+    controller.poll()
+
+    (alert,) = [e for e in published if isinstance(e, Alert)]
+    assert (alert.code, alert.severity, alert.adapter) == (
+        "connection_silent",
+        "error",
+        "SCRIPT",
+    )
+    assert "45.0s" in alert.detail
+
+
+def test_a_controller_can_be_taken_off_the_adapter_it_wrapped() -> None:
+    """Registering is a construction side effect and there was no way to undo it, so a
+    controller that was replaced or discarded stayed strongly referenced and went on
+    receiving signals — one live socket driving two machines, the second of which is
+    dead and answers a signal by raising `IllegalTransition` inside the socket reader.
+    #39 holds controllers across a lifespan and is the first to hit it."""
+    adapter = ScriptedAdapter()
+    published: list = []
+    controller = ConnectionController(adapter, published.append)
+    controller.start()
+
+    controller.detach()
+
+    assert adapter._listeners == []
+    published.clear()
+    adapter._signal(ConnectionSignal.CLOSED, "a socket this controller no longer owns")
+    assert published == []
+    assert controller.state is ConnectionState.CONNECTING
+
+
+def test_detaching_twice_is_not_an_error() -> None:
+    """A supervisor that tidies up on both the normal and the failed path must be able
+    to call it twice."""
+    adapter = ScriptedAdapter()
+    controller = ConnectionController(adapter, [].append)
+
+    controller.detach()
+    controller.detach()
+
+    assert adapter._listeners == []
+
+
+def test_run_leaves_nothing_registered_on_the_adapter() -> None:
+    """The leak closes itself on the ordinary path: a controller whose stream has
+    returned is finished with that adapter, and holds on to nothing."""
+    adapter = ScriptedAdapter(script=[Frames("ob_l2", [])])
+    controller = ConnectionController(
+        adapter, [].append, heartbeat_every=1_000.0, poll_seconds=0.01
+    )
+
+    asyncio.run(controller.run())
+
+    assert adapter._listeners == []
+
+
+def test_a_restarted_controller_is_registered_again() -> None:
+    """Detaching on the way out would be a trap if a resumed controller stayed deaf, so
+    `start()` puts it back. #41's resume command is the caller that needs this."""
+    adapter = ScriptedAdapter()
+    published: list = []
+    controller = ConnectionController(adapter, published.append)
+    controller.detach()
+
+    controller.start()
+    published.clear()
+    adapter._signal(ConnectionSignal.OPENED, "back")
+
+    assert controller.state is ConnectionState.CONNECTED
+    assert len(adapter._listeners) == 1
+
+
+def test_an_open_while_already_connected_rebases_rather_than_vanishing() -> None:
+    """No move is allowed out of `connected`, so the state does not change — but the
+    signal is not nothing. A socket that says it reopened is a socket that stopped and
+    started, and going on measuring its silence against a message the socket before it
+    delivered is the same mistake the reconnect grace exists to undo."""
+    clock = FakeClock()
+    published: list = []
+    controller = ConnectionController(
+        ScriptedAdapter(),
+        published.append,
+        clock=clock.read,
+        degraded_after=15.0,
+        reconnect_after=45.0,
+        heartbeat_every=1_000.0,
+    )
+    controller.start()
+    controller.connection_opened()
+    controller.message_arrived()
+
+    clock.now = 14.0
+    controller.connection_opened("a second open nobody announced a close for")
+    published.clear()
+
+    clock.now = 20.0
+    controller.poll()
+
+    assert controller.state is ConnectionState.CONNECTED
+    assert _reasons(published) == []

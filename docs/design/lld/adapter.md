@@ -27,9 +27,9 @@ true of the code and not only of the diagram.
 
 ## 2. The protocol, and what it deliberately omits
 
-Seven members in three groups: **describe yourself** (`venue`, `underlyings`), **feed**
-(`instruments`, `subscribe`, `on_connection`, `stream`, `stop`), **read** (`expiries`,
-`chain_snapshot`). `on_connection` is #38's — [controller.md](controller.md) §5.
+Eight members in three groups: **describe yourself** (`venue`, `underlyings`), **feed**
+(`instruments`, `subscribe`, `on_connection`, `off_connection`, `stream`, `stop`), **read**
+(`expiries`, `chain_snapshot`). The connection pair is #38's — [connection-signal.md](connection-signal.md).
 The two REST reads are on the adapter because the venue client *is* part of knowing a
 venue, and putting them beside it means a second module learns a second venue.
 

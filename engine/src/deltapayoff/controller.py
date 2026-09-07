@@ -40,10 +40,11 @@ starts, and this module's table does not change.
 
 ## The connection signal
 
-`adapters.base.Adapter` grew one member for this ticket — `on_connection(listener)` —
-because the protocol carried no way for an adapter to say its socket had come or gone.
-Two signals, `OPENED` and `CLOSED`; synchronous and non-blocking for the same reason
-`Publish` is, since the socket reader calls it between reads.
+`adapters.base.Adapter` grew two members for this ticket — `on_connection(listener)` and
+`off_connection(listener)` — because the protocol carried no way for an adapter to say
+its socket had come or gone, and then no way to stop listening. Two signals, `OPENED` and
+`CLOSED`; synchronous and non-blocking for the same reason `Publish` is, since the socket
+reader calls it between reads. `docs/design/lld/connection-signal.md` is the design.
 
 The full table and every number are in `docs/design/lld/controller.md`.
 """
@@ -58,7 +59,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .adapters.base import Adapter, ConnectionSignal
-from .events import ConnectionState, Event, FeedConnection, Heartbeat
+from .events import Alert, ConnectionState, Event, FeedConnection, Heartbeat
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,15 @@ RECONNECT_AFTER_SECONDS = 45.0
 HEARTBEAT_SECONDS = 10.0
 #: The staleness timer's resolution: a 15 s bound is observed to the nearest second.
 POLL_SECONDS = 1.0
+#: Consecutive failed polls before the watchdog stops merely logging and emits an
+#: `alert`. `assumed`. One failure is a blip a log line covers; three in a row at
+#: `poll_seconds` is a consumer that is going to keep raising, and a staleness timer
+#: whose every tick fails is a watchdog that is not watching.
+POLL_FAILURES_BEFORE_ALERT = 3
+
+#: `alert` codes. Short and stable, for the same reason a `reason` is.
+ALERT_CONNECTION_SILENT = "connection_silent"
+ALERT_POLL_FAILING = "poll_failing"
 
 
 class ConnectionController:
@@ -184,13 +194,47 @@ class ConnectionController:
         #: and delivers nothing is stale from the moment it opened, not never.
         self._entered_at = clock()
         self._last_message_at: float | None = None
-        #: `None` until the first poll, which beats immediately.
+        #: When a socket was last reported open **and resubscribed**. What staleness is
+        #: measured from when it is more recent than the last message: a replayed socket
+        #: has not had a chance to speak yet, and the silence before it is not its own.
+        self._opened_at: float | None = None
+        #: `None` until the first poll. That poll beats whenever it comes — under
+        #: `run()`, one `poll_seconds` after the start rather than at the instant of it.
         self._last_beat_at: float | None = None
 
         #: Transitions since construction, for `/health` in #39.
         self.transitions = 0
 
-        adapter.on_connection(self.connection_signal)
+        #: Whether this controller is on the adapter's connection register. Tracked so
+        #: that attaching and detaching are both idempotent.
+        self._attached = False
+        self._attach()
+
+    # --- being on the adapter, and coming off it ------------------------------------
+
+    def _attach(self) -> None:
+        """Listen to the adapter's socket. Idempotent."""
+        if self._attached:
+            return
+        self._adapter.on_connection(self.connection_signal)
+        self._attached = True
+
+    def detach(self) -> None:
+        """Come off the adapter's connection register. **Idempotent.**
+
+        Registering was a construction side effect with no way to undo it, so a
+        controller that was replaced or discarded stayed strongly referenced by the
+        adapter and went on being told about a socket it no longer owned: one live
+        socket driving two machines, the dead one answering a signal by raising
+        `IllegalTransition` inside the socket reader. `run()` calls this on the way out
+        and `start()` puts it back, so the ordinary path needs no bookkeeping; #39's
+        supervisor, which holds controllers across a lifespan and may replace one, is
+        the caller that needs to say so itself.
+        """
+        if not self._attached:
+            return
+        self._adapter.off_connection(self.connection_signal)
+        self._attached = False
 
     # --- what it reports ----------------------------------------------------------
 
@@ -237,6 +281,11 @@ class ConnectionController:
         """
         reason = REASON_RESUME if self._state is State.STOPPED else REASON_START
         self._last_message_at = None
+        self._opened_at = None
+        # A controller `run()` detached on its way out is deaf until it is put back, and
+        # a resumed connection that never heard its socket open would sit in
+        # `connecting` until the staleness bound moved it. #41's resume is the caller.
+        self._attach()
         self.transition(State.CONNECTING, reason)
 
     def stop(self, reason: str = REASON_STOPPED, detail: str = "") -> None:
@@ -263,7 +312,30 @@ class ConnectionController:
             self.transition(State.CONNECTED, REASON_MESSAGE)
 
     def connection_opened(self, detail: str = "") -> None:
-        """The adapter's socket is up and every subscription has been replayed."""
+        """The adapter's socket is up and every subscription has been replayed.
+
+        **The replayed socket's silence starts here.** A reconnect keeps the venue's age
+        while it is reconnecting — that gap is what the bound exists to catch — but once
+        the replay is done there is a new socket that has not been given a chance to
+        speak, and measuring it against a message from before the drop demotes it on the
+        next poll. See `docs/design/lld/controller.md` §8.
+
+        An open reported while the connection is **already** running is not dropped on
+        the floor: no move is allowed out of `connected`, but the grace is rebased and
+        the fact is logged, because a socket that says it reopened is a socket that
+        stopped and started, and forgetting that would leave the machine measuring
+        against a connection that no longer exists.
+        """
+        self._opened_at = self._clock()
+        if self._state in (State.CONNECTED, State.DEGRADED):
+            logger.info(
+                "feed connection %s: open while already %s; the staleness clock is "
+                "rebased and the state is unchanged%s",
+                self.adapter_name,
+                self._state.value,
+                f" ({detail})" if detail else "",
+            )
+            return
         if self._state is State.RECONNECTING:
             self.transition(State.CONNECTING, REASON_BACKOFF, detail)
         if self._state is State.CONNECTING:
@@ -316,23 +388,62 @@ class ConnectionController:
         **A connection that opens and delivers nothing is stale from the open**, not
         never: an age of `None` treated as "not yet old" is exactly the healthy-socket,
         zero-messages failure `feed.py` records.
+
+        **And the last message is not the whole story.** A socket reported open and
+        resubscribed since that message is a *new* socket whose own silence began at the
+        open, so the later of the two is what this measures from. Without it, every
+        outage longer than `reconnect_after` ends in a flap: the reopened socket is
+        demoted on the next poll for a gap that belonged to the socket before it. The
+        age the heartbeat reports is untouched — that one is the venue's own silence and
+        stays true across the reconnect.
         """
         if self._state not in (State.CONNECTING, State.CONNECTED, State.DEGRADED):
             return
         since = self._last_message_at
         if since is None:
             since = self._entered_at
+        if self._opened_at is not None and self._opened_at > since:
+            since = self._opened_at
         age = now - since
         if age >= self.reconnect_after:
-            self.transition(State.RECONNECTING, REASON_SILENT, f"{age:.1f}s silent")
+            detail = f"{age:.1f}s silent"
+            self.transition(State.RECONNECTING, REASON_SILENT, detail)
+            # `events.md` lists "a connection has gone stale" among the things an alert
+            # is for, and this is that moment. **Not `degraded`:** fifteen quiet seconds
+            # is a badge and a heartbeat, and an alert on every quiet minute is exactly
+            # the flood an alert exists to stand out from.
+            self._alert(ALERT_CONNECTION_SILENT, detail)
         elif age >= self.degraded_after and self._state is State.CONNECTED:
             self.transition(State.DEGRADED, REASON_STALE, f"{age:.1f}s silent")
+
+    def _alert(self, code: str, detail: str, severity: str = "error") -> None:
+        """Publish one `alert`, and never let publishing it be the thing that raises.
+
+        The guard is not decoration: the caller most likely to need an alert is the poll
+        that just failed **because `_publish` raised**, and an alert that re-raised into
+        the watchdog would kill the watchdog with the report of its own illness.
+        """
+        try:
+            self._publish(
+                Alert(
+                    source=SOURCE,
+                    ts_received=self._wall_clock(),
+                    adapter=self.adapter_name,
+                    severity=severity,
+                    code=code,
+                    detail=detail,
+                )
+            )
+        except Exception:
+            logger.exception("publishing an alert raised; the alert is lost")
 
     def _beat(self, now: float) -> None:
         """One `heartbeat` per cadence, whatever the state. Not a message from the venue.
 
-        The first poll after a start beats immediately, so `/health` and the badge have
-        an answer before the first cadence has elapsed.
+        **The first poll after a start beats, whenever that poll comes** — which under
+        `run()` is one `poll_seconds` after the start and not at the instant of it. So
+        `/health` and the badge have an answer a second in rather than a cadence in;
+        they do not have one the moment `run()` is awaited.
         """
         if self._state is None:
             return
@@ -370,13 +481,59 @@ class ConnectionController:
             await self._adapter.stream(self.sink)
         finally:
             timer.cancel()
-            await asyncio.gather(timer, return_exceptions=True)
+            # **The result is read, not discarded.** `return_exceptions=True` retrieves
+            # the exception, which is what stops asyncio's "Task exception was never
+            # retrieved" warning from firing — so a timer that died of anything other
+            # than its own cancellation would otherwise leave no trace anywhere.
+            (ended,) = await asyncio.gather(timer, return_exceptions=True)
+            if isinstance(ended, BaseException) and not isinstance(
+                ended, asyncio.CancelledError
+            ):
+                logger.error(
+                    "the staleness timer for %s ended in an exception; staleness was "
+                    "not being watched",
+                    self.adapter_name,
+                    exc_info=ended,
+                )
+                self._alert(
+                    ALERT_POLL_FAILING, f"the staleness timer stopped: {ended!r}"
+                )
             self.stop(detail="the adapter's stream returned")
+            # Finished with this adapter, and holding on to nothing of it. `start()`
+            # puts the listener back, so a resume is not left deaf.
+            self.detach()
 
     async def _tick_forever(self) -> None:
+        """Poll until cancelled. **A poll that raises must not end the watchdog.**
+
+        `poll()` reaches `_publish`, which is the bus and, from #39, a consumer's code.
+        Letting that exception out killed the timer silently — `run()`'s `gather` caught
+        it, so not even asyncio's unretrieved-exception warning fired — and left the
+        connection sitting in `connected` through any silence at all. A watchdog that
+        dies of a consumer's bug is the plausible-and-wrong failure this module is
+        against, so it logs, counts, and keeps ticking; and once the failures are a
+        pattern rather than a blip, it says so on the bus as well.
+        """
+        failures = 0
         while True:
             await self._sleep(self.poll_seconds)
-            self.poll()
+            try:
+                self.poll()
+            except Exception:
+                failures += 1
+                logger.exception(
+                    "the staleness poll for %s raised (%d in a row); the watchdog "
+                    "keeps ticking",
+                    self.adapter_name,
+                    failures,
+                )
+                if failures == POLL_FAILURES_BEFORE_ALERT:
+                    self._alert(
+                        ALERT_POLL_FAILING,
+                        f"{failures} staleness polls in a row raised",
+                    )
+            else:
+                failures = 0
 
     # --- the one place the state changes ------------------------------------------
 
