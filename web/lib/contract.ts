@@ -114,10 +114,18 @@ export interface ChainRow {
 export interface ChainResponse {
   underlying: Underlying;
   expiry: ExpiryDate;
-  /** Delta's top-level `spot_price`. `greeks.spot` is deliberately not exposed. */
-  spot: number;
-  /** The listed strike closest to spot. A lookup, not a model. */
-  atm_strike: number;
+  /**
+   * Delta's top-level `spot_price`. `greeks.spot` is deliberately not exposed.
+   *
+   * Always present on this route — a live chain always carries a spot price. Typed
+   * `number | null` anyway because `ChainResponse` is the exact shape `/chain/at`
+   * answers too (`docs/historical-chain-contract.md`), and a minute with nothing in
+   * `spot-bars` legitimately has neither `spot` nor `atm_strike`. #47.
+   */
+  spot: number | null;
+  /** The listed strike closest to spot. A lookup, not a model. `null` exactly when
+   * `spot` is — see `spot` above. */
+  atm_strike: number | null;
   /** ISO 8601, UTC, e.g. "2026-09-01T09:21:04Z". */
   fetched_at: string;
   /** Ascending by strike. */

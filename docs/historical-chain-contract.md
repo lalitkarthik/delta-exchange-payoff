@@ -96,15 +96,19 @@ quote-bars is not, for the same minute — see the LLD for what this means for t
 tables read here for the first time, `reference-bars` and `spot-bars`.
 
 **`spot-bars` is a fourth table, and the ticket that specified this route named three.**
-`chain-contract.md` fixes `spot` and `atm_strike` as plain numbers, and
-`web/components/ChainLadder.tsx` reads `chain.spot` without a null check — a `null`
-there is not rendered as an absence, it is `strike < null`, which JavaScript coerces to
-`strike < 0` and silently washes every leg on the wrong side. Reading the table that
-already records the real spot for that minute is the honest fourth field; inventing one
-from the forward would conflate two figures the parent contract is explicit are never
-the same number. When `spot-bars` itself holds nothing for the minute, `spot` and
-`atm_strike` are `null` and that pre-existing gap in the component is inherited rather
-than closed — see the LLD's open item.
+`chain-contract.md` types `spot` and `atm_strike` `number | null` (#47) precisely for this
+route: reading the table that already records the real spot for that minute is the honest
+fourth field; inventing one from the forward would conflate two figures the parent contract
+is explicit are never the same number.
+
+**When `spot-bars` itself holds nothing for the minute, `spot` and `atm_strike` are both
+`null`, and this is the one behaviour to know:** the minute still answers `"chain"`, not
+`"waiting"` — quote-bars, not spot-bars, decides whether a minute exists at all, per the
+"No forward-fill" rule below. The ladder renders with every strike, every quote and every
+computed figure exactly as it would with spot present; only the two fields sourced from
+this fourth table are `null`, and `web/components/ChainLadder.tsx`'s `inTheMoney` guard
+renders that as no highlight on either side — never a wash at zero. `engine/tests/test_historical.py::test_spot_is_null_when_table_d_has_nothing_for_this_minute`
+pins the response; `web/tests/moneyness.test.ts` pins the render.
 
 ## No forward-fill
 
