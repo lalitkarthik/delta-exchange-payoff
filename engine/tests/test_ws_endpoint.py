@@ -188,7 +188,10 @@ def test_two_browsers_get_their_own_stream(live_stream) -> None:
 def test_the_rest_endpoints_still_work(live_stream) -> None:
     """Adding a live path must not disturb the one the fixtures and tests rely on."""
     client = TestClient(app)
-    assert client.get("/health").json() == {"status": "ok"}
+    # **The old shape, preserved as one field.** #39 grew this route from a liveness
+    # ping into a report, and the one thing it must not do is break a reader of the
+    # field it used to be.
+    assert client.get("/health").json()["status"] == "ok"
 
 
 def test_the_push_interval_cannot_be_driven_below_its_floor(live_stream) -> None:

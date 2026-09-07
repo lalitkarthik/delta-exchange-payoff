@@ -167,30 +167,31 @@ def test_symbols_registered_before_connecting_are_not_lost() -> None:
 # --- reconnecting ----------------------------------------------------------------
 
 
-def test_a_dropped_connection_resubscribes_everything() -> None:
+def test_the_registry_is_replayed_on_every_open() -> None:
     """The failure that produces no error: reconnect, receive nothing, notice hours later.
 
-    The first socket drops after its scripted frames. The second must be sent the same
-    complete registry — not a subset, and not nothing.
+    A reconnected socket is a fresh, empty socket and Delta has forgotten every
+    subscription. This is the socket owner's half of the guard — **every connection it
+    opens is sent the complete registry** — and it is now the whole of its half, because
+    #39 moved the decision to open a second one to the controller. That the controller
+    does open one, and that the replay it produces is complete, is
+    `test_controller.py::test_a_dropped_connection_is_redialled_and_resubscribed`.
     """
     first = FakeSocket([ticker_frame(CHAIN[0], 579, 584)], close_after=0)
-    second = FakeSocket([])
-    feed = DeltaFeed(
-        FanOut(), connect=connector([first, second]), retry_delay=0.01
-    )
+    feed = DeltaFeed(FanOut(), connect=connector([first]))
     feed.subscribe("ticker", CHAIN)
     feed.subscribe("ob_l2", CHAIN)
 
     asyncio.run(drive(feed, seconds=0.3))
 
-    resent = [
+    sent = [
         entry
-        for message in second.sent
+        for message in first.sent
         if message.get("type") == "subscribe"
         for entry in message["payload"]["channels"]
     ]
-    assert {c["name"] for c in resent} == {"ticker", "ob_l2"}
-    for channel in resent:
+    assert {c["name"] for c in sent} == {"ticker", "ob_l2"}
+    for channel in sent:
         assert sorted(channel["symbols"]) == sorted(CHAIN)
 
 
@@ -199,7 +200,7 @@ def test_the_registry_survives_the_drop_that_caused_the_reconnect() -> None:
     not per message: a message-keyed registry replays a whole batch when one symbol in
     it is rejected."""
     first = FakeSocket([], close_after=0)
-    feed = DeltaFeed(FanOut(), connect=connector([first]), retry_delay=0.01)
+    feed = DeltaFeed(FanOut(), connect=connector([first]))
     feed.subscribe("ticker", CHAIN)
 
     asyncio.run(drive(feed, seconds=0.2))
@@ -207,23 +208,10 @@ def test_the_registry_survives_the_drop_that_caused_the_reconnect() -> None:
     assert feed.registry["ticker"] == set(CHAIN)
 
 
-def test_the_retry_budget_resets_after_a_healthy_connection() -> None:
-    """A cumulative retry counter looks correct and dies after a month.
-
-    OpenAlgo records the bug in a comment: a long-lived feed that reconnects once a day
-    silently exhausts a lifetime budget and never comes back. A connection that came up
-    and delivered data has proved the endpoint works, so the budget is restored.
-    """
-    healthy = FakeSocket([ticker_frame(CHAIN[0], 579, 584)], close_after=0)
-    feed = DeltaFeed(
-        FanOut(), connect=connector([healthy]), retry_delay=0.01, max_retries=2
-    )
-    feed.subscribe("ticker", CHAIN)
-
-    asyncio.run(drive(feed, seconds=0.2))
-
-    assert feed.connections >= 2
-    assert feed.consecutive_failures == 0
+# The lifetime reconnect budget, the backoff and the giving up moved to the controller
+# in #39, and their tests moved with them: `test_controller.py`, section "the reconnect
+# that moved here from the feed". What is left in this file is one connection's worth of
+# behaviour, which is all this module does now.
 
 
 # --- heartbeats ------------------------------------------------------------------
@@ -330,7 +318,7 @@ def _feed_factory(connect):
     """Build the real `DeltaFeed` over a scripted connection, for the adapter to own."""
 
     def factory(sink, **kwargs):
-        return DeltaFeed(sink, connect=connect, retry_delay=0.01, **kwargs)
+        return DeltaFeed(sink, connect=connect, **kwargs)
 
     return factory
 
@@ -384,20 +372,20 @@ def test_an_unknown_channel_is_refused_before_the_socket_opens() -> None:
         feed.subscribe("v2/ticker", CHAIN)
 
 
-def test_a_connection_that_dies_before_delivering_anything_is_a_failure() -> None:
+def test_a_connection_that_dies_before_delivering_anything_says_so() -> None:
     """A budget that always resets is as broken as one that never does.
 
     Delta can accept the handshake and close straight away — a rejected subscribe, a
     throttled IP, an endpoint draining. If merely opening a socket counted as healthy,
-    the retry budget would reset on every pass and `run()` would reconnect forever:
-    **measured at 21 attempts in 0.3 s with `max_retries=3`** before this was fixed. At
-    the production one-second delay that exhausts the 150-connections-per-5-minutes
-    budget in about two and a half minutes and keeps hammering.
+    the retry budget would reset on every pass and the feed would reconnect forever:
+    **measured at 21 attempts in 0.3 s with a budget of 3** before that was fixed.
 
-    So a connection counts as healthy only once it has delivered a message. That is what
-    the module docstring always claimed and what the code did not do.
+    Since #39 the budget is the controller's, so what this module owes it is the *fact*
+    it decides on: an attempt that opened and delivered nothing must leave `last_error`
+    set, and one that delivered must clear it. Get that wrong and the controller
+    restores a budget that was never earned, which is the same forever-reconnecting bug
+    one layer up.
     """
-    attempts = 0
 
     class DeadOnArrival:
         async def send(self, raw):
@@ -415,23 +403,34 @@ def test_a_connection_that_dies_before_delivering_anything_is_a_failure() -> Non
         async def __aexit__(self, *_):
             return False
 
-    def connect(url):
-        nonlocal attempts
-        attempts += 1
-        return DeadOnArrival()
-
     async def scenario():
-        feed = DeltaFeed(
-            FanOut(), connect=connect, retry_delay=0.001, max_retries=3
-        )
+        feed = DeltaFeed(FanOut(), connect=lambda url: DeadOnArrival())
         feed.subscribe("ticker", CHAIN)
         await asyncio.wait_for(feed.run(), timeout=2.0)
         return feed
 
     feed = asyncio.run(scenario())
 
-    assert feed.consecutive_failures > feed.max_retries
-    assert attempts <= feed.max_retries + 2, f"{attempts} attempts; it never gave up"
+    assert feed.connections == 1, "one call to run() is one connection since #39"
+    assert feed.messages == 0
+    assert feed.last_error is not None, (
+        "an attempt that delivered nothing must not look like a healthy one"
+    )
+
+
+def test_a_connection_that_delivered_clears_the_error_that_would_spend_the_budget() -> (
+    None
+):
+    """The other half. `last_error` back to `None` is how the controller is told this
+    endpoint works, and it is what restores the lifetime budget."""
+    socket = FakeSocket([ticker_frame(CHAIN[0], 579, 584)], close_after=0)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
+    feed.subscribe("ticker", CHAIN)
+
+    asyncio.run(drive(feed, seconds=0.2))
+
+    assert feed.messages == 1
+    assert feed.last_error is None
 
 
 def test_the_reason_a_connection_ended_is_recorded() -> None:
@@ -459,9 +458,7 @@ def test_the_reason_a_connection_ended_is_recorded() -> None:
             return False
 
     async def scenario():
-        feed = DeltaFeed(
-            FanOut(), connect=lambda url: Broken(), retry_delay=0.001, max_retries=1
-        )
+        feed = DeltaFeed(FanOut(), connect=lambda url: Broken())
         feed.subscribe("ticker", CHAIN)
         await asyncio.wait_for(feed.run(), timeout=2.0)
         return feed
@@ -499,7 +496,7 @@ def test_open_is_reported_only_after_the_registry_has_gone_out() -> None:
 def test_a_dropped_connection_is_reported_with_the_venues_words() -> None:
     closed: list[str] = []
     socket = FakeSocket([], close_after=0)
-    feed = DeltaFeed(FanOut(), connect=connector([socket]), retry_delay=0.01)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
     feed.on_close(closed.append)
 
     asyncio.run(drive(feed))
@@ -517,7 +514,7 @@ def test_a_dial_that_never_opened_is_reported_too() -> None:
     def refuse(_url):
         raise OSError("no route to host")
 
-    feed = DeltaFeed(FanOut(), connect=refuse, retry_delay=0.01)
+    feed = DeltaFeed(FanOut(), connect=refuse)
     feed.on_open(opened.append)
     feed.on_close(closed.append)
 
@@ -594,7 +591,7 @@ def test_an_open_with_nothing_subscribed_is_not_announced_as_open() -> None:
     """
     opened: list[str] = []
     socket = FakeSocket([], close_after=0)
-    feed = DeltaFeed(FanOut(), connect=connector([socket]), retry_delay=0.01)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
     feed.on_open(opened.append)
 
     asyncio.run(drive(feed))
@@ -609,7 +606,7 @@ def test_an_open_with_something_subscribed_is_announced_as_before() -> None:
     and reports the open, which is every real connection."""
     opened: list[str] = []
     socket = FakeSocket([], close_after=0)
-    feed = DeltaFeed(FanOut(), connect=connector([socket]), retry_delay=0.01)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
     feed.subscribe("ob_l2", CHAIN)
     feed.on_open(opened.append)
 
