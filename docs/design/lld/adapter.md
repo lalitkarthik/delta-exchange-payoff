@@ -109,7 +109,7 @@ All `measured` from the 2026-09-03 captures, in this session's decode pass. Tags
   there. Absent stays absent: a zero would read as "it last traded at zero".
 - **Two ticker body fields reach no event**: `pb`, the price band, and `m24hc`. Recorded
   so the next reader knows they were seen and skipped rather than overlooked.
-- **The decode is not the hot path**: `derived` 1.3% of one core at the live rates.
+- **The decode is not the hot path**: `derived` 1.3% of one core, most of it pre-existing.
 
 ## 6. The shim, and the four fields it exists for
 
@@ -195,5 +195,5 @@ shim, red-green verified by removing it.
 | One distinct `sp` across all 136 ticker frames; `tick_size` absent on 136/136 | `measured` | same capture |
 | 11 of 136 contracts at exactly zero open interest; 16 of 136 never traded | `measured` | same capture |
 | Decode 30.6 µs per book frame, 43.6 µs per ticker frame | `measured` | 20 passes over the captures, this session |
-| ≈1.3% of one core to decode the live BTC feed | `derived` | the two above against `docs/ingestion.md`'s 267.7 and 117.6 msg/s |
+| ≈1.3% of one core to decode the live BTC feed — 4.9% against the contested higher rate in `hld.md` §5. The wire decode inside it already ran in the socket reader before #36; only the event construction is new | `derived` | the two above against `docs/ingestion.md`'s 267.7 and 117.6 msg/s |
 | Live: `/health` ok, `/ws/chain` a 21-row ladder after 5 `waiting` messages (spot 79634.8, forward 79642.12, 42 legs with our IV), 4 Parquet files at 412,100 bytes, 7,385 rows written | `measured` | engine run 2026-09-07T13:24:41Z, 410 s, BTC only |

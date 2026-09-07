@@ -440,6 +440,42 @@ def test_the_delta_adapter_satisfies_the_protocol() -> None:
     assert isinstance(adapter(), Adapter)
 
 
+def test_the_protocol_check_can_actually_fail() -> None:
+    """**The conformance test above is worth nothing unless this one holds.**
+
+    `events/bus.py` records writing `class FanOut(Bus)` and reverting it, because
+    `isinstance` against a nominal subclass is `True` whatever the class contains — the
+    check becomes unfalsifiable and a missing method starts returning `None` silently.
+    This asserts the structural check still discriminates: drop one member and it fails.
+    """
+
+    class MissingStream:
+        venue = "X"
+        underlyings = ()
+
+        async def instruments(self, underlying):
+            return []
+
+        def subscribe(self, instruments):
+            return None
+
+        def stop(self):
+            return None
+
+        async def expiries(self, underlying):
+            return None
+
+        async def chain_snapshot(self, underlying, expiry):
+            return None
+
+    class Complete(MissingStream):
+        async def stream(self, publish):
+            return None
+
+    assert not isinstance(MissingStream(), Adapter)
+    assert isinstance(Complete(), Adapter)
+
+
 def test_the_adapter_describes_itself() -> None:
     """The recorded set is configuration, read at start-up. BTC alone for now: ETH is
     #43 and the cost of adding it has not been measured."""
@@ -546,6 +582,33 @@ def test_the_sink_publishes_events_and_feeds_the_shim() -> None:
         (TICKER_CHANNEL, "C-BTC-77600-040926", 579.0, 584.0),
     ]
     assert delta.emitted == 3
+
+
+def test_the_event_and_the_old_record_agree_on_an_absent_price() -> None:
+    """**Two forms of one fact must not disagree**, which is the whole discipline of an
+    expand–contract pair. Handing the shim the raw decode while the event got the
+    non-finite guard would produce an `md.option_quote` saying the bid is absent and a
+    `Quote` saying it is `NaN`, from the same frame, in the same instant.
+    """
+
+    class _Bridge:
+        def __init__(self) -> None:
+            self.seen: list[tuple] = []
+
+        def republish(self, message, *, bid, ask) -> None:
+            self.seen.append((bid, ask))
+
+    bridge = _Bridge()
+    delta = adapter(legacy=bridge)
+    published: list = []
+    delta._publish = published.append
+
+    frame = book_frame("C-BTC-77600-040926")
+    frame["b"] = [[float("nan"), "10"]]
+    delta.feed.sink.publish(_message(BOOK_CHANNEL, frame))
+
+    assert published[0].bid is None
+    assert bridge.seen == [(None, 125.0)], "the old record kept a NaN the event refused"
 
 
 def test_a_malformed_frame_reaches_neither_the_shim_nor_the_bus() -> None:
