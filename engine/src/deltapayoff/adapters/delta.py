@@ -313,9 +313,10 @@ class DeltaAdapter:
             self.undecodable += 1
             if self.undecodable == 1:
                 # **The first one only.** A systematic decode bug would otherwise zero
-                # the whole event stream while `feed.messages` kept climbing, and
-                # `undecodable` is not on `/health` until #39 — a silent failure with a
-                # counter nobody reads. Logging every frame would flood at 1,323 msg/s,
+                # the whole event stream while `feed.messages` kept climbing. **#39 put
+                # this counter on `/health`**, beside `empty_opens`, so it is a silent
+                # failure with a reader now. Logging every frame would flood at 1,323
+                # msg/s,
                 # so the first says what happened and the counter carries the rest.
                 logger.warning(
                     "the first undecodable %s frame for %r; the count carries the rest",

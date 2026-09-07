@@ -287,6 +287,12 @@ class AdapterHealth(BaseModel):
     #: deliver nothing, which is the failure with no error. `null` when the adapter has
     #: no socket owner to ask, because an absent count is not a count of zero.
     empty_opens: int | None = None
+    #: Frames that parsed as JSON and then made no sense to the decoder. `delta.py` logs
+    #: the first and counts the rest, and its comment says why this belongs here: a
+    #: systematic decode bug zeroes the event stream while the message counter keeps
+    #: climbing, which is a silent failure with a counter nobody reads. `null` when the
+    #: adapter does not decode anything of its own.
+    undecodable: int | None = None
 
 
 class HealthReport(BaseModel):

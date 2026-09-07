@@ -195,23 +195,23 @@ def _adapter_health(controller: ConnectionController, now: datetime) -> AdapterH
         reconnects=controller.reconnects,
         budget_remaining=controller.budget_remaining,
         transitions=controller.transitions,
-        empty_opens=_empty_opens(controller.adapter),
+        empty_opens=_counter(getattr(controller.adapter, "feed", None), "empty_opens"),
+        undecodable=_counter(controller.adapter, "undecodable"),
     )
 
 
-def _empty_opens(adapter: Adapter) -> int | None:
-    """Sockets that opened with nothing subscribed, if this adapter counts them.
+def _counter(source: object, name: str) -> int | None:
+    """One of an adapter's silent-failure counters, or `None` if it keeps none.
 
-    **`None` rather than `0` when the adapter has no socket owner to ask**, which is
-    every adapter that is not Delta's and every fake. A zero here would say "no empty
-    opens have happened", and the rule this repo keeps everywhere is that an absent
-    number is `null` and a real zero is `0` — the difference matters more for this
-    counter than most, because a counter stuck above zero is the entire signal that
-    nobody subscribed anything.
+    **`None` rather than `0` when there is nothing to ask**, which is every adapter that
+    is not Delta's and every fake. A zero would say "this has not happened", and the rule
+    this repo keeps everywhere is that an absent number is `null` and a real zero is `0`.
+    The difference matters more for these two than most: each is a counter whose entire
+    signal is being **above** zero, so a reader watching for that must be able to tell
+    "still nought" from "nobody is counting".
     """
-    feed = getattr(adapter, "feed", None)
-    empty = getattr(feed, "empty_opens", None)
-    return empty if isinstance(empty, int) else None
+    value = getattr(source, name, None)
+    return value if isinstance(value, int) else None
 
 
 def _report_finished_controller(task: asyncio.Task) -> None:
