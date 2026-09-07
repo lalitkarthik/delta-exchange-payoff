@@ -1171,3 +1171,38 @@ def test_a_silence_the_venue_never_closed_is_not_redialled() -> None:
 
     assert adapter.connections == 1
     assert moves(published)[-1] == (60.0, "reconnecting", "stopped", "stopped")
+
+
+def test_a_socket_that_dies_after_going_silent_still_spends_the_budget() -> None:
+    """**A drop is a drop, whatever state the machine was already in.**
+
+    The staleness watchdog can reach `reconnecting` on its own, over a socket the venue
+    has not closed yet. When that socket then really does die, the close arrives at a
+    machine already in `reconnecting` — and a budget spent only on the *transition* would
+    not be spent at all. That is an unbounded reconnect loop in exactly the case the
+    budget exists for: a connection that goes quiet and dies, over and over, spending a
+    venue's connection allowance with a full budget on the books the whole time.
+    """
+    clock = FakeClock()
+    published: list = []
+    controller = ConnectionController(
+        ScriptedAdapter(),
+        published.append,
+        clock=clock.read,
+        degraded_after=15.0,
+        reconnect_after=45.0,
+        heartbeat_every=1_000.0,
+        reconnect_budget=2,
+    )
+    controller.start()
+    controller.connection_opened()
+    controller.message_arrived()
+
+    clock.now = 60.0
+    controller.poll()
+    assert controller.state is ConnectionState.RECONNECTING, "the silence, not the close"
+
+    controller.connection_closed("1006")
+
+    assert controller.reconnects == 1
+    assert controller.budget_remaining == 1, "the drop was free"

@@ -415,9 +415,16 @@ class ConnectionController:
         table for exactly this, with one `alert` and one error-level log beside it.
         """
         self._socket_closed = True
-        if self._state is None or self._state in (State.STOPPED, State.RECONNECTING):
+        if self._state is None or self._state is State.STOPPED:
             return
-        self.transition(State.RECONNECTING, REASON_CLOSED, detail)
+        # **The budget is spent on the drop, not on the transition**, and the two are not
+        # the same event. The staleness watchdog reaches `reconnecting` on its own, over
+        # a socket the venue has not closed yet; when that socket then really dies, the
+        # close arrives at a machine already in `reconnecting`. Counting only the
+        # transition made that drop free — an unbounded reconnect loop in precisely the
+        # case the budget exists for, with a full budget on the books throughout.
+        if self._state is not State.RECONNECTING:
+            self.transition(State.RECONNECTING, REASON_CLOSED, detail)
         self.reconnects += 1
         self._spend_reconnect(detail)
 
