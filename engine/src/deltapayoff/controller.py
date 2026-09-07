@@ -235,6 +235,18 @@ class ConnectionController:
         #: `None` until the first poll. That poll beats whenever it comes — under
         #: `run()`, one `poll_seconds` after the start rather than at the instant of it.
         self._last_beat_at: float | None = None
+        #: When the current **dial attempt** began, on the monotonic clock. The third
+        #: thing staleness can be measured from, and new in the review of #39.
+        #:
+        #: `_opened_at` gives a reopened socket its own grace; this gives the *attempt*
+        #: its own grace, and it is needed for the same reason one step earlier. Since
+        #: #39 `reconnecting -> connecting` is announced when a dial begins, so
+        #: `connecting` is now reachable without a socket ever existing — under #38 it
+        #: was only ever entered by `connection_opened`, which sets `_opened_at`. Without
+        #: this, every announced attempt in an outage longer than `reconnect_after` was
+        #: demoted with reason `silent` on the very next poll, and raised an alert about
+        #: a socket that was never open. See `_attempt_forever`.
+        self._attempt_at: float | None = None
 
         #: Transitions since construction, for `/health` in #39.
         self.transitions = 0
@@ -341,6 +353,7 @@ class ConnectionController:
         reason = REASON_RESUME if self._state is State.STOPPED else REASON_START
         self._last_message_at = None
         self._opened_at = None
+        self._attempt_at = None
         # A controller `run()` detached on its way out is deaf until it is put back, and
         # a resumed connection that never heard its socket open would sit in
         # `connecting` until the staleness bound moved it. #41's resume is the caller.
@@ -518,6 +531,13 @@ class ConnectionController:
             since = self._entered_at
         if self._opened_at is not None and self._opened_at > since:
             since = self._opened_at
+        # And an **attempt** that has not opened yet is younger still. A dial in flight
+        # is measured from when it was dialled, not from a socket that is already gone;
+        # otherwise every announced redial past `reconnect_after` is called silent on the
+        # next poll. The heartbeat's age is untouched, as above — that one is the venue's
+        # own silence and stays true across the whole outage.
+        if self._attempt_at is not None and self._attempt_at > since:
+            since = self._attempt_at
         age = now - since
         if age >= self.reconnect_after:
             detail = f"{age:.1f}s silent"
@@ -650,6 +670,10 @@ class ConnectionController:
             if self._state is State.STOPPED:
                 return
             if self._state is State.RECONNECTING:
+                # **The attempt gets its own grace.** Set before the transition, because
+                # the transition publishes and a consumer that polls on the way through
+                # must not see the attempt measured against the socket it replaced.
+                self._attempt_at = self._clock()
                 # **Emitted when the attempt begins, not when it succeeds.** #38 could
                 # only move here at the instant a socket opened, because it did not own
                 # the dial; a badge that showed `reconnecting` for the whole of a

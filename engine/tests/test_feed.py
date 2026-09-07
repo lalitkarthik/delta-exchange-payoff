@@ -614,3 +614,67 @@ def test_an_open_with_something_subscribed_is_announced_as_before() -> None:
 
     assert opened
     assert feed.empty_opens == 0
+
+
+def test_a_close_says_the_socket_delivered_nothing_because_that_is_the_diagnosis() -> (
+    None
+):
+    """**The most diagnostic thing this module knows, told to nobody.**
+
+    "Connected but closed without delivering a message" is the whole
+    healthy-socket-zero-messages failure in one sentence, and it is the fact the budget
+    rule turns on: Delta accepting a handshake and closing straight away — a rejected
+    subscribe, a throttled IP, an endpoint draining — is not a working endpoint. The
+    module computed that sentence *after* it had already told its close listeners, so
+    what the controller heard was the transport error alone: `ConnectionResetError`,
+    which is what a healthy socket dropping in a storm also says. Two very different
+    incidents, one indistinguishable close detail.
+
+    The second attempt is the point. `last_error` is instance state that survives across
+    `run()` calls, and neither `last_error` test drives more than one attempt, so nothing
+    pinned what a *later* close is told.
+    """
+    delivered_then_reset = FakeSocket([ticker_frame(CHAIN[0], 579, 584)], close_after=0)
+
+    class OpensAndSaysNothing:
+        async def send(self, raw):
+            pass
+
+        async def recv(self):
+            raise ConnectionResetError("closed straight away")
+
+        async def ping(self):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+    async def scenario():
+        closes: list[str] = []
+        attempts = {"n": 0}
+
+        def connect(url):
+            attempts["n"] += 1
+            return delivered_then_reset if attempts["n"] == 1 else OpensAndSaysNothing()
+
+        feed = DeltaFeed(FanOut(), connect=connect)
+        feed.on_close(closes.append)
+        feed.subscribe("ticker", CHAIN)
+        await asyncio.wait_for(feed.run(), timeout=2.0)
+        await asyncio.wait_for(feed.run(), timeout=2.0)
+        return feed, closes
+
+    feed, closes = asyncio.run(scenario())
+
+    assert len(closes) == 2
+    assert feed.messages == 1, "only the first attempt delivered"
+    # The first attempt delivered, so its close is an ordinary drop and says so.
+    assert "without delivering" not in closes[0]
+    # The second opened and delivered nothing, which is the diagnosis.
+    assert "without delivering a message" in closes[1], (
+        "the close listener was told only the transport error, which a healthy socket "
+        f"dropping in a storm also reports: {closes[1]!r}"
+    )

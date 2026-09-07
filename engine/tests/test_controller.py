@@ -1206,3 +1206,100 @@ def test_a_socket_that_dies_after_going_silent_still_spends_the_budget() -> None
 
     assert controller.reconnects == 1
     assert controller.budget_remaining == 1, "the drop was free"
+
+
+def test_an_announced_redial_is_not_immediately_called_silent() -> None:
+    """**The flood #39 introduced, and the reason `_opened_at` exists pointed one step
+    earlier.**
+
+    `_attempt_forever` announces `reconnecting -> connecting` when a dial *begins*, which
+    is new in #39 — under #38 `connecting` was only ever entered by `connection_opened`,
+    and that sets `_opened_at`. Nothing rebased the staleness clock on the announcement,
+    and `_check_staleness` includes `connecting` and measures from the last message or
+    the last open, both of which are from before the drop.
+
+    So in any outage longer than `reconnect_after` every single attempt was announced and
+    then, on the very next poll, demoted with reason `silent` — and an
+    `ALERT_CONNECTION_SILENT` was raised about a socket that does not exist. Once per
+    attempt, for the whole outage: roughly five or six extra alerts and a dozen extra
+    transitions in a ten-minute one, inflating `transitions` on `/health` and flipping
+    #40's badge back within a second of each try.
+
+    It is the same family as the flap #38 fixed, and it contradicts `controller.md`'s own
+    rule that alerts must not flood during the incident an operator is watching.
+
+    Scripted as one socket that delivers a frame and closes, and an endpoint that refuses
+    every dial after it — so every `connecting` here is an announcement and none of them
+    is a socket.
+    """
+    first = FakeSocket([ticker_frame(SYMBOL, 579, 584)], close_after=0)
+
+    class HangingDial:
+        """A dial that takes time and then fails, which is what an outage looks like.
+
+        `websockets.connect` carries a 20 s `open_timeout`, so an attempt against a dead
+        endpoint occupies `connecting` for many polls. A fake that refuses *instantly*
+        returns to `reconnecting` before the next poll can see it and hides this bug
+        completely — which is exactly what the first draft of this test did.
+
+        The hang is **shorter than `reconnect_after` and longer than `poll_seconds`**,
+        which is the real ratio: the production dial gives up at 20 s and the bound is
+        45 s, so a dial in flight can never legitimately outlive the bound. Scripting a
+        hang longer than the bound would test something else — a dial the machine is
+        entitled to call silent.
+        """
+
+        async def __aenter__(self):
+            await asyncio.sleep(0.025)
+            raise ConnectionRefusedError("the endpoint is down")
+
+        async def __aexit__(self, *_):
+            return False
+
+    def connect(url):
+        return HangingDial() if first.closed else first
+
+    adapter = _delta_over(connect)
+    published: list = []
+    controller = ConnectionController(
+        adapter,
+        published.append,
+        retry_delay=0.01,
+        degraded_after=0.02,
+        reconnect_after=0.05,
+        poll_seconds=0.005,
+        heartbeat_every=1_000.0,
+    )
+
+    asyncio.run(_drive(controller, seconds=0.5))
+
+    announced = [
+        event
+        for event in published
+        if isinstance(event, FeedConnection)
+        and event.to_state is ConnectionState.CONNECTING
+        and event.reason == "backoff"
+    ]
+    assert announced, "the outage produced no announced redial, so this proves nothing"
+
+    demoted = [
+        event
+        for event in published
+        if isinstance(event, FeedConnection)
+        and event.from_state is ConnectionState.CONNECTING
+        and event.reason == "silent"
+    ]
+    assert demoted == [], (
+        f"{len(demoted)} announced attempts were called silent on the next poll, for a "
+        "socket that was never open"
+    )
+
+    alerts = [
+        event
+        for event in published
+        if isinstance(event, Alert) and event.code == "connection_silent"
+    ]
+    assert alerts == [], (
+        f"{len(alerts)} silence alerts fired during one outage — an alert per redial is "
+        "the flood an alert exists to stand out from"
+    )
