@@ -1290,6 +1290,34 @@ class BarWriter:
         }
 
 
+# --- shared by every read path that unions disk and buffer ----------------------------
+
+
+def scan_and_pending(store: BarStore, clause: pl.Expr) -> pl.LazyFrame:
+    """Disk **and** buffer, filtered by the same clause, unioned.
+
+    **The union is the point, not a convenience.** The store flushes every five minutes,
+    so a parquet-only read hands a reader a right edge up to a full flush interval
+    behind what the store actually holds — `measured` one session at 07:38Z flushed
+    against a clock of 08:05Z, a 27-minute hole (`smile.py`'s own docstring). Every read
+    path that wants "everything this store holds matching X" was writing this
+    three-line concatenation itself — `historical._union`, `contract_bars._rows` and
+    `smile._rows` all had their own copy — which is exactly how the union silently stops
+    happening in a fourth one some ticket writes without noticing the first three had a
+    pattern.
+
+    `smile._rows`'s own version additionally widens categorical columns to strings
+    before concatenating; that extra step is not folded in here; `vertical_relaxed`
+    already tolerates the dtype mismatch it existed to smooth over on every path that
+    does not need the widening for some other reason, and `smile.py` is left reading as
+    it always has rather than being touched by a ticket that does not own it.
+    """
+    return pl.concat(
+        [source.filter(clause) for source in (store.scan(), store.pending())],
+        how="vertical_relaxed",
+    )
+
+
 # --- the read path for the volatility screen ----------------------------------------
 
 
