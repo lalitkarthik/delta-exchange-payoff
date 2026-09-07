@@ -18,9 +18,9 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from deltapayoff.feed import Quote
 from deltapayoff.main import MIN_PUSH_INTERVAL_SECONDS, app, get_chain_stream
 from deltapayoff.stream import ChainStream
+from fakes.decoder import events_from_frame
 
 EXPIRY = "04-09-2026"
 
@@ -45,6 +45,12 @@ def ticker(symbol, bid, ask):
     }
 
 
+def feed(stream, symbol, bid, ask):
+    """One frame through the real decoder, and every event it produced into the cache."""
+    for event in events_from_frame("ticker", ticker(symbol, bid, ask)):
+        stream.apply(event)
+
+
 @pytest.fixture
 def live_stream():
     """A stream primed with two contracts, wired in place of the real feed."""
@@ -53,14 +59,7 @@ def live_stream():
         ("C-BTC-77600-040926", 579, 584),
         ("P-BTC-77600-040926", 120, 125),
     ):
-        stream.apply(
-            Quote(
-                symbol=symbol,
-                channel="ticker",
-                received_at=0.0,
-                frame=ticker(symbol, bid, ask),
-            )
-        )
+        feed(stream, symbol, bid, ask)
     app.dependency_overrides[get_chain_stream] = lambda: stream
     yield stream
     app.dependency_overrides.clear()
@@ -123,14 +122,7 @@ def test_updates_keep_arriving_and_carry_the_newest_prices(live_stream) -> None:
     ) as socket:
         first = json.loads(socket.receive_text())["data"]
 
-        live_stream.apply(
-            Quote(
-                symbol="C-BTC-77600-040926",
-                channel="ticker",
-                received_at=0.0,
-                frame=ticker("C-BTC-77600-040926", 601, 607),
-            )
-        )
+        feed(live_stream, "C-BTC-77600-040926", 601, 607)
         second = json.loads(socket.receive_text())["data"]
 
     assert first["rows"][0]["call"]["bid"] == 579.0

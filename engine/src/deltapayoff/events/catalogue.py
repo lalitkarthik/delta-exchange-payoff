@@ -6,10 +6,11 @@ headings and asserts this registry matches, so neither can move without the othe
 
 Field spellings are **the browser contract's**, `docs/chain-contract.md` and `models.Leg`
 — `mark`, `oi`, `oi_value_usd`, `oi_change_usd_6h`, `tick_size`,
-`bid_iv`/`ask_iv`/`mark_iv`, `iv`/`iv_leg`/`iv_reason` — so that #37 wires producers to
-consumers without renaming anything. **The store spells three of the same quantities
-differently** and is not being followed here: `oi_contracts`, `ltp_*` and `mark_*` in
-`store.py`'s `REFERENCE_SCHEMA`. #37 owns that translation and it is one place, not four.
+`bid_iv`/`ask_iv`/`mark_iv`, `iv`/`iv_leg`/`iv_reason` — so that a producer wires to the
+browser without renaming anything. **The store spells several of the same quantities
+differently** and is not followed here: `oi_contracts`, `ltp_*` and `venue_*` in
+`store.py`'s `REFERENCE_SCHEMA`. That translation is `bars.samples_from_reference`, one
+place and not four, and `docs/design/lld/store.md` tables it column by column.
 
 **`null` is not `0`, and that is the adapter's boundary to hold, not this module's.**
 Every price and size here is nullable so the distinction *can* be carried: an absent quote
@@ -67,21 +68,44 @@ class OptionQuote(Event):
     bid_size: float | None = None
     ask: float | None = None
     ask_size: float | None = None
+    #: The venue's own last-trade stamp on the book frame, as the venue gave it. **Carried
+    #: and never bucketed on**: `ts_venue` alone decides which minute a tick belongs to,
+    #: and this travels to the quote bars' `last_lts` column deciding nothing. Added by
+    #: #37 with `schema_version` left at 1, which `docs/design/events.md` calls a
+    #: compatible change.
+    lts: datetime | None = None
 
 
 @register
 class OptionReference(Event):
-    """`md.option_reference` — the venue's own view of a contract, from its ticker.
+    """`md.option_reference` — the venue's own view of a contract.
 
     **Reference columns, never inputs.** Nothing computes on them;
     `tests/test_no_delta_inputs.py` pins that and must keep passing with this event in
     place. `oi` is contracts and `oi_value_usd` is a notional: different quantities, and
-    the ticker channel carries only the first.
+    this event carries only the first.
     """
 
     type: Literal["md.option_reference"] = "md.option_reference"
+    #: The venue's numeric id for this contract. Not an opinion and not a price — it is
+    #: carried because it reaches the browser as `models.Leg.product_id`.
+    product_id: int | None = None
     mark: float | None = None
     last_price: float | None = None
+    #: Traded value over the venue's rolling window, for the reference bars' `turnover`
+    #: column. `null` for a contract that has never traded, never `0`.
+    turnover: float | None = None
+    #: **The venue's own top of book, as its slower channel reports it.** The same
+    #: quantity `md.option_quote` carries, observed on the channel that carries
+    #: everything else here — `measured` 5,001 ms against the book's 508 ms. It is the
+    #: **fallback quote** for a contract whose book stays silent for a whole minute, and
+    #: a consumer holding both takes the book's **wholesale** rather than merging them.
+    #:
+    #: This is a quote and not a reference column: `test_no_delta_inputs.py`'s rule is
+    #: about the venue's *opinions* — its IV, its greeks, its mark — and a bid is an
+    #: observed price, which is what every implied volatility in this project inverts.
+    bid: float | None = None
+    ask: float | None = None
     #: Open interest in **contracts**.
     oi: float | None = None
     #: Open interest as a **USD notional**. Absent rather than derived on the live path.
@@ -105,7 +129,7 @@ class OptionReference(Event):
 
 @register
 class IndexQuote(Event):
-    """`md.index_quote` — the underlying's spot, off the same ticker frames.
+    """`md.index_quote` — the underlying's spot, off the same frames as the reference.
 
     `instrument` is `null` and the payload names the underlying instead: spot is a
     property of BTC, not of the contract whose frame happened to carry it. Storing the

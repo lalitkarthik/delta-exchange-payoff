@@ -1,4 +1,11 @@
-"""The socket owner: one connection to Delta, decoded and fanned out.
+"""The socket owner: one connection to Delta, read and republished frame by frame.
+
+**Inside `adapters/` since #37, and that is the whole reason it moved.** `ob_l2` and
+`ticker` are Delta's words, and the acceptance test for retiring the old quote record is
+that they appear nowhere but the Delta adapter. The socket owner *is* part of knowing a
+venue — it subscribes by channel name — so it belongs in the package that owns one rather
+than beside the modules that must never learn one. Nothing about it changed in the move
+except the retirement of the `Quote` record it used to publish.
 
 Four jobs, and the third and fourth are where the real failures live.
 
@@ -33,10 +40,12 @@ symbol rather than per message for the reason OpenAlgo gives: a message-keyed re
 replays a whole batch when one symbol inside it is rejected.
 
 **Nothing here decodes anything, since #36.** This module used to turn a frame into a
-`Quote` by calling `wire`, which meant the venue's array offsets were read by the socket
-owner — so "the wire layout lives behind the adapter" was not true of the code. It now
+quote record by calling `wire`, which meant the venue's array offsets were read by the
+socket owner — so "the wire layout lives behind the adapter" was not true of the code. It
 publishes a `VenueMessage`: the frame verbatim, its channel, and the instant it arrived.
-`adapters.delta.DeltaAdapter` is the only thing that reads inside one.
+`adapters.delta.DeltaAdapter` is the only thing that reads inside one, and since #37 it is
+the only thing that reads one at all — the record that used to carry a frame past it, to
+the chain cache and the bar writer, is gone and those two take canonical events.
 
 That leaves this module with exactly the four jobs above and no knowledge of what Delta's
 payloads mean, which is what lets #38 lift it under a connection controller without
@@ -52,12 +61,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel
-
 PUBLIC_WS = "wss://public-socket.india.delta.exchange"
 
-#: Delta's two channel names. `bars.py` spells them again for its own `Tick.source`; the
-#: adapter reads them from here, because this is the module that subscribes to them.
+#: Delta's two channel names, and **the only place either string appears** outside the
+#: adapter's own dispatch. `bars.py` used to spell them again for its `Tick.source`; since
+#: #37 a tick's provenance is the event type it came from, so the venue's vocabulary stops
+#: at this package.
 TICKER_CHANNEL = "ticker"
 BOOK_CHANNEL = "ob_l2"
 
@@ -91,43 +100,6 @@ class VenueMessage:
     symbol: str
     frame: dict[str, Any]
     received_at: float
-
-
-class Quote(BaseModel):
-    """One contract's prices at one moment, from whichever channel carried them.
-
-    **Retired by #37.** Nothing produces this on the live path any more: the adapter
-    emits canonical events and `adapters.shim` rebuilds this record for the two consumers
-    that have not moved yet. It stays here, unchanged, because those consumers and their
-    tests are typed against it and this ticket is the expand half of an expand–contract.
-
-    A consumer should never have to know that the bid is `q[2]` on one channel and
-    `b[0][0]` on the other. `channel` travels with the record because the two refresh at
-    very different rates and a consumer may reasonably care which it is looking at.
-
-    `received_at` is a **wall clock** stamp, for #5 to store beside the quote. It is
-    deliberately not a latency clock: `time.time()` can step backwards under an NTP
-    correction, which would make `now - received_at` negative. Anything measuring elapsed
-    time uses `timing.time_it`, which is built on `perf_counter`. If #6 needs a monotonic
-    arrival stamp it should be a second field rather than a change of meaning here.
-    """
-
-    symbol: str
-    channel: str
-    bid: float | None = None
-    ask: float | None = None
-    received_at: float
-    #: The frame this came from, verbatim. Carried because the screen shows more than a
-    #: quote — mark, open interest, and Delta's Greeks and implied vols as reference
-    #: columns — and re-decoding downstream would duplicate `wire`'s array offsets in a
-    #: second place. Consumers that only want prices ignore it.
-    frame: dict[str, Any] | None = None
-
-    @property
-    def mid(self) -> float | None:
-        if self.bid is None or self.ask is None:
-            return None
-        return (self.bid + self.ask) / 2
 
 
 class DeltaFeed:

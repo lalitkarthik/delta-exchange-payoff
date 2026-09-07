@@ -118,17 +118,17 @@ nine failed alternatives where the fault is one unknown name.
 
 `schema_version` starts at `1` for every type and is **bumped when a field changes meaning,
 never when one is added with a default.** Adding an optional field is compatible: an old
-consumer ignores it, a new one reads it, and nothing that was true stops being true. Renaming
-a field, changing its units, or changing when it is `null` is not, and that is what a bump
-announces. The version is per type, so bumping `md.option_reference` leaves the other eight
-at `1`. Expect all nine to sit at `1` for a long time, because most changes are additions —
-a reader a year from now should take that as the rule working, not as nobody maintaining it.
+consumer ignores it, a new one reads it, and nothing true stops being true. Renaming a field,
+changing its units, or changing when it is `null` is not, and that is what a bump announces.
+The version is per type, so bumping one leaves the other eight at `1`. Expect all nine to sit
+at `1` for a long time: #37 added nine fields across two types and bumped nothing.
 
-**A consumer that receives a version it does not know must fail loudly rather than guess,
-and `parse_event` does not make that check.** It keys on `type`; the version is a payload
-fact and what counts as "known" belongs to the consumer, which is #37's to write. Today
-`parse_event` returns a `schema_version: 99` event happily. Named here rather than left to
-be discovered, because a gap nobody wrote down is a gap nobody closes.
+**A consumer receiving a version it does not know must fail loudly rather than guess**, and
+since #37 `parse_event` makes that check: `UnknownSchemaVersion`, naming the type and both
+versions, for anything but the integer the class declares. What counts as "known" is the
+consumer's business and there was no consumer when #35 landed. It is checked at **parse** and
+not at construction — a producer builds at the version it was compiled with, and "do I
+understand this?" only arises for a payload that crossed a boundary.
 
 Three units are fixed and are **not** a versioning matter, because changing one is a bug:
 IV is a decimal fraction on the wire and a percentage only on screen; every decimal is a
@@ -174,7 +174,7 @@ module whose imports are `asyncio` and nothing else.
 | `venue` or `underlying` contains `-` | `ValidationError` — it would break the canonical string's own inverse |
 | A price is `NaN` or `Infinity` | `ValidationError` — otherwise it serialises to `null` and reads as an absent quote |
 | `ChainStrike.iv` is `0` | `ValidationError` — a solved volatility of zero is not a thing |
-| A `schema_version` nobody knows | **Nothing.** Accepted; the check is the consumer's, and #37 owns it |
+| A `schema_version` nobody knows | `UnknownSchemaVersion` at parse, naming the type and both versions. Since #37 |
 
 ## 7. The seam the tests drive
 
