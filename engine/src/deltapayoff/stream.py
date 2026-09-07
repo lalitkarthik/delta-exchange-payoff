@@ -96,6 +96,9 @@ class ChainStream:
         #: contract**: spot is a property of BTC, not of the contract whose frame carried
         #: it, and the event says so by leaving `instrument` null.
         self._spot: dict[str, float] = {}
+        #: Underlying to the expiries this cache has seen contracts for. Kept so a spot
+        #: that moves can mark them dirty without walking every instrument; see `apply`.
+        self._expiries: dict[str, set[str]] = {}
         self._subscription = None
         self.applied = 0
         #: Bus records this cache makes nothing of — anything that is not one of the three
@@ -128,9 +131,32 @@ class ChainStream:
         underlying instead.
         """
         if isinstance(event, IndexQuote):
-            if event.spot is not None:
-                self._spot[event.underlying.upper()] = event.spot
-                self.applied += 1
+            if event.spot is None:
+                # An absent spot is not an observation of absence, and it is still a
+                # record this cache made nothing of.
+                self.skipped += 1
+                return
+            underlying = event.underlying.upper()
+            moved = self._spot.get(underlying) != event.spot
+            self._spot[underlying] = event.spot
+            self.applied += 1
+            if moved:
+                # **A spot that moves schedules work, and this is not optional.** Spot
+                # sets the ATM strike, the forward and therefore every implied volatility
+                # on the ladder, so an expiry left clean would keep serving a chain priced
+                # against the previous spot for as long as no contract of its own ticked.
+                # `md.index_quote` carries no instrument by design — it is a fact about
+                # the underlying — so nothing else marks it.
+                #
+                # **On change and not on arrival**, because this event now arrives once
+                # per reference frame (`derived` ~118 a second) while spot moves far less
+                # often. Marking on arrival would make every expiry dirty on every pass
+                # and burn a core reproducing numbers that had not changed, which is the
+                # thing the dirty set exists to prevent.
+                self.dirty.update(
+                    (underlying, expiry)
+                    for expiry in self._expiries.get(underlying, ())
+                )
             return
 
         if isinstance(event, OptionReference):
@@ -149,7 +175,9 @@ class ChainStream:
         key = instrument.canonical()
         target[key] = (instrument, event) if target is self._reference else event
         self.applied += 1
-        self.dirty.add(_pair(instrument))
+        pair = _pair(instrument)
+        self._expiries.setdefault(pair[0], set()).add(pair[1])
+        self.dirty.add(pair)
 
     async def run(self) -> None:
         """Drain the subscription forever. Cancel to stop."""

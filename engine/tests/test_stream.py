@@ -21,9 +21,13 @@ import math
 from datetime import datetime, timezone
 
 from deltapayoff.black76 import call_price, put_price
+from deltapayoff.events import IndexQuote
 from deltapayoff.fanout import FanOut
 from deltapayoff.stream import ChainStream
-from fakes.decoder import events_from_frame
+from fakes.decoder import ARRIVED_AT, events_from_frame
+
+#: An arrival stamp, aware, because the envelope refuses a naive one.
+ARRIVED = datetime.fromtimestamp(ARRIVED_AT, tz=timezone.utc)
 
 EXPIRY = "04-09-2026"
 OTHER_EXPIRY = "11-09-2026"
@@ -437,3 +441,74 @@ def test_the_offered_chains_are_a_snapshot_the_loop_cannot_change_underneath() -
     stream.recompute_dirty()
 
     assert len(held) == 1, "the sampler's snapshot grew under it"
+
+
+# --- spot, which belongs to no contract and moves every ladder ---------------------
+
+
+def index_quote(spot, underlying="BTC"):
+    """One `md.index_quote`, built by the real decoder off a reference frame."""
+    frame = ticker("C-BTC-77600-040926", 579, 584, spot=str(spot))
+    (quote,) = [
+        event
+        for event in events_from_frame("ticker", frame)
+        if type(event).__name__ == "IndexQuote"
+    ]
+    return quote
+
+
+def test_a_spot_that_moves_marks_every_expiry_of_its_underlying() -> None:
+    """**Spot belongs to no contract, so nothing else marks it dirty.**
+
+    It sets the ATM strike, the forward and therefore every implied volatility on the
+    ladder. An expiry left clean would go on serving a chain priced against the previous
+    spot for as long as none of its own contracts ticked — last minute's volatility on
+    screen with nothing saying so, which is the failure this project keeps refusing.
+    """
+    stream = ChainStream()
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, ticker("C-BTC-80000-110926", 200, 210), "ticker")
+    stream.recompute_dirty()
+    assert stream.dirty == set()
+
+    stream.apply(index_quote(90_000.0))
+
+    assert stream.dirty == {("BTC", EXPIRY), ("BTC", OTHER_EXPIRY)}
+
+
+def test_the_moved_spot_reaches_the_ladder_it_marked() -> None:
+    """Not "it was marked dirty" — the number a reader is served actually changes."""
+    stream = ChainStream()
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, ticker("P-BTC-77600-040926", 120, 125), "ticker")
+    before = stream.chain("BTC", EXPIRY)
+    assert before.spot == 77_651.9
+
+    stream.apply(index_quote(90_000.0))
+
+    assert stream.chain("BTC", EXPIRY).spot == 90_000.0
+
+
+def test_an_unchanged_spot_schedules_no_work() -> None:
+    """The event arrives once per reference frame — `derived` ~118 a second — while spot
+    moves far less often. Marking on arrival rather than on change would make every expiry
+    dirty on every pass and burn a core reproducing numbers that had not moved."""
+    stream = ChainStream()
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    stream.recompute_dirty()
+    assert stream.dirty == set()
+
+    stream.apply(index_quote(77_651.9))
+
+    assert stream.dirty == set(), "an unchanged spot scheduled a recompute"
+    assert stream.applied, "the observation was not counted at all"
+
+
+def test_an_index_quote_carrying_no_spot_is_counted() -> None:
+    """An absent spot is not an observation of absence — and `skipped` claims to count
+    every record this cache made nothing of, so it has to count this one."""
+    stream = ChainStream()
+    stream.apply(IndexQuote(source="DELTA", ts_received=ARRIVED, underlying="BTC"))
+
+    assert stream._spot == {}
+    assert stream.skipped == 1
