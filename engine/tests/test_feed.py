@@ -9,6 +9,10 @@ every open, and that is what most of these tests are about.
 A fake connection stands in for the network. It records what was sent, yields scripted
 frames, and can close on demand — which makes "pull the cable" an assertion rather than a
 manual exercise.
+
+**Since #36 the socket owner decodes nothing.** It publishes the frame verbatim and the
+adapter turns it into canonical events, so the last two sections here are frames in,
+events out: a scripted connection at one end and `md.option_quote` at the other.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import json
 
 import pytest
 
+from deltapayoff.adapters import DeltaAdapter
 from deltapayoff.fanout import FanOut
 from deltapayoff.feed import DeltaFeed
 
@@ -242,15 +247,15 @@ def test_heartbeats_are_sent_on_the_interval() -> None:
 # --- what comes out --------------------------------------------------------------
 
 
-def test_decoded_records_reach_the_fan_out() -> None:
-    """The feed publishes decoded `Leg`s, not raw frames. A consumer should never have
-    to know that `q[2]` is the bid."""
+def test_the_frame_reaches_the_sink_undecoded() -> None:
+    """Since #36 the socket owner decodes nothing: it publishes the frame verbatim, its
+    channel and the instant it arrived, and the adapter is the only thing that reads
+    inside one. That is what makes "the wire layout lives behind the adapter" true of the
+    code and not only of the diagram."""
     bus = FanOut()
     subscription = bus.subscribe("test", maxsize=100)
-    socket = FakeSocket(
-        [ticker_frame(CHAIN[0], 579, 584), book_frame(CHAIN[1], 120, 125)]
-    )
-    feed = DeltaFeed(bus, connect=connector([socket]))
+    ticker, book = ticker_frame(CHAIN[0], 579, 584), book_frame(CHAIN[1], 120, 125)
+    feed = DeltaFeed(bus, connect=connector([FakeSocket([ticker, book])]))
     feed.subscribe("ticker", CHAIN)
 
     asyncio.run(drive(feed))
@@ -259,13 +264,38 @@ def test_decoded_records_reach_the_fan_out() -> None:
     while not subscription.queue.empty():
         records.append(subscription.queue.get_nowait())
 
-    assert len(records) == 2
-    by_symbol = {r.symbol: r for r in records}
-    assert by_symbol[CHAIN[0]].channel == "ticker"
-    assert by_symbol[CHAIN[0]].bid == 579.0
-    assert by_symbol[CHAIN[0]].ask == 584.0
-    assert by_symbol[CHAIN[1]].channel == "ob_l2"
-    assert by_symbol[CHAIN[1]].bid == 120.0
+    assert [record.channel for record in records] == ["ticker", "ob_l2"]
+    assert [record.symbol for record in records] == [CHAIN[0], CHAIN[1]]
+    assert [record.frame for record in records] == [ticker, book]
+    assert all(record.received_at > 0 for record in records)
+
+
+def test_frames_off_the_socket_become_canonical_events() -> None:
+    """**Frames in, events out, through the real socket loop.**
+
+    The socket owner and the adapter, wired as the running engine wires them: a scripted
+    connection yields one frame on each channel, and what comes out the far end is
+    canonical events carrying canonical instruments. Nothing downstream sees that `q[2]`
+    was the bid, or that there were two channels at all.
+    """
+    published: list = []
+    adapter = DeltaAdapter(feed_factory=_feed_factory(connector([
+        FakeSocket([ticker_frame(CHAIN[0], 579, 584), book_frame(CHAIN[1], 120, 125)])
+    ])))
+
+    asyncio.run(_stream(adapter, published))
+
+    assert [type(event).__name__ for event in published] == [
+        "OptionReference",
+        "IndexQuote",
+        "OptionQuote",
+    ]
+    reference, index, quote = published
+    assert reference.instrument.canonical() == "DELTA-BTC-20260904-77600-C"
+    assert reference.mark_iv == 0.30
+    assert index.underlying == "BTC" and index.spot == 77651.9
+    assert quote.instrument.canonical() == "DELTA-BTC-20260904-77600-P"
+    assert (quote.bid, quote.ask) == (120.0, 125.0)
 
 
 def test_a_malformed_frame_does_not_kill_the_feed() -> None:
@@ -273,22 +303,41 @@ def test_a_malformed_frame_does_not_kill_the_feed() -> None:
 
     This is break 3 from the design: an exception raised while decoding unwinds through
     the read loop and takes the socket with it. The frame is counted and skipped.
+
+    **The count moved with the decode.** `feed.malformed` now counts only what is not
+    JSON at all; a frame that parses and then makes no sense is the adapter's
+    `undecodable`, because the adapter is the only thing that looks inside one.
     """
-    bus = FanOut()
-    subscription = bus.subscribe("test", maxsize=100)
-    socket = FakeSocket(
-        [
+    published: list = []
+    adapter = DeltaAdapter(feed_factory=_feed_factory(connector([
+        FakeSocket([
             {"type": "ticker", "sy": "C-BTC-1-010126", "d": "not a list"},
-            ticker_frame(CHAIN[0], 579, 584),
-        ]
-    )
-    feed = DeltaFeed(bus, connect=connector([socket]))
-    feed.subscribe("ticker", CHAIN)
+            book_frame(CHAIN[1], 120, 125),
+        ])
+    ])))
 
-    asyncio.run(drive(feed))
+    asyncio.run(_stream(adapter, published))
 
-    assert feed.malformed == 1
-    assert subscription.queue.qsize() == 1
+    assert adapter.undecodable == 1
+    assert adapter.feed.malformed == 0, "it was JSON; it just made no sense"
+    assert len(published) == 1, "the frame after the bad one still arrived"
+
+
+def _feed_factory(connect):
+    """Build the real `DeltaFeed` over a scripted connection, for the adapter to own."""
+
+    def factory(sink, **kwargs):
+        return DeltaFeed(sink, connect=connect, retry_delay=0.01, **kwargs)
+
+    return factory
+
+
+async def _stream(adapter, published: list) -> None:
+    task = asyncio.create_task(adapter.stream(published.append))
+    await asyncio.sleep(0.2)
+    adapter.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 def test_subscription_acknowledgements_are_not_published_as_data() -> None:
