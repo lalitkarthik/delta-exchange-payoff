@@ -8,10 +8,11 @@ names, the wire layout. Nothing downstream of an adapter ever sees venue JSON.
 **The protocol demands only what a feed needs**, which is the whole test of the
 abstraction: a venue with a different shape — NSE spells the same contract
 `NIFTY-20260908-25500CE`, in rupees, in lots, off a different calendar — must be able to
-fill it without the interface bending. Seven members, in three groups:
+fill it without the interface bending. Eight members, in three groups:
 
 * **Describe yourself** — `venue`, `underlyings`.
-* **Feed** — `instruments`, `subscribe`, `on_connection`, `stream`, `stop`.
+* **Feed** — `instruments`, `subscribe`, `on_connection` and `off_connection`, `stream`,
+  `stop`.
 * **Read** — `expiries`, `chain_snapshot`, the two venue REST reads the screens need.
 
 The two REST reads are here rather than beside the adapter because the venue client *is*
@@ -81,7 +82,7 @@ ConnectionListener = Callable[[ConnectionSignal, str], None]
 
 @runtime_checkable
 class Adapter(Protocol):
-    """One venue, behind seven members."""
+    """One venue, behind eight members."""
 
     @property
     def venue(self) -> str:
@@ -128,6 +129,22 @@ class Adapter(Protocol):
 
         This is a *register*, not a single slot, so the controller and a future recorder
         can both listen without either knowing about the other.
+        """
+        ...
+
+    def off_connection(self, listener: ConnectionListener) -> None:
+        """Stop telling this listener. **Quiet about one that was never registered.**
+
+        A register with no way out is a leak with a voice: whatever was ever put in it
+        stays strongly referenced for the life of the adapter and goes on being called,
+        so a controller that was replaced keeps driving a state machine nobody reads,
+        off a socket it no longer owns — and answers a signal it should never have seen
+        by raising, inside the socket reader. The owner of a controller is the one that
+        knows it is finished, so the owner is given a way to say so.
+
+        Removes **one** registration, matching the listener by equality, and is safe to
+        call twice: a supervisor tidying up on both the normal and the failed path must
+        not be given a second failure by the tidy-up.
         """
         ...
 

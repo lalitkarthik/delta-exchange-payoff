@@ -156,6 +156,11 @@ class DeltaAdapter:
         self._feed = feed_factory(self._sink, **feed_kwargs)
         self._publish: Publish | None = None
 
+        #: `(listener, on_open, on_close)` per `on_connection` call. The two closures
+        #: are the only handles on what was put on the feed, and `off_connection` is
+        #: handed nothing but the listener, so the pair is kept beside it.
+        self._translated: list[tuple[Any, Any, Any]] = []
+
         #: The last spot **emitted** per underlying, which is what makes `md.index_quote`
         #: once-per-underlying rather than once-per-contract. See `_index_quote`.
         self._last_spot: dict[str, float] = {}
@@ -236,9 +241,36 @@ class DeltaAdapter:
         import the adapter package that imports it. Naming those two facts
         `ConnectionSignal.OPENED` and `.CLOSED` is this class's job, in the same way
         naming `sy` an `Instrument` is.
+
+        **The two closures are remembered against the listener that asked for them**,
+        because they are the only handles on them and `off_connection` is given nothing
+        but the listener: a translation layer that forgot what it built could register
+        but never remove.
         """
-        self._feed.on_open(lambda detail: listener(ConnectionSignal.OPENED, detail))
-        self._feed.on_close(lambda detail: listener(ConnectionSignal.CLOSED, detail))
+
+        def on_open(detail: str) -> None:
+            listener(ConnectionSignal.OPENED, detail)
+
+        def on_close(detail: str) -> None:
+            listener(ConnectionSignal.CLOSED, detail)
+
+        self._translated.append((listener, on_open, on_close))
+        self._feed.on_open(on_open)
+        self._feed.on_close(on_close)
+
+    def off_connection(self, listener: ConnectionListener) -> None:
+        """Take this listener, and the pair of closures built for it, back off the feed.
+
+        One registration, matching by equality, and quiet about a listener that was
+        never registered — the protocol's rule, so that a supervisor tidying up twice is
+        not handed a failure by the tidy-up.
+        """
+        for index, (registered, on_open, on_close) in enumerate(self._translated):
+            if registered == listener:
+                del self._translated[index]
+                self._feed.off_open(on_open)
+                self._feed.off_close(on_close)
+                return
 
     async def stream(self, publish: Publish) -> None:
         """Run the socket until stopped, publishing canonical events.

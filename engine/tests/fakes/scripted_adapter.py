@@ -208,6 +208,14 @@ class ScriptedAdapter:
     def on_connection(self, listener: ConnectionListener) -> None:
         self._listeners.append(listener)
 
+    def off_connection(self, listener: ConnectionListener) -> None:
+        """One registration off, and quiet about one that was never on — the protocol's
+        rule, so a supervisor that tidies up twice is not handed a failure by it."""
+        try:
+            self._listeners.remove(listener)
+        except ValueError:
+            pass
+
     def _signal(self, signal: ConnectionSignal, detail: str) -> None:
         for listener in self._listeners:
             listener(signal, detail)

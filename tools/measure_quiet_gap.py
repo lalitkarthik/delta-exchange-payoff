@@ -13,7 +13,11 @@ which is precisely what the controller's staleness timer measures. One hour by d
     python tools/measure_quiet_gap.py             # one hour
     python tools/measure_quiet_gap.py 300         # five minutes
 
-Writes a JSON summary to `tools/out/` so the number can be quoted with its run named.
+Writes a JSON summary to `tools/out/`, named by the run's start time and length, so the
+number can be quoted with its run named and **so a later run cannot overwrite an earlier
+one**. `tools/out/` is gitignored: what a re-run destroys there is not recoverable, so the
+results that matter are copied into `docs/design/quiet-gap.md`, which is where the runs
+taken so far are recorded.
 """
 
 from __future__ import annotations
@@ -34,6 +38,11 @@ from deltapayoff.feed import BOOK_CHANNEL, TICKER_CHANNEL, DeltaFeed
 
 REST = "https://api.india.delta.exchange"
 DEFAULT_SECONDS = 3600.0
+#: **Not optional.** Delta's edge answers a request without one with HTTP 403 and an
+#: HTML body, which `json.load` then fails to parse — a listing failure that reads as a
+#: bug in this script. `probe_api.py` measured that behaviour and every sibling probe
+#: sets one; this one did not.
+USER_AGENT = "convex-hedge-probe/1.0 (+delta-exchange-payoff)"
 
 
 def symbols() -> list[str]:
@@ -41,7 +50,8 @@ def symbols() -> list[str]:
         f"{REST}/v2/tickers?contract_types=call_options,put_options"
         "&underlying_asset_symbols=BTC"
     )
-    with urllib.request.urlopen(url, timeout=60) as response:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=60) as response:
         return [row["symbol"] for row in json.load(response)["result"]]
 
 
@@ -115,10 +125,20 @@ async def main() -> None:
         ],
         "per_channel": dict(recorder.channels),
     }
-    out = Path(__file__).resolve().parent / "out" / "measure_quiet_gap.json"
-    out.parent.mkdir(exist_ok=True)
-    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(json.dumps(summary, indent=2))
+    # **Named by the run, not by the script.** A fixed filename means the second run
+    # silently destroys the first, and `tools/out/` is gitignored, so what it destroys
+    # is unrecoverable — a completed thirty-five-second measurement was one re-run away
+    # from being lost while this was being written. `latest.json` is a convenience copy
+    # and is the only thing here that is ever overwritten.
+    stamp = started_at.strftime("%Y%m%dT%H%M%SZ")
+    out = Path(__file__).resolve().parent / "out"
+    out.mkdir(exist_ok=True)
+    body = json.dumps(summary, indent=2)
+    (out / f"measure_quiet_gap-{stamp}-{int(elapsed)}s.json").write_text(
+        body, encoding="utf-8"
+    )
+    (out / "measure_quiet_gap-latest.json").write_text(body, encoding="utf-8")
+    print(body)
 
 
 if __name__ == "__main__":

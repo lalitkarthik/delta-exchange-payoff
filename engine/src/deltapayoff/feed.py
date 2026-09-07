@@ -175,6 +175,11 @@ class DeltaFeed:
         self.messages = 0
         self.bytes_read = 0
         self.malformed = 0
+        #: Attempts that opened a socket with an **empty registry**, and so were not
+        #: announced as open. Counted rather than only logged because a feed whose every
+        #: connection is empty is a feed nobody subscribed, and a counter stuck above
+        #: zero is the signal that says so.
+        self.empty_opens = 0
         self.started_at: float | None = None
         #: Why the last connection ended. `None` means it has not ended yet. Without
         #: this a persistently failing feed is indistinguishable from a quiet healthy
@@ -219,6 +224,33 @@ class DeltaFeed:
     def on_close(self, listener: Callable[[str], None]) -> None:
         """Be told when an attempt has ended, opened or not."""
         self._on_close.append(listener)
+
+    def off_open(self, listener: Callable[[str], None]) -> None:
+        """Stop telling this listener. **Quiet about one that is not registered.**
+
+        A register with no way out keeps whatever was ever put in it alive for the life
+        of the feed, and goes on calling it: a replaced controller would keep driving a
+        state machine nobody reads, off a socket it no longer owns.
+        """
+        self._forget(self._on_open, listener)
+
+    def off_close(self, listener: Callable[[str], None]) -> None:
+        """Stop telling this listener. Quiet about one that is not registered."""
+        self._forget(self._on_close, listener)
+
+    @staticmethod
+    def _forget(
+        listeners: list[Callable[[str], None]], listener: Callable[[str], None]
+    ) -> None:
+        """Remove one registration, and only one, leaving any duplicate in place.
+
+        Raising on an absent listener would make the tidy-up path of a supervisor that
+        cleans up on both success and failure into a second failure.
+        """
+        try:
+            listeners.remove(listener)
+        except ValueError:
+            pass
 
     @staticmethod
     def _tell(listeners: list[Callable[[str], None]], detail: str) -> None:
@@ -277,13 +309,25 @@ class DeltaFeed:
     async def _pump(self, socket) -> None:
         """Read until the connection ends. Publishes; never computes."""
         payload = self._subscribe_payload()
-        if payload is not None:
+        if payload is None:
+            # An empty registry sends no subscribe, so this socket is guaranteed to
+            # deliver nothing. **It is not announced as open.** "Open" promises a socket
+            # that has been resubscribed, and a green badge over a socket with no
+            # subscriptions on it is precisely the healthy-connection-zero-messages
+            # failure this module exists to prevent — the one case the resubscribe-
+            # everything rule is written against. Staying quiet leaves the controller in
+            # `connecting`, which reaches `reconnecting` at its own bound rather than
+            # sitting green for as long as the process runs.
+            self.empty_opens += 1
+            logger.warning(
+                "the socket opened with nothing subscribed; not reporting it as open"
+            )
+        else:
             await socket.send(payload)
-        # After the replay, never before. "Open" promises a socket that has been
-        # resubscribed; announcing one before its subscriptions have gone out is exactly
-        # the healthy-connection-no-messages failure this module exists to prevent, and
-        # announcing it early would hide that failure behind a green badge.
-        self._tell(self._on_open, self.url)
+            # After the replay, never before. Announcing an open before its
+            # subscriptions have gone out would hide the same failure behind the same
+            # green badge, one moment earlier.
+            self._tell(self._on_open, self.url)
 
         heartbeat = asyncio.create_task(self._heartbeat(socket))
         try:
