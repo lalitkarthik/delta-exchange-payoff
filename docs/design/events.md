@@ -133,6 +133,11 @@ Eight travel outbound from a producer to the bus. One travels inbound.
   failed, or a lossless queue dropped a message — which should be impossible and is logged at
   error.
 - **Payload** `severity`, `code` (a short stable name), `detail`, and `adapter` where one applies.
+- **Codes emitted so far.** The controller (#38): `connection_silent`, when silence passes
+  `reconnect_after` and forces `-> reconnecting`; and `poll_failing`, when the staleness
+  watchdog's own polls keep raising. **`degraded` does not alert** — fifteen quiet seconds is
+  already a badge and a heartbeat, and an alert on every quiet minute is the flood an alert
+  exists to stand out from. The budget codes are #39's, which owns the budget.
 
 ### `control.command` — the one inbound event
 

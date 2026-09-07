@@ -470,3 +470,150 @@ def test_the_reason_a_connection_ended_is_recorded() -> None:
 
     assert feed.last_error is not None
     assert "subscribe rejected" in feed.last_error
+
+
+# --- reporting the connection (#38) ----------------------------------------------
+
+
+def test_open_is_reported_only_after_the_registry_has_gone_out() -> None:
+    """**The promise the signal makes.**
+
+    A controller told "open" marks the connection `connected` and the badge goes green.
+    If that arrived before the resubscribe, green would mean a fresh, empty socket
+    carrying nothing — the failure with no error this module exists to prevent, wearing
+    a healthy badge. So the assertion is not that the signal fires but *when*: the
+    subscribe message is already on the wire.
+    """
+    socket = FakeSocket([book_frame("C-BTC-77600-040926", 120, 125)])
+    sent_when_opened: list[int] = []
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
+    feed.subscribe("ob_l2", ["C-BTC-77600-040926"])
+    feed.on_open(lambda _detail: sent_when_opened.append(len(socket.sent)))
+
+    asyncio.run(drive(feed))
+
+    assert sent_when_opened == [1]
+    assert socket.sent[0]["type"] == "subscribe"
+
+
+def test_a_dropped_connection_is_reported_with_the_venues_words() -> None:
+    closed: list[str] = []
+    socket = FakeSocket([], close_after=0)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]), retry_delay=0.01)
+    feed.on_close(closed.append)
+
+    asyncio.run(drive(feed))
+
+    assert closed
+    assert "ConnectionResetError: scripted drop" in closed[0]
+
+
+def test_a_dial_that_never_opened_is_reported_too() -> None:
+    """A controller told only about sockets that had opened would sit in `connecting`
+    for the length of an endpoint outage, which reads on a badge as "starting up"."""
+    opened: list[str] = []
+    closed: list[str] = []
+
+    def refuse(_url):
+        raise OSError("no route to host")
+
+    feed = DeltaFeed(FanOut(), connect=refuse, retry_delay=0.01)
+    feed.on_open(opened.append)
+    feed.on_close(closed.append)
+
+    asyncio.run(drive(feed))
+
+    assert opened == []
+    assert "OSError: no route to host" in closed[0]
+
+
+def test_a_listener_that_raises_cannot_take_the_feed_down() -> None:
+    """The same rule `publish` follows: a broken consumer is a bug in the consumer, and
+    a socket reader is not the place to discover it."""
+    published: list = []
+    bus = FanOut()
+    drained = bus.subscribe("test", maxsize=100)
+    socket = FakeSocket([book_frame("C-BTC-77600-040926", 120, 125)])
+    feed = DeltaFeed(bus, connect=connector([socket]))
+    feed.subscribe("ob_l2", ["C-BTC-77600-040926"])
+
+    def explode(_detail: str) -> None:
+        raise RuntimeError("a listener's own bug")
+
+    feed.on_open(explode)
+
+    asyncio.run(drive(feed))
+
+    while not drained.queue.empty():
+        published.append(drained.queue.get_nowait())
+    assert feed.messages == 1
+    assert len(published) == 1
+
+
+def test_a_stop_is_not_reported_as_a_drop() -> None:
+    """Stopping on purpose is not the connection failing, and a badge that flashed
+    `reconnecting` on every clean shutdown would teach a person to ignore it.
+
+    **The attempt has to end with the stop already asked for**, which is the only way
+    through `run`'s `if not self._stopping` guard. An earlier version of this test idled
+    a socket in `recv` and cancelled the task instead: `run` re-raised the
+    `CancelledError` before ever reaching the guard, so the assertion held just as well
+    with the guard deleted, and the test could not fail.
+    """
+    closed: list[str] = []
+
+    class StopThenDrop(FakeSocket):
+        """The shutdown as it really happens: `stop()` is asked for, and the socket the
+        reader is sitting on ends the attempt a moment later."""
+
+        async def recv(self):
+            feed.stop()
+            raise ConnectionResetError("the socket went with the stop")
+
+    feed = DeltaFeed(FanOut(), connect=connector([StopThenDrop([])]))
+    feed.subscribe("ob_l2", CHAIN)
+    feed.on_close(closed.append)
+
+    asyncio.run(feed.run())
+
+    assert feed._stopping is True
+    assert feed.last_error == "ConnectionResetError: the socket went with the stop"
+    assert closed == []
+
+
+def test_an_open_with_nothing_subscribed_is_not_announced_as_open() -> None:
+    """`OPENED` promises a socket that has been **resubscribed**, and an empty registry
+    sends no subscribe at all — so announcing it would put a green badge on a socket
+    that is guaranteed to deliver nothing, which is the healthy-connection-zero-messages
+    failure this module exists to prevent.
+
+    Unreachable from `main.py` today only because it subscribes before it streams;
+    nothing enforces that ordering, and #39's supervisor takes over the start sequence.
+    Not announcing it leaves the controller in `connecting`, which reaches
+    `reconnecting` at its own bound rather than sitting green forever.
+    """
+    opened: list[str] = []
+    socket = FakeSocket([], close_after=0)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]), retry_delay=0.01)
+    feed.on_open(opened.append)
+
+    asyncio.run(drive(feed))
+
+    assert opened == []
+    assert socket.sent == []
+    assert feed.empty_opens >= 1
+
+
+def test_an_open_with_something_subscribed_is_announced_as_before() -> None:
+    """The other half of the guard: a registry with symbols in it sends its subscribe
+    and reports the open, which is every real connection."""
+    opened: list[str] = []
+    socket = FakeSocket([], close_after=0)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]), retry_delay=0.01)
+    feed.subscribe("ob_l2", CHAIN)
+    feed.on_open(opened.append)
+
+    asyncio.run(drive(feed))
+
+    assert opened
+    assert feed.empty_opens == 0
