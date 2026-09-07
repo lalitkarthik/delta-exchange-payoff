@@ -225,6 +225,16 @@ Live cross-check: our theta's median **−76.05** against Delta's **−77.84** �
 
 ---
 
+## Realised volatility, and the gap against implied
+
+Implied volatility is the market's forecast. **Realised** volatility is what actually arrived, and there is more than one way to measure it from the same bars — close-to-close throws away everything inside a bar, while Parkinson, Garman-Klass and Rogers-Satchell read the high and low as well. The five estimators disagree, and the disagreement is informative rather than a defect to average away.
+
+Two traps worth knowing before reading the code. **A gap is not a long return**: a minute with no arrivals produces no row, so the step across the hole spans two minutes and is not a sample of the one-minute return distribution. And **a range estimator reads the high and low it can see** — a finitely sampled path never reaches the extremes a continuous one does, so Parkinson and its relatives come in low by an amount that depends on how many observations went into the bar rather than on anything about the market.
+
+**Deeper:** [iv-vs-rv.md](iv-vs-rv.md)
+
+---
+
 ## Word list
 
 | term | meaning |

@@ -7,10 +7,19 @@ import { ENGINE_URL, type Source } from "@/lib/engine";
 import { formatFetchedClock, formatSpot } from "@/lib/format";
 import { LIVE_STATUS_LABEL, type LiveStatus } from "@/lib/live";
 import { formatTimeToExpiry } from "@/lib/smile";
+import { type Tab } from "@/lib/view";
 
 /**
  * The header strip: the two series pickers, the four figures the current minute is read
  * by, the model stamp, and the two chips saying where each half of the screen came from.
+ *
+ * **On the IV-vs-RV tab all of that is dropped but the underlying.** Expiry, forward,
+ * minute, time to expiry, forward method and the two source chips describe one expiry at
+ * one minute, and that tab reads neither — it spans every listed expiry and a range of
+ * minutes. Leaving them on screen would print six dashes and two chips about data the
+ * chart in front of the reader is not made of, which is worse than printing nothing.
+ * The underlying stays because both tabs are views of the same series and the picker has
+ * to live in exactly one place or the two can disagree.
  *
  * **Everything here is read from the response.** The forward, the minute, the clock the
  * volatility is quoted on, which forward method produced it and which model stamp is on
@@ -33,6 +42,7 @@ export default function VolatilityHeader({
   fallbackReason,
   liveStatus,
   liveDetail,
+  tab,
 }: {
   underlying: Underlying;
   onPickUnderlying: (next: Underlying) => void;
@@ -51,7 +61,36 @@ export default function VolatilityHeader({
   fallbackReason: string | null;
   liveStatus: LiveStatus;
   liveDetail: string | null;
+  tab: Tab;
 }) {
+  if (tab === "iv-rv") {
+    return (
+      <header className="header">
+        <div className="brand">DELTA</div>
+        <h1 className="screen-title">Volatility</h1>
+
+        <label className="picker">
+          <span className="stat-label">Underlying</span>
+          <select
+            className="picker-select"
+            value={underlying}
+            onChange={(e) => onPickUnderlying(e.target.value as Underlying)}
+            disabled={busy}
+          >
+            {UNDERLYINGS.map((u) => (
+              <option key={u} value={u}>
+                {u}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <ThemeToggle />
+      </header>
+    );
+  }
+
+
   return (
     <header className="header">
       <div className="brand">DELTA</div>

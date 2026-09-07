@@ -24,6 +24,10 @@ tools/out/
 # estimated) a year of it would be about 52 GB in a git history.
 data/
 
+# Windows download metadata. `curl`-ing a file into WSL from a browser leaves one of
+# these beside every download; they are not part of the repository.
+*:Zone.Identifier
+
 # local dev server logs
 *.log
 *.log.err

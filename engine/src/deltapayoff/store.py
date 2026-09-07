@@ -110,6 +110,8 @@ from .bars import (
     samples_from_ticker,
     tick_from_quote,
 )
+from .iv_index import ContractIv
+from .realised_vol import Bar as RvBar
 
 #: One directory per table. All four of #5's now exist.
 #:
@@ -1286,3 +1288,94 @@ class BarWriter:
                 "buffered": self.computed_store.buffered,
             },
         }
+
+
+# --- the read path for the volatility screen ----------------------------------------
+
+
+def read_spot_bars(
+    store: BarStore,
+    underlying: str,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> list[RvBar]:
+    """`spot-bars` as the estimators' own bar type, ascending, gaps left as gaps.
+
+    The filter is pushed into the lazy scan so the partition directories answer the date
+    part of it before a file is opened — which only happens if the filter reaches the
+    scan, and would not if this collected first.
+
+    **A minute with a null price is dropped, not defaulted.** `null` is not `0` here as
+    everywhere else: an absent price means nobody quoted, and a bar built on a zero would
+    be a 100% return into and out of it.
+    """
+    frame = store.scan().filter(pl.col("underlying") == underlying)
+    if start is not None:
+        frame = frame.filter(pl.col("minute") >= start)
+    if end is not None:
+        frame = frame.filter(pl.col("minute") <= end)
+
+    rows = (
+        frame.select(
+            "minute", "spot_open", "spot_high", "spot_low", "spot_close"
+        )
+        .drop_nulls()
+        .sort("minute")
+        .collect()
+    )
+    return [
+        RvBar(
+            at=row["minute"],
+            open=row["spot_open"],
+            high=row["spot_high"],
+            low=row["spot_low"],
+            close=row["spot_close"],
+        )
+        for row in rows.iter_rows(named=True)
+    ]
+
+
+def read_contract_ivs(
+    store: BarStore,
+    underlying: str,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> dict[datetime, list[ContractIv]]:
+    """`computed-bars` keyed by minute, one row per solved `(expiry, strike)`.
+
+    **One IV per strike, not per leg.** Implied volatility is a property of the strike
+    here — recovered from the out-of-the-money leg and written to both — so the call and
+    the put row carry the same number, and keeping both would give the strike twice the
+    weight of its neighbours in an interpolation.
+
+    Rows with no `iv` are dropped: a strike that did not solve has no opinion, and
+    `iv_reason` on the row already records why.
+    """
+    frame = store.scan().filter(pl.col("underlying") == underlying)
+    if start is not None:
+        frame = frame.filter(pl.col("minute") >= start)
+    if end is not None:
+        frame = frame.filter(pl.col("minute") <= end)
+
+    rows = (
+        frame.select("minute", "expiry", "strike", "iv", "forward", "years_to_expiry")
+        .drop_nulls()
+        .unique(subset=["minute", "expiry", "strike"], keep="first")
+        .sort("minute", "expiry", "strike")
+        .collect()
+    )
+
+    by_minute: dict[datetime, list[ContractIv]] = {}
+    for row in rows.iter_rows(named=True):
+        by_minute.setdefault(row["minute"], []).append(
+            ContractIv(
+                expiry=str(row["expiry"]),
+                strike=row["strike"],
+                iv=row["iv"],
+                forward=row["forward"],
+                years_to_expiry=row["years_to_expiry"],
+            )
+        )
+    return by_minute
