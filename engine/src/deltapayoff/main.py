@@ -69,7 +69,9 @@ from .chain import (
     validate_expiry,
 )
 from .compute import enrich
+from .contract_bars import ContractBarsResponse, read_contract_bars
 from .delta_client import DeltaClient, DeltaUnavailable
+from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
 from .feed import DeltaFeed
 from .historical import list_minutes, read_ladder_at
@@ -715,6 +717,48 @@ def chain_at(
             "detail": f"no stored quotes for {symbol} expiring {expiry_date} at {minute}",
         }
     return {"type": "chain", "data": ladder.model_dump(mode="json")}
+
+
+@app.get("/bars", response_model=ContractBarsResponse)
+def bars(
+    instrument: Annotated[
+        str,
+        Query(description="canonical string, e.g. DELTA-BTC-20260627-60000-C"),
+    ],
+    date: Annotated[str, Query(description="YYYY-MM-DD, the store's own spelling")],
+    source: Annotated[HistoricalSource, Depends(get_historical_source)],
+) -> ContractBarsResponse:
+    """One contract's minute bars for one date, addressed by canonical string.
+    `docs/bars-contract.md`.
+
+    Reads `quote-bars` and `reference-bars` and never Delta, so there is no 502 and no
+    404 here: a contract this store never recorded and a day nobody has lived through
+    both answer 200 with an empty `bars` — the same disposition `/smile` and `/chain/at`
+    take for their own kind of nothing-yet.
+
+    `def`, not `async def`, for the reason `/smile` and the historical routes give: this
+    opens Parquet files, which blocks, and FastAPI runs a plain `def` route off the event
+    loop the feed's socket reader lives on.
+    """
+    try:
+        parsed = Instrument.from_canonical(instrument)
+    except InstrumentParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Normalised — case-insensitively, and rejected outside BTC/ETH — before it ever
+    # reaches the store, exactly as every other route's `underlying` query parameter is.
+    # `parsed` itself is left alone; the normalised value is what both the store filter
+    # and the echoed response use, so the two cannot disagree about which underlying
+    # answered.
+    symbol = _validated(normalise_underlying, parsed.underlying)
+    normalised = parsed.model_copy(update={"underlying": symbol})
+    day = _validated_date(date)
+    return ContractBarsResponse(
+        instrument=normalised.canonical(),
+        underlying=symbol,
+        expiry=normalised.expiry.strftime("%d-%m-%Y"),
+        date=date,
+        bars=read_contract_bars(source.quote, source.reference, normalised, day),
+    )
 
 
 def _recording_state(writer: BarWriter) -> RecordingState:

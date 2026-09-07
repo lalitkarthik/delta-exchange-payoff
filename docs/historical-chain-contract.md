@@ -6,7 +6,8 @@ and `/ws/chain` — all three serve Delta **now** — and of
 [smile-contract.md](smile-contract.md), which reads the same stored tables for a
 different screen. Split out for the reason `smile-contract.md` was: `chain-contract.md`
 was already past this project's 200-line bound, and a second read path is a different
-subject, not an appendix to the first.
+subject, not an appendix to the first. [bars-contract.md](bars-contract.md) is a third:
+one contract's day rather than every strike at one minute.
 
 `/chain/at` answers with the **same shape** `/chain` and `/ws/chain` do, so
 `web/components/ChainLadder.tsx` renders a historical response exactly as it renders a
