@@ -30,8 +30,9 @@ state, and sharing one structure would make them fight. It subscribes losslessly
 disk write runs in a worker thread — a flush on this event loop would stop the socket
 reader, fill the receive buffer and get us disconnected.
 
-**Both channels the feed subscribes are stored, into three tables.** `ob_l2` becomes the
-quote bars; `ticker` becomes the reference bars and the spot bars, and also supplies the
+**Every market-data event is stored, into three tables.** `md.option_quote` becomes the
+quote bars; `md.option_reference` becomes the reference bars and `md.index_quote` the spot
+bars, and the reference event also supplies the
 quote bars' fallback for a contract whose book is silent. One writer takes one lossless
 subscription and drives all three — a second writer would mean a second subscription
 carrying the same messages and two watermarks drifting apart on two clocks.
@@ -62,19 +63,16 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 
-from .adapters import DeltaAdapter, LegacyQuoteBridge
+from .adapters import Adapter, DeltaAdapter, DeltaFeed
 from .chain import (
     UNDERLYINGS,
     ValidationError,
-    build_chain,
-    build_expiries,
     normalise_underlying,
     validate_expiry,
 )
 from .compute import enrich
 from .delta_client import DeltaClient, DeltaUnavailable
 from .fanout import FanOut
-from .feed import DeltaFeed
 from .historical import list_minutes, read_ladder_at
 from .models import (
     ChainResponse,
@@ -121,7 +119,7 @@ logger = logging.getLogger(__name__)
 
 #: How often a connected browser is sent the chain. One second is well under what anyone
 #: reads and far above what the eye needs, and it is one JSON push regardless of how many
-#: messages arrived underneath. **Measured**: a 136-symbol chain on `ob_l2` delivers about
+#: messages arrived underneath. **Measured**: a 136-symbol chain's book delivers about
 #: 268 messages a second, so pushing per message would be roughly 268x oversampled.
 PUSH_INTERVAL_SECONDS = 1.0
 
@@ -142,7 +140,7 @@ MIN_PUSH_INTERVAL_SECONDS = 0.02
 #: Underlyings the live feed subscribes at start-up **when nothing says otherwise**.
 #: Every listed BTC option, both channels — about 600 messages and 300 KB a second,
 #: measured. That buys instant expiry switching with no subscribe round trip. Narrowing
-#: `ob_l2` to the watched expiry would cut it to roughly a third; see
+#: the book subscription to the watched expiry would cut it to roughly a third; see
 #: `docs/ingestion.md`.
 #:
 #: **BTC alone, deliberately.** ETH is #43's ticket and the cost of adding it has not been
@@ -179,7 +177,7 @@ def live_underlyings() -> tuple[str, ...]:
     """Which underlyings to record, from the environment, defaulting to BTC alone.
 
     **An unknown name is dropped and logged at error rather than subscribed.** Delta
-    answers a request for an underlying it does not list with an empty ticker list, so a
+    answers a request for an underlying it does not list with an empty listing, so a
     typo would otherwise produce a feed that connects, subscribes nothing and records
     nothing, with no error anywhere — the silent failure this whole component exists to
     refuse. If nothing valid is left, the default stands, because recording BTC is a
@@ -213,22 +211,17 @@ class FeedStack:
     reach for them and this is a refactor, not a rename.
     """
 
-    #: **The canonical bus.** The adapter publishes `md.option_quote`,
-    #: `md.option_reference` and `md.index_quote` here. Nothing subscribes to it yet:
-    #: #37 moves the chain cache and the bar writer onto it, #38 the controller. It is
-    #: separate from `quotes` because an `Event` and a `feed.Quote` share no attribute,
-    #: and either consumer would raise on the other's records.
+    #: **The bus, and since #37 the only one.** The adapter publishes `md.option_quote`,
+    #: `md.option_reference` and `md.index_quote` here; the chain cache and the bar writer
+    #: subscribe, with different queue policies (see `fanout.py`). #36 ran a second bus
+    #: beside it carrying the retired quote record — that was the expand half of an
+    #: expand-contract, and it is gone with the record and the shim that filled it.
     events: FanOut
-    #: The bus the chain cache and the bar writer read, carrying today's `feed.Quote`.
-    #: Both subscribe to this one and their queue policies differ; see `fanout.py`.
-    #: **Retired by #37**, along with the shim that fills it.
-    quotes: FanOut
     stream: ChainStream
     writer: BarWriter
-    #: The venue, behind `adapters.base.Adapter`. Everything venue-specific is inside it.
+    #: The venue, behind `adapters.base.Adapter`. Everything venue-specific is inside it,
+    #: including the two REST reads `/expiries` and `/chain` are answered from.
     adapter: Any
-    #: The expand half of the expand–contract. #37 deletes it. See `adapters/shim.py`.
-    shim: Any
     #: The background tasks, empty until `start_feed_stack` runs. Cancelled on shutdown.
     tasks: list[asyncio.Task] = field(default_factory=list)
 
@@ -239,7 +232,7 @@ class FeedStack:
 
 
 def build_feed_stack(client: DeltaClient) -> FeedStack:
-    """Wire the two buses, the chain cache, the bar writer and the adapter together.
+    """Wire the bus, the chain cache, the bar writer and the adapter together.
 
     **Nothing here starts, connects or awaits.** Building is separated from starting so
     that a process with no live feed — every test, and any run with `DELTA_LIVE_FEED=0`
@@ -263,24 +256,20 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     factory for exactly that reason: the adapter builds the socket owner around its own
     sink, and the name it builds is still this module's.
     """
-    quotes = FanOut()
+    events = FanOut()
     stream = ChainStream()
-    stream.attach(quotes)
+    stream.attach(events)
     writer = BarWriter(BarStore(), chains=stream.computed_chains)
-    writer.attach(quotes)
-    shim = LegacyQuoteBridge(quotes)
+    writer.attach(events)
     return FeedStack(
-        events=FanOut(),
-        quotes=quotes,
+        events=events,
         stream=stream,
         writer=writer,
         adapter=DeltaAdapter(
             client=client,
             underlyings=live_underlyings(),
             feed_factory=DeltaFeed,
-            legacy=shim,
         ),
-        shim=shim,
     )
 
 
@@ -349,7 +338,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     stack = build_feed_stack(client)
     app.state.stack = stack
-    app.state.fanout = stack.quotes
     app.state.events = stack.events
     app.state.adapter = stack.adapter
     app.state.stream = stack.stream
@@ -398,9 +386,18 @@ app.add_middleware(
 )
 
 
-def get_delta_client() -> DeltaClient:
-    """Overridden in tests so nothing here ever reaches the network."""
-    return app.state.delta
+def get_adapter() -> Adapter:
+    """The venue, behind the protocol. Overridden in tests so nothing reaches the network.
+
+    **`/expiries` and `/chain` are answered from here since #37**, not from a
+    `DeltaClient` beside it. The two REST reads are on `adapters.base.Adapter` because a
+    venue's client *is* part of knowing it: a second venue answers the same two questions
+    from its
+    own snapshot, and a route that reached for `app.state.delta` would be naming Delta in
+    the one layer that must not. #36 put the reads on the adapter and left the routes
+    where they were, which was the expand half; this is the contract half.
+    """
+    return app.state.adapter
 
 
 def _report_finished_task(task: asyncio.Task) -> None:
@@ -535,37 +532,39 @@ async def health() -> dict[str, str]:
 @app.get("/expiries", response_model=ExpiriesResponse)
 async def expiries(
     underlying: Annotated[str, Query(description="BTC or ETH")],
-    delta: Annotated[DeltaClient, Depends(get_delta_client)],
+    adapter: Annotated[Adapter, Depends(get_adapter)],
 ) -> ExpiriesResponse:
     """Every listed expiry for one underlying, ascending. Source of the dropdown."""
     symbol = _validated(normalise_underlying, underlying)
-    tickers = await _fetch(delta, symbol, None)
-    if not tickers:
+    listed = await _venue(adapter.expiries(symbol))
+    if not listed.expiries:
         raise HTTPException(
-            status_code=404, detail=f"Delta lists no option contracts for {symbol}"
+            status_code=404, detail=f"the venue lists no option contracts for {symbol}"
         )
-    return build_expiries(symbol, tickers)
+    return listed
 
 
 @app.get("/chain", response_model=ChainResponse)
 async def chain(
     underlying: Annotated[str, Query(description="BTC or ETH")],
-    expiry: Annotated[str, Query(description="DD-MM-YYYY, as Delta spells it")],
-    delta: Annotated[DeltaClient, Depends(get_delta_client)],
+    expiry: Annotated[str, Query(description="DD-MM-YYYY, as the venue spells it")],
+    adapter: Annotated[Adapter, Depends(get_adapter)],
 ) -> ChainResponse:
     """The pivoted ladder for one underlying and one expiry."""
     symbol = _validated(normalise_underlying, underlying)
     date = _validated(validate_expiry, expiry)
-    tickers = await _fetch(delta, symbol, date)
-    if not tickers:
+    snapshot = await _venue(adapter.chain_snapshot(symbol, date))
+    if not snapshot.rows:
         raise HTTPException(
             status_code=404,
-            detail=f"Delta lists no option contracts for {symbol} expiring {date}",
+            detail=f"the venue lists no option contracts for {symbol} expiring {date}",
         )
-    # Enriched here as well as on the live path, so the two transports return the
-    # same populated shape. A REST reader that got null Greeks where the websocket
-    # sends real ones would be reading a different contract.
-    return enrich(build_chain(symbol, date, tickers))
+    # Enriched here and not in the adapter: our implied volatility and Greeks are the
+    # pricing core's work, and an adapter returning them would be answering a question
+    # about us. Enriched at all so the two transports return the same populated shape —
+    # a REST reader given null Greeks where the websocket sends real ones would be
+    # reading a different contract.
+    return enrich(snapshot)
 
 
 @app.get("/volatility/bounds", response_model=BoundsResponse)
@@ -721,11 +720,16 @@ def _validated(check: Callable[[str], str], value: str) -> str:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-async def _fetch(
-    delta: DeltaClient, underlying: str, expiry: str | None
-) -> list[dict[str, Any]]:
+async def _venue(awaitable):
+    """Await one of the adapter's REST reads, turning an unreachable venue into a 502.
+
+    The adapter raises `DeltaUnavailable` from inside its own client; a route's job is to
+    say so in HTTP rather than to leak a 500 with a traceback. It is deliberately not
+    caught deeper: a caller that wanted the exception — `start_feed_stack` does — must
+    still be able to see it.
+    """
     try:
-        return await delta.tickers(underlying, expiry)
+        return await awaitable
     except DeltaUnavailable as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

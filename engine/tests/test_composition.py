@@ -1,25 +1,31 @@
-"""How the engine is wired, and the bridge that keeps today's consumers working.
+"""How the engine is wired: one socket, one bus, two consumers with two queue policies.
 
-Two buses now: the adapter publishes canonical events on one, and the shim republishes
-today's `feed.Quote` on the other, which is what the chain cache and the bar writer still
-read. That arrangement is the expand half of an expand–contract and #37 removes half of
-it, so it is asserted here rather than assumed — a shim that quietly stopped republishing
-would leave the ladder frozen with nothing saying why.
+**The tracer bullet through the contract half of the expand–contract.** #36 ran two buses
+— canonical events on one, a rebuilt `feed.Quote` on the other — because the chain cache
+and the bar writer still read the old record. #37 moved both onto the events and deleted
+the record and the shim that made it, so what this file asserts is that a frame arriving
+on the socket reaches the ladder **without any of that** in between.
+
+A quiet regression here is the shape this project keeps refusing: nothing raises, the
+ladder simply stops moving. So the path is driven end to end from a scripted connection
+rather than assumed from the parts passing their own tests.
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
 from deltapayoff import main
-from deltapayoff.adapters import DeltaAdapter, LegacyQuoteBridge
+from deltapayoff.adapters import DeltaAdapter, DeltaFeed
 from deltapayoff.events import Event
 from deltapayoff.fanout import FanOut
-from deltapayoff.feed import DeltaFeed, Quote
+from deltapayoff.store import BarStore, BarWriter
 from deltapayoff.stream import ChainStream
 
 CALL = "C-BTC-77600-040926"
@@ -75,13 +81,13 @@ class _Socket:
         return False
 
 
-def _adapter(quotes: FanOut, script) -> DeltaAdapter:
-    """The real adapter over the real socket owner, with the real shim behind it."""
+def _adapter(script) -> DeltaAdapter:
+    """The real adapter over the real socket owner, over a scripted connection."""
 
     def factory(sink, **kwargs):
         return DeltaFeed(sink, connect=lambda url: _Socket(script), **kwargs)
 
-    return DeltaAdapter(feed_factory=factory, legacy=LegacyQuoteBridge(quotes))
+    return DeltaAdapter(feed_factory=factory)
 
 
 async def _drive(adapter, events: FanOut, seconds: float = 0.2) -> None:
@@ -92,57 +98,83 @@ async def _drive(adapter, events: FanOut, seconds: float = 0.2) -> None:
     await asyncio.gather(task, return_exceptions=True)
 
 
-# --- the bridge -------------------------------------------------------------------
+# --- socket to ladder -------------------------------------------------------------
 
 
-def test_the_shim_turns_a_socket_frame_into_the_record_the_cache_reads() -> None:
-    """**The tracer bullet through the expand half.**
+def test_a_socket_frame_reaches_the_ladder_as_an_event() -> None:
+    """**The tracer bullet, and the whole of #37 in one assertion.**
 
-    A frame arrives on the socket, the adapter decodes it once, the shim republishes it
-    in the old shape, and the chain cache — untouched by this ticket — builds a ladder
-    from it. If the bridge stopped bridging, this is the test that says so.
+    A frame arrives on the socket, the adapter decodes it once into canonical events, and
+    the chain cache builds a ladder from them. Nothing between the two knows the venue had
+    channels, and no record carries a raw frame past the adapter.
     """
-    quotes, events = FanOut(), FanOut()
+    bus = FanOut()
     stream = ChainStream()
-    stream.attach(quotes)
-    adapter = _adapter(
-        quotes, [ticker_frame(CALL, 579, 584), ticker_frame(PUT, 120, 125)]
-    )
+    stream.attach(bus)
+    adapter = _adapter([ticker_frame(CALL, 579, 584), ticker_frame(PUT, 120, 125)])
 
     async def scenario() -> None:
-        await _drive(adapter, events)
+        await _drive(adapter, bus)
         while not stream._subscription.queue.empty():
             stream.apply(stream._subscription.queue.get_nowait())
 
     asyncio.run(scenario())
 
     chain = stream.chain("BTC", EXPIRY)
-    assert chain is not None, "the shim published nothing the chain cache could use"
+    assert chain is not None, "nothing the chain cache could use reached the bus"
     assert chain.spot == pytest.approx(77651.9)
-    strikes = {row.strike for row in chain.rows}
-    assert 77600.0 in strikes
     row = next(row for row in chain.rows if row.strike == 77600.0)
     assert row.call is not None and row.call.bid == 579.0
     assert row.put is not None and row.put.bid == 120.0
+    # `product_id` and the venue symbol reach the browser off the reference event, which
+    # is one of the four fields the shim used to carry a whole frame for.
+    assert row.call.product_id == 1
+    assert row.call.symbol == CALL
 
 
-def test_the_two_buses_carry_two_different_things() -> None:
-    """An `Event` and a `feed.Quote` share no attribute, so a consumer handed the wrong
-    one raises rather than misreading it. That is why there are two buses and not one
-    with a filter: the separation is structural instead of conventional."""
-    quotes, events = FanOut(), FanOut()
-    from_quotes = quotes.subscribe("test-quotes", maxsize=100)
-    from_events = events.subscribe("test-events", maxsize=100)
-    adapter = _adapter(quotes, [ticker_frame(CALL, 579, 584)])
+def test_a_socket_frame_reaches_the_bar_writer_as_an_event(tmp_path) -> None:
+    """The second consumer, on the same bus and the same events.
 
-    asyncio.run(_drive(adapter, events))
+    The reference event feeds table B outright and lends table A its fallback quote; the
+    index quote feeds table D. All three counts move from one frame, which is what
+    "the bar writer takes events" has to mean.
+    """
+    bus = FanOut()
+    writer = BarWriter(BarStore(tmp_path))
+    writer.attach(bus)
+    adapter = _adapter([ticker_frame(CALL, 579, 584)])
 
-    published_quotes = _drain(from_quotes)
-    published_events = _drain(from_events)
+    async def scenario() -> None:
+        await _drive(adapter, bus)
+        while not writer._subscription.queue.empty():
+            writer.ingest(writer._subscription.queue.get_nowait())
 
-    assert [type(record) for record in published_quotes] == [Quote]
-    assert all(isinstance(record, Event) for record in published_events)
-    assert [record.type for record in published_events] == [
+    asyncio.run(scenario())
+
+    stats = writer.stats()
+    assert stats["skipped"] == 0, "the writer could make nothing of the events"
+    assert stats["reference"]["ticks"] == 1
+    assert stats["spot"]["ticks"] == 1
+    assert stats["ticks"] == 1, "the reference event's fallback quote reached table A"
+
+
+def test_only_canonical_events_leave_the_adapter() -> None:
+    """One bus since #37, and everything on it is an `Event`.
+
+    #36 needed two because an `Event` and the old quote record shared no attribute and
+    either consumer would have raised on the other's records. With the record gone the
+    separation is not needed, and a second bus would only be a second thing to forget to
+    subscribe to.
+    """
+    bus = FanOut()
+    subscription = bus.subscribe("test-events", maxsize=100)
+    adapter = _adapter([ticker_frame(CALL, 579, 584)])
+
+    asyncio.run(_drive(adapter, bus))
+    published = _drain(subscription)
+
+    assert all(isinstance(record, Event) for record in published)
+    assert [record.type for record in published] == [
         "md.option_reference",
         "md.index_quote",
     ]
@@ -155,22 +187,99 @@ def _drain(subscription) -> list:
     return drained
 
 
+# --- the venue stops at the adapter -----------------------------------------------
+
+
+SRC = Path(__file__).resolve().parents[1] / "src" / "deltapayoff"
+
+#: **The names that must not escape**, as a module would actually use them: the retired
+#: record's two classes, the venue's two channel names as string literals, and the two
+#: constants that held them. Prose is not searched — a docstring saying what a number was
+#: measured against is history, and `bars.py` keeps one line of exactly that on purpose —
+#: because the failure this guards is a module *routing* on a venue's vocabulary again.
+FORBIDDEN = (
+    "LegacyQuoteBridge",
+    "TICKER_CHANNEL",
+    "BOOK_CHANNEL",
+    '"ob_l2"',
+    "'ob_l2'",
+    '"ticker"',
+    "'ticker'",
+    "feed.Quote",
+)
+
+#: The one package allowed a venue's vocabulary. **`wire.py` is deliberately not on this
+#: list**: it is Delta's payload layout and it names both channels in prose, but it never
+#: uses either as a literal or a constant, so the strict form holds there too.
+ALLOWED = (SRC / "adapters",)
+
+
+def test_the_venue_channel_names_and_the_old_record_live_only_in_the_adapter() -> None:
+    """**The ticket's acceptance grep, run as a test rather than as a habit.**
+
+    The boundary took a ticket to establish and would take one line to lose, and losing it
+    produces no error at all: a module that reached for `"ob_l2"` again would simply be a
+    module that knows a venue, and the second adapter would find out the hard way.
+
+    What is searched is `src/`, because a test that decodes a captured frame must name
+    which venue payload shape it is handing the decoder, and that is the decoder's
+    parameter rather than a consumer's knowledge. And what is searched *for* is the
+    load-bearing form — a literal, a constant, a class — not the word: `chain.py` loops
+    over Delta's REST `tickers` rows and `bars.py` keeps one comment saying what these two
+    constants used to be, and neither is a module routing on a venue's vocabulary.
+    """
+    offenders = []
+    for path in sorted(SRC.rglob("*.py")):
+        if any(path == allowed or allowed in path.parents for allowed in ALLOWED):
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for name in FORBIDDEN:
+                if name in line:
+                    offenders.append(f"{path.relative_to(SRC)}:{number}: {line.strip()}")
+
+    assert offenders == [], "the venue's vocabulary escaped the adapter:\n" + "\n".join(
+        offenders
+    )
+
+
+def test_the_retired_quote_record_is_gone_from_the_package_entirely() -> None:
+    """`feed.Quote` carried a raw venue frame past the adapter to two consumers. It is
+    not moved, renamed or deprecated — it is deleted, with the module it lived in and the
+    shim that rebuilt it, which is what makes the contract half of a parallel change a
+    deletion rather than an archaeology."""
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("deltapayoff.feed")
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("deltapayoff.adapters.shim")
+
+    from deltapayoff import adapters
+
+    assert not hasattr(adapters, "LegacyQuoteBridge")
+
+
 # --- the stack --------------------------------------------------------------------
 
 
 def test_the_stack_gives_each_consumer_the_queue_policy_it_needs(monkeypatch) -> None:
     """Unchanged by the refactor, and the reason it must stay unchanged is in
     `fanout.py`: drop-oldest under load systematically shaves the highs and lows the bars
-    exist to capture, which is a bias and not noise."""
+    exist to capture, which is a bias and not noise.
+
+    **Both subscriptions are on the event bus now**, which is what #37 set out to do: the
+    second bus and the shim that filled it are gone, and a stack with an unsubscribed
+    event bus would mean the ladder and the store were being fed by nothing.
+    """
     monkeypatch.setattr(main, "DeltaFeed", lambda sink, **kwargs: _NoFeed(sink))
 
     stack = main.build_feed_stack(client=None)
-    stats = stack.quotes.stats()
+    stats = stack.events.stats()
 
     assert stats["bar-writer"]["lossless"] is True
     assert stats["chain-stream"]["lossless"] is False
-    assert stack.events.stats() == {}, "nothing subscribes to the event bus until #37"
-    assert stack.shim.bus is stack.quotes
+    assert set(stats) == {"bar-writer", "chain-stream"}
+    assert not hasattr(stack, "quotes"), "the second bus outlived the shim"
+    assert not hasattr(stack, "shim"), "the shim outlived the record it existed for"
     assert stack.feed is stack.adapter.feed
 
 

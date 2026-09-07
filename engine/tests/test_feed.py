@@ -13,6 +13,9 @@ manual exercise.
 **Since #36 the socket owner decodes nothing.** It publishes the frame verbatim and the
 adapter turns it into canonical events, so the last two sections here are frames in,
 events out: a scripted connection at one end and `md.option_quote` at the other.
+
+**Since #37 it lives inside `adapters/`**, because `ticker` and `ob_l2` are Delta's words
+and the module that subscribes by them belongs in the package that owns the venue.
 """
 
 from __future__ import annotations
@@ -23,8 +26,8 @@ import json
 import pytest
 
 from deltapayoff.adapters import DeltaAdapter
+from deltapayoff.adapters.delta_socket import DeltaFeed
 from deltapayoff.fanout import FanOut
-from deltapayoff.feed import DeltaFeed
 
 CHAIN = ["C-BTC-77600-040926", "P-BTC-77600-040926"]
 

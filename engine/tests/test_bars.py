@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from deltapayoff.bars import (
+    REFERENCE_SOURCE,
     BarAggregator,
     ComputedAggregator,
     ComputedTick,
@@ -25,14 +26,47 @@ from deltapayoff.bars import (
     SpotTick,
     Tick,
     computed_ticks_from_chain,
-    samples_from_ticker,
-    tick_from_quote,
+    samples_from_reference,
+    spot_from_index,
+    tick_from_option_quote,
 )
 from deltapayoff.compute import MODEL_VERSION, NO_QUOTE
-from deltapayoff.feed import Quote
 from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
+from fakes.decoder import events_from_frame
 
 SYMBOL = "C-BTC-77600-040926"
+
+
+def book_frame(ts: int | None, *, lts: int | None = None, bid=70.0, ask=72.0) -> dict:
+    """A `ob_l2` frame in the venue's own shape, for the real decoder to read."""
+    frame: dict = {"sy": SYMBOL, "b": [[str(bid), "10"]], "a": [[str(ask), "10"]]}
+    if ts is not None:
+        frame["ts"] = ts
+    if lts is not None:
+        frame["lts"] = lts
+    return frame
+
+
+def ticker_frame(ts: int, bid=1066.0, ask=1080.0) -> dict:
+    """A `ticker` frame in the venue's own shape, for the real decoder to read."""
+    return {
+        "sy": SYMBOL,
+        "sp": "77651.9",
+        "ts": ts,
+        "d": [
+            {
+                "s": SYMBOL,
+                "i": 1,
+                "m": "580.6",
+                "q": [str(ask), "10", str(bid), "20", None],
+                "qiv": ["0.31", "0.29", "0.30"],
+                "g": ["0.55", "0.0003", "1.23", "-234.2", "16.58"],
+                "oi": ["100", "200"],
+                "ohlc": ["1", "2", "3", "4"],
+                "to": ["5", "5"],
+            }
+        ],
+    }
 
 #: 2026-09-04T09:00:00Z, in microseconds. A round minute boundary, so every offset below
 #: reads as "seconds into the minute".
@@ -270,24 +304,20 @@ def test_a_partial_bar_is_flushed_with_its_true_counts_and_no_flag() -> None:
 def test_ticks_are_bucketed_on_the_venue_clock_and_never_on_our_arrival() -> None:
     """A tick stamped at 09:00:59.9 belongs to 09:00 however late it reaches us.
 
-    Fed through `tick_from_quote`, so the `Quote` this asserts about carries a
-    `received_at` in the *next* minute — the exact case where bucketing on arrival would
-    move an event across a boundary and our network latency would decide which minute a
-    price belonged to.
+    Fed through `tick_from_option_quote`, so the event this asserts about carries a
+    `ts_received` in the *next* minute — the exact case where bucketing on arrival would
+    move an observation across a boundary and our network latency would decide which
+    minute a price belonged to.
     """
-    frame = {"sy": SYMBOL, "ts": MINUTE_US + 59_900_000, "lts": MINUTE_US + 59_600_000}
-    quote = Quote(
-        symbol=SYMBOL,
-        channel="ob_l2",
-        bid=70.0,
-        ask=72.0,
-        received_at=(MINUTE_US + MINUTE + 240_000) / 1e6,  # 09:01:00.24, the next minute
-        frame=frame,
-    )
+    frame = book_frame(MINUTE_US + 59_900_000, lts=MINUTE_US + 59_600_000)
+    # 09:01:00.24, the next minute.
+    arrived_at = (MINUTE_US + MINUTE + 240_000) / 1e6
+    (quote,) = events_from_frame("ob_l2", frame, arrived_at)
 
     aggregator = BarAggregator()
-    tick = tick_from_quote(quote)
+    tick = tick_from_option_quote(quote)
     assert tick is not None
+    assert tick.exchange_us == MINUTE_US + 59_900_000, "the venue stamp lost precision"
     aggregator.add(tick)
     (bar,) = aggregator.seal(wall_after(1))
 
@@ -389,33 +419,21 @@ def test_a_tick_with_neither_price_advances_nothing() -> None:
     assert aggregator.flush() == []
 
 
-def test_tick_from_quote_refuses_what_it_cannot_bucket() -> None:
-    """The `ticker` channel and any frame without a `ts`.
+def test_tick_from_option_quote_refuses_what_it_cannot_bucket() -> None:
+    """A reference event, and any event without a venue stamp.
 
-    `ticker`'s stamp runs a median 3,176 ms and up to 5,298.8 ms behind arrival
-    (measured, 2026-09-04) — a whole republish cycle — so it needs its own watermark and
-    its own table. And a frame with no `ts` has nothing to bucket on but our arrival
-    time, which is the one thing this module exists not to do.
+    The reference channel's stamp runs a median 3,176 ms and up to 5,298.8 ms behind
+    arrival (measured, 2026-09-04) — a whole republish cycle — so it needs its own
+    watermark and its own table; its quote reaches table A as a fallback tick instead. And
+    an event with no `ts_venue` has nothing to bucket on but our arrival time, which is
+    the one thing this module exists not to do.
     """
-    ticker = Quote(
-        symbol=SYMBOL,
-        channel="ticker",
-        bid=70.0,
-        ask=72.0,
-        received_at=MINUTE_US / 1e6,
-        frame={"sy": SYMBOL, "ts": MINUTE_US},
-    )
-    stampless = Quote(
-        symbol=SYMBOL,
-        channel="ob_l2",
-        bid=70.0,
-        ask=72.0,
-        received_at=MINUTE_US / 1e6,
-        frame={"sy": SYMBOL},
-    )
+    (reference, _index) = events_from_frame("ticker", ticker_frame(MINUTE_US))
+    (stampless,) = events_from_frame("ob_l2", book_frame(None))
 
-    assert tick_from_quote(ticker) is None
-    assert tick_from_quote(stampless) is None
+    assert tick_from_option_quote(reference) is None
+    assert stampless.ts_venue is None
+    assert tick_from_option_quote(stampless) is None
 
 
 def test_flushing_also_seals_the_minutes_it_emitted() -> None:
@@ -440,15 +458,18 @@ def test_flushing_also_seals_the_minutes_it_emitted() -> None:
 # --- table D: spot bars, at per-underlying grain ----------------------------------
 
 
-PUT = "P-BTC-75600-040926"
-FAR = "C-BTC-90000-111226"
-
-
 def spot_at(
-    second: float, spot: float, *, minute: int = 0, symbol: str = SYMBOL
+    second: float, spot: float, *, minute: int = 0, underlying: str = "BTC"
 ) -> SpotTick:
+    """One spot observation, named by its **underlying**.
+
+    Until #37 this carried the symbol of whichever contract's frame happened to bring the
+    spot, and the aggregator parsed the underlying back out of it. `md.index_quote` names
+    the underlying outright, so the messenger is gone from this table's input as it was
+    always absent from its output.
+    """
     return SpotTick(
-        symbol=symbol,
+        underlying=underlying,
         exchange_us=MINUTE_US + minute * MINUTE + int(second * SECOND_US),
         spot=spot,
     )
@@ -464,9 +485,10 @@ def test_spot_is_one_row_per_underlying_per_minute_not_one_per_contract() -> Non
     contracts' frames in one minute make **one** row with a tick count of three.
     """
     aggregator = SpotAggregator()
-    aggregator.add(spot_at(1, 77650.0, symbol=SYMBOL))
-    aggregator.add(spot_at(2, 77700.0, symbol=PUT))
-    aggregator.add(spot_at(3, 77600.0, symbol=FAR))
+    # Three contracts of the same underlying, whose frames each carried the same `sp`.
+    aggregator.add(spot_at(1, 77650.0))
+    aggregator.add(spot_at(2, 77700.0))
+    aggregator.add(spot_at(3, 77600.0))
 
     bars = aggregator.seal(wall_after(1))
 
@@ -489,8 +511,8 @@ def test_two_underlyings_get_their_own_spot_rows() -> None:
     """The partition key already anticipates ETH. A BTC frame must never move an ETH
     spot bar, which a key on the minute alone would allow."""
     aggregator = SpotAggregator()
-    aggregator.add(spot_at(1, 77650.0, symbol=SYMBOL))
-    aggregator.add(spot_at(2, 3000.0, symbol="C-ETH-3000-040926"))
+    aggregator.add(spot_at(1, 77650.0, underlying="BTC"))
+    aggregator.add(spot_at(2, 3000.0, underlying="ETH"))
 
     bars = {bar.underlying: bar for bar in aggregator.seal(wall_after(1))}
 
@@ -544,15 +566,19 @@ def test_spot_bars_are_bucketed_on_the_venue_clock_and_seal_on_the_ticker_waterm
     assert bar.spot_close == 77700.0
 
 
-def test_a_ticker_frame_without_a_spot_advances_nothing() -> None:
-    """`sp` missing is not a spot of zero. A bar with no observation behind it is a row
-    invented out of nothing."""
+def test_a_tick_without_a_spot_advances_nothing() -> None:
+    """An absent spot is not a spot of zero. A bar with no observation behind it is a row
+    invented out of nothing.
+
+    Unreachable from the live path since #37 — `md.index_quote` is not emitted for a frame
+    with no readable spot, and a spot spelled `"0"` is absent rather than zero — but the
+    aggregator does not get to assume its caller knows that.
+    """
     aggregator = SpotAggregator()
-    aggregator.add(SpotTick(symbol=SYMBOL, exchange_us=MINUTE_US, spot=None))
-    aggregator.add(SpotTick(symbol="BTCUSD", exchange_us=MINUTE_US, spot=77650.0))
+    aggregator.add(SpotTick(underlying="BTC", exchange_us=MINUTE_US, spot=None))
 
     assert aggregator.empty == 1
-    assert aggregator.unparseable == 1
+    assert aggregator.unparseable == 0, "there is no symbol left here to fail to parse"
     assert aggregator.flush() == []
 
 
@@ -813,34 +839,28 @@ def test_a_reference_tick_arriving_after_its_bar_was_sealed_is_counted_and_disca
     assert aggregator.flush() == [], "the late tick was kept somewhere"
 
 
-# --- the ticker frame, decoded once for all three tables --------------------------
+# --- the reference and index events, into the three tables they feed ---------------
 
 
-def ticker_quote(frame: dict, bid: float | None = 1066.0, ask: float | None = 1080.0):
-    return Quote(
-        symbol=frame["sy"],
-        channel="ticker",
-        bid=bid,
-        ask=ask,
-        received_at=(MINUTE_US + 3_200_000) / 1e6,
-        frame=frame,
-    )
+def test_a_real_reference_event_carries_every_column_table_b_stores(
+    ws_ticker_frames,
+) -> None:
+    """One frame, one decode at the adapter, and every reference column named.
 
-
-def test_a_real_ticker_frame_lands_in_all_three_tables(ws_ticker_frames) -> None:
-    """One frame, one decode, three destinations — and the array offsets are read by
-    `wire`, never re-indexed here.
-
-    The values are checked against the frame's own payload rather than against constants
-    written out again: `g[0]` is delta and `qiv[2]` is the mark IV because
-    `tests/test_wire.py` pins those orderings against the REST snapshot captured
-    alongside, and this test would move with them.
+    **This is the translation the catalogue and the store disagree about**, and it is the
+    test that pins it: the events spell these `oi`, `last_price`, `delta`, `mark_iv`, and
+    this table spells the same quantities `oi_contracts`, `last_traded_price`,
+    `venue_delta`, `venue_mark_iv`. The values are checked against the frame's own payload
+    rather than against constants written out again, so `g[0]` is delta and `qiv[2]` is
+    the mark IV because `tests/test_wire.py` pins those orderings against the REST
+    snapshot captured alongside, and this test moves with them.
     """
     symbol = "P-BTC-78500-040926"
     frame = ws_ticker_frames[symbol]
     body = frame["d"][0]
+    reference_event, _index = events_from_frame("ticker", frame)
 
-    sample = samples_from_ticker(ticker_quote(frame))
+    sample = samples_from_reference(reference_event)
 
     assert sample is not None
     assert sample.reference.symbol == symbol
@@ -854,34 +874,64 @@ def test_a_real_ticker_frame_lands_in_all_three_tables(ws_ticker_frames) -> None
     assert sample.reference.venue_vega == float(body["g"][4])
     assert sample.reference.venue_mark_iv == float(body["qiv"][2])
 
-    assert sample.spot.spot == float(frame["sp"])
-    assert sample.spot.exchange_us == frame["ts"]
-
     assert sample.quote is not None
-    assert sample.quote.source == "ticker"
-    assert (sample.quote.bid, sample.quote.ask) == (1066.0, 1080.0)
-
-
-def test_a_ticker_frame_with_no_stamp_is_refused_whole() -> None:
-    """Bucketing on our arrival time is the one thing this module exists not to do, and
-    a reference row without a bucket cannot be salvaged."""
-    assert samples_from_ticker(ticker_quote({"sy": SYMBOL, "d": [{}]})) is None
-
-
-def test_samples_from_ticker_refuses_the_book_channel() -> None:
-    """The two converters do not overlap. `tick_from_quote` owns `ob_l2` and this owns
-    `ticker`; a frame reaching both would be counted twice in one bar."""
-    book = Quote(
-        symbol=SYMBOL,
-        channel="ob_l2",
-        bid=70.0,
-        ask=72.0,
-        received_at=MINUTE_US / 1e6,
-        frame={"sy": SYMBOL, "ts": MINUTE_US},
+    assert sample.quote.source == REFERENCE_SOURCE
+    assert (sample.quote.bid, sample.quote.ask) == (
+        float(body["q"][2]),
+        float(body["q"][0]),
     )
 
-    assert samples_from_ticker(book) is None
-    assert tick_from_quote(book) is not None
+
+def test_the_index_event_carries_the_spot_bars_column(ws_ticker_frames) -> None:
+    """Spot left the reference sample in #37 and travels as its own event.
+
+    It names the underlying rather than the contract whose frame carried it, so a spot
+    observation can no longer be lost to an unparseable option symbol.
+    """
+    frame = ws_ticker_frames["P-BTC-78500-040926"]
+    _reference, index = events_from_frame("ticker", frame)
+
+    spot = spot_from_index(index)
+
+    assert spot is not None
+    assert spot.underlying == "BTC"
+    assert spot.spot == float(frame["sp"])
+    assert spot.exchange_us == frame["ts"]
+
+
+def test_an_event_with_no_stamp_is_refused_whole(ws_ticker_frames) -> None:
+    """Bucketing on our arrival time is the one thing this module exists not to do, and
+    a reference row without a bucket cannot be salvaged."""
+    frame = dict(ws_ticker_frames["P-BTC-78500-040926"])
+    frame.pop("ts")
+    reference, index = events_from_frame("ticker", frame)
+
+    assert reference.ts_venue is None
+    assert samples_from_reference(reference) is None
+    assert spot_from_index(index) is None
+
+
+def test_the_three_converters_do_not_overlap() -> None:
+    """Each refuses anything but its own event type, so no event is counted twice.
+
+    Before #37 they discriminated on a channel string carried by one record type, where a
+    typo routed a frame to the wrong table silently. A mismatched event now simply is not
+    that class.
+    """
+    (book,) = events_from_frame("ob_l2", book_frame(MINUTE_US))
+    reference, index = events_from_frame("ticker", ticker_frame(MINUTE_US))
+
+    assert tick_from_option_quote(book) is not None
+    assert samples_from_reference(book) is None
+    assert spot_from_index(book) is None
+
+    assert tick_from_option_quote(reference) is None
+    assert samples_from_reference(reference) is not None
+    assert spot_from_index(reference) is None
+
+    assert tick_from_option_quote(index) is None
+    assert samples_from_reference(index) is None
+    assert spot_from_index(index) is not None
 
 
 # --- the provenance flag on table A -----------------------------------------------
@@ -890,13 +940,13 @@ def test_samples_from_ticker_refuses_the_book_channel() -> None:
 def from_ticker(
     second: float, bid: float | None, ask: float | None, *, minute: int = 0
 ) -> Tick:
-    """The same tick, arriving on the slower channel."""
+    """The same tick, built from the slower event instead of the book's."""
     return Tick(
         symbol=SYMBOL,
         exchange_us=MINUTE_US + minute * MINUTE + int(second * SECOND_US),
         bid=bid,
         ask=ask,
-        source="ticker",
+        source=REFERENCE_SOURCE,
     )
 
 
@@ -934,10 +984,10 @@ def test_a_contract_with_no_book_falls_back_to_the_ticker_and_says_so() -> None:
     assert bar.mid_high == 105.0
 
 
-def test_the_book_overrides_the_ticker_wholesale_when_both_arrive() -> None:
-    """`wire.chain_from_frames` replaces a ticker quote with a book quote outright rather
-    than averaging them, and a bar has to make the same choice or its provenance flag
-    would be answering for a mixture.
+def test_the_book_overrides_the_fallback_wholesale_when_both_arrive() -> None:
+    """The live ladder replaces a reference quote with a book quote outright rather than
+    averaging them, and a bar has to make the same choice or its provenance flag would be
+    answering for a mixture.
 
     The ticker samples here carry extremes far outside the book's range. None of them may
     reach the bar: if they did, `bid_high` would be 999.0 and the row would claim a price
@@ -970,7 +1020,7 @@ def test_one_contracts_fallback_does_not_flag_another_contracts_bar() -> None:
             exchange_us=MINUTE_US + 2 * SECOND_US,
             bid=5.0,
             ask=6.0,
-            source="ticker",
+            source=REFERENCE_SOURCE,
         )
     )
 

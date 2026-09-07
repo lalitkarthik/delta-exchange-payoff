@@ -37,6 +37,15 @@ turnover. Neither is decoded.
 `chain.build_chain` cannot be reused directly — hence `chain_from_frames`, which rebuilds
 the ticker dicts the REST path expects and then hands off to the same pivot. One pivot,
 two transports.
+
+**`chain_from_frames`, `_as_rest_ticker` and `decode_ob_l2` left the live path in #37.**
+The chain cache builds its ladder from canonical events now, through
+`stream.leg_from_events` and `chain.chain_from_legs`. They are kept because they are the
+only way to run a whole websocket chain through this decoder and compare it, field for
+field, against the REST snapshot captured beside it — the cross-transport agreement test
+in `tests/test_wire.py`, which is what catches a transposed array index. **Named here so a
+reader does not mistake them for the live path**, and so keeping them is a decision on the
+record rather than something nobody got round to deleting.
 """
 
 from __future__ import annotations
@@ -150,14 +159,25 @@ def decode_ticker_extras(frame: dict[str, Any]) -> TickerExtras:
     frames captured inside a 0.06 s window carried an identical `sp` of 77651.9, which
     is why spot gets a table of its own at per-underlying grain rather than a column on
     588 contract rows.
+
+    **The last trade and spot go through `to_quote_number`, not `to_number`, since #37.**
+    Delta spells an absent value `"0"` as readily as it spells it `null`, and both of
+    these are prices: a last trade of zero is a price nobody paid and an index at zero is
+    not an index. `turnover` keeps `to_number`, because a contract really can have turned
+    over nothing and `0` is the true answer for it.
+
+    #36 read `sp` with `to_number` here and in the adapter's `md.index_quote`, and
+    `docs/design/lld/adapter.md` §6 recorded the pair as one gap rather than fixing half
+    of it: changing the event path alone would have made the event and the stored spot
+    row disagree about the same frame.
     """
     body = (frame.get("d") or [{}])[0]
     candle = body.get("ohlc") or []
     turnover = body.get("to") or []
     return TickerExtras(
-        last_traded_price=to_number(_at(candle, _OHLC_CLOSE)),
+        last_traded_price=to_quote_number(_at(candle, _OHLC_CLOSE)),
         turnover=to_number(_at(turnover, _TURNOVER)),
-        spot=to_number(frame.get("sp")),
+        spot=to_quote_number(frame.get("sp")),
     )
 
 

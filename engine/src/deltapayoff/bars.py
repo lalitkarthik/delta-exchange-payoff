@@ -40,7 +40,7 @@ it is specified now rather than discovered in six months of data.
 
 **Bars are bucketed on the venue's `ts`, never on our arrival time.** A bucket boundary
 should be a property of the market rather than of our network, or a latency spike
-silently moves an event across a boundary. `ob_l2`'s second stamp `lts` is carried as a
+silently moves an event across a boundary. The book's second stamp, `lts`, is carried as a
 column and **never bucketed on**: measured, it sits a median 377 ms before `ts` with a
 range from -13.7 ms to +7,979.5 ms, and its meaning is unverified. This project has been
 caught three times by a plausible constant taken on trust and will not add a fourth by
@@ -52,7 +52,7 @@ clock passes its boundary plus `GRACE_SECONDS`; anything arriving after that is
 reading one, which is what keeps this module pure and lateness a test parameter.
 
 `GRACE_SECONDS = 2.0` — `derived` from a **measured** distribution, not chosen because it
-sounded reasonable. `tools/measure_arrival_lag.py`, 2026-09-04, 61,648 `ob_l2` frames over
+sounded reasonable. `tools/measure_arrival_lag.py`, 2026-09-04, 61,648 book frames over
 45 s on the all-expiries BTC subscription: lag p50 212.6 ms, p95 226.6 ms, p99 365.3 ms,
 p99.9 438.7 ms, max 510.3 ms, min 204.2 ms. Two seconds is ~3.9x the measured maximum.
 
@@ -71,11 +71,11 @@ eighteen is self-evidently short — and a dedicated flag would be true for a fe
 rows a day while inviting readers to treat it as the only kind of incomplete bar, which
 it is not.
 
-**The `ticker` channel has its own watermark, and that is the whole reason it needed
+**The reference stream has its own watermark, and that is the whole reason it needed
 one.** Measured in the same run, its frames carry a `ts` a median 3,176 ms and up to
 5,298.8 ms behind our arrival — a full republish cycle of staleness, because that stamp
 appears to mark the underlying quote rather than the publish. Bucketing it on `ts` under
-`ob_l2`'s 2.0 s grace would call almost every frame late, which is why #10 refused the
+The book's 2.0 s grace would call almost every one late, which is why #10 refused the
 channel outright rather than storing a table that was mysteriously empty. See
 `TICKER_GRACE_SECONDS`.
 
@@ -83,12 +83,12 @@ channel outright rather than storing a table that was mysteriously empty. See
 
 **Four tables are built here, and they have different grains on purpose.**
 
-*Table A, quote bars,* per contract per minute, from the book channel with the ticker
+*Table A, quote bars,* per contract per minute, from `md.option_quote` with the reference
 channel as its **fallback**. Which one a minute's quotes came from is recorded in
 `from_book`, because a bar sampled 118 times and a bar sampled 12 times are different
 objects and a tick count alone cannot tell "quiet book" from "no book at all".
 
-*Table B, reference bars,* per contract per minute, from the ticker channel: mark and
+*Table B, reference bars,* per contract per minute, from `md.option_reference`: mark and
 last traded price as OHLC, everything else last-value-in-bar. **Mark and LTP are prices
 and they move, so they get a range; open interest, turnover, Delta's five Greeks and its
 three implied vols are levels, and an OHLC of rho means nothing.** The LTP is the
@@ -100,7 +100,7 @@ preserve, that their vol steps while ours moves continuously underneath it, is a
 observation to capture once, not a reason to store ten million rows a day forever.
 
 *Table D, spot bars,* per **underlying** per minute. Spot is a property of the underlying
-and not of a contract: measured, all 136 ticker frames captured inside a 0.06 s window
+and not of a contract: measured, all 136 reference frames captured in a 0.06 s window
 carried an identical `sp` of 77651.9. Putting it on contract rows would store the same
 four numbers 588 times a minute and, worse, would let two contracts whose frames
 straddled a boundary disagree about what spot was. It is also the best-sampled series in
@@ -120,25 +120,25 @@ change to the model silently mixing two populations in one column.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .chain import expiry_from_symbol
 from .compute import MODEL_VERSION
-from .wire import decode_ticker, decode_ticker_extras
+from .events import IndexQuote, OptionQuote, OptionReference
 
 #: One bar's width. Not configurable: every count and estimate in #5 is against minutes,
 #: and a second width would make two populations of rows indistinguishable in one table.
 BUCKET_US = 60_000_000
 
-#: `ob_l2`'s own watermark. See the module docstring — `derived` from a measured
+#: The book's own watermark. See the module docstring — `derived` from a measured
 #: arrival-lag distribution, 2026-09-04. It is no longer what the quote bars seal on,
 #: for the reason `QUOTE_GRACE_SECONDS` gives, and it stays here because it is still the
-#: book channel's lateness bound and the number every `ob_l2` figure is argued from.
+#: book's lateness bound and the number every book-side figure is argued from.
 GRACE_SECONDS = 2.0
 
-#: `ticker`'s watermark, measured the same way and **fifteen times larger**, because
-#: that channel's `ts` is not a publish time.
+#: The reference stream's watermark, measured the same way and **fifteen times larger**,
+#: because its venue stamp is not a publish time.
 #:
 #: `tools/measure_arrival_lag.py`, 2026-09-04, 60 s, all 685 listed BTC options, lossless
 #: queue: 8,220 frames, mean 3,078.7 ms, p50 2,882.5, p90 4,415.8, p95 4,557.4, p99
@@ -149,18 +149,18 @@ GRACE_SECONDS = 2.0
 #: The shape is structural rather than stochastic, which is what makes a modest multiple
 #: safe: the stamp marks the quote the frame describes and the channel republishes every
 #: 5,001 ms, so the lag is bounded by one republish interval plus transit — 5,001 ms plus
-#: `ob_l2`'s measured 510.3 ms maximum is a **5,511 ms ceiling**. Eight seconds is 1.5x
+#: the book's measured 510.3 ms maximum is a **5,511 ms ceiling**. Eight seconds is 1.5x
 #: the worst frame ever observed and 1.45x that ceiling, and the remaining 2.5 s absorbs
 #: the two things the measurement cannot: unsynchronised clocks (our `time.time()` and
 #: Delta's `ts` are two clocks and an NTP offset of tens of milliseconds is ordinary) and
 #: queue latency, since the watermark is read when the writer drains.
 TICKER_GRACE_SECONDS = 8.0
 
-#: What the **quote** bars seal on, and it is the ticker's number rather than the book's.
+#: What the **quote** bars seal on, and it is the reference number, not the book's.
 #:
-#: #10 sealed table A at 2.0 s because `ob_l2` was its only source. #11 gives it a
-#: second: the ticker channel's `q` array is the fallback when the book is silent for a
-#: contract, exactly as `wire.chain_from_frames` already overrides one with the other.
+#: #10 sealed table A at 2.0 s because the book was its only source. #11 gives it a
+#: second: the reference event's own bid and ask are the fallback when the book is silent
+#: for a contract, exactly as `stream.leg_from_events` overrides one with the other.
 #: A bar that seals at 2.0 s has closed four seconds before its fallback could arrive,
 #: so every fallback quote would be counted late, the fallback would be dead code and
 #: the provenance flag would be a constant `True`. Sealing on the larger of the two
@@ -171,10 +171,24 @@ TICKER_GRACE_SECONDS = 8.0
 #: whole column of quotes that never arrive.
 QUOTE_GRACE_SECONDS = TICKER_GRACE_SECONDS
 
-#: The two channel names, spelled once. `feed.Quote.channel` and `Tick.source` both
-#: carry them and a typo in either would silently route every tick to the fallback.
-BOOK_CHANNEL = "ob_l2"
-TICKER_CHANNEL = "ticker"
+#: **Where a quote tick came from, in this engine's words and not a venue's.**
+#:
+#: Until #37 these two were the venue's own channel names, carried on the retired quote
+#: record and compared here — so the store knew that Delta had two channels and which of
+#: them was the fallback. They are not spelled out even in this comment, because the one
+#: assertion holding the boundary is a search of `src/` for exactly those two strings.
+#:
+#: The events carry no channel, deliberately, and the provenance is now **which event a
+#: tick was built from**: `md.option_quote` is the book, `md.option_reference`'s own bid
+#: and ask are the fallback. A second venue with three quote channels still maps onto
+#: these two words.
+#:
+#: They are strings rather than a bool because `Tick.source` selects one of a bucket's two
+#: sets of series and `_Sources.of` reads better for it; the stored column stays the
+#: `from_book` boolean it has always been. See `docs/design/events.md`, *A note on
+#: provenance*.
+BOOK_SOURCE = "book"
+REFERENCE_SOURCE = "reference"
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,11 +202,11 @@ class Tick:
     Either price may be absent. `bid=None, ask=None` is not a quote at all and advances
     nothing; one side present advances that side alone.
 
-    `source` is the channel this came from — `"ob_l2"` or `"ticker"`. It decides which
-    of a bucket's two sets of series the tick lands in and therefore what `from_book`
-    says; it never decides which bucket, because both channels are bucketed on the
-    venue's `ts`. It defaults to the book because the book is the source of every quote
-    that is not a fallback.
+    `source` is which event this came from — `BOOK_SOURCE` or `REFERENCE_SOURCE`. It
+    decides which of a bucket's two sets of series the tick lands in and therefore what
+    `from_book` says; it never decides which bucket, because both are bucketed on the
+    venue's own stamp. It defaults to the book because the book is the source of every
+    quote that is not a fallback.
     """
 
     symbol: str
@@ -200,7 +214,7 @@ class Tick:
     bid: float | None = None
     ask: float | None = None
     lts_us: int | None = None
-    source: str = BOOK_CHANNEL
+    source: str = BOOK_SOURCE
 
     @property
     def mid(self) -> float | None:
@@ -246,8 +260,8 @@ class QuoteBar:
     mid_ticks: int
 
     #: **True** when this minute's quotes came from the order book channel, **False**
-    #: when the book was silent for this contract and the ticker channel's slower `q`
-    #: array supplied them instead. Not decoration: a bar sampled 118 times and a bar
+    #: when the book was silent for this contract and `md.option_reference`'s slower
+    #: quote supplied them instead. Not decoration: a bar sampled 118 times and a bar
     #: sampled 12 times are different objects, and a tick count alone cannot distinguish
     #: a quiet book from no book at all. Twelve could be either.
     from_book: bool
@@ -261,7 +275,7 @@ class _Series:
     """One series' running OHLC inside one open bar.
 
     `open` and `close` are chosen by the **venue's** clock, not by arrival order. Two
-    ticks in one minute can reach us out of order — measured lag on `ob_l2` spreads from
+    ticks in one minute can reach us out of order — measured book lag spreads from
     204.2 ms to 510.3 ms, which is most of a 508 ms republish interval — so taking the
     first and last *received* would let our network decide which price opened the minute.
     """
@@ -332,17 +346,17 @@ class _Sources:
     """One bucket's two candidate bars, one per channel, kept apart until the bar is
     emitted.
 
-    They are not merged. `wire.chain_from_frames` overrides a ticker quote with a book
-    quote **wholesale** for a live chain, and a bar has to make the same choice or its
-    provenance flag would be answering for a mixture. A book bar with two stale ticker
-    samples folded into its high and low is a bar nothing can describe.
+    They are not merged. The live ladder overrides a reference quote with a book quote
+    **wholesale**, and a bar has to make the same choice or its provenance flag would be
+    answering for a mixture. A book bar with two stale fallback samples folded into its
+    high and low is a bar nothing can describe.
     """
 
     book: _OpenBar = field(default_factory=_OpenBar)
-    ticker: _OpenBar = field(default_factory=_OpenBar)
+    reference: _OpenBar = field(default_factory=_OpenBar)
 
     def of(self, source: str) -> _OpenBar:
-        return self.ticker if source == TICKER_CHANNEL else self.book
+        return self.reference if source == REFERENCE_SOURCE else self.book
 
 
 def _to_utc(microseconds: int) -> datetime:
@@ -355,6 +369,25 @@ def _to_utc(microseconds: int) -> datetime:
     """
     seconds, remainder = divmod(int(microseconds), 1_000_000)
     return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(microsecond=remainder)
+
+
+#: The epoch, aware, so that a stamp can be turned back into microseconds by integer
+#: division rather than through `timestamp()`, which returns a float and rounds the last
+#: digit away. `_to_utc` is the inverse and takes the same care in the other direction.
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_ONE_MICROSECOND = timedelta(microseconds=1)
+
+
+def _micros(stamp: datetime) -> int:
+    """An aware datetime to microseconds since the epoch, **exactly**.
+
+    `int(stamp.timestamp() * 1e6)` goes through a double, which has already spent more
+    than its 15-16 significant digits on the integer part of a microsecond epoch, so the
+    last digit is not reliably representable. Subtracting two datetimes and dividing the
+    resulting `timedelta` keeps it exact, and this number decides which minute a tick
+    belongs to.
+    """
+    return (stamp - _EPOCH) // _ONE_MICROSECOND
 
 
 def _parse_symbol(symbol: str) -> tuple[str, str, float, str] | None:
@@ -497,15 +530,15 @@ class _Watermarked:
 class BarAggregator(_Watermarked):
     """Every open quote bar, keyed by `(symbol, minute)`. Feed it ticks; ask it for bars.
 
-    Two sources reach the same bar and they do **not** mix. `ob_l2` is the book channel
-    and owns the quotes; `ticker` carries the same two numbers about ten times more
+    Two sources reach the same bar and they do **not** mix. `md.option_quote` is the book
+    and owns the quotes; `md.option_reference` carries the same two numbers ten times more
     slowly and is the **fallback** for a contract whose book is silent — exactly the
-    precedence `wire.chain_from_frames` already applies to a live chain, where a book
-    frame overrides a ticker one wholesale rather than being averaged with it.
+    precedence `stream.leg_from_events` applies to a live ladder, where the book's pair
+    overrides the reference's wholesale rather than being averaged with it.
 
     So each bucket holds two independent sets of series, one per source, and the emitted
-    bar takes the book's if it saw anything at all and the ticker's otherwise. Folding
-    both into one set was rejected: a book bar with two stale ticker samples mixed into
+    bar takes the book's if it saw anything at all and the fallback's otherwise. Folding
+    both into one set was rejected: a book bar with two stale fallback samples mixed into
     its high and low would be a bar whose provenance is unanswerable, and the provenance
     is the whole point of the flag.
     """
@@ -548,7 +581,7 @@ class BarAggregator(_Watermarked):
 
         # Last by the venue's clock, like every other close in the bar. `lts` is stored
         # and never bucketed on, so this is the only thing it participates in. Only the
-        # book channel carries it; a `ticker` frame has no `lts` at all.
+        # `md.option_quote` carries it; a reference event has none at all.
         if tick.lts_us is not None and tick.exchange_us >= bar.last_lts_at:
             bar.last_lts_us, bar.last_lts_at = tick.lts_us, tick.exchange_us
 
@@ -556,13 +589,13 @@ class BarAggregator(_Watermarked):
         """The chosen source wins the whole bar, not a column of it.
 
         `from_book` is not decoration. A bar built from 118 book samples and one built
-        from 12 ticker samples are different objects, and a tick count alone cannot tell
+        from 12 fallback samples are different objects, and a tick count alone cannot tell
         "quiet book" from "no book at all" — 12 could be either. The flag can.
         """
         symbol, minute_us = key
         underlying, expiry, strike, option_type = self._meta[symbol]
         from_book = sources.book.observed
-        bar = sources.book if from_book else sources.ticker
+        bar = sources.book if from_book else sources.reference
         return QuoteBar(
             symbol=symbol,
             underlying=underlying,
@@ -589,43 +622,33 @@ class BarAggregator(_Watermarked):
             last_lts=None if bar.last_lts_us is None else _to_utc(bar.last_lts_us),
         )
 
-def tick_from_quote(quote: Any) -> Tick | None:
-    """A `feed.Quote` to a `Tick`, or `None` if it cannot be bucketed.
+def tick_from_option_quote(event: Any) -> Tick | None:
+    """An `md.option_quote` to a book `Tick`, or `None` if it cannot be bucketed.
 
-    This is the only place that knows a `Quote` exists, and it is here rather than in the
-    writer so the aggregator's input stays one small dataclass with no pydantic model and
-    no wire format behind it.
+    This and `samples_from_reference` are the only places that know the catalogue exists,
+    and they are here rather than in the writer so the aggregators' input stays small
+    dataclasses with no model and no wire format behind them.
 
-    **`ticker` frames are refused.** Their `ts` runs a median 3,176 ms and up to
-    5,298.8 ms behind arrival (measured, `tools/measure_arrival_lag.py`, 2026-09-04)
-    — a whole republish cycle — so bucketing them on the same watermark as the book
-    would call almost every one of them late. They belong to #5's table B, with a
-    watermark of their own.
+    **Anything that is not this event is refused.** `md.option_reference` in particular:
+    its stamp runs a median 3,176 ms and up to 5,298.8 ms behind arrival (`measured`,
+    `tools/measure_arrival_lag.py`, 2026-09-04) — a whole republish cycle — so bucketing
+    it on the book's watermark would call almost every one late. Its own quote reaches
+    these bars through `samples_from_reference`, as a fallback tick with its own source.
 
-    A frame with no `ts` is refused too. Bucketing it on our arrival time would be the
-    one thing this module exists not to do.
+    **An event with no `ts_venue` is refused.** Bucketing it on our arrival time would be
+    the one thing this module exists not to do. `lts` is carried and decides nothing.
     """
-    if quote is None or quote.channel != "ob_l2":
+    if not isinstance(event, OptionQuote):
         return None
-    frame = quote.frame or {}
-    exchange_us = frame.get("ts")
-    if exchange_us is None:
+    instrument = event.instrument
+    if instrument is None or event.ts_venue is None:
         return None
-    try:
-        stamp = int(exchange_us)
-    except (TypeError, ValueError):
-        return None
-    aux = frame.get("lts")
-    try:
-        lts_us = None if aux is None else int(aux)
-    except (TypeError, ValueError):
-        lts_us = None
     return Tick(
-        symbol=quote.symbol,
-        exchange_us=stamp,
-        bid=quote.bid,
-        ask=quote.ask,
-        lts_us=lts_us,
+        symbol=instrument.venue_symbol or instrument.canonical(),
+        exchange_us=_micros(event.ts_venue),
+        bid=event.bid,
+        ask=event.ask,
+        lts_us=None if event.lts is None else _micros(event.lts),
     )
 
 
@@ -634,15 +657,16 @@ def tick_from_quote(quote: Any) -> Tick | None:
 
 @dataclass(frozen=True, slots=True)
 class SpotTick:
-    """One underlying's price at one venue instant, carried on a contract's frame.
+    """One underlying's price at one venue instant.
 
-    `symbol` is the contract the frame arrived on and is used for **nothing but working
-    out which underlying this is**. It is deliberately not stored: spot belongs to BTC,
-    not to `P-BTC-78500-040926`, and keeping the messenger on the row would invite a
-    reader to join on it.
+    **`underlying`, not the contract whose frame carried it.** Until #37 this held the
+    messenger's symbol and the aggregator parsed the underlying back out of it, which
+    meant a spot observation could be lost to an unparseable option symbol.
+    `md.index_quote` names the underlying outright and carries no instrument at all, so
+    that failure mode is gone rather than merely rare.
     """
 
-    symbol: str
+    underlying: str
     exchange_us: int
     spot: float | None
 
@@ -668,24 +692,27 @@ class SpotBar:
 class SpotAggregator(_Watermarked):
     """Spot bars, keyed by `(underlying, minute)`.
 
-    **The best-sampled series in the feed**: every one of ~588 contracts' ticker frames
-    carries the same `sp`, so a minute holds roughly 7,056 observations of it against the
+    **The best-sampled series in the feed**: every one of ~588 contracts' reference frames
+    carries the same spot, so a minute holds roughly 7,056 observations of it against the
     118 an individual contract's book gets. That is why the tick count is worth storing —
-    it is the one number that says whether the ingester was actually running.
+    it is the one number that says whether the ingester was actually running, and it is
+    why #37 stopped the adapter suppressing an unchanged spot.
 
-    Sealed on the ticker watermark, because that is the channel it arrives on.
+    Sealed on the reference watermark, because that is the event it arrives beside.
+
+    **`unparseable` is structurally zero here since #37.** The underlying arrives named
+    rather than parsed out of a messenger's symbol, so there is nothing left to fail.
     """
 
     def __init__(self, grace_seconds: float = TICKER_GRACE_SECONDS) -> None:
         super().__init__(grace_seconds)
 
     def add(self, tick: SpotTick) -> None:
-        meta = self._parsed(tick.symbol)
-        if meta is None:
-            return
         if tick.spot is None:
-            # An absent `sp` is not a spot of zero. A bar opened on it would be a row
-            # invented out of no observation.
+            # An absent spot is not a spot of zero. A bar opened on it would be a row
+            # invented out of no observation. Unreachable from the live path since #37,
+            # because `md.index_quote` is not emitted for a frame with no readable spot —
+            # kept because a caller is not obliged to know that.
             self.empty += 1
             return
         minute_us = self._bucket(tick.exchange_us)
@@ -693,7 +720,7 @@ class SpotAggregator(_Watermarked):
             return
 
         self.ticks += 1
-        key = (meta[0], minute_us)
+        key = (tick.underlying, minute_us)
         series = self._open.get(key)
         if series is None:
             series = self._open[key] = _Series()
@@ -717,7 +744,7 @@ class SpotAggregator(_Watermarked):
 
 @dataclass(frozen=True, slots=True)
 class ReferenceTick:
-    """One ticker frame's worth of what a contract was *worth*, as opposed to quoted at.
+    """One reference event's worth of what a contract was *worth*, not quoted at.
 
     Every `venue_` field is **Delta's own opinion** and travels as a reference column.
     The prefix is not decoration either: #5's table C stores our computed Greeks and
@@ -725,7 +752,7 @@ class ReferenceTick:
     be exactly the confusion `tests/test_no_delta_inputs.py` exists to prevent.
 
     Not carried, and deliberately: the price band, the 24-hour mark change, the symbol
-    echo and the product id — static or derivable — and the ticker's own bid and ask,
+    echo and the product id — static or derivable — and the reference's own bid and ask,
     which the book channel already owns and which reach table A as a fallback rather than
     as columns of their own.
     """
@@ -740,7 +767,7 @@ class ReferenceTick:
     #: **Not** open interest in USD, whatever `wire.decode_ticker` calls it. Verified
     #: against the REST snapshot captured beside the frames: `oi[1]` equals Delta's
     #: `oi_change_usd_6h` on all 136 symbols, is not its `oi_value_usd` on 126 of them,
-    #: and goes negative, which a notional cannot. The ticker channel carries no USD
+    #: and goes negative, which a notional cannot. The reference event carries no USD
     #: open interest, so this store does not pretend to one.
     oi_change_usd_6h: float | None
     turnover: float | None
@@ -829,7 +856,7 @@ class _OpenReference:
 
 
 class ReferenceAggregator(_Watermarked):
-    """Reference bars, keyed by `(symbol, minute)`, sealed on the ticker watermark.
+    """Reference bars, keyed by `(symbol, minute)`, on the reference watermark.
 
     **Last-value-in-bar means the last frame's values, taken together.** The alternative
     — each field carrying its own most-recent non-null — was rejected: it produces a row
@@ -903,76 +930,96 @@ class ReferenceAggregator(_Watermarked):
 
 
 @dataclass(frozen=True, slots=True)
-class TickerSample:
-    """What one `ticker` frame is worth to the store: a fallback quote, a row of
-    reference values, and one observation of spot.
+class ReferenceSample:
+    """What one `md.option_reference` is worth to the store: a fallback quote and a row
+    of reference values.
 
-    Returned together because they come from one frame and one decode. Three separate
-    converters would parse the same payload three times at 137 frames a second, and would
-    give three places for the frame's shape to be assumed differently.
+    Returned together because they come from one event and describe one contract at one
+    instant. Two converters over the same event would give two places for its shape to be
+    assumed differently, at 118 events a second.
+
+    **Spot is no longer part of this.** It arrives as its own `md.index_quote` beside this
+    event, because it is a property of the underlying and not of the contract whose frame
+    happened to carry it. `spot_from_index` handles it.
     """
 
     quote: Tick | None
     reference: ReferenceTick | None
-    spot: SpotTick | None
 
 
-def samples_from_ticker(quote: Any) -> TickerSample | None:
-    """A `feed.Quote` from the `ticker` channel to everything the store wants from it.
+def samples_from_reference(event: Any) -> ReferenceSample | None:
+    """An `md.option_reference` to a fallback quote tick and a reference tick.
 
-    **The array offsets are not repeated here.** `wire.decode_ticker` and
-    `wire.decode_ticker_extras` own them, and `tests/test_wire.py` checks their ordering
-    against the REST snapshot captured beside the frames. Re-indexing `g` or `qiv` in a
-    second place is precisely how a transposed index gets into a store that will outlive
-    everyone's memory of the wire format — the numbers stay plausible and nothing
-    crashes.
+    **No array offsets and no venue spelling.** Until #37 this decoded the raw frame with
+    `wire.decode_ticker`, so the store read Delta's `g` and `qiv` positions itself. The
+    adapter reads them once now and the fields arrive named; the store's own column names
+    differ from the catalogue's — `oi_contracts` for `oi`, `ltp_*` for the last trade,
+    `venue_*` for the venue's greeks and vols — and **this function is the one place that
+    translation happens.**
 
-    A frame with no `ts` is refused whole. Bucketing it on our arrival time would be the
-    one thing this module exists not to do, and a reference row without a bucket is not
-    salvageable.
+    **An event with no `ts_venue` is refused whole.** Bucketing it on our arrival time
+    would be the one thing this module exists not to do, and a reference row without a
+    bucket is not salvageable.
+
+    The fallback quote is built only when the event actually quotes a side. A pair of
+    absent prices is not a quote and would open a bar out of nothing.
     """
-    if quote is None or quote.channel != TICKER_CHANNEL:
+    if not isinstance(event, OptionReference):
         return None
-    frame = quote.frame or {}
-    try:
-        stamp = int(frame["ts"])
-    except (KeyError, TypeError, ValueError):
+    instrument = event.instrument
+    if instrument is None or event.ts_venue is None:
         return None
 
-    _, leg = decode_ticker(frame)
-    extras = decode_ticker_extras(frame)
-    symbol = quote.symbol
+    stamp = _micros(event.ts_venue)
+    symbol = instrument.venue_symbol or instrument.canonical()
 
     fallback = None
-    if quote.bid is not None or quote.ask is not None:
+    if event.bid is not None or event.ask is not None:
         fallback = Tick(
             symbol=symbol,
             exchange_us=stamp,
-            bid=quote.bid,
-            ask=quote.ask,
-            source=TICKER_CHANNEL,
+            bid=event.bid,
+            ask=event.ask,
+            source=REFERENCE_SOURCE,
         )
 
-    return TickerSample(
+    return ReferenceSample(
         quote=fallback,
         reference=ReferenceTick(
             symbol=symbol,
             exchange_us=stamp,
-            mark=leg.mark,
-            last_traded_price=extras.last_traded_price,
-            oi_contracts=leg.oi,
-            oi_change_usd_6h=leg.oi_change_usd_6h,
-            turnover=extras.turnover,
-            venue_delta=leg.delta,
-            venue_gamma=leg.gamma,
-            venue_rho=leg.rho,
-            venue_theta=leg.theta,
-            venue_vega=leg.vega,
-            venue_bid_iv=leg.bid_iv,
-            venue_ask_iv=leg.ask_iv,
-            venue_mark_iv=leg.mark_iv,
+            mark=event.mark,
+            last_traded_price=event.last_price,
+            oi_contracts=event.oi,
+            oi_change_usd_6h=event.oi_change_usd_6h,
+            turnover=event.turnover,
+            venue_delta=event.delta,
+            venue_gamma=event.gamma,
+            venue_rho=event.rho,
+            venue_theta=event.theta,
+            venue_vega=event.vega,
+            venue_bid_iv=event.bid_iv,
+            venue_ask_iv=event.ask_iv,
+            venue_mark_iv=event.mark_iv,
         ),
-        spot=SpotTick(symbol=symbol, exchange_us=stamp, spot=extras.spot),
+    )
+
+
+def spot_from_index(event: Any) -> SpotTick | None:
+    """An `md.index_quote` to a `SpotTick`, or `None` if it cannot be bucketed.
+
+    The underlying arrives named, so nothing is parsed and nothing can be filed under a
+    guess. An event with no `ts_venue` is refused, for the same reason as everywhere else
+    in this module.
+    """
+    if not isinstance(event, IndexQuote):
+        return None
+    if event.ts_venue is None:
+        return None
+    return SpotTick(
+        underlying=event.underlying.upper(),
+        exchange_us=_micros(event.ts_venue),
+        spot=event.spot,
     )
 
 

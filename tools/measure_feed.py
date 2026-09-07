@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine" / "src"))
 
 from deltapayoff.fanout import FanOut  # noqa: E402
-from deltapayoff.feed import DeltaFeed  # noqa: E402
+from deltapayoff.adapters import DeltaFeed  # noqa: E402
 
 REST = "https://api.india.delta.exchange"
 RUN_SECONDS = 20.0

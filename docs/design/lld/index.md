@@ -12,8 +12,8 @@ file, and change the row's status to a link. Do not write one ahead of the code.
 |---|---|---|
 | Events — the envelope, the registry, the instrument | [events.md](events.md) | #35, #37 |
 | The broker adapter — the protocol, the Delta implementation, the fake | [adapter.md](adapter.md) | #36, #37 |
-| The chain cache — invalidation, the recompute passes, watched pairs | not yet written | #37, #44 |
-| The store — the four tables, sealing, flushing, ETH | not yet written | #37, #43 |
+| The chain cache — invalidation, the recompute passes, watched pairs | [chain-cache.md](chain-cache.md) | #37, #44 |
+| The store — the four tables, sealing, flushing, ETH | [store.md](store.md) | #37, #43 |
 | The connection controller — the state machine, backoff, replay, commands | not yet written | #38, #41 |
 | The supervisor — aggregate state, lifespan, the health report | not yet written | #39 |
 | Logging — the JSON-lines formatter, the sinks, what is logged and at what level | not yet written | #42 |
