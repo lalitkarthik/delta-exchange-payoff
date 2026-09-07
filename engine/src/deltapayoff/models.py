@@ -108,6 +108,35 @@ class ExpiriesResponse(BaseModel):
     expiries: list[str]
 
 
+class HistoricalMinutes(BaseModel):
+    """`GET /chain/minutes` — `docs/historical-chain-contract.md`.
+
+    Every minute the store holds quotes for, on one underlying, expiry and date. The
+    slider's domain and, by what is missing from it, its gaps.
+    """
+
+    underlying: str
+    expiry: str
+    #: `YYYY-MM-DD` — the store's own partition spelling, not Delta's `DD-MM-YYYY`.
+    date: str
+    #: Ascending. ISO 8601 UTC, second precision, `Z`-suffixed — `smile.MINUTE_FORMAT`'s
+    #: spelling, so a stamp round-trips into the ladder route with no reformatting.
+    minutes: list[str]
+
+
+class HistoricalChain(ChainResponse):
+    """`GET /chain/at` — `docs/historical-chain-contract.md`.
+
+    Every field `/chain` and `/ws/chain` carry, unchanged, plus `minute`: the ladder
+    component renders either shape without knowing which one it was handed, and the
+    header reads `minute` to say which one it is showing.
+    """
+
+    #: ISO 8601 UTC, second precision, `Z`-suffixed — the exact minute this ladder was
+    #: rebuilt for, and the same stamp `fetched_at` carries here (see `historical.py`).
+    minute: str
+
+
 class SmilePoint(BaseModel):
     """One strike's volatility at one minute. `docs/smile-contract.md`.
 
