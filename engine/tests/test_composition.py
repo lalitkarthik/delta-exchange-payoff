@@ -287,6 +287,12 @@ class _NoFeed:
     def __init__(self, sink) -> None:
         self.sink = sink
 
+    def on_open(self, listener) -> None:
+        return None
+
+    def on_close(self, listener) -> None:
+        return None
+
 
 # --- which underlyings are recorded ----------------------------------------------
 

@@ -52,7 +52,7 @@ from ..delta_client import DeltaClient
 from ..events import Event, IndexQuote, Instrument, OptionQuote, OptionReference, Right
 from ..models import ChainResponse, ExpiriesResponse
 from ..wire import decode_ob_l2_top, decode_ticker, decode_ticker_extras
-from .base import Publish
+from .base import ConnectionListener, ConnectionSignal, Publish
 from .delta_socket import BOOK_CHANNEL, TICKER_CHANNEL, DeltaFeed, VenueMessage
 
 logger = logging.getLogger(__name__)
@@ -149,6 +149,11 @@ class DeltaAdapter:
         self._feed = feed_factory(self._sink, **feed_kwargs)
         self._publish: Publish | None = None
 
+        #: `(listener, on_open, on_close)` per `on_connection` call. The two closures
+        #: are the only handles on what was put on the feed, and `off_connection` is
+        #: handed nothing but the listener, so the pair is kept beside it.
+        self._translated: list[tuple[Any, Any, Any]] = []
+
         #: Events handed to `publish`. The adapter's own throughput, independent of the
         #: socket's message count, because one ticker frame is two events and a book
         #: frame is one.
@@ -216,6 +221,44 @@ class DeltaAdapter:
             return
         self._feed.subscribe(TICKER_CHANNEL, symbols)
         self._feed.subscribe(BOOK_CHANNEL, symbols)
+
+    def on_connection(self, listener: ConnectionListener) -> None:
+        """Translate the socket owner's two facts into the protocol's vocabulary.
+
+        `DeltaFeed` reports "opened" and "closed" as bare callbacks because it must not
+        import the adapter package that imports it. Naming those two facts
+        `ConnectionSignal.OPENED` and `.CLOSED` is this class's job, in the same way
+        naming `sy` an `Instrument` is.
+
+        **The two closures are remembered against the listener that asked for them**,
+        because they are the only handles on them and `off_connection` is given nothing
+        but the listener: a translation layer that forgot what it built could register
+        but never remove.
+        """
+
+        def on_open(detail: str) -> None:
+            listener(ConnectionSignal.OPENED, detail)
+
+        def on_close(detail: str) -> None:
+            listener(ConnectionSignal.CLOSED, detail)
+
+        self._translated.append((listener, on_open, on_close))
+        self._feed.on_open(on_open)
+        self._feed.on_close(on_close)
+
+    def off_connection(self, listener: ConnectionListener) -> None:
+        """Take this listener, and the pair of closures built for it, back off the feed.
+
+        One registration, matching by equality, and quiet about a listener that was
+        never registered — the protocol's rule, so that a supervisor tidying up twice is
+        not handed a failure by the tidy-up.
+        """
+        for index, (registered, on_open, on_close) in enumerate(self._translated):
+            if registered == listener:
+                del self._translated[index]
+                self._feed.off_open(on_open)
+                self._feed.off_close(on_close)
+                return
 
     async def stream(self, publish: Publish) -> None:
         """Run the socket until stopped, publishing canonical events.

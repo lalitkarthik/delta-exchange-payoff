@@ -15,7 +15,7 @@ canonical events off the bus.
 
 from __future__ import annotations
 
-from .base import Adapter, Publish
+from .base import Adapter, ConnectionListener, ConnectionSignal, Publish
 from .delta import VENUE, DeltaAdapter, instrument_from_symbol
 from .delta_socket import BOOK_CHANNEL, CHANNELS, TICKER_CHANNEL, DeltaFeed, VenueMessage
 
@@ -25,6 +25,8 @@ __all__ = [
     "TICKER_CHANNEL",
     "VENUE",
     "Adapter",
+    "ConnectionListener",
+    "ConnectionSignal",
     "DeltaAdapter",
     "DeltaFeed",
     "Publish",
