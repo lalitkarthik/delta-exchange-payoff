@@ -976,6 +976,12 @@ class BarWriter:
         #: aggregating, the sampling, the sealing and the writing stop.
         #: `docs/recording-contract.md` is the authority.
         self.recording = True
+        #: One full pass of `run`'s drain loop: ingest, sample, seal, maybe-flush. A
+        #: liveness counter — a health check can watch it advance to tell a writer that
+        #: is idle-but-alive from one that has wedged — and it is what lets a test wait
+        #: for "the loop has seen this clock reading" instead of guessing a sleep long
+        #: enough for a tick to have passed.
+        self.loops = 0
 
     @property
     def stores(self) -> tuple[BarStore, ...]:
@@ -1090,6 +1096,7 @@ class BarWriter:
             self._sample_computed(now)
             self._seal(now)
             await self._maybe_flush()
+            self.loops += 1
 
     def _sample_computed(self, now: float, *, force: bool = False) -> int:
         """Read the chain cache every ten seconds, and at each minute edge. Returns
