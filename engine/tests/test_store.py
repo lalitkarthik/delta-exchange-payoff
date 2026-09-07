@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -387,6 +388,25 @@ def test_a_null_last_lts_round_trips_as_null(tmp_path: Path) -> None:
     assert store.scan().collect()["last_lts"].to_list() == [None]
 
 
+async def wait_until(
+    condition: Callable[[], bool], *, timeout: float = 2.0, poll: float = 0.005
+) -> None:
+    """Poll a real-time condition until it is true, or fail loudly past `timeout`.
+
+    For synchronising a test with a `BarWriter` task driven by a **fake** clock: the
+    condition is always something the writer sets after doing the real work (a row
+    count, a buffer length, `writer.loops`), never a guess at how long that work takes.
+    `timeout` is real wall-clock slack for a loaded machine to schedule the writer's
+    task and, where a flush is involved, its worker thread — it does not move the fake
+    clock, which the test alone controls.
+    """
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"condition not met within {timeout}s")
+        await asyncio.sleep(poll)
+
+
 def test_the_writer_subscribes_losslessly(tmp_path: Path) -> None:
     """Drop-oldest systematically shaves the highs and lows, because drops happen under
     load and load is when price moves fastest. That is a bias, not noise, and it is
@@ -468,6 +488,13 @@ def test_the_writer_flushes_on_the_default_five_minute_cadence(tmp_path: Path) -
     a second past five minutes. The clock is a variable this test assigns, never a real
     one it waits on: a test that slept for five minutes would be no test at all, and one
     that read the wall clock would be the third time-bomb this suite has grown.
+
+    **The wait is on the condition, not on an elapsed guess.** A fixed real sleep here
+    was the fourth time-bomb: a flush is a thread hop plus a Parquet write, and on a
+    loaded machine 50ms is not always enough for both to land before the counter is
+    read — `measured` 2026-09-07, 1 failure in 8 runs of the unrepaired test under load.
+    So every step below polls `writer.loops` (one full pass of the drain loop) or the
+    store's own counters instead of guessing a duration, via `wait_until` above.
     """
 
     async def scenario():
@@ -483,7 +510,8 @@ def test_the_writer_flushes_on_the_default_five_minute_cadence(tmp_path: Path) -
         bus = FanOut()
         writer.attach(bus)
         task = asyncio.create_task(writer.run())
-        await asyncio.sleep(0.05)  # the writer stamps `_last_flush` at `started`
+        # `_last_flush` is stamped once, before the loop's first pass.
+        await wait_until(lambda: writer._last_flush is not None)
 
         publish(
             bus,
@@ -491,15 +519,23 @@ def test_the_writer_flushes_on_the_default_five_minute_cadence(tmp_path: Path) -
             book_frame("C-BTC-77600-040926", MINUTE_US + 5_000_000),
         )
         now = started + 120.0  # past the boundary and the grace: the bar seals
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: store.buffered == 1)
         buffered = store.buffered
 
+        # A loop iteration that starts after `now` moves is guaranteed to read the new
+        # value — the writer's only await points are `queue.get` and the flush itself,
+        # so nothing can observe a stale `now` once a fresh pass begins. Snapshotting
+        # `loops` first and waiting for it to advance is therefore "the writer has seen
+        # this clock reading", not a guess at how long seeing it takes.
+        passes = writer.loops
         now = started + 299.0  # four minutes fifty-nine
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: writer.loops > passes)
         early = store.rows_written
 
         now = started + 301.0  # a second past five minutes
-        await asyncio.sleep(0.05)
+        # The flush itself: a thread hop and a Parquet write. Wait on its result, not on
+        # the loop noticing the clock — `rows_written` only moves once the write lands.
+        await wait_until(lambda: store.rows_written == 1, timeout=5.0)
         late = store.rows_written
 
         task.cancel()
