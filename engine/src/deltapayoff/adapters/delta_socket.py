@@ -80,6 +80,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: What an attempt that opened and delivered nothing is called, in the close it
+#: reports and in `last_error`. One spelling, because the controller's budget rule
+#: and an operator reading a log line are looking at the same fact.
+NOTHING_DELIVERED = "connected but closed without delivering a message"
+
 PUBLIC_WS = "wss://public-socket.india.delta.exchange"
 
 #: Delta's two channel names, and **the only place either string appears** outside the
@@ -366,6 +371,14 @@ class DeltaFeed:
             self.started_at = time.perf_counter()
 
         before = self.messages
+        # **This attempt's own error, in a local.** `last_error` is instance state that
+        # survives across `run()` calls, and since #39 there are many calls where there
+        # used to be one loop. Reading it below to describe *this* ending would let a
+        # previous attempt's dial failure be reported as the reason this socket closed.
+        # Nothing constructs that today — every ending here raises, so the assignment
+        # below always lands first — but it is one refactor away, and a local costs
+        # nothing to make it impossible.
+        attempt_error: str | None = None
         try:
             async with self._connect(self.url) as socket:
                 self.connections += 1
@@ -373,7 +386,22 @@ class DeltaFeed:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.last_error = f"{type(exc).__name__}: {exc}"[:300]
+            attempt_error = f"{type(exc).__name__}: {exc}"[:300]
+            self.last_error = attempt_error
+
+        delivered = self.messages > before
+        # **The diagnosis, resolved before anyone is told rather than after.** An attempt
+        # that opened and delivered nothing is the healthy-socket-zero-messages failure
+        # this whole module exists to refuse, and it is the fact the budget rule turns
+        # on. It used to be computed below the `_tell`, so a listener heard only
+        # `ConnectionResetError` — which is also what a healthy socket dropping in a
+        # storm reports. Two very different incidents, one indistinguishable detail.
+        if delivered:
+            ending = attempt_error or "closed by the venue"
+        elif attempt_error is None:
+            ending = NOTHING_DELIVERED
+        else:
+            ending = f"{attempt_error}; {NOTHING_DELIVERED}"
 
         # The attempt has ended, whether it ever opened or the dial failed outright.
         # The failed dial is reported too: a controller told only about sockets that had
@@ -382,7 +410,7 @@ class DeltaFeed:
         # reported as one — and the controller reads exactly this signal to tell the two
         # endings apart, so staying quiet on a stop is what stops it redialling.
         if not self._stopping:
-            self._tell(self._on_close, self.last_error or "closed by the venue")
+            self._tell(self._on_close, ending)
 
         # Delivering data, not connecting, is what proves the endpoint works. Delta can
         # accept the handshake and close straight away — a rejected subscribe, a
@@ -391,7 +419,7 @@ class DeltaFeed:
         # attempts in 0.3 s with a budget of 3, still going. At the production
         # one-second delay that exhausts the 150-per-5-minutes connection budget in
         # about two and a half minutes and keeps hammering.
-        if self.messages > before:
+        if delivered:
             self.last_error = None
         elif self.last_error is None:
-            self.last_error = "connected but closed without delivering a message"
+            self.last_error = NOTHING_DELIVERED
