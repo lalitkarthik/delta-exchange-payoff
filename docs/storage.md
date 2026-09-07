@@ -114,8 +114,9 @@ behind our arrival — very nearly the channel's whole 5,001 ms republish interv
 marks the quote the frame describes rather than the moment it was sent.
 
 So **the two channels cannot share a watermark**, which is now resolved rather than
-merely recorded: `tick_from_quote` still refuses `ticker` frames, `samples_from_ticker`
-handles them, and both the reference and spot tables seal at 8.0 s. This is the kind of
+merely recorded: `tick_from_option_quote` takes the book's event alone,
+`samples_from_reference` and `spot_from_index` take the slower one's, and both the
+reference and spot tables seal at 8.0 s. This is the kind of
 thing that would otherwise have been discovered as "the reference bars are mysteriously
 empty".
 

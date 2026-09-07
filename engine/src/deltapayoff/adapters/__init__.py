@@ -17,12 +17,13 @@ from __future__ import annotations
 
 from .base import Adapter, ConnectionListener, ConnectionSignal, Publish
 from .delta import VENUE, DeltaAdapter, instrument_from_symbol
-from .delta_socket import BOOK_CHANNEL, CHANNELS, TICKER_CHANNEL, DeltaFeed, VenueMessage
+from .delta_socket import DeltaFeed
 
+#: **The channel names are deliberately not re-exported here.** `delta.py` imports them
+#: from `delta_socket` and so does every test that needs one; hoisting them to the package
+#: root would put the venue's vocabulary one import closer to the boundary this package
+#: exists to hold, for no caller that wanted it.
 __all__ = [
-    "BOOK_CHANNEL",
-    "CHANNELS",
-    "TICKER_CHANNEL",
     "VENUE",
     "Adapter",
     "ConnectionListener",
@@ -30,6 +31,5 @@ __all__ = [
     "DeltaAdapter",
     "DeltaFeed",
     "Publish",
-    "VenueMessage",
     "instrument_from_symbol",
 ]
