@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ChainLadder } from "@/components/ChainLadder";
+import ContractPanel from "@/components/ContractPanel";
 import RecordingToggle from "@/components/RecordingToggle";
 import ThemeToggle from "@/components/ThemeToggle";
 import TimeScrubber from "@/components/TimeScrubber";
@@ -14,6 +15,7 @@ import {
   type Underlying,
 } from "@/lib/contract";
 import { ENGINE_URL, loadChainAt, loadChainMinutes, loadExpiries } from "@/lib/engine";
+import { looksCanonical } from "@/lib/instrument";
 import { LIVE_STATUS_LABEL, subscribeChain, type LiveStatus } from "@/lib/live";
 import { formatFetchedAt, formatFetchedClock, formatSpot } from "@/lib/format";
 import { positionOf } from "@/lib/position";
@@ -35,13 +37,20 @@ function todayUtc(): string {
 }
 
 /**
- * `?underlying=BTC&expiry=04-09-2026` live, `&minute=...` added standing anywhere else.
- * `lib/view.ts`'s `viewQuery` was not reused: that one always writes a minute, and
- * "live" here is the absence of one rather than a stamp that happens to be the newest.
+ * `?underlying=BTC&expiry=04-09-2026` live, `&minute=...` added standing anywhere else,
+ * `&instrument=...` added whenever the chart panel is open. `lib/view.ts`'s `viewQuery`
+ * was not reused: that one always writes a minute, and "live" here is the absence of one
+ * rather than a stamp that happens to be the newest.
  */
-function chainQuery(underlying: Underlying, expiry: string, minute: string | null): string {
+function chainQuery(
+  underlying: Underlying,
+  expiry: string,
+  minute: string | null,
+  instrument: string | null,
+): string {
   const params = new URLSearchParams({ underlying, expiry });
   if (minute) params.set("minute", minute);
+  if (instrument) params.set("instrument", instrument);
   return `?${params.toString().replace(/%3A/g, ":")}`;
 }
 
@@ -63,7 +72,15 @@ function chainQuery(underlying: Underlying, expiry: string, minute: string | nul
  * more than `wanted` returning to `null`, which is already this codebase's spelling of
  * "follow whatever the right edge is".
  */
-export default function ChainScreen({ initial }: { initial: ViewRequest }) {
+export default function ChainScreen({
+  initial,
+  initialInstrument,
+}: {
+  initial: ViewRequest;
+  /** #46: the canonical instrument string the URL carried on load, or `null`. Read by
+   * `app/page.tsx` separately from `initial` — see that file's comment on why. */
+  initialInstrument: string | null;
+}) {
   const [underlying, setUnderlying] = useState<Underlying>(initial.underlying ?? "BTC");
   const [expiries, setExpiries] = useState<string[]>([]);
   const [expiry, setExpiry] = useState<string>(initial.expiry ?? "");
@@ -91,6 +108,11 @@ export default function ChainScreen({ initial }: { initial: ViewRequest }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /** #46: the contract chart panel. `null` means closed. Seeded from the URL so a link
+   * carrying a contract opens straight onto its chart, as `docs/bars-contract.md`'s own
+   * user story asks for. */
+  const [panelInstrument, setPanelInstrument] = useState<string | null>(initialInstrument);
+
   // Guards against a slow earlier request landing after a newer one.
   const expiryRequest = useRef(0);
   const minutesRequest = useRef(0);
@@ -114,6 +136,14 @@ export default function ChainScreen({ initial }: { initial: ViewRequest }) {
           : (available[0] ?? "");
       const chosen = wanted && available.includes(wanted) ? wanted : fallback;
       setExpiry(chosen);
+
+      // A link naming an expiry this underlying no longer lists — the common case is a
+      // contract's expiry rolling off Delta's board — falls back to a different one
+      // silently here, and a chart panel seeded from that same link names a contract on
+      // the expiry that was asked for, not the one just substituted. Closing it is the
+      // same call `pickExpiry` already makes for a reader-driven change; this is the
+      // page doing it for a change nobody asked for in this session.
+      if (wanted && chosen !== wanted) setPanelInstrument(null);
 
       if (!chosen) setError(`No expiries listed for ${next}.`);
     } catch (err) {
@@ -203,25 +233,30 @@ export default function ChainScreen({ initial }: { initial: ViewRequest }) {
     })();
   }, [underlying, expiry, onLive, stamp]);
 
-  // The address bar follows the slider; it never drives it after the first render.
+  // The address bar follows the slider and the chart panel; it never drives either
+  // after the first render.
   useEffect(() => {
     if (!expiry) return;
-    const query = chainQuery(underlying, expiry, onLive ? null : stamp);
+    const query = chainQuery(underlying, expiry, onLive ? null : stamp, panelInstrument);
     if (window.location.search === query) return;
     const timer = window.setTimeout(() => {
       window.history.replaceState(null, "", query);
     }, URL_SETTLE_MS);
     return () => window.clearTimeout(timer);
-  }, [underlying, expiry, onLive, stamp]);
+  }, [underlying, expiry, onLive, stamp, panelInstrument]);
 
   const pickUnderlying = (next: Underlying) => {
     setUnderlying(next);
     setWanted(null);
+    // A contract from the old underlying's chain has no row on the new one; open panel,
+    // wrong ladder underneath it is worse than a closed one.
+    setPanelInstrument(null);
   };
 
   const pickExpiry = (next: string) => {
     setExpiry(next);
     setWanted(null);
+    setPanelInstrument(null);
   };
 
   /** Where the scrubber puts the view. Standing on the right edge is spelled `null` —
@@ -345,7 +380,11 @@ export default function ChainScreen({ initial }: { initial: ViewRequest }) {
         {error ? <p className="notice error">{error}</p> : null}
 
         {chain ? (
-          <ChainLadder key={`${chain.underlying}:${chain.expiry}`} chain={chain} />
+          <ChainLadder
+            key={`${chain.underlying}:${chain.expiry}`}
+            chain={chain}
+            onSelectContract={setPanelInstrument}
+          />
         ) : error || (onLive && liveStatus === "error") || historicalWaiting ? null : (
           <p className="notice">
             {historicalBusy
@@ -357,6 +396,17 @@ export default function ChainScreen({ initial }: { initial: ViewRequest }) {
         )}
 
         <TimeScrubber timeline={timeline} index={index} onChange={pickIndex} />
+
+        {panelInstrument ? (
+          <ContractPanel
+            key={panelInstrument}
+            instrument={panelInstrument}
+            date={date}
+            liveChain={liveChain}
+            onLive={onLive}
+            onClose={() => setPanelInstrument(null)}
+          />
+        ) : null}
 
         <p className="note">
           A hatched half means that side is not listed at this strike. An empty cell means the

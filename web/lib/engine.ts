@@ -10,6 +10,7 @@
 import {
   isEngineError,
   type ChainResponse,
+  type ContractBarsResponse,
   type ExpiriesResponse,
   type HistoricalChainMessage,
   type HistoricalMinutesResponse,
@@ -317,6 +318,23 @@ export async function loadChainAt(
   return get<HistoricalChainMessage>(
     `/chain/at?underlying=${underlying}&expiry=${encodeURIComponent(expiry)}` +
       `&minute=${encodeURIComponent(minute)}`,
+  );
+}
+
+/**
+ * One contract's minute bars for one date. `docs/bars-contract.md`.
+ *
+ * **No fixture fallback**, for the reason `loadChainMinutes` gives: there is no fixture
+ * for "which minutes of *this* contract's day are stored", and inventing one would let
+ * the chart draw candles nothing behind it can answer. An unreachable engine is
+ * surfaced, not papered over.
+ */
+export async function loadContractBars(
+  instrument: string,
+  date: string,
+): Promise<ContractBarsResponse> {
+  return get<ContractBarsResponse>(
+    `/bars?instrument=${encodeURIComponent(instrument)}&date=${encodeURIComponent(date)}`,
   );
 }
 
