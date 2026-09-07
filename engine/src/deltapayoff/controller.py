@@ -451,12 +451,10 @@ class ConnectionController:
         spent = (
             f"the reconnect budget of {self.reconnect_budget} is spent after "
             f"{self.reconnects} drops; this connection will not come back without a "
-            f"resume ({detail})"
-            if detail
-            else f"the reconnect budget of {self.reconnect_budget} is spent after "
-            f"{self.reconnects} drops; this connection will not come back without a "
             f"resume"
         )
+        if detail:
+            spent = f"{spent} ({detail})"
         # An error record and not a warning, and the only one this module logs at error
         # besides a dead watchdog. A feed that has given up produces no other symptom:
         # the screens simply stop moving.
