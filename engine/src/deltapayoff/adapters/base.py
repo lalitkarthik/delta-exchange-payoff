@@ -8,10 +8,10 @@ names, the wire layout. Nothing downstream of an adapter ever sees venue JSON.
 **The protocol demands only what a feed needs**, which is the whole test of the
 abstraction: a venue with a different shape — NSE spells the same contract
 `NIFTY-20260908-25500CE`, in rupees, in lots, off a different calendar — must be able to
-fill it without the interface bending. Six members, in three groups:
+fill it without the interface bending. Seven members, in three groups:
 
 * **Describe yourself** — `venue`, `underlyings`.
-* **Feed** — `instruments`, `subscribe`, `stream`, `stop`.
+* **Feed** — `instruments`, `subscribe`, `on_connection`, `stream`, `stop`.
 * **Read** — `expiries`, `chain_snapshot`, the two venue REST reads the screens need.
 
 The two REST reads are here rather than beside the adapter because the venue client *is*
@@ -25,16 +25,20 @@ constructs and inherits `...`-bodied stubs returning `None` — a missing `strea
 stop raising `AttributeError` and start delivering silence. Conformance is checked by
 `isinstance` against the structural protocol, which does fail when a member goes missing.
 
-**Reconnect is not in this interface, and that is deliberate for exactly one ticket.**
-Backoff, the lifetime budget, subscription replay and staleness live inside the Delta
-adapter today because that is where `feed.py` already has them, correct and tested. #38
-lifts them into a connection controller wrapped around this protocol, and #39 puts a
-supervisor over that. Moving them early would mean writing the state machine twice.
+**Reconnect is not in this interface, and that is deliberate for exactly one ticket
+more.** Backoff, the lifetime budget and subscription replay live inside the Delta
+adapter still, because that is where `feed.py` already has them, correct and tested. #38
+put the **state machine** over this protocol — `controller.ConnectionController` — and
+took staleness with it, which is why `on_connection` exists: a machine needs to observe
+the connection it describes. #39 lifts backoff, the budget and replay up beside it and
+puts a supervisor over the result. Moving them early would have meant writing the state
+machine twice.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..events import Event, Instrument
@@ -49,9 +53,35 @@ if TYPE_CHECKING:  # pragma: no cover - imported for typing only
 Publish = Callable[[Event], None]
 
 
+class ConnectionSignal(str, Enum):
+    """What an adapter says about its socket, and the whole of what it says.
+
+    **Added in #38**, because the protocol carried no way for an adapter to report that
+    its connection had come or gone, and a controller cannot run a state machine over a
+    connection it cannot observe. Two members and no more: an adapter reports *facts
+    about its socket*, and what those facts mean — `connected`, `degraded`,
+    `reconnecting` — is the controller's to decide. An adapter that reported states
+    would be a second state machine disagreeing with the first.
+    """
+
+    #: The socket is up **and every subscription has been replayed**. Not merely
+    #: connected: a fresh socket with no subscriptions on it delivers nothing, which is
+    #: the failure with no error that `feed.py` exists to prevent, so an adapter must not
+    #: claim `OPENED` before it has replayed.
+    OPENED = "opened"
+    #: The socket is gone or unusable. The detail is the venue's own words, for a log
+    #: line; the controller's `reason` stays the short, stable `closed`.
+    CLOSED = "closed"
+
+
+#: What `on_connection` registers. **Synchronous and never blocking**, for the same
+#: reason `Publish` is: the socket reader calls it between reads.
+ConnectionListener = Callable[[ConnectionSignal, str], None]
+
+
 @runtime_checkable
 class Adapter(Protocol):
-    """One venue, behind six members."""
+    """One venue, behind seven members."""
 
     @property
     def venue(self) -> str:
@@ -88,6 +118,19 @@ class Adapter(Protocol):
         """
         ...
 
+    def on_connection(self, listener: ConnectionListener) -> None:
+        """Be told when this adapter's socket opens and closes. **Added in #38.**
+
+        Registered before `stream` and safe to call at any time, like `subscribe`. Every
+        registered listener is called with a `ConnectionSignal` and a detail string; a
+        listener that raises must not end the stream, because a socket reader is not the
+        place to discover a consumer's bug.
+
+        This is a *register*, not a single slot, so the controller and a future recorder
+        can both listen without either knowing about the other.
+        """
+        ...
+
     async def stream(self, publish: Publish) -> None:
         """Emit canonical events into `publish` until `stop` is called.
 
@@ -110,4 +153,10 @@ class Adapter(Protocol):
         ...
 
 
-__all__ = ["Adapter", "Instrument", "Publish"]
+__all__ = [
+    "Adapter",
+    "ConnectionListener",
+    "ConnectionSignal",
+    "Instrument",
+    "Publish",
+]

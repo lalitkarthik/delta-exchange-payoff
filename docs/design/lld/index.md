@@ -14,7 +14,7 @@ file, and change the row's status to a link. Do not write one ahead of the code.
 | The broker adapter — the protocol, the Delta implementation, the fake | [adapter.md](adapter.md) | #36, #37 |
 | The chain cache — invalidation, the recompute passes, watched pairs | not yet written | #37, #44 |
 | The store — the four tables, sealing, flushing, ETH | not yet written | #37, #43 |
-| The connection controller — the state machine, backoff, replay, commands | not yet written | #38, #41 |
+| The connection controller — the state machine, staleness, backoff, commands | [controller.md](controller.md) | #38, #39, #41 |
 | The supervisor — aggregate state, lifespan, the health report | not yet written | #39 |
 | Logging — the JSON-lines formatter, the sinks, what is logged and at what level | not yet written | #42 |
 | The historical read path — the ladder at a stored minute, and the day's minutes | [historical-read-path.md](historical-read-path.md) | #45 |

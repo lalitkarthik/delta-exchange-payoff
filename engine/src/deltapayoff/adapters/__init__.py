@@ -11,13 +11,15 @@ deletes it.
 
 from __future__ import annotations
 
-from .base import Adapter, Publish
+from .base import Adapter, ConnectionListener, ConnectionSignal, Publish
 from .delta import VENUE, DeltaAdapter, instrument_from_symbol
 from .shim import LegacyQuoteBridge
 
 __all__ = [
     "VENUE",
     "Adapter",
+    "ConnectionListener",
+    "ConnectionSignal",
     "DeltaAdapter",
     "LegacyQuoteBridge",
     "Publish",

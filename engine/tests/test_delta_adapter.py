@@ -17,7 +17,12 @@ from decimal import Decimal
 
 import pytest
 
-from deltapayoff.adapters import Adapter, DeltaAdapter, instrument_from_symbol
+from deltapayoff.adapters import (
+    Adapter,
+    ConnectionSignal,
+    DeltaAdapter,
+    instrument_from_symbol,
+)
 from deltapayoff.adapters.delta import VENUE
 from deltapayoff.events import IndexQuote, OptionQuote, OptionReference, Right
 from deltapayoff.feed import BOOK_CHANNEL, TICKER_CHANNEL
@@ -34,9 +39,17 @@ class _StubFeed:
         self.registry: dict[str, list[str]] = {}
         self.ran = False
         self.stopped = False
+        self.open_listeners: list = []
+        self.close_listeners: list = []
 
     def subscribe(self, channel: str, symbols) -> None:
         self.registry.setdefault(channel, []).extend(symbols)
+
+    def on_open(self, listener) -> None:
+        self.open_listeners.append(listener)
+
+    def on_close(self, listener) -> None:
+        self.close_listeners.append(listener)
 
     async def run(self) -> None:
         self.ran = True
@@ -477,6 +490,9 @@ def test_the_protocol_check_can_actually_fail() -> None:
         def subscribe(self, instruments):
             return None
 
+        def on_connection(self, listener):
+            return None
+
         def stop(self):
             return None
 
@@ -667,3 +683,36 @@ def _message(channel: str, frame: dict):
         frame=frame,
         received_at=ARRIVED_AT,
     )
+
+
+def test_the_adapter_translates_the_sockets_two_facts() -> None:
+    """`DeltaFeed` reports "opened" and "closed" as bare callbacks, because importing the
+    adapter protocol into the socket owner would be a cycle. Naming those two facts in
+    the protocol's vocabulary is this class's job, like naming `sy` an `Instrument`."""
+    delta = adapter()
+    seen: list[tuple[ConnectionSignal, str]] = []
+
+    delta.on_connection(lambda signal, detail: seen.append((signal, detail)))
+    delta.feed.open_listeners[0]("wss://public-socket.india.delta.exchange")
+    delta.feed.close_listeners[0]("ConnectionResetError: scripted drop")
+
+    assert seen == [
+        (ConnectionSignal.OPENED, "wss://public-socket.india.delta.exchange"),
+        (ConnectionSignal.CLOSED, "ConnectionResetError: scripted drop"),
+    ]
+
+
+def test_the_signal_is_a_register_and_not_a_slot() -> None:
+    """Two listeners, both told. The controller and a future recorder can listen without
+    either knowing about the other."""
+    delta = adapter()
+    first: list = []
+    second: list = []
+
+    delta.on_connection(lambda signal, detail: first.append(signal))
+    delta.on_connection(lambda signal, detail: second.append(signal))
+    for listener in delta.feed.open_listeners:
+        listener("up")
+
+    assert first == [ConnectionSignal.OPENED]
+    assert second == [ConnectionSignal.OPENED]

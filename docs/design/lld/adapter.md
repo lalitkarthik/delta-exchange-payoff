@@ -27,8 +27,9 @@ true of the code and not only of the diagram.
 
 ## 2. The protocol, and what it deliberately omits
 
-Six members in three groups: **describe yourself** (`venue`, `underlyings`), **feed**
-(`instruments`, `subscribe`, `stream`, `stop`), **read** (`expiries`, `chain_snapshot`).
+Seven members in three groups: **describe yourself** (`venue`, `underlyings`), **feed**
+(`instruments`, `subscribe`, `on_connection`, `stream`, `stop`), **read** (`expiries`,
+`chain_snapshot`). `on_connection` is #38's — [controller.md](controller.md) §5.
 The two REST reads are on the adapter because the venue client *is* part of knowing a
 venue, and putting them beside it means a second module learns a second venue.
 
@@ -38,8 +39,8 @@ bridging queue to invert it.
 
 **Reconnect is not on the interface.** Backoff, the lifetime budget, subscription replay
 and the reason a connection ended stay inside `feed.DeltaFeed`, correct and tested. #38
-lifts them into a controller around this protocol and #39 puts a supervisor over that;
-moving them early meant writing the state machine twice.
+put the **state machine** around this protocol — which is why `on_connection` exists — and
+#39 lifts the rest up beside it. Moving them early meant writing the machine twice.
 
 **Conformance is structural**, for the reason `events/bus.py` records: an explicit subclass
 would inherit `...`-bodied stubs and pass. A test pins that the check can still fail.

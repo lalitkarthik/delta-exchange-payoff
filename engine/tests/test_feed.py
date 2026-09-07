@@ -467,3 +467,100 @@ def test_the_reason_a_connection_ended_is_recorded() -> None:
 
     assert feed.last_error is not None
     assert "subscribe rejected" in feed.last_error
+
+
+# --- reporting the connection (#38) ----------------------------------------------
+
+
+def test_open_is_reported_only_after_the_registry_has_gone_out() -> None:
+    """**The promise the signal makes.**
+
+    A controller told "open" marks the connection `connected` and the badge goes green.
+    If that arrived before the resubscribe, green would mean a fresh, empty socket
+    carrying nothing — the failure with no error this module exists to prevent, wearing
+    a healthy badge. So the assertion is not that the signal fires but *when*: the
+    subscribe message is already on the wire.
+    """
+    socket = FakeSocket([book_frame("C-BTC-77600-040926", 120, 125)])
+    sent_when_opened: list[int] = []
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
+    feed.subscribe("ob_l2", ["C-BTC-77600-040926"])
+    feed.on_open(lambda _detail: sent_when_opened.append(len(socket.sent)))
+
+    asyncio.run(drive(feed))
+
+    assert sent_when_opened == [1]
+    assert socket.sent[0]["type"] == "subscribe"
+
+
+def test_a_dropped_connection_is_reported_with_the_venues_words() -> None:
+    closed: list[str] = []
+    socket = FakeSocket([], close_after=0)
+    feed = DeltaFeed(FanOut(), connect=connector([socket]), retry_delay=0.01)
+    feed.on_close(closed.append)
+
+    asyncio.run(drive(feed))
+
+    assert closed
+    assert "ConnectionResetError: scripted drop" in closed[0]
+
+
+def test_a_dial_that_never_opened_is_reported_too() -> None:
+    """A controller told only about sockets that had opened would sit in `connecting`
+    for the length of an endpoint outage, which reads on a badge as "starting up"."""
+    opened: list[str] = []
+    closed: list[str] = []
+
+    def refuse(_url):
+        raise OSError("no route to host")
+
+    feed = DeltaFeed(FanOut(), connect=refuse, retry_delay=0.01)
+    feed.on_open(opened.append)
+    feed.on_close(closed.append)
+
+    asyncio.run(drive(feed))
+
+    assert opened == []
+    assert "OSError: no route to host" in closed[0]
+
+
+def test_a_listener_that_raises_cannot_take_the_feed_down() -> None:
+    """The same rule `publish` follows: a broken consumer is a bug in the consumer, and
+    a socket reader is not the place to discover it."""
+    published: list = []
+    bus = FanOut()
+    drained = bus.subscribe("test", maxsize=100)
+    socket = FakeSocket([book_frame("C-BTC-77600-040926", 120, 125)])
+    feed = DeltaFeed(bus, connect=connector([socket]))
+    feed.subscribe("ob_l2", ["C-BTC-77600-040926"])
+
+    def explode(_detail: str) -> None:
+        raise RuntimeError("a listener's own bug")
+
+    feed.on_open(explode)
+
+    asyncio.run(drive(feed))
+
+    while not drained.queue.empty():
+        published.append(drained.queue.get_nowait())
+    assert feed.messages == 1
+    assert len(published) == 1
+
+
+def test_a_stop_is_not_reported_as_a_drop() -> None:
+    """Stopping on purpose is not the connection failing, and a badge that flashed
+    `reconnecting` on every clean shutdown would teach a person to ignore it."""
+    closed: list[str] = []
+    feed = DeltaFeed(FanOut(), connect=connector([FakeSocket([])]))
+    feed.on_close(closed.append)
+
+    async def run_then_stop() -> None:
+        task = asyncio.create_task(feed.run())
+        await asyncio.sleep(0.05)
+        feed.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run_then_stop())
+
+    assert closed == []

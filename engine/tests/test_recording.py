@@ -84,6 +84,12 @@ class _StubFeed:
     def subscribe(self, channel: str, symbols) -> None:
         self.registry.setdefault(channel, []).extend(symbols)
 
+    def on_open(self, listener) -> None:
+        return None
+
+    def on_close(self, listener) -> None:
+        return None
+
     async def run(self) -> None:
         await asyncio.Event().wait()
 
