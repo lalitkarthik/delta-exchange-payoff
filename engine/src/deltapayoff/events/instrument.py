@@ -39,11 +39,22 @@ class Right(str, Enum):
     """Call or put.
 
     The values are `C` and `P` because that is what the store's `option_type` column
-    already holds and what the canonical string prints. One spelling, no mapping table.
+    already holds and what the canonical string prints. **One spelling** — `side` below is
+    a rendering of it, not a second one.
     """
 
     CALL = "C"
     PUT = "P"
+
+    @property
+    def side(self) -> str:
+        """`"call"` or `"put"` — the spelling `docs/chain-contract.md` fixes for the
+        browser and `models.ChainRow` uses for its two slots.
+
+        The ladder has to name a side somewhere, since a `Leg` does not carry one, and
+        one property here is the alternative to that mapping appearing at every fold.
+        """
+        return "call" if self is Right.CALL else "put"
 
 
 def format_strike(strike: Decimal) -> str:

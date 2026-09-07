@@ -1,14 +1,14 @@
 """Delta Exchange India, behind the adapter protocol.
 
 **Everything venue-specific is in this file or in the three modules it owns** — the socket
-(`feed.py`), the REST client (`delta_client.py`) and the wire layout (`wire.py`). What
-leaves here is canonical: `Instrument`s and catalogued `Event`s, never Delta JSON.
+(`delta_socket.py`), the REST client (`delta_client.py`) and the wire layout (`wire.py`).
+What leaves here is canonical: `Instrument`s and catalogued `Event`s, never Delta JSON.
 
 Three mappings, and they are the whole of it:
 
     ob_l2  frame  ->  md.option_quote
     ticker frame  ->  md.option_reference
-    ticker frame  ->  md.index_quote      once per underlying, when spot moves
+    ticker frame  ->  md.index_quote      one per frame, since #37
 
 **`null` is not `0`, and this is the boundary that holds it.** Delta spells an absent
 quote three ways — `"0"`, `""` and `null` — and all three become `None` on a price, a size
@@ -31,9 +31,9 @@ standard JSON does not, so this is reachable from a venue and not merely defensi
 `None`; this closes the float-shaped hole beside it.
 
 **Reconnect stays here for this ticket.** Backoff, the lifetime budget, subscription
-replay and the reason a connection ended all live in `feed.DeltaFeed`, which this class
-owns and drives. #38 lifts them into a connection controller wrapped around the protocol.
-Moving them early would mean writing the state machine twice.
+replay and the reason a connection ended all live in `delta_socket.DeltaFeed`, which this
+class owns and drives. #38 lifts them into a connection controller wrapped around the
+protocol. Moving them early would mean writing the state machine twice.
 """
 
 from __future__ import annotations
@@ -48,13 +48,12 @@ from typing import Any
 from pydantic import ValidationError
 
 from ..chain import build_chain, build_expiries
-from ..convert import to_number
 from ..delta_client import DeltaClient
 from ..events import Event, IndexQuote, Instrument, OptionQuote, OptionReference, Right
-from ..feed import BOOK_CHANNEL, TICKER_CHANNEL, DeltaFeed, VenueMessage
 from ..models import ChainResponse, ExpiriesResponse
 from ..wire import decode_ob_l2_top, decode_ticker, decode_ticker_extras
 from .base import Publish
+from .delta_socket import BOOK_CHANNEL, TICKER_CHANNEL, DeltaFeed, VenueMessage
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +133,6 @@ class DeltaAdapter:
         *,
         underlyings: Sequence[str] = ("BTC",),
         feed_factory: Any = DeltaFeed,
-        legacy: Any = None,
         **feed_kwargs: Any,
     ) -> None:
         """`feed_factory` is the socket owner's constructor, called with the sink.
@@ -144,21 +142,12 @@ class DeltaAdapter:
         that registers subscriptions and never dials out. `connect=` and the retry
         settings pass through in `feed_kwargs`, which is the seam `tests/test_feed.py`
         drives.
-
-        `legacy` is the temporary shim of `adapters.shim`. `None` means nothing is
-        republished in the old shape, which is what every adapter test wants and what
-        #37 makes the only case.
         """
         self._client = client if client is not None else DeltaClient()
         self._underlyings = tuple(name.strip().upper() for name in underlyings if name)
-        self._legacy = legacy
         self._sink = _FrameSink(self)
         self._feed = feed_factory(self._sink, **feed_kwargs)
         self._publish: Publish | None = None
-
-        #: The last spot **emitted** per underlying, which is what makes `md.index_quote`
-        #: once-per-underlying rather than once-per-contract. See `_index_quote`.
-        self._last_spot: dict[str, float] = {}
 
         #: Events handed to `publish`. The adapter's own throughput, independent of the
         #: socket's message count, because one ticker frame is two events and a book
@@ -169,8 +158,7 @@ class DeltaAdapter:
         #: that raises anywhere in the decode lands here and is dropped whole.
         self.undecodable = 0
         #: Symbols that are not Delta option symbols, from a frame's `sy` or from a row
-        #: of the venue's listing. A frame carrying one still reaches the shim, so
-        #: nothing that worked before stops working; it produces no events, because an
+        #: of the venue's listing. Such a frame produces no events at all, because an
         #: event with no instrument would be a quote about nothing.
         self.unparseable_symbols = 0
         #: Numbers that arrived as `NaN` or `Infinity` and were carried as absent.
@@ -264,19 +252,16 @@ class DeltaAdapter:
     # --- frames in, events out ---------------------------------------------------
 
     def handle(self, message: VenueMessage) -> None:
-        """One frame off the socket: decode once, feed the shim, publish the events.
+        """One frame off the socket: decode once, publish the events.
 
-        **The decode happens before either consumer sees anything**, so a frame that makes
-        no sense is dropped whole rather than reaching the old path as a record with a
-        broken payload inside it. That is what `feed.py` did before the decode moved here,
-        and the chain cache would otherwise raise on it once a minute for as long as the
-        frame stayed the newest for its contract.
-
-        The shim is served first. It is today's path and it should not wait behind work
-        nothing consumes yet.
+        **The decode happens before any consumer sees anything**, so a frame that makes no
+        sense is dropped whole rather than reaching a consumer with a broken payload
+        inside it. That is what `feed.py` did before the decode moved here, and the chain
+        cache would otherwise raise on it on every pass for as long as the frame stayed
+        the newest for its contract.
         """
         try:
-            events, bid, ask = self._decode(message)
+            events = self._decode(message)
         except Exception:
             self.undecodable += 1
             if self.undecodable == 1:
@@ -293,9 +278,6 @@ class DeltaAdapter:
                 )
             return
 
-        if self._legacy is not None:
-            self._legacy.republish(message, bid=bid, ask=ask)
-
         if self._publish is None:
             return
         for event in events:
@@ -307,13 +289,13 @@ class DeltaAdapter:
     ) -> list[Event]:
         """The decode, as a function of three plain values. **The seam the tests drive.**
 
-        No socket, no bus and no `Quote`: a captured frame goes in and canonical events
-        come out, which is what lets every fixture in `tests/fixtures/ws-*.json` be run
-        through the real boundary. Raises nothing — a frame that cannot be read is
-        counted and produces no events, exactly as it does on the live path.
+        No socket and no bus: a captured frame goes in and canonical events come out,
+        which is what lets every fixture in `tests/fixtures/ws-*.json` be run through the
+        real boundary. Raises nothing — a frame that cannot be read is counted and
+        produces no events, exactly as it does on the live path.
         """
         try:
-            events, _, _ = self._decode(
+            events = self._decode(
                 VenueMessage(
                     channel=channel,
                     symbol=frame.get("sy") or "",
@@ -326,19 +308,13 @@ class DeltaAdapter:
             return []
         return events
 
-    def _decode(
-        self, message: VenueMessage
-    ) -> tuple[list[Event], float | None, float | None]:
-        """`(events, bid, ask)` for one frame. Raises on a frame that makes no sense.
+    def _decode(self, message: VenueMessage) -> list[Event]:
+        """The events for one frame. Raises on a frame that makes no sense.
 
-        The top of book is returned beside the events because the shim needs it and this
-        is the only decode: computing it twice would read Delta's array offsets twice, in
-        two places, which is the hazard `wire.py` exists to concentrate.
-
-        **The bid and ask handed back are the same values the event carries**, non-finite
-        guard included. Returning the raw pair would let one frame become an event saying
-        the bid is absent and a `Quote` saying it is `NaN` — two forms of one fact
-        disagreeing, which is the whole thing an expand–contract pair must not do.
+        **One decode per frame, and one place that reads Delta's array offsets.** A book
+        frame is one `md.option_quote`; a ticker frame is one `md.option_reference` and
+        one `md.index_quote`. Since #37 every field either consumer needs is on one of
+        those three, so nothing carries the frame onward and the venue's layout ends here.
         """
         frame = message.frame or {}
         instrument = instrument_from_symbol(message.symbol)
@@ -359,7 +335,7 @@ class DeltaAdapter:
             bid, bid_size = self._finite_quote(top.bid, top.bid_size)
             ask, ask_size = self._finite_quote(top.ask, top.ask_size)
             if instrument is None:
-                return [], bid, ask
+                return []
             quote = OptionQuote(
                 source=VENUE,
                 instrument=instrument,
@@ -367,23 +343,31 @@ class DeltaAdapter:
                 bid_size=bid_size,
                 ask=ask,
                 ask_size=ask_size,
+                # Delta's own last-trade stamp on the book frame. **Carried, never
+                # bucketed on** — the quote bars store it in `last_lts` and it decides
+                # nothing. It travels on the event since #37 because once the frame stops
+                # travelling there is nowhere else for it to live.
+                lts=_venue_time(frame.get("lts")),
                 **stamps,
             )
-            return [quote], bid, ask
+            return [quote]
 
         if message.channel != TICKER_CHANNEL:
-            return [], None, None
+            return []
 
         _, leg = decode_ticker(frame)
         extras = decode_ticker_extras(frame)
-        bid, ask = self._finite(leg.bid), self._finite(leg.ask)
         if instrument is None:
-            return [], bid, ask
+            return []
 
         events: list[Event] = [
             OptionReference(
                 source=VENUE,
                 instrument=instrument,
+                # Delta's numeric id for the contract. Neither a price nor an opinion: it
+                # reaches the browser as `models.Leg.product_id`, and this frame is the
+                # only place the websocket transport carries it.
+                product_id=leg.product_id,
                 mark=self._finite(leg.mark),
                 last_price=self._finite(extras.last_traded_price),
                 oi=self._finite(leg.oi),
@@ -403,39 +387,55 @@ class DeltaAdapter:
                 theta=self._finite(leg.theta),
                 vega=self._finite(leg.vega),
                 rho=self._finite(leg.rho),
+                # Traded value over Delta's rolling window, `to[0]`. The reference bars
+                # store it and this frame is where it lives; `null` for a contract that
+                # never traded, never `0`.
+                turnover=self._finite(extras.turnover),
+                # **This channel's own top of book.** The fallback quote the quote bars
+                # use when a contract's book stays silent for a whole minute, and the base
+                # the live ladder overrides wholesale with the book's when it has one.
+                # See `docs/design/events.md`, *A note on provenance*.
+                bid=self._finite(leg.bid),
+                ask=self._finite(leg.ask),
                 **stamps,
             )
         ]
-        index = self._index_quote(instrument.underlying, frame, stamps)
+        index = self._index_quote(instrument.underlying, extras.spot, stamps)
         if index is not None:
             events.append(index)
-        return events, bid, ask
+        return events
 
     def _index_quote(
-        self, underlying: str, frame: dict[str, Any], stamps: dict[str, Any]
+        self, underlying: str, spot: float | None, stamps: dict[str, Any]
     ) -> IndexQuote | None:
-        """One spot observation per underlying, not one per contract.
+        """One spot observation per ticker frame.
 
         **Measured**: all 136 frames captured inside a 0.06 s window carried an identical
-        `sp` of 77651.9 (`tools/capture_ws.py`, 2026-09-03, recorded in `wire.py`). Spot
-        is a property of BTC and not of the contract whose frame happened to carry it, so
-        emitting it 136 times would put 135 copies of one fact on the bus and invite a
-        consumer to join on the messenger.
+        `sp` of 77651.9 (`tools/capture_ws.py`, 2026-09-03, recorded in `wire.py`). #36
+        emitted this only when the value **changed**, so that 135 copies of one fact did
+        not travel the bus.
 
-        So an event is emitted when the value **changes**, and the first observation
-        always counts. The cost is real and is named here rather than discovered: an
-        unchanged spot re-observed at a later instant is not re-emitted, so this event
-        stream alone cannot tell how long a price held. #37's spot bars need that, and
-        the frame's own stamp is still on every `md.option_reference` beside it.
+        **#37 removed the suppression**, and the reason is the store rather than the
+        screen. The spot bars count observations: `spot_ticks` is `measured` ~7,056 a
+        minute against an individual contract's 118, and it is the one column that says
+        whether the ingester was actually running. A deduplicated stream cannot say how
+        long a price held, so a suppressed re-observation would be a row this engine had
+        to invent. The four price columns are unaffected either way — suppression only
+        ever dropped a value identical to the one immediately before it.
 
-        A frame with no readable spot yields nothing. An absent spot is not an
-        observation of absence.
+        The cost is `derived` ≈118 extra events a second, one per ticker frame, against
+        a `measured` 1,322.9 msg/s feed (`tools/measure_feed.py`, 2026-09-03).
+
+        A frame with no readable spot yields nothing: an absent spot is not an
+        observation of absence. `wire.decode_ticker_extras` reads `sp` with
+        `to_quote_number` since #37, so a spot spelled `"0"` is absent and not a price of
+        zero — the gap `docs/design/lld/adapter.md` §6 recorded, closed on both paths at
+        once so the event and the stored spot row cannot disagree about one frame.
         """
-        spot = self._finite(to_number(frame.get("sp")))
-        if spot is None or self._last_spot.get(underlying) == spot:
+        checked = self._finite(spot)
+        if checked is None:
             return None
-        self._last_spot[underlying] = spot
-        return IndexQuote(source=VENUE, underlying=underlying, spot=spot, **stamps)
+        return IndexQuote(source=VENUE, underlying=underlying, spot=checked, **stamps)
 
     def _finite(self, value: float | None) -> float | None:
         """`NaN` and `Infinity` become `None`, counted. See the module docstring."""
@@ -467,6 +467,13 @@ def _venue_time(stamp: Any) -> datetime | None:
     except (TypeError, ValueError):
         return None
     try:
-        return datetime.fromtimestamp(microseconds / 1e6, tz=timezone.utc)
+        # Divided as integers, never through a float. A microsecond epoch already spends
+        # more than a double's 15-16 significant digits on its integer part, so
+        # `fromtimestamp(us / 1e6)` rounds the last digit away — and since #37 this stamp
+        # is what the bar writer buckets on, exactly as `bars._to_utc` has always done.
+        seconds, remainder = divmod(microseconds, 1_000_000)
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(
+            microsecond=remainder
+        )
     except (OverflowError, OSError, ValueError):
         return None

@@ -18,9 +18,9 @@ from decimal import Decimal
 import pytest
 
 from deltapayoff.adapters import Adapter, DeltaAdapter, instrument_from_symbol
-from deltapayoff.adapters.delta import VENUE
+from deltapayoff.adapters.delta import VENUE, _venue_time
+from deltapayoff.adapters.delta_socket import BOOK_CHANNEL, TICKER_CHANNEL
 from deltapayoff.events import IndexQuote, OptionQuote, OptionReference, Right
-from deltapayoff.feed import BOOK_CHANNEL, TICKER_CHANNEL
 
 #: An arrival stamp this file chose, so nothing here reads a clock.
 ARRIVED_AT = 1_788_430_800.5
@@ -178,12 +178,18 @@ def test_every_captured_ticker_frame_yields_a_reference(ws_ticker_frames) -> Non
     assert delta.undecodable == 0
 
 
-def test_the_index_quote_is_emitted_once_per_underlying(ws_ticker_frames) -> None:
-    """Spot is a property of BTC, not of the contract whose frame carried it.
+def test_the_index_quote_is_emitted_once_per_frame(ws_ticker_frames) -> None:
+    """One spot observation per frame, and **not** one per change.
 
     **Measured**: all 136 captured frames were taken inside a 0.06 s window and carry an
-    identical `sp` of 77651.9. Emitting one per frame would put 135 copies of one fact on
-    the bus and invite a consumer to join on the messenger.
+    identical `sp` of 77651.9. #36 emitted only the first of those, so that 135 copies of
+    one fact did not travel the bus; #37 emits all 136, because the spot bars count
+    observations and `spot_ticks` is the column that says whether the ingester was
+    running at all. A deduplicated stream cannot say how long a price held.
+
+    `instrument` stays `null` on every one of them: spot is a property of BTC and not of
+    the contract whose frame happened to carry it, and storing the messenger would invite
+    a reader to join on it.
     """
     delta = adapter()
 
@@ -194,15 +200,19 @@ def test_the_index_quote_is_emitted_once_per_underlying(ws_ticker_frames) -> Non
         if isinstance(event, IndexQuote)
     ]
 
-    assert len(index_quotes) == 1
-    assert index_quotes[0].underlying == "BTC"
-    assert index_quotes[0].instrument is None
-    assert index_quotes[0].spot == pytest.approx(77651.9)
+    assert len(index_quotes) == len(ws_ticker_frames) == 136
+    assert {event.underlying for event in index_quotes} == {"BTC"}
+    assert {event.instrument for event in index_quotes} == {None}
+    assert {round(event.spot, 1) for event in index_quotes} == {77651.9}
 
 
-def test_a_spot_that_moves_is_emitted_again() -> None:
-    """Change is what schedules the event, so a market that moves is not deduplicated
-    into silence."""
+def test_an_unchanged_spot_is_emitted_again() -> None:
+    """The suppression #36 had is gone, and this is the test that would have caught it.
+
+    A re-observation of the same price at a later instant is a real observation: it is
+    what a `spot_ticks` of ~7,056 a minute is made of, and it is the difference between
+    a quiet market and a dead ingester.
+    """
     delta = adapter()
     symbol = "C-BTC-77600-040926"
 
@@ -214,7 +224,37 @@ def test_a_spot_that_moves_is_emitted_again() -> None:
 
     assert [type(e).__name__ for e in first] == ["OptionReference", "IndexQuote"]
     assert [type(e).__name__ for e in second] == ["OptionReference", "IndexQuote"]
-    assert [type(e).__name__ for e in again] == ["OptionReference"]
+    assert [type(e).__name__ for e in again] == ["OptionReference", "IndexQuote"]
+    assert [e.spot for e in again if isinstance(e, IndexQuote)] == [77700.0]
+
+
+def test_a_spot_spelled_zero_is_absent_and_not_a_price_of_zero() -> None:
+    """`null` is not `0`, on the one field #36 left reading it as a number.
+
+    `docs/design/lld/adapter.md` §6 recorded this as a known gap and handed it to #37 with
+    the instruction to fix `wire.decode_ticker_extras` at the same time, since the spot
+    bars read `sp` through that function and an event disagreeing with a stored row about
+    one frame is worse than either being wrong alone.
+    """
+    frame = ticker_frame("C-BTC-77600-040926")
+    frame["sp"] = "0"
+
+    events = adapter().events_from_frame(TICKER_CHANNEL, frame, ARRIVED_AT)
+
+    assert not [e for e in events if isinstance(e, IndexQuote)]
+
+
+def test_a_last_price_spelled_zero_is_absent_too() -> None:
+    """`ohlc[3]` has the same shape as `sp`: a price nobody paid is not a price of zero.
+
+    Sixteen of the 136 captured contracts have never traded and send `ohlc` all-null; a
+    seventeenth spelling it `"0"` must land the same way.
+    """
+    frame = ticker_frame("C-BTC-77600-040926", ohlc=["1", "2", "3", "0"])
+
+    reference = adapter().events_from_frame(TICKER_CHANNEL, frame, ARRIVED_AT)[0]
+
+    assert reference.last_price is None
 
 
 def test_a_frame_with_no_spot_yields_no_index_quote() -> None:
@@ -225,6 +265,96 @@ def test_a_frame_with_no_spot_yields_no_index_quote() -> None:
     events = adapter().events_from_frame(TICKER_CHANNEL, frame, ARRIVED_AT)
 
     assert not [e for e in events if isinstance(e, IndexQuote)]
+
+
+# --- the four fields the shim existed for ----------------------------------------
+#
+# #36's shim carried the venue's whole frame past the adapter, because four things the
+# consumers read had no field in the catalogue: `lts`, turnover, `product_id` and the
+# ticker channel's own bid and ask. #37 added all four to the events and deleted the shim.
+# These are the tests that say the deletion did not lose them.
+
+
+def test_every_book_event_carries_the_venue_last_trade_stamp(ws_book_frames) -> None:
+    """`lts` feeds the quote bars' `last_lts` column, populated on all 2,460 rows of #36's
+    410 s live run. Carried on the event and **never bucketed on**: `ts_venue` alone
+    decides which minute a tick belongs to."""
+    delta = adapter()
+
+    quotes = [
+        delta.events_from_frame(BOOK_CHANNEL, frame, ARRIVED_AT)[0]
+        for frame in ws_book_frames.values()
+    ]
+
+    assert len(quotes) == 136
+    assert all(quote.lts is not None for quote in quotes), "a bar would lose its last_lts"
+    for quote, frame in zip(quotes, ws_book_frames.values(), strict=True):
+        assert quote.lts == _venue_time(frame["lts"])
+        assert quote.lts != quote.ts_venue, "lts and ts are two different stamps"
+
+
+def test_the_reference_event_carries_turnover_and_the_product_id(
+    ws_ticker_frames,
+) -> None:
+    """`to[0]` is a stored column and `i` reaches the browser as `Leg.product_id`. Neither
+    is derivable from anything else on the bus, so both travel on the event."""
+    delta = adapter()
+    symbol = "P-BTC-78500-040926"
+    frame = ws_ticker_frames[symbol]
+    body = frame["d"][0]
+
+    reference = delta.events_from_frame(TICKER_CHANNEL, frame, ARRIVED_AT)[0]
+
+    assert reference.product_id == body["i"]
+    assert reference.turnover == body["to"][0]
+
+
+def test_a_contract_that_never_traded_carries_no_turnover_and_no_last_price(
+    ws_ticker_frames,
+) -> None:
+    """**Sixteen of the 136 captured contracts have never traded** and send `ohlc` and
+    `to` all-null. Absent stays absent: a zero would read as "it turned over nothing and
+    last traded at zero", which is two claims nobody made."""
+    delta = adapter()
+    untraded = [
+        delta.events_from_frame(TICKER_CHANNEL, frame, ARRIVED_AT)[0]
+        for frame in ws_ticker_frames.values()
+        if frame["d"][0]["ohlc"][3] is None
+    ]
+
+    assert len(untraded) == 16, "the capture no longer holds the never-traded contracts"
+    assert all(event.last_price is None for event in untraded)
+    assert all(event.turnover is None for event in untraded)
+
+
+def test_the_reference_event_carries_the_channels_own_top_of_book(
+    ws_ticker_frames, ws_book_frames
+) -> None:
+    """**The fallback quote, and the reason `from_book` needs no channel on the bus.**
+
+    The ticker channel publishes its own bid and ask; they are the quote bars' fallback
+    for a contract whose book stays silent for a whole minute, and the base the live
+    ladder overrides wholesale when a book quote exists. A consumer decides provenance by
+    *which event* a price came from, so no venue channel has to re-enter the catalogue.
+    """
+    delta = adapter()
+    symbol = "P-BTC-78500-040926"
+    body = ws_ticker_frames[symbol]["d"][0]
+
+    reference = delta.events_from_frame(
+        TICKER_CHANNEL, ws_ticker_frames[symbol], ARRIVED_AT
+    )[0]
+    book = delta.events_from_frame(BOOK_CHANNEL, ws_book_frames[symbol], ARRIVED_AT)[0]
+
+    assert reference.bid == float(body["q"][2])
+    assert reference.ask == float(body["q"][0])
+    # The two describe the same top of book at two instants — the book republishes every
+    # 508 ms against the ticker channel's 5,001 ms — so they are close and not equal.
+    # That gap is exactly why one overrides the other **wholesale**: taking the bid from
+    # one and the ask from the other would report a spread neither channel ever quoted.
+    assert book.bid is not None and book.ask is not None
+    assert abs(book.bid - reference.bid) / reference.bid < 0.05
+    assert (book.bid, book.ask) != (reference.bid, reference.ask)
 
 
 # --- null is not 0, at the one boundary that knows -------------------------------
@@ -299,17 +429,10 @@ def test_the_three_absent_spellings_become_null_and_a_real_zero_survives(
     assert book.bid_size is None, "a size without its price is not a quote"
     assert book.ask_size is None
 
-    # The same two spellings on the ticker channel, where the quote reaches the old
-    # record rather than an event.
-    carried: list = []
-
-    class _Bridge:
-        def republish(self, message, *, bid, ask) -> None:
-            carried.append((bid, ask))
-
-    adapter(legacy=_Bridge()).feed.sink.publish(_message(TICKER_CHANNEL, frame))
-
-    assert carried == [(None, None)], 'a ticker `q` spelling "0"/"" is nobody quoting'
+    # The same two spellings on the ticker channel, where since #37 the quote reaches
+    # `md.option_reference`'s own bid and ask rather than a record carrying a channel.
+    assert reference.bid is None, 'a ticker `q` bid spelled "0" is nobody quoting'
+    assert reference.ask is None, 'a ticker `q` ask spelled "" is nobody quoting'
 
 
 def test_a_zero_that_is_really_zero_survives_on_a_second_fixture_row(
@@ -567,57 +690,38 @@ def test_streaming_runs_the_socket_owner_and_stopping_stops_it() -> None:
     assert delta.feed.stopped is True
 
 
-def test_the_sink_publishes_events_and_feeds_the_shim() -> None:
-    """The whole live path, one frame at a time: the socket owner's sink decodes once,
-    hands the old record to the shim, and publishes the canonical events."""
+def test_the_sink_decodes_once_and_publishes_the_events() -> None:
+    """The whole live path, one frame at a time: the socket owner's sink decodes once and
+    publishes the canonical events, and nothing else leaves the adapter.
 
-    class _Bridge:
-        def __init__(self) -> None:
-            self.quotes = []
-
-        def republish(self, message, *, bid, ask) -> None:
-            self.quotes.append((message.channel, message.symbol, bid, ask))
-
-    bridge = _Bridge()
-    delta = adapter(legacy=bridge)
+    **Two events from the ticker frame, not one.** The reference carries the contract; the
+    index quote carries spot, which belongs to the underlying.
+    """
+    delta = adapter()
     published: list = []
     delta._publish = published.append
 
-    delta.feed.sink.publish(
-        _message(BOOK_CHANNEL, book_frame("C-BTC-77600-040926"))
-    )
-    delta.feed.sink.publish(
-        _message(TICKER_CHANNEL, ticker_frame("C-BTC-77600-040926"))
-    )
+    delta.feed.sink.publish(_message(BOOK_CHANNEL, book_frame("C-BTC-77600-040926")))
+    delta.feed.sink.publish(_message(TICKER_CHANNEL, ticker_frame("C-BTC-77600-040926")))
 
     assert [type(event).__name__ for event in published] == [
         "OptionQuote",
         "OptionReference",
         "IndexQuote",
     ]
-    assert bridge.quotes == [
-        (BOOK_CHANNEL, "C-BTC-77600-040926", 120.0, 125.0),
-        (TICKER_CHANNEL, "C-BTC-77600-040926", 579.0, 584.0),
-    ]
+    assert (published[0].bid, published[0].ask) == (120.0, 125.0)
+    assert (published[1].bid, published[1].ask) == (579.0, 584.0)
     assert delta.emitted == 3
 
 
-def test_the_event_and_the_old_record_agree_on_an_absent_price() -> None:
-    """**Two forms of one fact must not disagree**, which is the whole discipline of an
-    expand–contract pair. Handing the shim the raw decode while the event got the
-    non-finite guard would produce an `md.option_quote` saying the bid is absent and a
-    `Quote` saying it is `NaN`, from the same frame, in the same instant.
+def test_a_non_finite_price_is_absent_and_takes_its_size_with_it() -> None:
+    """`NaN` must not reach a consumer as a quote, and must not reach one as a size.
+
+    Pydantic serialises `NaN` to JSON `null`, so a garbage number would arrive downstream
+    indistinguishable from a quote that was never there. Refused before the event is built
+    — if the refusal reached the socket reader it would end the connection.
     """
-
-    class _Bridge:
-        def __init__(self) -> None:
-            self.seen: list[tuple] = []
-
-        def republish(self, message, *, bid, ask) -> None:
-            self.seen.append((bid, ask))
-
-    bridge = _Bridge()
-    delta = adapter(legacy=bridge)
+    delta = adapter()
     published: list = []
     delta._publish = published.append
 
@@ -626,26 +730,19 @@ def test_the_event_and_the_old_record_agree_on_an_absent_price() -> None:
     delta.feed.sink.publish(_message(BOOK_CHANNEL, frame))
 
     assert published[0].bid is None
-    assert bridge.seen == [(None, 125.0)], "the old record kept a NaN the event refused"
+    assert published[0].bid_size is None, "a size without its price is not a quote"
+    assert published[0].ask == 125.0
+    assert delta.non_finite == 1
 
 
-def test_a_malformed_frame_reaches_neither_the_shim_nor_the_bus() -> None:
-    """Dropped whole, as `feed.py` dropped it before the decode moved here.
+def test_a_malformed_frame_reaches_no_consumer() -> None:
+    """Dropped whole, as the socket owner dropped it before the decode moved here.
 
-    Letting it through to the old path would leave the chain cache holding a frame it
-    raises on, once every recompute pass, for as long as it stayed the newest for its
-    contract — a screen that stops updating with nothing saying why.
+    Letting it through would leave the chain cache holding something it raises on, once
+    every recompute pass, for as long as it stayed the newest for its contract — a screen
+    that stops updating with nothing saying why.
     """
-
-    class _Bridge:
-        def __init__(self) -> None:
-            self.republished = 0
-
-        def republish(self, message, *, bid, ask) -> None:
-            self.republished += 1
-
-    bridge = _Bridge()
-    delta = adapter(legacy=bridge)
+    delta = adapter()
     published: list = []
     delta._publish = published.append
 
@@ -654,12 +751,11 @@ def test_a_malformed_frame_reaches_neither_the_shim_nor_the_bus() -> None:
     )
 
     assert published == []
-    assert bridge.republished == 0
     assert delta.undecodable == 1
 
 
 def _message(channel: str, frame: dict):
-    from deltapayoff.feed import VenueMessage
+    from deltapayoff.adapters.delta_socket import VenueMessage
 
     return VenueMessage(
         channel=channel,

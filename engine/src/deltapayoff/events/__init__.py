@@ -4,10 +4,10 @@
 is `docs/design/events.md` and it is the authority; how this package is built inside is
 `docs/design/lld/events.md`.
 
-**Nothing consumes any of this yet.** #36 gives the adapter that produces the market-data
-events, #37 moves the feed, the chain cache and the bar writer onto them. Importing
-`catalogue` here is what fills the registry, so `registry()` is complete for anyone who
-imported this package at all.
+#36 gave the adapter that produces the market-data events; #37 moved the chain cache and
+the bar writer onto them and retired the record they used to read. Importing `catalogue`
+here is what fills the registry, so `registry()` is complete for anyone who imported this
+package at all.
 """
 
 from __future__ import annotations
@@ -27,7 +27,15 @@ from .catalogue import (
     OptionQuote,
     OptionReference,
 )
-from .envelope import Event, UnknownEventType, parse_event, register, registry
+from .envelope import (
+    Event,
+    UnknownEventType,
+    UnknownSchemaVersion,
+    known_schema_version,
+    parse_event,
+    register,
+    registry,
+)
 from .instrument import Instrument, InstrumentParseError, Right, format_strike
 
 __all__ = [
@@ -49,7 +57,9 @@ __all__ = [
     "OptionReference",
     "Right",
     "UnknownEventType",
+    "UnknownSchemaVersion",
     "format_strike",
+    "known_schema_version",
     "parse_event",
     "register",
     "registry",

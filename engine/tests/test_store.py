@@ -38,8 +38,8 @@ from deltapayoff.bars import (
 )
 from deltapayoff.chain import EXPIRY_FORMAT, nearest_strike
 from deltapayoff.compute import MODEL_VERSION, enrich
+from deltapayoff.events import ConnectionState, Heartbeat
 from deltapayoff.fanout import FanOut
-from deltapayoff.feed import Quote
 from deltapayoff.forward import DAYS_PER_YEAR, SETTLEMENT_HOUR_UTC
 from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
 from deltapayoff.store import (
@@ -52,7 +52,8 @@ from deltapayoff.store import (
     BarStore,
     BarWriter,
 )
-from deltapayoff.wire import chain_from_frames, decode_ob_l2, decode_ticker
+from deltapayoff.wire import chain_from_frames
+from fakes.decoder import events_from_frame
 
 MINUTE_US = int(datetime(2026, 9, 4, 9, 0, 0, tzinfo=timezone.utc).timestamp() * 1e6)
 MINUTE = 60_000_000
@@ -415,31 +416,23 @@ def test_the_writer_turns_bus_quotes_into_parquet_bars(tmp_path: Path) -> None:
         task = asyncio.create_task(writer.run())
 
         for second in (5, 25, 45):
-            bus.publish(
-                Quote(
-                    symbol="C-BTC-77600-040926",
-                    channel="ob_l2",
+            publish(
+                bus,
+                "ob_l2",
+                book_frame(
+                    "C-BTC-77600-040926",
+                    MINUTE_US + second * 1_000_000,
                     bid=70.0 + second,
                     ask=72.0 + second,
-                    received_at=now,
-                    frame={
-                        "sy": "C-BTC-77600-040926",
-                        "ts": MINUTE_US + second * 1_000_000,
-                        "lts": MINUTE_US + second * 1_000_000 - 300_000,
-                    },
-                )
+                ),
             )
-        # A ticker frame on the same bus. It must not reach the quote bars: its `ts` runs
-        # a median 3,176 ms behind arrival and it belongs to a table of its own.
-        bus.publish(
-            Quote(
-                symbol="C-BTC-77600-040926",
-                channel="ticker",
-                bid=1.0,
-                ask=2.0,
-                received_at=now,
-                frame={"sy": "C-BTC-77600-040926", "ts": MINUTE_US + 30_000_000},
-            )
+        # A reference event on the same bus. Its own quote is the *fallback* and must not
+        # displace the book's: its stamp runs a median 3,176 ms behind arrival, and the
+        # book spoke for this contract-minute.
+        publish(
+            bus,
+            "ticker",
+            ticker_frame("C-BTC-77600-040926", MINUTE_US + 30_000_000),
         )
 
         await asyncio.sleep(0.05)
@@ -492,15 +485,10 @@ def test_the_writer_flushes_on_the_default_five_minute_cadence(tmp_path: Path) -
         task = asyncio.create_task(writer.run())
         await asyncio.sleep(0.05)  # the writer stamps `_last_flush` at `started`
 
-        bus.publish(
-            Quote(
-                symbol="C-BTC-77600-040926",
-                channel="ob_l2",
-                bid=70.0,
-                ask=72.0,
-                received_at=now,
-                frame={"sy": "C-BTC-77600-040926", "ts": MINUTE_US + 5_000_000},
-            )
+        publish(
+            bus,
+            "ob_l2",
+            book_frame("C-BTC-77600-040926", MINUTE_US + 5_000_000),
         )
         now = started + 120.0  # past the boundary and the grace: the bar seals
         await asyncio.sleep(0.05)
@@ -613,18 +601,15 @@ def test_a_slow_flush_cannot_block_the_socket_reader(tmp_path: Path) -> None:
                 longest = max(longest, turn - last)
                 last = turn
                 if published < 200:
-                    bus.publish(
-                        Quote(
-                            symbol="C-BTC-77600-040926",
-                            channel="ob_l2",
-                            bid=float(published),
-                            ask=float(published) + 1,
-                            received_at=now,
-                            frame={
-                                "sy": "C-BTC-77600-040926",
-                                "ts": MINUTE_US + (published % 60) * 1_000_000,
-                            },
-                        )
+                    publish(
+                        bus,
+                        "ob_l2",
+                        book_frame(
+                            "C-BTC-77600-040926",
+                            MINUTE_US + (published % 60) * 1_000_000,
+                            bid=float(published) + 1,
+                            ask=float(published) + 2,
+                        ),
                     )
                     published += 1
 
@@ -1029,7 +1014,7 @@ def test_the_spot_row_count_equals_the_minutes_that_actually_had_frames(
         for second in (5, 25, 45):
             aggregator.add(
                 SpotTick(
-                    symbol="C-BTC-77600-040926",
+                    underlying="BTC",
                     exchange_us=MINUTE_US + minute * MINUTE + second * 1_000_000,
                     spot=77650.0 + minute,
                 )
@@ -1152,6 +1137,32 @@ def test_the_provenance_flag_round_trips_as_a_boolean(tmp_path: Path) -> None:
 # --- the writer, filling three tables from one bus --------------------------------
 
 
+def book_frame(
+    symbol: str, exchange_us: int, bid: float = 70.0, ask: float = 72.0, lts: int = 0
+) -> dict:
+    """An `ob_l2` payload shaped exactly as the venue sends one."""
+    frame = {
+        "type": "ob_l2",
+        "sy": symbol,
+        "ts": exchange_us,
+        "lts": lts or exchange_us - 300_000,
+        "b": [[str(bid), "10"]],
+        "a": [[str(ask), "10"]],
+    }
+    return frame
+
+
+def publish(bus, channel: str, frame: dict) -> None:
+    """Decode one frame the way the live path does and publish every event it produced.
+
+    **The events are the adapter's, not this file's.** A hand-built event would be a
+    second copy of the catalogue with no way to notice the producer drifting away from it,
+    and the whole point of the writer taking events is that the two agree.
+    """
+    for event in events_from_frame(channel, frame):
+        bus.publish(event)
+
+
 def ticker_frame(symbol: str, exchange_us: int, spot_price: str = "77651.9") -> dict:
     """A `ticker` payload shaped exactly as Delta sends one.
 
@@ -1214,32 +1225,18 @@ def test_the_writer_fills_all_three_tables_from_one_bus(tmp_path: Path) -> None:
         task = asyncio.create_task(writer.run())
 
         for second in (5, 25, 45):
-            bus.publish(
-                Quote(
-                    symbol=booked,
-                    channel="ob_l2",
+            publish(
+                bus,
+                "ob_l2",
+                book_frame(
+                    booked,
+                    MINUTE_US + second * 1_000_000,
                     bid=70.0 + second,
                     ask=72.0 + second,
-                    received_at=now,
-                    frame={
-                        "sy": booked,
-                        "ts": MINUTE_US + second * 1_000_000,
-                        "lts": MINUTE_US + second * 1_000_000 - 300_000,
-                    },
-                )
+                ),
             )
         for symbol in (booked, quiet):
-            frame = ticker_frame(symbol, MINUTE_US + 30_000_000)
-            bus.publish(
-                Quote(
-                    symbol=symbol,
-                    channel="ticker",
-                    bid=1066.0,
-                    ask=1080.0,
-                    received_at=now,
-                    frame=frame,
-                )
-            )
+            publish(bus, "ticker", ticker_frame(symbol, MINUTE_US + 30_000_000))
 
         await asyncio.sleep(0.05)
         now = (MINUTE_US + 2 * MINUTE) / 1e6  # past the boundary and the grace period
@@ -1300,23 +1297,27 @@ def test_the_writers_three_stores_share_the_root_they_were_given(tmp_path: Path)
 def test_the_writer_counts_a_bus_record_it_can_use_for_nothing(tmp_path: Path) -> None:
     """"The writer ignored most of the bus" should be a number rather than a discovery.
 
-    A ticker frame with no `ts` cannot be bucketed on anything but our arrival time,
-    which is the one thing this design refuses, so it is refused whole and counted.
+    Two shapes reach `skipped`. A reference event with no venue stamp cannot be bucketed
+    on anything but our arrival time, which is the one thing this design refuses. And an
+    event of a type this writer does not store — a heartbeat, a connection transition —
+    is not a defect either: the subscription is to the whole bus.
     """
-    writer = BarWriter(BarStore(tmp_path))
-    writer.ingest(
-        Quote(
-            symbol="C-BTC-77600-040926",
-            channel="ticker",
-            bid=1.0,
-            ask=2.0,
-            received_at=MINUTE_US / 1e6,
-            frame={"sy": "C-BTC-77600-040926", "d": [{}]},
-        )
+    # No `ts` and no readable `sp`: one reference event whose `ts_venue` is null, and no
+    # index quote at all, because an absent spot is not an observation of absence.
+    (stampless,) = events_from_frame("ticker", {"sy": "C-BTC-77600-040926", "d": [{}]})
+    heartbeat = Heartbeat(
+        source="DELTA",
+        ts_received=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+        adapter="DELTA",
+        state=ConnectionState.CONNECTED,
     )
 
+    writer = BarWriter(BarStore(tmp_path))
+    writer.ingest(stampless)
+    writer.ingest(heartbeat)
+
     stats = writer.stats()
-    assert stats["skipped"] == 1
+    assert stats["skipped"] == 2
     assert stats["ticks"] == 0
     assert stats["reference"]["ticks"] == 0
     assert stats["spot"]["ticks"] == 0
@@ -1367,7 +1368,7 @@ def test_the_app_attaches_the_writer_to_the_bus_losslessly(monkeypatch, tmp_path
 
     with TestClient(main.app):
         assert isinstance(main.app.state.writer, BarWriter)
-        stats = main.app.state.fanout.stats()
+        stats = main.app.state.events.stats()
         assert stats["bar-writer"]["lossless"] is True
         assert stats["chain-stream"]["lossless"] is False
 
@@ -1398,19 +1399,15 @@ def test_the_lifespan_runs_the_writer_and_flushes_the_open_minute_on_shutdown(
         now = time.time()
         exchange_us = int(now * 1e6)
         for offset in (0, 1, 2):
-            main.app.state.fanout.publish(
-                Quote(
-                    symbol="C-BTC-77600-040926",
-                    channel="ob_l2",
+            publish(
+                main.app.state.events,
+                "ob_l2",
+                book_frame(
+                    "C-BTC-77600-040926",
+                    exchange_us + offset * 1000,
                     bid=70.0 + offset,
                     ask=72.0 + offset,
-                    received_at=now,
-                    frame={
-                        "sy": "C-BTC-77600-040926",
-                        "ts": exchange_us + offset * 1000,
-                        "lts": exchange_us + offset * 1000 - 300_000,
-                    },
-                )
+                ),
             )
         # Let the writer's task drain the queue before the lifespan tears it down.
         time.sleep(0.2)
@@ -1449,25 +1446,9 @@ def test_the_running_app_writes_all_three_tables(monkeypatch, tmp_path) -> None:
 
         now = time.time()
         exchange_us = int(now * 1e6)
-        main.app.state.fanout.publish(
-            Quote(
-                symbol=symbol,
-                channel="ob_l2",
-                bid=70.0,
-                ask=72.0,
-                received_at=now,
-                frame={"sy": symbol, "ts": exchange_us, "lts": exchange_us - 300_000},
-            )
-        )
-        main.app.state.fanout.publish(
-            Quote(
-                symbol=symbol,
-                channel="ticker",
-                bid=1066.0,
-                ask=1080.0,
-                received_at=now,
-                frame=ticker_frame(symbol, exchange_us + 1000),
-            )
+        publish(main.app.state.events, "ob_l2", book_frame(symbol, exchange_us))
+        publish(
+            main.app.state.events, "ticker", ticker_frame(symbol, exchange_us + 1000)
         )
         time.sleep(0.2)  # let the writer drain before the lifespan tears it down
 
@@ -2184,16 +2165,7 @@ def test_the_running_app_stores_our_computed_values_too(monkeypatch, tmp_path) -
         assert writer.chains == stream.computed_chains, "the writer samples nothing"
 
         now = time.time()
-        main.app.state.fanout.publish(
-            Quote(
-                symbol=symbol,
-                channel="ticker",
-                bid=1066.0,
-                ask=1080.0,
-                received_at=now,
-                frame=ticker_frame(symbol, int(now * 1e6)),
-            )
-        )
+        publish(main.app.state.events, "ticker", ticker_frame(symbol, int(now * 1e6)))
         time.sleep(0.4)  # the recompute loop runs every 100 ms
         assert stream.computed_chains(), "the loop computed nothing to sample"
 
@@ -2269,30 +2241,10 @@ def test_a_stored_row_reproduces_offline_from_the_quote_bar_beside_it(
         await asyncio.sleep(0.05)
 
         stamp = MINUTE_US + 50_000_000
-        for symbol, frame in ws_ticker_frames.items():
-            _, leg = decode_ticker(frame)
-            bus.publish(
-                Quote(
-                    symbol=symbol,
-                    channel="ticker",
-                    bid=leg.bid,
-                    ask=leg.ask,
-                    received_at=now,
-                    frame={**frame, "ts": stamp},
-                )
-            )
-        for symbol, frame in ws_book_frames.items():
-            _, bid, ask = decode_ob_l2(frame)
-            bus.publish(
-                Quote(
-                    symbol=symbol,
-                    channel="ob_l2",
-                    bid=bid,
-                    ask=ask,
-                    received_at=now,
-                    frame={**frame, "ts": stamp},
-                )
-            )
+        for frame in ws_ticker_frames.values():
+            publish(bus, "ticker", {**frame, "ts": stamp})
+        for frame in ws_book_frames.values():
+            publish(bus, "ob_l2", {**frame, "ts": stamp})
 
         await asyncio.sleep(0.1)
         now = (MINUTE_US + MINUTE) / 1e6 + 10.0  # past every grace period
