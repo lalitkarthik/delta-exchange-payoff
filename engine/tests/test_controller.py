@@ -1125,31 +1125,49 @@ def test_the_attempt_is_announced_when_it_begins_not_when_it_succeeds() -> None:
     assert adapter.feed.connections == 1, "the second dial was refused, as scripted"
 
 
-def test_a_stop_is_not_redialled() -> None:
-    """A stop and a drop both end `stream`, and telling them apart is the difference
-    between a shutdown and a feed that reconnects through it.
+def test_a_silence_the_venue_never_closed_is_not_redialled() -> None:
+    """**`reconnecting` is not the same question as "the socket is gone".**
 
-    `DeltaFeed` reports a close on a drop and stays quiet on a stop, and the controller
-    redials on **the adapter's last word about its socket** rather than on its own
-    state. Nothing here scripts a second socket, so a redial would show up as a second
-    connection — and the counter is what this asserts.
+    The staleness watchdog reaches `reconnecting` over a connection the venue never
+    closed and merely stopped speaking on. Redialling that would dial a second socket
+    over one that is still open, so the controller backs off on the **adapter's last
+    word about its socket**, not on its own state.
+
+    The backoff delay is a distinctive number here, and the injected sleep records what
+    it was asked for, so a redial is an assertion that fails rather than a hang.
     """
-    socket = FakeSocket([ticker_frame(SYMBOL, 579, 584)])
-    adapter = _delta_over(connector([socket]))
+    BACKOFF = 7.0
+    clock = ScriptClock()
     published: list = []
-    controller = ConnectionController(
-        adapter, published.append, retry_delay=0.01, heartbeat_every=1_000.0
+
+    async def sleep(seconds: float) -> None:
+        # **It raises rather than recording.** Removing the guard does not merely add one
+        # redial: the fake walks its script again, and because a scripted silence yields
+        # to no event loop the whole thing spins without ever reaching an assertion — so
+        # a test that only checked afterwards would hang instead of failing, and a test
+        # that cannot fail is worse than no test. Raising here fails on the first redial.
+        if seconds == BACKOFF:  # the backoff, and nothing else uses this number
+            raise AssertionError("it backed off over a socket the venue never closed")
+        await asyncio.Event().wait()  # the poll timer; the script clock drives polls
+
+    adapter = ScriptedAdapter(
+        script=[Frames("ob_l2", [BOOK_FRAME]), Silence(60.0)], sleep=clock.sleep
     )
+    instrument = instrument_from_symbol(SYMBOL)
+    assert instrument is not None
+    adapter.subscribe([instrument])
+    controller = ConnectionController(
+        adapter,
+        lambda event: published.append((clock.now, event)),
+        clock=clock.read,
+        sleep=sleep,
+        degraded_after=15.0,
+        reconnect_after=45.0,
+        retry_delay=BACKOFF,
+    )
+    clock.controller = controller
 
-    async def scenario() -> None:
-        task = asyncio.create_task(controller.run())
-        await asyncio.sleep(0.05)
-        controller.stop()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(controller.run())
 
-    asyncio.run(scenario())
-
-    assert adapter.feed.connections == 1
-    assert controller.reconnects == 0
-    assert controller.budget_remaining == controller.reconnect_budget
+    assert adapter.connections == 1
+    assert moves(published)[-1] == (60.0, "reconnecting", "stopped", "stopped")
