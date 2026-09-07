@@ -1,8 +1,7 @@
 # Low-level design: the broker adapter
 
-**What is built inside `engine/src/deltapayoff/adapters/`.** The parts are
-[../hld.md](../hld.md); what crosses out is [../events.md](../events.md). Numbers carry
-the run that produced them.
+**What is built inside `engine/src/deltapayoff/adapters/`.** The parts are [../hld.md](../hld.md);
+what crosses out is [../events.md](../events.md). Numbers carry the run that produced them.
 
 **Landed by #36, completed by #37.** #36 was the expand half of an expand–contract: the
 adapter emitted canonical events while a shim rebuilt the old quote record for two
@@ -41,8 +40,8 @@ bridging queue to invert it.
 
 **Reconnect is not on the interface, and since #39 not below it either.** `stream` is
 **one connection**: dial, replay, publish until the socket ends, return. Backoff, the
-budget and the decision to redial are [reconnect.md](reconnect.md)'s; the replay and the
-reason a connection ended stay in `DeltaFeed`, because both need a socket.
+budget and the redial are [reconnect.md](reconnect.md)'s; the replay and the reason a
+connection ended stay in `DeltaFeed`, because both need a socket.
 
 **Conformance is structural**, for the reason `events/bus.py` records: an explicit subclass
 would inherit `...`-bodied stubs and pass. A test pins that the check can still fail.
@@ -187,7 +186,7 @@ asserted against 136 real contracts on both channels. `tests/test_feed.py` drive
 loop, a scripted connection at one end and `md.option_quote` at the other, and
 `tests/test_composition.py` is the tracer bullet from a scripted socket to a rendered
 ladder and the bar writer's counters. Every consumer test decodes through this same
-function via `tests/fakes/decoder.py`, so none drifts from the producer.
+function via `tests/fakes/decoder.py`, so none drifts from it.
 
 ## 10. Numbers
 
