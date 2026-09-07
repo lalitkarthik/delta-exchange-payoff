@@ -1,9 +1,10 @@
 /**
  * Types for the engine's HTTP interface.
  *
- * These mirror `docs/chain-contract.md`, `docs/smile-contract.md` and
- * `docs/recording-contract.md` field for field. Those files are the authority; if this
- * file and a contract disagree, this file is wrong.
+ * These mirror `docs/chain-contract.md`, `docs/smile-contract.md`,
+ * `docs/recording-contract.md` and `docs/historical-chain-contract.md` field for field.
+ * Those files are the authority; if this file and a contract disagree, this file is
+ * wrong.
  *
  * Two rules from the contract are load-bearing for every type here:
  *
@@ -245,3 +246,44 @@ export interface RecordingState {
   /** Rows this engine process has written to Parquet, across all four tables. */
   rows_written: number;
 }
+
+/**
+ * `GET /chain/minutes` — `docs/historical-chain-contract.md`.
+ *
+ * The chain slider's domain and, by what is missing from an otherwise-contiguous run,
+ * its gaps. Sibling of `SmileResponse`, but plain stamps rather than `SmileMinute[]`: a
+ * ladder is heavy enough that this screen fetches one minute at a time (see
+ * `docs/design/lld/historical-read-path.md`), so the domain and the data travel apart.
+ */
+export interface HistoricalMinutesResponse {
+  underlying: Underlying;
+  expiry: ExpiryDate;
+  /** `YYYY-MM-DD` — the store's own partition spelling, not `expiry`'s `DD-MM-YYYY`. */
+  date: string;
+  /** Ascending. ISO 8601 UTC, second precision, `Z`-suffixed — `SmileMinute.minute`'s
+   * own spelling, so a stamp round-trips into `/chain/at` with no reformatting. */
+  minutes: string[];
+}
+
+/**
+ * `GET /chain/at` — `docs/historical-chain-contract.md`.
+ *
+ * Every field `ChainResponse` carries, unchanged, plus `minute`: `ChainLadder` renders
+ * either shape without knowing which one it was handed, and the header reads `minute`
+ * to say which one it is showing.
+ */
+export interface HistoricalChain extends ChainResponse {
+  /** ISO 8601 UTC, second precision, `Z`-suffixed — the exact minute this ladder was
+   * rebuilt for. `fetched_at` carries the same stamp: there is no "when we asked Delta"
+   * for a historical read. */
+  minute: string;
+}
+
+/**
+ * What `/chain/at` answers with. The same envelope `/ws/chain` sends over the socket —
+ * `LiveMessage` in `lib/live.ts` — so a client that already reads `chain`/`waiting`
+ * needs no third vocabulary to read this over REST.
+ */
+export type HistoricalChainMessage =
+  | { type: "chain"; data: HistoricalChain }
+  | { type: "waiting"; detail: string };
