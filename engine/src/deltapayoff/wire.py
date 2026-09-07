@@ -70,6 +70,10 @@ _OHLC_OPEN, _OHLC_HIGH, _OHLC_LOW, _OHLC_CLOSE = 0, 1, 2, 3
 #: read, because storing a number twice invites the two copies to disagree.
 _TURNOVER, _TURNOVER_USD = 0, 1
 
+#: Positions inside one `ob_l2` book level, `[price, size]`. Named for the same reason
+#: every other offset here is: position-as-meaning is how Delta's payloads go wrong.
+_LEVEL_PRICE, _LEVEL_SIZE = 0, 1
+
 
 def _at(values: list[Any] | None, index: int) -> Any:
     if not values or index >= len(values):
@@ -157,18 +161,58 @@ def decode_ticker_extras(frame: dict[str, Any]) -> TickerExtras:
     )
 
 
-def decode_ob_l2(frame: dict[str, Any]) -> tuple[str, float | None, float | None]:
-    """One `ob_l2` frame to `(symbol, best_bid, best_ask)`.
+class BookTop(NamedTuple):
+    """The top of book, prices **and** sizes, named rather than positional.
+
+    Sizes were never decoded before #36: the chain cache and the bar tables want prices
+    alone, so `decode_ob_l2` returns two floats and nothing asked for more. The
+    `md.option_quote` event carries `bid_size` and `ask_size`, so the offsets have to be
+    read — and they are read **here**, beside every other Delta offset, rather than in
+    the adapter. A transposed index produces numbers that are entirely plausible and
+    entirely wrong, and this module exists so that hazard lives in one file.
+    """
+
+    bid: float | None
+    bid_size: float | None
+    ask: float | None
+    ask_size: float | None
+
+
+def decode_ob_l2_top(frame: dict[str, Any]) -> tuple[str, BookTop]:
+    """One `ob_l2` frame to `(symbol, BookTop)`.
 
     The book arrives sorted — `a` cheapest ask first, `b` highest bid first — so the best
     quote is row zero of each. **Only row zero is used.** The other fourteen levels are
     what a large order would pay, which is a liquidity question and not a pricing one;
     every implied vol in this project inverts the top-of-book midpoint.
+
+    **A size without its price is not a quote.** If the price at a level is absent the
+    size is dropped with it, rather than travelling on alone as a number describing an
+    order nobody can see. Sizes go through `to_quote_number` for the same reason prices
+    do: a level quoted at size zero is a level that is not there.
     """
     asks, bids = frame.get("a") or [], frame.get("b") or []
-    best_bid = to_quote_number(bids[0][0]) if bids and bids[0] else None
-    best_ask = to_quote_number(asks[0][0]) if asks and asks[0] else None
-    return frame.get("sy") or "", best_bid, best_ask
+    best_bid = to_quote_number(_at(bids[0], _LEVEL_PRICE)) if bids and bids[0] else None
+    best_ask = to_quote_number(_at(asks[0], _LEVEL_PRICE)) if asks and asks[0] else None
+    bid_size = to_quote_number(_at(bids[0], _LEVEL_SIZE)) if bids and bids[0] else None
+    ask_size = to_quote_number(_at(asks[0], _LEVEL_SIZE)) if asks and asks[0] else None
+    return frame.get("sy") or "", BookTop(
+        bid=best_bid,
+        bid_size=None if best_bid is None else bid_size,
+        ask=best_ask,
+        ask_size=None if best_ask is None else ask_size,
+    )
+
+
+def decode_ob_l2(frame: dict[str, Any]) -> tuple[str, float | None, float | None]:
+    """One `ob_l2` frame to `(symbol, best_bid, best_ask)`.
+
+    The prices alone, which is what the chain cache and the bar tables want. Kept as its
+    own name rather than folded into `decode_ob_l2_top` because three call sites read it
+    and none of them has a use for a size.
+    """
+    symbol, top = decode_ob_l2_top(frame)
+    return symbol, top.bid, top.ask
 
 
 def _as_rest_ticker(symbol: str, leg: Leg, spot: float | None) -> dict[str, Any]:

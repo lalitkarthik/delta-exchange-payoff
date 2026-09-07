@@ -61,7 +61,9 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 
+from .adapters import DeltaAdapter, LegacyQuoteBridge
 from .chain import (
+    UNDERLYINGS,
     ValidationError,
     build_chain,
     build_expiries,
@@ -132,11 +134,21 @@ PUSH_INTERVAL_SECONDS = 1.0
 #: data; it would not be if either changed.
 MIN_PUSH_INTERVAL_SECONDS = 0.02
 
-#: Underlyings the live feed subscribes at start-up. Every listed BTC option, both
-#: channels — about 600 messages and 300 KB a second, measured. That buys instant expiry
-#: switching with no subscribe round trip. Narrowing `ob_l2` to the watched expiry would
-#: cut it to roughly a third; see `docs/ingestion.md`.
+#: Underlyings the live feed subscribes at start-up **when nothing says otherwise**.
+#: Every listed BTC option, both channels — about 600 messages and 300 KB a second,
+#: measured. That buys instant expiry switching with no subscribe round trip. Narrowing
+#: `ob_l2` to the watched expiry would cut it to roughly a third; see
+#: `docs/ingestion.md`.
+#:
+#: **BTC alone, deliberately.** ETH is #43's ticket and the cost of adding it has not been
+#: measured — #33 requires the feed's rate and bandwidth measured for sixty seconds after
+#: ETH is enabled before it is called fine, and `docs/design/hld.md` §5 records that the
+#: BTC-only figure is itself contested between two runs.
 LIVE_UNDERLYINGS = ("BTC",)
+
+#: Comma-separated, e.g. `BTC,ETH`. Read at start-up rather than at import, so which
+#: assets are recorded is a deployment decision and not a code change.
+LIVE_UNDERLYINGS_ENV = "DELTA_LIVE_UNDERLYINGS"
 
 #: The most points `/volatility` will put in one response unless asked for fewer.
 #:
@@ -158,6 +170,33 @@ def live_feed_enabled() -> bool:
     return os.environ.get(LIVE_FEED_ENV, "1") != "0"
 
 
+def live_underlyings() -> tuple[str, ...]:
+    """Which underlyings to record, from the environment, defaulting to BTC alone.
+
+    **An unknown name is dropped and logged at error rather than subscribed.** Delta
+    answers a request for an underlying it does not list with an empty ticker list, so a
+    typo would otherwise produce a feed that connects, subscribes nothing and records
+    nothing, with no error anywhere — the silent failure this whole component exists to
+    refuse. If nothing valid is left, the default stands, because recording BTC is a
+    better answer to a bad config line than recording nothing.
+    """
+    raw = os.environ.get(LIVE_UNDERLYINGS_ENV, "")
+    wanted = [name.strip().upper() for name in raw.split(",") if name.strip()]
+    if not wanted:
+        return LIVE_UNDERLYINGS
+
+    known = [name for name in wanted if name in UNDERLYINGS]
+    unknown = [name for name in wanted if name not in UNDERLYINGS]
+    if unknown:
+        logger.error(
+            "%s names %s, which Delta does not list; recording %s",
+            LIVE_UNDERLYINGS_ENV,
+            ", ".join(unknown),
+            ", ".join(known) or ", ".join(LIVE_UNDERLYINGS),
+        )
+    return tuple(known) or LIVE_UNDERLYINGS
+
+
 @dataclass
 class FeedStack:
     """Every moving part of the live feed, wired to the bus and to each other.
@@ -169,18 +208,33 @@ class FeedStack:
     reach for them and this is a refactor, not a rename.
     """
 
-    #: The bus the chain cache and the bar writer read. Both subscribe to this one and
-    #: their queue policies differ; see `fanout.py`.
+    #: **The canonical bus.** The adapter publishes `md.option_quote`,
+    #: `md.option_reference` and `md.index_quote` here. Nothing subscribes to it yet:
+    #: #37 moves the chain cache and the bar writer onto it, #38 the controller. It is
+    #: separate from `quotes` because an `Event` and a `feed.Quote` share no attribute,
+    #: and either consumer would raise on the other's records.
+    events: FanOut
+    #: The bus the chain cache and the bar writer read, carrying today's `feed.Quote`.
+    #: Both subscribe to this one and their queue policies differ; see `fanout.py`.
+    #: **Retired by #37**, along with the shim that fills it.
     quotes: FanOut
     stream: ChainStream
     writer: BarWriter
-    feed: Any
+    #: The venue, behind `adapters.base.Adapter`. Everything venue-specific is inside it.
+    adapter: Any
+    #: The expand half of the expand–contract. #37 deletes it. See `adapters/shim.py`.
+    shim: Any
     #: The background tasks, empty until `start_feed_stack` runs. Cancelled on shutdown.
     tasks: list[asyncio.Task] = field(default_factory=list)
 
+    @property
+    def feed(self) -> Any:
+        """The socket owner inside the adapter, for the counters #39's `/health` reads."""
+        return self.adapter.feed
 
-def build_feed_stack() -> FeedStack:
-    """Wire the bus, the chain cache, the bar writer and the socket owner together.
+
+def build_feed_stack(client: DeltaClient) -> FeedStack:
+    """Wire the two buses, the chain cache, the bar writer and the adapter together.
 
     **Nothing here starts, connects or awaits.** Building is separated from starting so
     that a process with no live feed — every test, and any run with `DELTA_LIVE_FEED=0`
@@ -200,21 +254,32 @@ def build_feed_stack() -> FeedStack:
 
     Every collaborator is looked up in this module's globals **at call time**, which is
     what lets a test replace `DeltaClient`, `DeltaFeed`, `BarStore` or `BarWriter` with a
-    stub and get a stack that never opens a socket.
+    stub and get a stack that never opens a socket. `DeltaFeed` reaches the adapter as a
+    factory for exactly that reason: the adapter builds the socket owner around its own
+    sink, and the name it builds is still this module's.
     """
     quotes = FanOut()
     stream = ChainStream()
     stream.attach(quotes)
     writer = BarWriter(BarStore(), chains=stream.computed_chains)
     writer.attach(quotes)
+    shim = LegacyQuoteBridge(quotes)
     return FeedStack(
-        quotes=quotes, stream=stream, writer=writer, feed=DeltaFeed(quotes)
+        events=FanOut(),
+        quotes=quotes,
+        stream=stream,
+        writer=writer,
+        adapter=DeltaAdapter(
+            client=client,
+            underlyings=live_underlyings(),
+            feed_factory=DeltaFeed,
+            legacy=shim,
+        ),
+        shim=shim,
     )
 
 
-async def start_feed_stack(
-    stack: FeedStack, client: DeltaClient, underlyings: Sequence[str]
-) -> None:
+async def start_feed_stack(stack: FeedStack, underlyings: Sequence[str]) -> None:
     """Subscribe every listed contract and start the four background tasks.
 
     Raises `DeltaUnavailable` if the venue cannot be asked what it lists — the caller
@@ -223,12 +288,12 @@ async def start_feed_stack(
     silent failure `feed.py` exists to prevent.
     """
     for underlying in underlyings:
-        symbols = [row["symbol"] for row in await client.tickers(underlying, None)]
-        stack.feed.subscribe("ticker", symbols)
-        stack.feed.subscribe("ob_l2", symbols)
+        stack.adapter.subscribe(await stack.adapter.instruments(underlying))
 
     stack.tasks = [
-        asyncio.create_task(stack.feed.run(), name="delta-feed"),
+        asyncio.create_task(
+            stack.adapter.stream(stack.events.publish), name="delta-feed"
+        ),
         asyncio.create_task(stack.stream.run(), name="chain-stream"),
         asyncio.create_task(recompute_forever(stack.stream), name="chain-recompute"),
         asyncio.create_task(stack.writer.run(), name="bar-writer"),
@@ -273,9 +338,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await client.__aenter__()
     app.state.delta = client
 
-    stack = build_feed_stack()
+    stack = build_feed_stack(client)
     app.state.stack = stack
     app.state.fanout = stack.quotes
+    app.state.events = stack.events
+    app.state.adapter = stack.adapter
     app.state.stream = stack.stream
     app.state.writer = stack.writer
     app.state.feed = stack.feed
@@ -283,7 +350,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     if live_feed_enabled():
         try:
-            await start_feed_stack(stack, client, LIVE_UNDERLYINGS)
+            await start_feed_stack(stack, stack.adapter.underlyings)
             app.state.tasks = stack.tasks
         except DeltaUnavailable:
             # The REST endpoints still work and the websocket reports "waiting". A
