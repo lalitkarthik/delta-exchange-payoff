@@ -47,7 +47,8 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import date as Date
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from fastapi import (
@@ -71,9 +72,11 @@ from .compute import enrich
 from .delta_client import DeltaClient, DeltaUnavailable
 from .fanout import FanOut
 from .feed import DeltaFeed
+from .historical import list_minutes, read_ladder_at
 from .models import (
     ChainResponse,
     ExpiriesResponse,
+    HistoricalMinutes,
     RecordingRequest,
     RecordingState,
     SmileResponse,
@@ -83,6 +86,8 @@ from .smile import read_smile
 from .store import (
     COMPUTED_DATASET,
     COMPUTED_SCHEMA,
+    REFERENCE_DATASET,
+    REFERENCE_SCHEMA,
     SPOT_DATASET,
     SPOT_SCHEMA,
     BarStore,
@@ -344,6 +349,42 @@ def get_volatility_source() -> StoreVolatilitySource:
     return StoreVolatilitySource()
 
 
+class HistoricalSource:
+    """The historical chain's read path: quote, reference, computed and spot bars.
+
+    Sibling of `StoreVolatilitySource`, for the same reason: a named object so the whole
+    of it can be swapped in a test for four stores built on a `tmp_path`, without either
+    route learning that a writer exists at all.
+    """
+
+    def __init__(
+        self, quote: BarStore, reference: BarStore, computed: BarStore, spot: BarStore
+    ) -> None:
+        self.quote = quote
+        self.reference = reference
+        self.computed = computed
+        self.spot = spot
+
+
+def get_historical_source() -> HistoricalSource:
+    """The writer's own four stores when a writer exists, so the buffer is included
+    exactly as `/smile` includes it for table C — a parquet-only read would hand the
+    slider's right edge a hole up to a flush interval wide. A process with no writer
+    still gets readers over whatever is on disk; see `get_computed_store`.
+    """
+    writer = getattr(app.state, "writer", None)
+    if writer is not None:
+        return HistoricalSource(
+            writer.store, writer.reference_store, writer.computed_store, writer.spot_store
+        )
+    return HistoricalSource(
+        BarStore(),
+        BarStore(dataset=REFERENCE_DATASET, schema=REFERENCE_SCHEMA),
+        BarStore(dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA),
+        BarStore(dataset=SPOT_DATASET, schema=SPOT_SCHEMA),
+    )
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness only. Says nothing about Delta."""
@@ -572,6 +613,108 @@ def smile(
     symbol = _validated(normalise_underlying, underlying)
     date = _validated(validate_expiry, expiry)
     return read_smile(store, symbol, date)
+
+
+#: `2026-09-04T09:00:00Z`. Matches `historical.MINUTE_FORMAT` and `smile.MINUTE_FORMAT`.
+_MINUTE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _validated_date(value: str) -> Date:
+    """`YYYY-MM-DD`, the store's own partition spelling — not Delta's `DD-MM-YYYY`,
+    which `expiry` already carries on this route. Malformed is a 400, not a 422: the
+    same disposition `_validated` gives every other query parameter here."""
+    try:
+        return Date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"date must be YYYY-MM-DD; got {value!r}"
+        ) from exc
+
+
+def _validated_minute(value: str) -> datetime:
+    """ISO 8601 UTC, second precision, `Z`-suffixed — the one spelling `smile` and the
+    scrubber both use, so a stamp taken from either travels here unchanged."""
+    try:
+        return datetime.strptime(value, _MINUTE_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"minute must be YYYY-MM-DDTHH:MM:SSZ; got {value!r}",
+        ) from exc
+
+
+@app.get("/chain/minutes", response_model=HistoricalMinutes)
+def chain_minutes(
+    underlying: Annotated[str, Query(description="BTC or ETH")],
+    expiry: Annotated[str, Query(description="DD-MM-YYYY, as Delta spells it")],
+    date: Annotated[str, Query(description="YYYY-MM-DD, the store's own spelling")],
+    source: Annotated[HistoricalSource, Depends(get_historical_source)],
+) -> HistoricalMinutes:
+    """Every minute the store holds quotes for, on one day.
+
+    `docs/historical-chain-contract.md`.
+
+    The slider's domain, and — by what is missing from an otherwise-contiguous run —
+    its gaps. Reads the local store and never Delta, so absence is 200 and empty exactly
+    as `/smile` treats it: a day nobody has lived through yet is "nothing yet", not a 404.
+
+    `def`, not `async def`, for the reason `/smile` gives: this opens Parquet files,
+    which blocks, and FastAPI runs a plain `def` route off the event loop the feed's
+    socket reader lives on.
+    """
+    symbol = _validated(normalise_underlying, underlying)
+    expiry_date = _validated(validate_expiry, expiry)
+    day = _validated_date(date)
+    return HistoricalMinutes(
+        underlying=symbol,
+        expiry=expiry_date,
+        date=date,
+        minutes=list_minutes(source.quote, symbol, expiry_date, day),
+    )
+
+
+@app.get("/chain/at")
+def chain_at(
+    underlying: Annotated[str, Query(description="BTC or ETH")],
+    expiry: Annotated[str, Query(description="DD-MM-YYYY, as Delta spells it")],
+    minute: Annotated[
+        str,
+        Query(description="ISO 8601 UTC, second precision, e.g. 2026-09-04T09:00:00Z"),
+    ],
+    source: Annotated[HistoricalSource, Depends(get_historical_source)],
+) -> dict[str, Any]:
+    """The ladder as it stood at one stored minute. `docs/historical-chain-contract.md`.
+
+    Same envelope `/ws/chain` sends, so a client that already reads `chain`/`waiting`
+    needs no third vocabulary to read this:
+
+        {"type": "chain",   "data": {...ChainResponse, "minute": "..."}}
+        {"type": "waiting", "detail": "..."}
+
+    **`waiting`, never a neighbouring minute's rows.** A minute nobody quoted answers
+    `waiting` exactly as an expiry nobody has pushed a live frame for does — the same
+    "nothing here yet" the websocket already spells, for the same reason: an empty
+    ladder and a ladder that was never asked for look identical on screen, and only one
+    of them is what the store actually holds.
+    """
+    symbol = _validated(normalise_underlying, underlying)
+    expiry_date = _validated(validate_expiry, expiry)
+    when = _validated_minute(minute)
+    ladder = read_ladder_at(
+        source.quote,
+        source.reference,
+        source.computed,
+        source.spot,
+        symbol,
+        expiry_date,
+        when,
+    )
+    if ladder is None:
+        return {
+            "type": "waiting",
+            "detail": f"no stored quotes for {symbol} expiring {expiry_date} at {minute}",
+        }
+    return {"type": "chain", "data": ladder.model_dump(mode="json")}
 
 
 def _recording_state(writer: BarWriter) -> RecordingState:

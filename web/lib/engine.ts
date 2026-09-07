@@ -11,6 +11,8 @@ import {
   isEngineError,
   type ChainResponse,
   type ExpiriesResponse,
+  type HistoricalChainMessage,
+  type HistoricalMinutesResponse,
   type RecordingState,
   type SmileResponse,
   type Underlying,
@@ -275,6 +277,47 @@ export async function loadSmile(
  */
 export async function loadRecording(): Promise<RecordingState> {
   return get<RecordingState>("/recording");
+}
+
+/**
+ * The chain slider's domain: every minute the store holds quotes for, on one day.
+ * `docs/historical-chain-contract.md`.
+ *
+ * **No fixture fallback, and deliberately.** Every other loader in this file stands in
+ * for an unreachable engine with the committed fixture, because the fixture is real
+ * data that was really captured. There is no fixture for "which minutes of *this* day
+ * are stored" — inventing a domain would let the slider offer positions nothing behind
+ * it can answer, which is the exact lie `docs/historical-chain-contract.md` refuses. An
+ * unreachable engine is surfaced here, the same disposition `loadRecording` takes.
+ */
+export async function loadChainMinutes(
+  underlying: Underlying,
+  expiry: string,
+  date: string,
+): Promise<HistoricalMinutesResponse> {
+  return get<HistoricalMinutesResponse>(
+    `/chain/minutes?underlying=${underlying}&expiry=${encodeURIComponent(expiry)}` +
+      `&date=${encodeURIComponent(date)}`,
+  );
+}
+
+/**
+ * The ladder as it stood at one stored minute. `docs/historical-chain-contract.md`.
+ *
+ * Returns the envelope whole — `{"type": "chain", "data": ...}` or
+ * `{"type": "waiting", "detail": ...}` — rather than throwing on `waiting`, because
+ * "nothing stored at this minute" is the ordinary answer for a hole in the slider, not
+ * a failure. No fixture fallback, for the reason `loadChainMinutes` gives.
+ */
+export async function loadChainAt(
+  underlying: Underlying,
+  expiry: string,
+  minute: string,
+): Promise<HistoricalChainMessage> {
+  return get<HistoricalChainMessage>(
+    `/chain/at?underlying=${underlying}&expiry=${encodeURIComponent(expiry)}` +
+      `&minute=${encodeURIComponent(minute)}`,
+  );
 }
 
 /**
