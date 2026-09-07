@@ -10,6 +10,16 @@ fixed before either exists. Change it by changing this file first.
 > `/recording` — the switch that decides whether anything is stored at all — has its own
 > file too: [recording-contract.md](recording-contract.md). It is the engine's only
 > mutating route, and the reason `allow_methods` here is no longer `["GET"]` alone.
+>
+> `/chain/minutes` and `/chain/at` — the ladder at a **stored** minute, for the chain
+> page's time slider — have their own file too:
+> [historical-chain-contract.md](historical-chain-contract.md). Same reason `/smile` got
+> one: this file was already at 208 lines before that split and is not the place to
+> describe a second read path.
+>
+> `/bars` — one contract's minute candles, for the chart panel a clicked strike opens —
+> has its own file too: [bars-contract.md](bars-contract.md). A third read path is a
+> third subject, not an appendix to the first two.
 
 Delta has **no option-chain endpoint**. A chain is `GET /v2/tickers` filtered by underlying and
 expiry, with the rows pivoted so a call and a put sharing a strike land on one line. The engine

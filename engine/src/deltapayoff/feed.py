@@ -32,8 +32,15 @@ you get a healthy connection, zero messages, and a screen that quietly stops upd
 symbol rather than per message for the reason OpenAlgo gives: a message-keyed registry
 replays a whole batch when one symbol inside it is rejected.
 
-Nothing here computes anything. It publishes decoded records; `fanout.FanOut` decides who
-sees them and what happens when someone falls behind.
+**Nothing here decodes anything, since #36.** This module used to turn a frame into a
+`Quote` by calling `wire`, which meant the venue's array offsets were read by the socket
+owner — so "the wire layout lives behind the adapter" was not true of the code. It now
+publishes a `VenueMessage`: the frame verbatim, its channel, and the instant it arrived.
+`adapters.delta.DeltaAdapter` is the only thing that reads inside one.
+
+That leaves this module with exactly the four jobs above and no knowledge of what Delta's
+payloads mean, which is what lets #38 lift it under a connection controller without
+carrying a decoder along.
 """
 
 from __future__ import annotations
@@ -42,18 +49,22 @@ import asyncio
 import json
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel
 
-from .wire import decode_ob_l2, decode_ticker
-
 PUBLIC_WS = "wss://public-socket.india.delta.exchange"
+
+#: Delta's two channel names. `bars.py` spells them again for its own `Tick.source`; the
+#: adapter reads them from here, because this is the module that subscribes to them.
+TICKER_CHANNEL = "ticker"
+BOOK_CHANNEL = "ob_l2"
 
 #: The only channels Delta's public endpoint accepts. It retired `v2/ticker`,
 #: `l1_orderbook` and `l2_orderbook` on 31 July 2026 and now rejects them as invalid, so
 #: the old names are refused here rather than producing a silently empty stream.
-CHANNELS = ("ticker", "ob_l2")
+CHANNELS = (TICKER_CHANNEL, BOOK_CHANNEL)
 
 HEARTBEAT_SECONDS = 30.0
 RETRY_DELAY_SECONDS = 1.0
@@ -61,8 +72,34 @@ MAX_RETRY_DELAY_SECONDS = 60.0
 MAX_RETRIES = 10
 
 
+@dataclass(frozen=True, slots=True)
+class VenueMessage:
+    """One frame off the socket, undecoded, with the channel and the arrival stamp.
+
+    **What the socket owner publishes.** The frame is Delta's own JSON object, kept
+    verbatim: reading inside it is the adapter's business, and this record exists so that
+    the reader and the decoder can be two things.
+
+    `received_at` is a **wall clock** stamp, taken once here, so that the arrival time of
+    a frame is the instant it was read rather than the instant something got around to
+    decoding it. It is deliberately not a latency clock — `time.time()` can step backwards
+    under an NTP correction. Anything measuring elapsed time uses `timing.time_it`, which
+    is built on `perf_counter`.
+    """
+
+    channel: str
+    symbol: str
+    frame: dict[str, Any]
+    received_at: float
+
+
 class Quote(BaseModel):
     """One contract's prices at one moment, from whichever channel carried them.
+
+    **Retired by #37.** Nothing produces this on the live path any more: the adapter
+    emits canonical events and `adapters.shim` rebuilds this record for the two consumers
+    that have not moved yet. It stays here, unchanged, because those consumers and their
+    tests are typed against it and this ticket is the expand half of an expand–contract.
 
     A consumer should never have to know that the bid is `q[2]` on one channel and
     `b[0][0]` on the other. `channel` travels with the record because the two refresh at
@@ -94,18 +131,26 @@ class Quote(BaseModel):
 
 
 class DeltaFeed:
-    """Owns the connection. Publishes `Quote`s to a `FanOut`."""
+    """Owns the connection. Publishes `VenueMessage`s to whatever it was handed.
+
+    The sink is anything with a non-blocking `publish`. In the running engine it is the
+    Delta adapter's frame sink; in `tests/test_feed.py` it is a `FanOut`, so what the
+    socket produced can be drained and asserted about.
+    """
 
     def __init__(
         self,
-        fanout,
+        sink,
         connect: Callable[[str], Any] | None = None,
         url: str = PUBLIC_WS,
         heartbeat_seconds: float = HEARTBEAT_SECONDS,
         retry_delay: float = RETRY_DELAY_SECONDS,
         max_retries: int = MAX_RETRIES,
     ) -> None:
-        self.fanout = fanout
+        #: Anything with a non-blocking `publish`. Named `sink` rather than `fanout`
+        #: since #36: the running engine passes the adapter's frame sink, and only
+        #: `tests/test_feed.py` still hands this a `FanOut`.
+        self.sink = sink
         self.url = url
         self.heartbeat_seconds = heartbeat_seconds
         self.retry_delay = retry_delay
@@ -166,32 +211,25 @@ class DeltaFeed:
             return None
         return json.dumps({"type": "subscribe", "payload": {"channels": channels}})
 
-    def _to_quote(self, message: dict[str, Any]) -> Quote | None:
-        """One frame to one `Quote`, or `None` if it is control traffic."""
+    @staticmethod
+    def _to_message(message: dict[str, Any]) -> VenueMessage | None:
+        """One frame to one `VenueMessage`, or `None` if it is control traffic.
+
+        **The frame is not read beyond its `type` and `sy`.** Whether the payload makes
+        sense is the adapter's question, asked once, where the array offsets live.
+
+        `subscriptions`, `error` and anything else is control traffic and is dropped
+        here: publishing it would put a record carrying no market data on the bus.
+        """
         kind = message.get("type")
-        if kind == "ticker":
-            symbol, leg = decode_ticker(message)
-            return Quote(
-                symbol=symbol,
-                channel="ticker",
-                bid=leg.bid,
-                ask=leg.ask,
-                received_at=time.time(),
-                frame=message,
-            )
-        if kind == "ob_l2":
-            symbol, bid, ask = decode_ob_l2(message)
-            return Quote(
-                symbol=symbol,
-                channel="ob_l2",
-                bid=bid,
-                ask=ask,
-                received_at=time.time(),
-                frame=message,
-            )
-        # `subscriptions`, `error` and anything else is control traffic. Publishing it
-        # would put a record with no prices on the bus.
-        return None
+        if kind not in CHANNELS:
+            return None
+        return VenueMessage(
+            channel=kind,
+            symbol=message.get("sy") or "",
+            frame=message,
+            received_at=time.time(),
+        )
 
     async def _pump(self, socket) -> None:
         """Read until the connection ends. Publishes; never computes."""
@@ -206,15 +244,17 @@ class DeltaFeed:
                 self.messages += 1
                 self.bytes_read += len(raw)
                 try:
-                    message = json.loads(raw)
-                    quote = self._to_quote(message)
+                    venue_message = self._to_message(json.loads(raw))
                 except Exception:
                     # One bad frame must not end ingestion. Counted, not swallowed —
-                    # a malformed count that stays at zero is the useful signal.
+                    # a malformed count that stays at zero is the useful signal. Since
+                    # #36 this counts only frames that are not JSON at all: a frame that
+                    # parses but makes no sense is counted by the adapter, which is the
+                    # only thing that looks inside one.
                     self.malformed += 1
                     continue
-                if quote is not None:
-                    self.fanout.publish(quote)
+                if venue_message is not None:
+                    self.sink.publish(venue_message)
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)

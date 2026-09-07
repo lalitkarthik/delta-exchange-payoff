@@ -20,8 +20,41 @@ export interface Position {
   stamp: string | null;
   /** The stored minute there, or `null` — a hole is a position you can stand on. */
   minute: SmileMinute | null;
-  /** Standing on the live position — the right edge, following the stream. */
+  /**
+   * Standing on the live position — a live push has arrived and this is the position
+   * carrying it.
+   *
+   * **This is a fact about the data, not about the reader's intent, and it is false
+   * before the first push however much the reader wants to follow.** `timeline.liveIndex`
+   * is `-1` until `withLiveMinute` has been handed a minute, so a screen that has not yet
+   * heard from the stream has no live position to stand on. Gate a *subscription* on this
+   * and it can never open: no socket, so no push, so no live index, so no socket. That
+   * was issue #49. Use `following` for anything that decides whether to listen; use this
+   * only where the question really is "is a live minute on screen".
+   */
   onLive: boolean;
+  /**
+   * The reader has not pinned a historical minute — so the screen should be following
+   * whatever the right edge turns out to be.
+   *
+   * **This is the switch a live subscription belongs on**, and the distinction from
+   * `onLive` is the whole point of it. `null` is this codebase's spelling of "whatever
+   * the right edge is" (see `wanted` below and `pickIndex` on both screens); it is a
+   * standing instruction, and it is true from the first render, before any socket has
+   * opened and before any push has landed. `onLive` is the later, narrower observation
+   * that the instruction has been honoured.
+   *
+   * The second clause is not redundant. A deep link can name the live minute's own stamp
+   * — `?minute=` carrying the stamp a push has just put on the right edge — and a reader
+   * who arrives that way is standing on the live edge as surely as one who arrived with
+   * no query at all. Without `|| onLive` that link would open on live data and refuse to
+   * follow it.
+   *
+   * Everything keyed on which of the two chains is on screen must read *this*, not
+   * `onLive`, or the screen can label live figures with a historical clock in the window
+   * between a push arriving and the timeline placing it.
+   */
+  following: boolean;
   /**
    * A link naming a minute this expiry's store does not reach at all — not a hole in the
    * middle of the day, which is a position you can stand on, but a stamp outside it. It
@@ -45,12 +78,14 @@ export function positionOf(timeline: Timeline, wanted: string | null): Position 
   const askedIndex = wanted === null ? -1 : indexOfStamp(timeline, wanted);
   /** No answer for what was asked means the right edge, which is the newest minute. */
   const index = askedIndex >= 0 ? askedIndex : last;
+  const onLive = index >= 0 && index === timeline.liveIndex;
 
   return {
     index,
     stamp: index >= 0 ? (timeline.stamps[index] ?? null) : null,
     minute: index >= 0 ? (timeline.minutes[index] ?? null) : null,
-    onLive: index >= 0 && index === timeline.liveIndex,
+    onLive,
+    following: wanted === null || onLive,
     unreachable: wanted !== null && askedIndex < 0 && last >= 0 ? wanted : null,
   };
 }
