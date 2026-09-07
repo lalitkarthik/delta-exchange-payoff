@@ -47,6 +47,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Annotated, Any
 
 from fastapi import (
@@ -77,9 +78,27 @@ from .models import (
     RecordingState,
     SmileResponse,
 )
+from .realised_vol import ESTIMATORS
 from .smile import read_smile
-from .store import COMPUTED_DATASET, COMPUTED_SCHEMA, BarStore, BarWriter
+from .store import (
+    COMPUTED_DATASET,
+    COMPUTED_SCHEMA,
+    SPOT_DATASET,
+    SPOT_SCHEMA,
+    BarStore,
+    BarWriter,
+    read_contract_ivs,
+    read_spot_bars,
+)
 from .stream import ChainStream, recompute_forever
+from .volatility import (
+    ALIGNMENTS,
+    INTERVALS,
+    BoundsResponse,
+    VolatilitySeries,
+    lookback_bounds,
+    volatility_series,
+)
 
 #: The Next.js dev server. Development only; production origins are a deploy concern.
 ALLOWED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
@@ -117,6 +136,16 @@ MIN_PUSH_INTERVAL_SECONDS = 0.02
 #: switching with no subscribe round trip. Narrowing `ob_l2` to the watched expiry would
 #: cut it to roughly a third; see `docs/ingestion.md`.
 LIVE_UNDERLYINGS = ("BTC",)
+
+#: The most points `/volatility` will put in one response unless asked for fewer.
+#:
+#: A year at one-minute resolution is 525,600 points per series, and six series of that is
+#: a payload no browser wants. The cap is applied by **computing at fewer timestamps**,
+#: not by computing everything and throwing some away — each point still rests on its own
+#: full window, so this is a coarser reading of the same rolling estimate rather than a
+#: downsampling of it. The step actually used is reported as `step_seconds`, because a cap
+#: nobody is told about reads as "we covered everything".
+MAX_POINTS = 2000
 
 #: Environment switch: set to "0" to serve the REST endpoints and the websocket without
 #: opening a socket to Delta. Read at start-up rather than at import, so a test can set
@@ -288,6 +317,33 @@ def get_chain_stream() -> ChainStream:
     return app.state.stream
 
 
+class StoreVolatilitySource:
+    """The volatility screen's read path: two tables, read lazily, converted once.
+
+    A named object rather than two loose calls so the whole of it can be replaced in a
+    test with something that holds bars in a list — `/volatility` must be exercised
+    without a Parquet tree, and the suite must not learn to build one to test a
+    query string.
+    """
+
+    def __init__(self, root: Any = None) -> None:
+        self.spot = BarStore(root, dataset=SPOT_DATASET, schema=SPOT_SCHEMA)
+        self.computed = BarStore(
+            root, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA
+        )
+
+    def spot_bars(self, underlying: str, **kwargs: Any) -> Any:
+        return read_spot_bars(self.spot, underlying, **kwargs)
+
+    def contract_ivs(self, underlying: str, **kwargs: Any) -> Any:
+        return read_contract_ivs(self.computed, underlying, **kwargs)
+
+
+def get_volatility_source() -> StoreVolatilitySource:
+    """Overridden in tests, which hand the route bars instead of a directory tree."""
+    return StoreVolatilitySource()
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness only. Says nothing about Delta."""
@@ -328,6 +384,152 @@ async def chain(
     # same populated shape. A REST reader that got null Greeks where the websocket
     # sends real ones would be reading a different contract.
     return enrich(build_chain(symbol, date, tickers))
+
+
+@app.get("/volatility/bounds", response_model=BoundsResponse)
+async def volatility_bounds(
+    underlying: Annotated[str, Query(description="BTC or ETH")],
+    source: Annotated[StoreVolatilitySource, Depends(get_volatility_source)],
+    interval: Annotated[str, Query(description="sampling interval")] = "1m",
+) -> BoundsResponse:
+    """What `N` may be, before anyone has chosen one.
+
+    A store holding nothing usable answers 200 with `usable: false` rather than an error.
+    "No lookback works yet" is a real answer the screen can print, and printing it is the
+    difference between an instrument that is honest about its range and one that looks
+    broken for the first month of recording.
+    """
+    symbol = _validated(normalise_underlying, underlying)
+    if interval not in INTERVALS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"interval must be one of {', '.join(INTERVALS)}, not {interval!r}",
+        )
+    bounds = lookback_bounds(
+        spot_bars=source.spot_bars(symbol),
+        iv_rows=source.contract_ivs(symbol),
+        interval=INTERVALS[interval],
+    )
+    return BoundsResponse(
+        min_days=bounds.min_days,
+        max_days=bounds.max_days,
+        binding=bounds.binding,
+        detail=bounds.detail,
+        usable=bounds.usable,
+        intervals=list(INTERVALS),
+    )
+
+
+@app.get("/volatility", response_model=VolatilitySeries)
+async def volatility(
+    underlying: Annotated[str, Query(description="BTC or ETH")],
+    lookback_days: Annotated[float, Query(description="N: drives both series")],
+    source: Annotated[StoreVolatilitySource, Depends(get_volatility_source)],
+    interval: Annotated[str, Query(description="sampling interval")] = "1m",
+    estimators: Annotated[str, Query(description="comma-separated")] = ",".join(
+        ESTIMATORS
+    ),
+    alignment: str = "contemporaneous",
+    max_points: int = MAX_POINTS,
+) -> VolatilitySeries:
+    """Implied and realised volatility over one lookback, in the units the chart draws.
+
+    `lookback_days` is `N`, and it is deliberately one parameter rather than two: it sets
+    the realised lookback *and* the implied tenor, so the two lines always describe the
+    same length of time. Two parameters would make a ten-minute realised volatility
+    against a thirty-day implied one expressible, and the difference between them would
+    look like a signal.
+
+    A lookback outside the computed bounds is a **400 naming the binding constraint**,
+    not an empty chart — in the first month of recording the bound moves every day and a
+    screen that cannot say why it refused looks broken rather than honest.
+    """
+    symbol = _validated(normalise_underlying, underlying)
+
+    if interval not in INTERVALS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"interval must be one of {', '.join(INTERVALS)}, not {interval!r}",
+        )
+    wanted = [name.strip() for name in estimators.split(",") if name.strip()]
+    unknown = [name for name in wanted if name not in ESTIMATORS]
+    if unknown or not wanted:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"estimators must be drawn from {', '.join(ESTIMATORS)}; "
+                f"got {unknown or 'nothing'}"
+            ),
+        )
+    if alignment not in ALIGNMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"alignment must be one of {', '.join(ALIGNMENTS)}",
+        )
+
+    step_interval = INTERVALS[interval]
+    bars = source.spot_bars(symbol)
+    iv_rows = source.contract_ivs(symbol)
+    bounds = lookback_bounds(
+        spot_bars=bars, iv_rows=iv_rows, interval=step_interval
+    )
+
+    if not bounds.usable:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"no lookback works yet at {interval} sampling: the lower bound is "
+                f"{bounds.min_days:.2f} days and the upper is {bounds.max_days:.2f}. "
+                f"{bounds.detail}"
+            ),
+        )
+    if not bounds.min_days <= lookback_days <= bounds.max_days:
+        side = "below the lower" if lookback_days < bounds.min_days else "above the upper"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"lookback_days={lookback_days} is {side} bound "
+                f"[{bounds.min_days:.2f}, {bounds.max_days:.2f}]. {bounds.detail}"
+            ),
+        )
+
+    lookback = timedelta(days=lookback_days)
+    if not bars:
+        raise HTTPException(
+            status_code=404, detail=f"no spot bars stored for {symbol}"
+        )
+
+    # Contemporaneous needs a full window behind the first point; lag needs a full one
+    # ahead of the last. Either way the range is the part of the record that can answer.
+    first, last = bars[0].at, bars[-1].at
+    start = first + lookback if alignment == "contemporaneous" else first
+    end = last
+    if start > end:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"a {lookback_days}-day window does not fit in the "
+                f"{(last - first).days}-day record held"
+            ),
+        )
+
+    span = end - start
+    steps = max(1, int(span / step_interval))
+    stride = max(1, -(-steps // max(1, max_points)))
+
+    return volatility_series(
+        spot_bars=bars,
+        iv_rows=iv_rows,
+        lookback=lookback,
+        interval=step_interval,
+        estimators=wanted,
+        alignment=alignment,
+        start=start,
+        end=end,
+        step=stride * step_interval,
+        underlying=symbol,
+        bounds=bounds,
+    )
 
 
 def _validated(check: Callable[[str], str], value: str) -> str:
