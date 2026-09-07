@@ -21,17 +21,17 @@ per-module detail is still accurate where this document is silent.
 ## 1. The shape of the system
 
 ```
-       VENUES                 ENGINE FEED MANAGEMENT             CONSUMERS
+       VENUES                 ENGINE FEED MANAGEMENT
   +----------------+     +------------------------------+
   | Delta Exchange |     |  +------------------------+  |
   | India ws + REST|====>|  | Delta adapter     #36  |  |
   +----------------+     |  +-----------+------------+  |
   +----------------+     |  | connection controller  |  |
-  | NSE            |~~~~>|  | #38  state machine     |  |
-  | (not built)    |     |  +-----------+------------+  |
+  | NSE  ~~ = not  |~~~~>|  | #38  state machine     |  |
+  | built yet      |     |  +-----------+------------+  |
   +----------------+     |  | supervisor        #39  |  |
-  control.command   ---->|  +-----------+------------+  |
-  pause/resume/#41       +--------------|---------------+
+  control.command  ----->|  +-----------+------------+  |
+  pause/resume  (#41)    +--------------|---------------+
                                         | canonical events
                                  +------+-------+
                                  |   the bus    |  fanout.py
