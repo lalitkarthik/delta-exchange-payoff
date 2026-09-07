@@ -1,3 +1,8 @@
+> Superseded by [design/hld.md](design/hld.md) and [design/events.md](design/events.md).
+> This note describes the single-venue engine as it stood on 2026-09-04, before the adapter,
+> the connection controller and the events of #33. It is kept because links resolve into it
+> and its per-module detail is still accurate where the high-level design is silent.
+
 # The architecture, end to end
 
 **What the platform is: one connection to Delta Exchange India, fanned out to three
