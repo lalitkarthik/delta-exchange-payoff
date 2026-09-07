@@ -26,7 +26,10 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+
+from _window import run_window  # noqa: E402
 from deltapayoff.fanout import FanOut  # noqa: E402
 from deltapayoff.adapters import DeltaFeed  # noqa: E402
 
@@ -51,18 +54,30 @@ async def throughput(channel: str, names: list[str]) -> None:
     feed = DeltaFeed(bus)
     feed.subscribe(channel, names)
 
-    task = asyncio.create_task(feed.run())
-    await asyncio.sleep(1.0)  # connect and subscribe before the clock starts
-    start_messages, start_bytes = feed.messages, feed.bytes_read
+    # **One window that redials, not one connection.** Since #39 `feed.run()` returns
+    # at the first drop, so the old `create_task(run())` + `sleep` reported a full
+    # twenty seconds of throughput off however much of it preceded the drop.
+    # `tools/_window.py` carries the whole story.
+    warmup = 1.0  # connect and subscribe before the clock starts
     started = time.perf_counter()
-    await asyncio.sleep(RUN_SECONDS)
-    elapsed = time.perf_counter() - started
+    counters: dict[str, int] = {}
+
+    async def note_start() -> None:
+        await asyncio.sleep(warmup)
+        counters["messages"] = feed.messages
+        counters["bytes"] = feed.bytes_read
+        counters["at"] = time.perf_counter()
+
+    marker = asyncio.create_task(note_start())
+    window = await run_window(feed, warmup + RUN_SECONDS)
+    await asyncio.gather(marker, return_exceptions=True)
+
+    start_messages = counters.get("messages", 0)
+    start_bytes = counters.get("bytes", 0)
+    elapsed = time.perf_counter() - counters.get("at", started)
     messages = feed.messages - start_messages
     read = feed.bytes_read - start_bytes
-
-    feed.stop()
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    window.warn_if_truncated()
 
     seen: set[str] = set()
     while not sink.queue.empty():
@@ -72,7 +87,9 @@ async def throughput(channel: str, names: list[str]) -> None:
     print(
         f"{channel:8} {len(names):5} symbols  {messages / elapsed:7.1f} msg/s  "
         f"{read / 1024 / elapsed:7.1f} KB/s  {per_symbol:6.0f} ms/symbol  "
-        f"{len(seen):4} distinct  dropped {sink.dropped}"
+        f"{len(seen):4} distinct  dropped {sink.dropped}  "
+        f"{window.attempts} connection(s)"
+        + ("" if window.complete else "  ** WINDOW ENDED EARLY, see above **")
     )
 
 
