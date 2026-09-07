@@ -66,11 +66,20 @@ function chainQuery(
  * minute at a time (`docs/design/lld/historical-read-path.md`), over `/chain/at`.
  *
  * **Standing on the right edge means the socket is open; standing anywhere else means
- * it is not.** `onLive` — from `positionOf`, the same field the volatility screen reads
- * — is the one switch: true subscribes `/ws/chain` and tears down any historical fetch,
- * false does the opposite. Releasing the slider back onto the right edge is nothing
- * more than `wanted` returning to `null`, which is already this codebase's spelling of
- * "follow whatever the right edge is".
+ * it is not.** `following` — from `positionOf` — is the one switch: true subscribes
+ * `/ws/chain` and tears down any historical fetch, false does the opposite. Releasing
+ * the slider back onto the right edge is nothing more than `wanted` returning to `null`,
+ * which is already this codebase's spelling of "follow whatever the right edge is".
+ *
+ * **`following`, and not `positionOf`'s `onLive`, and the difference is load-bearing.**
+ * `onLive` asks whether a live push has been placed on the timeline; `following` asks
+ * whether the reader has pinned a historical minute. The first cannot be true until a
+ * socket has already delivered something, so a subscription gated on it never opens —
+ * no socket, no push, no live index, no socket. That was issue #49, and it left this,
+ * the app's primary screen, showing "Connecting to the engine…" for ever on any load
+ * without a `minute=` in the URL. Every switch on this screen that decides between the
+ * live ladder and a stored one now reads `following`; see the note over `chain` for the
+ * labels, which have to agree with it or lie quietly.
  */
 export default function ChainScreen({
   initial,
@@ -183,12 +192,19 @@ export default function ChainScreen({
     [storedTimeline, liveStatus, liveChain],
   );
 
-  const { index, stamp, onLive, unreachable } = positionOf(timeline, wanted);
+  const { index, stamp, following, unreachable } = positionOf(timeline, wanted);
 
-  // The live subscription: open only while standing on the right edge. Dragging off it
-  // tears the socket down; releasing back onto it reopens one.
+  // The live subscription: open unless the reader has pinned a historical minute.
+  // Dragging off the right edge tears the socket down; releasing back onto it reopens
+  // one.
+  //
+  // **`following`, never `onLive`.** `onLive` says a push has already been placed on the
+  // timeline, which cannot be true before a socket exists — gating the socket on it is
+  // the deadlock of #49, and it left the primary screen on "Connecting to the engine…"
+  // for ever. What should be asked here is whether the reader wants the stream, and that
+  // is answerable on the first render.
   useEffect(() => {
-    if (!expiry || !onLive) return;
+    if (!expiry || !following) return;
     setLiveChain(null);
     return subscribeChain(underlying, expiry, {
       onChain: setLiveChain,
@@ -197,11 +213,11 @@ export default function ChainScreen({
         setLiveStatusDetail(detail ?? null);
       },
     });
-  }, [underlying, expiry, onLive]);
+  }, [underlying, expiry, following]);
 
   // The historical read: one request per stored minute the slider stands on.
   useEffect(() => {
-    if (onLive || !stamp) {
+    if (following || !stamp) {
       // Bumped even though nothing is fetched here: it retires any request already in
       // flight, so a slow historical read landing after the reader has moved back to
       // live cannot overwrite the state this branch just cleared.
@@ -231,19 +247,23 @@ export default function ChainScreen({
         if (id === ladderRequest.current) setHistoricalBusy(false);
       }
     })();
-  }, [underlying, expiry, onLive, stamp]);
+  }, [underlying, expiry, following, stamp]);
 
   // The address bar follows the slider and the chart panel; it never drives either
   // after the first render.
+  //
+  // `following` rather than `onLive`, so a page that is following the stream but has not
+  // yet been sent a push writes no `minute=` — a link copied in that first second must
+  // mean "live", which is what the reader is looking at, not the last sealed minute.
   useEffect(() => {
     if (!expiry) return;
-    const query = chainQuery(underlying, expiry, onLive ? null : stamp, panelInstrument);
+    const query = chainQuery(underlying, expiry, following ? null : stamp, panelInstrument);
     if (window.location.search === query) return;
     const timer = window.setTimeout(() => {
       window.history.replaceState(null, "", query);
     }, URL_SETTLE_MS);
     return () => window.clearTimeout(timer);
-  }, [underlying, expiry, onLive, stamp, panelInstrument]);
+  }, [underlying, expiry, following, stamp, panelInstrument]);
 
   const pickUnderlying = (next: Underlying) => {
     setUnderlying(next);
@@ -272,7 +292,21 @@ export default function ChainScreen({
     setWanted(timeline.stamps[at] ?? null);
   };
 
-  const chain = onLive ? liveChain : historicalChain;
+  /**
+   * Which of the two ladders is on screen — and, below, the one predicate every label
+   * about it is read from.
+   *
+   * **The chain and the words describing it must come off the same switch.** Choosing
+   * the chain by `following` and labelling it by `onLive` would put live figures under a
+   * historical clock in the window between a push arriving and the timeline placing it,
+   * and a wrong label is worse than a missing ladder because nothing on screen announces
+   * it. So the header's LIVE/UTC, the connection chip, the stream notices and the chart
+   * panel's live quote all read `following` too. The `unreachable` and `historicalWaiting`
+   * notices are the only ones where the two predicates cannot differ — both require a
+   * pinned `wanted`, and `following` collapses to `onLive` there — and they are spelled
+   * the same way regardless, so no reader of this file has to work that out.
+   */
+  const chain = following ? liveChain : historicalChain;
 
   return (
     <div className="shell">
@@ -332,8 +366,8 @@ export default function ChainScreen({
             className="stat-value"
             title={chain ? formatFetchedAt(chain.fetched_at) : undefined}
           >
-            {onLive ? "LIVE" : chain ? formatFetchedClock(chain.fetched_at) : "—"}{" "}
-            <span className="stat-note">{onLive ? "" : "UTC"}</span>
+            {following ? "LIVE" : chain ? formatFetchedClock(chain.fetched_at) : "—"}{" "}
+            <span className="stat-note">{following ? "" : "UTC"}</span>
           </span>
         </div>
 
@@ -341,7 +375,7 @@ export default function ChainScreen({
           className="chip"
           title={liveStatusDetail ?? `Streaming from ${ENGINE_URL}.`}
         >
-          {onLive ? LIVE_STATUS_LABEL[liveStatus] : "history"}
+          {following ? LIVE_STATUS_LABEL[liveStatus] : "history"}
         </span>
 
         <RecordingToggle />
@@ -350,27 +384,27 @@ export default function ChainScreen({
       </header>
 
       <main className="main">
-        {onLive && liveStatus === "error" ? (
+        {following && liveStatus === "error" ? (
           <p className="notice error">
             {liveStatusDetail ?? "The live stream reported an error."}
           </p>
         ) : null}
 
-        {onLive && liveStatus === "closed" ? (
+        {following && liveStatus === "closed" ? (
           <p className="notice warn">
             Lost the connection to the engine at <code>{ENGINE_URL}</code>. Retrying — the
             figures below are the last ones that arrived, and they are not moving.
           </p>
         ) : null}
 
-        {!onLive && unreachable ? (
+        {!following && unreachable ? (
           <p className="notice warn">
             The link asked for <strong>{unreachable}</strong>, which this day&rsquo;s
             store does not reach. Showing the closest minute the slider can stand on.
           </p>
         ) : null}
 
-        {!onLive && historicalWaiting ? (
+        {!following && historicalWaiting ? (
           <p className="notice">
             No stored quotes for {underlying} expiring {expiry} at {stamp}. The store
             wrote no row for this minute — never a neighbouring one shown in its place.
@@ -385,11 +419,11 @@ export default function ChainScreen({
             chain={chain}
             onSelectContract={setPanelInstrument}
           />
-        ) : error || (onLive && liveStatus === "error") || historicalWaiting ? null : (
+        ) : error || (following && liveStatus === "error") || historicalWaiting ? null : (
           <p className="notice">
             {historicalBusy
               ? "Reading the stored ladder…"
-              : onLive && liveStatus === "waiting"
+              : following && liveStatus === "waiting"
                 ? "Connected. Waiting for the first quotes on this expiry…"
                 : "Connecting to the engine…"}
           </p>
@@ -403,7 +437,7 @@ export default function ChainScreen({
             instrument={panelInstrument}
             date={date}
             liveChain={liveChain}
-            onLive={onLive}
+            following={following}
             onClose={() => setPanelInstrument(null)}
           />
         ) : null}
