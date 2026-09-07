@@ -1,9 +1,10 @@
 /**
  * Types for the engine's HTTP interface.
  *
- * These mirror `docs/chain-contract.md`, `docs/smile-contract.md` and
- * `docs/recording-contract.md` field for field. Those files are the authority; if this
- * file and a contract disagree, this file is wrong.
+ * These mirror `docs/chain-contract.md`, `docs/smile-contract.md`,
+ * `docs/recording-contract.md`, `docs/historical-chain-contract.md` and
+ * `docs/bars-contract.md` field for field. Those files are the authority; if this file
+ * and a contract disagree, this file is wrong.
  *
  * Two rules from the contract are load-bearing for every type here:
  *
@@ -244,4 +245,99 @@ export interface RecordingState {
   buffered_rows: number;
   /** Rows this engine process has written to Parquet, across all four tables. */
   rows_written: number;
+}
+
+/**
+ * `GET /chain/minutes` — `docs/historical-chain-contract.md`.
+ *
+ * The chain slider's domain and, by what is missing from an otherwise-contiguous run,
+ * its gaps. Sibling of `SmileResponse`, but plain stamps rather than `SmileMinute[]`: a
+ * ladder is heavy enough that this screen fetches one minute at a time (see
+ * `docs/design/lld/historical-read-path.md`), so the domain and the data travel apart.
+ */
+export interface HistoricalMinutesResponse {
+  underlying: Underlying;
+  expiry: ExpiryDate;
+  /** `YYYY-MM-DD` — the store's own partition spelling, not `expiry`'s `DD-MM-YYYY`. */
+  date: string;
+  /** Ascending. ISO 8601 UTC, second precision, `Z`-suffixed — `SmileMinute.minute`'s
+   * own spelling, so a stamp round-trips into `/chain/at` with no reformatting. */
+  minutes: string[];
+}
+
+/**
+ * `GET /chain/at` — `docs/historical-chain-contract.md`.
+ *
+ * Every field `ChainResponse` carries, unchanged, plus `minute`: `ChainLadder` renders
+ * either shape without knowing which one it was handed, and the header reads `minute`
+ * to say which one it is showing.
+ */
+export interface HistoricalChain extends ChainResponse {
+  /** ISO 8601 UTC, second precision, `Z`-suffixed — the exact minute this ladder was
+   * rebuilt for. `fetched_at` carries the same stamp: there is no "when we asked Delta"
+   * for a historical read. */
+  minute: string;
+}
+
+/**
+ * What `/chain/at` answers with. The same envelope `/ws/chain` sends over the socket —
+ * `LiveMessage` in `lib/live.ts` — so a client that already reads `chain`/`waiting`
+ * needs no third vocabulary to read this over REST.
+ */
+export type HistoricalChainMessage =
+  | { type: "chain"; data: HistoricalChain }
+  | { type: "waiting"; detail: string };
+
+/**
+ * `GET /bars` — `docs/bars-contract.md`.
+ *
+ * One minute of one contract, in the two shapes the chart panel needs: `mid_*` for the
+ * default candle, `ltp_*` for the toggle, `bid_*`/`ask_*` for the two line series drawn
+ * over either. Every field is independently nullable — a one-sided tick minute has a
+ * `bid` series and no `mid` series, and a minute `reference-bars` never fed has no
+ * `ltp_*` at all even though `quote-bars` answers for it.
+ */
+export interface ContractBar {
+  /** ISO 8601 UTC, second precision, `Z`-suffixed. */
+  minute: string;
+
+  bid_open: number | null;
+  bid_high: number | null;
+  bid_low: number | null;
+  bid_close: number | null;
+
+  ask_open: number | null;
+  ask_high: number | null;
+  ask_low: number | null;
+  ask_close: number | null;
+
+  mid_open: number | null;
+  mid_high: number | null;
+  mid_low: number | null;
+  mid_close: number | null;
+
+  ltp_open: number | null;
+  ltp_high: number | null;
+  ltp_low: number | null;
+  ltp_close: number | null;
+}
+
+/**
+ * `GET /bars?instrument=...&date=...`.
+ *
+ * **A minute nobody quoted is absent from `bars`, never a null row.** `bars` ascends by
+ * minute; a hole in it is a hole the chart's whitespace data draws as a gap, never as an
+ * invented candle — see `lib/contractBars.ts`.
+ */
+export interface ContractBarsResponse {
+  /** The canonical string this route was asked with, echoed back — the underlying
+   * normalised, everything else unchanged. */
+  instrument: string;
+  underlying: Underlying;
+  /** `DD-MM-YYYY`, matching `/chain` and `/chain/at` — not this route's own `date`. */
+  expiry: ExpiryDate;
+  /** `YYYY-MM-DD` — the store's own partition spelling, the day these bars were read for. */
+  date: string;
+  /** Ascending by minute. */
+  bars: ContractBar[];
 }

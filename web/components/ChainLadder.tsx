@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type KeyboardEvent } from "react";
 
 import type { ChainResponse, ChainRow, Leg } from "@/lib/contract";
 import {
@@ -19,6 +19,7 @@ import {
   formatPrice,
   formatStrike,
 } from "@/lib/format";
+import { canonicalInstrument } from "@/lib/instrument";
 
 /**
  * Calls left, puts right, strikes down the middle — the sibling chain's table, wearing
@@ -98,12 +99,27 @@ const COLUMNS_PER_SIDE = 9;
  * and empty — computed before any moneyness, deliberately: shading an absence would be
  * a claim about a price that was never printed.
  */
-function QuoteCells({ leg, side, strike, spot, previous }: {
+function QuoteCells({
+  leg,
+  side,
+  strike,
+  spot,
+  previous,
+  underlying,
+  expiry,
+  onSelectContract,
+}: {
   leg: Leg | null;
   side: "call" | "put";
   strike: number;
   spot: number;
   previous: PriceMemory | null;
+  underlying: string;
+  expiry: string;
+  /** #46: opens the contract chart panel for this leg. `undefined` renders every cell
+   * exactly as before — the ladder has one caller today, but nothing here should break
+   * a second one that renders read-only. */
+  onSelectContract?: (instrument: string) => void;
 }) {
   if (leg === null) {
     const label = `No ${side} listed at this strike`;
@@ -143,8 +159,58 @@ function QuoteCells({ leg, side, strike, spot, previous }: {
     ` · Delta Δ ${formatDelta(leg.delta) || DASH}` +
     whyNot;
 
+  // #46: every cell of a listed leg opens the same contract, so the click target is the
+  // whole side rather than one column — a reader should not have to find the one cell
+  // that happens to be wired. Built once per leg rather than per cell so the canonical
+  // string is computed a single time regardless of which of the nine columns is clicked.
+  const instrument = onSelectContract
+    ? canonicalInstrument(underlying, expiry, strike, side)
+    : null;
+  const selectLabel = instrument
+    ? `Open the chart for ${side} ${formatStrike(strike)}`
+    : undefined;
+
+  // A plain `onClick` fires on the `mouseup` that ends a click-drag text selection too —
+  // there is nothing else in this handler to tell "clicked" from "just finished
+  // selecting a value to copy it" apart. Refusing to open the panel while the selection
+  // this click is ending is non-empty is what keeps copying a bid or a Greek out of the
+  // table from also swapping the chart underneath it.
+  const select = instrument
+    ? () => {
+        if (window.getSelection()?.toString()) return;
+        onSelectContract!(instrument);
+      }
+    : undefined;
+  const activate = instrument
+    ? (event: KeyboardEvent<HTMLTableCellElement>) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        onSelectContract!(instrument);
+      }
+    : undefined;
+  const clickable = select ? "clickable" : "";
+
+  // Spread onto every cell rather than passed as separate props: a `<td>` needs all
+  // four — the click guard, the keyboard equivalent, and enough ARIA to be a control
+  // rather than data — or none of them, never some, and a cell built without this would
+  // be reachable by mouse and invisible to a keyboard.
+  const activation = instrument
+    ? {
+        onClick: select,
+        onKeyDown: activate,
+        tabIndex: 0,
+        role: "button" as const,
+        "aria-label": selectLabel,
+      }
+    : {};
+
   const cell = (key: string, text: string) => (
-    <td key={key} className={`num ${itm}`} title={detail}>
+    <td
+      key={key}
+      className={`num ${itm} ${clickable}`.trim()}
+      title={detail}
+      {...activation}
+    >
       {text}
     </td>
   );
@@ -155,8 +221,9 @@ function QuoteCells({ leg, side, strike, spot, previous }: {
     return (
       <td
         key={key}
-        className={`num ${itm} ${moved ? `moved-${moved}` : ""}`.trim()}
+        className={`num ${itm} ${clickable} ${moved ? `moved-${moved}` : ""}`.trim()}
         title={detail}
+        {...activation}
       >
         {formatPrice(leg[key])}
         {moved && (
@@ -188,7 +255,15 @@ function QuoteCells({ leg, side, strike, spot, previous }: {
   return <>{side === "call" ? outwardIn : [...outwardIn].reverse()}</>;
 }
 
-export function ChainLadder({ chain }: { chain: ChainResponse }) {
+export function ChainLadder({
+  chain,
+  onSelectContract,
+}: {
+  chain: ChainResponse;
+  /** #46: called with a leg's canonical instrument string when a reader clicks it.
+   * Optional so a caller that only wants a read-only ladder is unaffected. */
+  onSelectContract?: (instrument: string) => void;
+}) {
   const money = useRef<HTMLTableRowElement>(null);
 
   // The previous push's prices, so this one can be compared against them.
@@ -289,6 +364,9 @@ export function ChainLadder({ chain }: { chain: ChainResponse }) {
                   strike={row.strike}
                   spot={chain.spot}
                   previous={seen}
+                  underlying={chain.underlying}
+                  expiry={chain.expiry}
+                  onSelectContract={onSelectContract}
                 />
                 <td className="strike">
                   {formatStrike(row.strike)}
@@ -300,6 +378,9 @@ export function ChainLadder({ chain }: { chain: ChainResponse }) {
                   strike={row.strike}
                   spot={chain.spot}
                   previous={seen}
+                  underlying={chain.underlying}
+                  expiry={chain.expiry}
+                  onSelectContract={onSelectContract}
                 />
               </tr>
             );
