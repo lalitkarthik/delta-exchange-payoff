@@ -71,11 +71,11 @@ stream events until stopped — and emits canonical events carrying a canonical 
 nothing downstream sees venue JSON. **One boundary rule lives here and nowhere else:** the
 venue's absent-quote spellings become `null`, and a real zero stays `0`.
 
-Today `feed.py`, `delta_client.py` and `wire.py` do this work with no interface over them, and
-`feed.py` publishes a `Quote` record rather than an event. #35 lands the instrument and the
-envelope, #36 moves the three modules behind the protocol and adds a **scripted fake adapter** —
-the one new test seam — and #37 retires the quote record. The `connect` factory stays injectable,
-because that is the seam the existing feed tests already drive.
+#35 landed the instrument and the envelope; #36 moved the venue's three modules behind the
+protocol and added a **scripted fake adapter**, the one new test seam; #37 retired the quote
+record that used to carry a raw frame past the adapter, moved the socket owner into the
+adapter package with it, and moved the two consumers onto the events. The `connect` factory
+stays injectable, because that is the seam the feed tests already drive.
 
 ### 2.3 The controller and the supervisor
 

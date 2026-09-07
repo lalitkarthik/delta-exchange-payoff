@@ -93,9 +93,10 @@ def test_frames_then_close_then_silence_then_resume() -> None:
 def test_resume_replays_a_ticker_script_whole() -> None:
     """**The promise has to hold on both channels, not just the one the test above uses.**
 
-    The real adapter emits `md.index_quote` only when spot *changes*, so replaying the
-    same ticker frames through one decoder would give the references again and no index
-    quote — `Resume` would look right for `ob_l2` and be quietly wrong for `ticker`. A
+    #36's adapter emitted `md.index_quote` only when spot *changed*, so replaying the
+    same ticker frames through one decoder gave the references again and no index quote —
+    `Resume` looked right for `ob_l2` and was quietly wrong for `ticker`. #37 removed that
+    suppression, so a replay is a replay without the double having to reset anything. A
     scripted reconnect therefore starts the decoder afresh.
     """
     published: list = []

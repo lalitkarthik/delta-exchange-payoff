@@ -50,7 +50,7 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine" / "src"))
 
 from deltapayoff.fanout import FanOut  # noqa: E402
-from deltapayoff.feed import DeltaFeed  # noqa: E402
+from deltapayoff.adapters import DeltaAdapter, DeltaFeed  # noqa: E402
 from deltapayoff.store import BarStore, BarWriter, all_stores, default_root  # noqa: E402
 from deltapayoff.stream import ChainStream, recompute_forever  # noqa: E402
 
@@ -138,12 +138,16 @@ async def capture(root: Path, seconds: float, flush_seconds: float) -> dict[str,
         flush_seconds=flush_seconds,
     )
     writer.attach(bus)
-    feed = DeltaFeed(bus)
+    # Through the adapter, because since #37 the bus carries canonical events and the
+    # socket owner publishes undecoded frames. Driving `DeltaFeed` straight into the bus
+    # would put venue frames in front of two consumers that no longer read one.
+    adapter = DeltaAdapter(underlyings=("BTC",))
+    feed = adapter.feed
     feed.subscribe("ticker", symbols)
     feed.subscribe("ob_l2", symbols)
 
     tasks = [
-        asyncio.create_task(feed.run(), name="feed"),
+        asyncio.create_task(adapter.stream(bus.publish), name="feed"),
         asyncio.create_task(stream.run(), name="stream"),
         asyncio.create_task(recompute_forever(stream), name="recompute"),
         asyncio.create_task(writer.run(), name="writer"),
@@ -156,7 +160,7 @@ async def capture(root: Path, seconds: float, flush_seconds: float) -> dict[str,
     messages = feed.messages - start_messages
     read = feed.bytes_read - start_bytes
 
-    feed.stop()
+    adapter.stop()
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)

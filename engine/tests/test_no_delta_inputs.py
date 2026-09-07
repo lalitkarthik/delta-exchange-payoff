@@ -9,6 +9,13 @@ The check is behavioural rather than textual. Grepping the source for `mark_iv` 
 nothing about what runs; corrupting every Delta-published number to nonsense and
 demanding identical output proves it directly. If any of these fields were consumed
 anywhere, at least one number downstream would move.
+
+**Two paths, since #37.** The REST snapshot still arrives as ticker dictionaries and is
+poisoned here as it always was. The live ladder no longer arrives as frames at all - it is
+folded out of `md.option_reference`, which carries the venue's IV and its five greeks as
+payload fields - so the last section of this file poisons *the event* and demands the same
+silence. The reference event is what #37 put between the venue and the solver, and an
+invariant tested on one of two paths is an invariant with a hole in it.
 """
 
 from __future__ import annotations
@@ -18,7 +25,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-from deltapayoff.chain import build_chain
+from deltapayoff.chain import build_chain, chain_from_legs
+from deltapayoff.compute import enrich
+from deltapayoff.events import IndexQuote, OptionReference
 from deltapayoff.forward import (
     f1_parity_fit,
     f2_single_strike,
@@ -33,6 +42,8 @@ from deltapayoff.solvers import (
     solve_chain,
     solve_chain_vectorised,
 )
+from deltapayoff.stream import leg_from_events
+from fakes.decoder import events_from_frame
 
 CAPTURE_TAKEN = datetime(2026, 8, 31, 16, 49, 17, tzinfo=timezone.utc)
 
@@ -136,3 +147,156 @@ def test_the_vectorised_solver_is_clean_too(pair) -> None:
     assert {k: v.sigma for k, v in clean.items()} == {
         k: v.sigma for k, v in dirty.items()
     }
+
+
+# --- the same rule, on the event path -------------------------------------------
+
+
+#: What `md.option_reference` carries that is the venue's **opinion** rather than an
+#: observed price: its three implied vols, its five greeks, and its mark, which is a model
+#: output and not a number anyone traded at.
+#:
+#: `bid` and `ask` are deliberately **not** on this list. #37 added them to the event, and
+#: they are quotes: the same numbers `md.option_quote` carries, and the numbers every
+#: implied volatility in this project is inverted out of. Poisoning them would test that
+#: the solver ignores its own input.
+POISONED_EVENT_FIELDS = {
+    "bid_iv": 9999.0,
+    "ask_iv": 9999.0,
+    "mark_iv": 9999.0,
+    "delta": -12345.0,
+    "gamma": -12345.0,
+    "theta": -12345.0,
+    "vega": -12345.0,
+    "rho": -12345.0,
+    "mark": 1.0,
+}
+
+
+def ladder_from_events(ticker_frames, book_frames, taken, *, poison: bool):
+    """The live ladder, folded the way the chain cache folds it, optionally poisoned.
+
+    Frames go through the real adapter, so these are the producer's events and not this
+    file's idea of them. Only the venue's opinions are overwritten; the quotes, the
+    strikes and the spot the study is allowed to read arrive untouched.
+    """
+    references = {}
+    quotes = {}
+    spot = None
+
+    for frame in ticker_frames.values():
+        for event in events_from_frame("ticker", frame):
+            if isinstance(event, IndexQuote):
+                spot = event.spot if spot is None else spot
+            elif isinstance(event, OptionReference):
+                if poison:
+                    event = event.model_copy(update=POISONED_EVENT_FIELDS)
+                references[event.instrument.canonical()] = event
+    for frame in book_frames.values():
+        for event in events_from_frame("ob_l2", frame):
+            quotes[event.instrument.canonical()] = event
+
+    legs = []
+    for key, reference in references.items():
+        instrument = reference.instrument
+        legs.append(
+            (
+                float(instrument.strike),
+                instrument.right.side,
+                leg_from_events(instrument, reference, quotes.get(key)),
+            )
+        )
+    return chain_from_legs("BTC", "04-09-2026", legs, spot, fetched_at=taken)
+
+
+@pytest.fixture
+def event_pair(ws_ticker_frames, ws_book_frames, ws_captured_at):
+    honest = ladder_from_events(
+        ws_ticker_frames, ws_book_frames, ws_captured_at, poison=False
+    )
+    poisoned = ladder_from_events(
+        ws_ticker_frames, ws_book_frames, ws_captured_at, poison=True
+    )
+    return honest, poisoned
+
+
+def test_the_event_corruption_actually_reaches_the_ladder(event_pair) -> None:
+    """Guard on the guard, for the second path. If poisoning the event silently did
+    nothing, every assertion below it would pass for the wrong reason."""
+    honest, poisoned = event_pair
+
+    assert len(honest.rows) == len(poisoned.rows) == 69
+    honest_leg = honest.rows[10].call
+    poisoned_leg = poisoned.rows[10].call
+
+    assert honest_leg.mark_iv != poisoned_leg.mark_iv
+    assert poisoned_leg.mark_iv == 9999.0
+    assert poisoned_leg.delta == -12345.0
+    assert poisoned_leg.mark == 1.0
+    # ...while the quotes and the spot the study is allowed to read are untouched.
+    assert honest_leg.bid == poisoned_leg.bid
+    assert honest_leg.ask == poisoned_leg.ask
+    assert honest.spot == poisoned.spot
+    assert honest.spot is not None
+
+
+@pytest.mark.parametrize("method", [f1_parity_fit, f2_single_strike, f3_carry, f4_spot])
+def test_no_forward_moves_when_the_reference_event_is_poisoned(
+    event_pair, method
+) -> None:
+    """All four forwards come from quotes, strikes and spot. The reference event carries
+    none of those three and must move none of them."""
+    honest, poisoned = event_pair
+
+    assert method(honest).forward == method(poisoned).forward
+    assert method(honest).discount == method(poisoned).discount
+
+
+@pytest.mark.parametrize(
+    "solver", [implied_vol_newton, implied_vol_brent, implied_vol_householder]
+)
+def test_no_implied_volatility_moves_when_the_reference_event_is_poisoned(
+    event_pair, solver
+) -> None:
+    """**The one that matters most, on the path #37 built.** Every IV on the live ladder
+    is inverted out of a bid/ask midpoint under a forward we recovered ourselves - never
+    seeded from, checked against, or nudged toward the venue's published figure, which now
+    travels on the same event as the quotes rather than on a frame of its own.
+    """
+    honest, poisoned = event_pair
+    clean = solve_chain(honest, f1_parity_fit(honest), solver=solver)
+    dirty = solve_chain(poisoned, f1_parity_fit(poisoned), solver=solver)
+
+    assert {k: v.sigma for k, v in clean.items()} == {
+        k: v.sigma for k, v in dirty.items()
+    }
+    assert any(result.sigma is not None for result in clean.values()), (
+        "nothing solved at all, so this proves nothing"
+    )
+
+
+def test_the_whole_enrichment_is_unmoved_by_a_poisoned_event(event_pair) -> None:
+    """End to end: what a browser is sent for the poisoned ladder is what it is sent for
+    the honest one, everywhere our own numbers live.
+
+    `compute.enrich` is the function the chain cache actually calls, so this is the ladder
+    a screen would render rather than a solver called in isolation.
+    """
+    honest, poisoned = event_pair
+    clean, dirty = enrich(honest), enrich(poisoned)
+
+    assert (clean.forward, clean.discount) == (dirty.forward, dirty.discount)
+    ours = [
+        (row.strike, leg.computed)
+        for row in clean.rows
+        for leg in (row.call, row.put)
+        if leg is not None
+    ]
+    theirs = [
+        (row.strike, leg.computed)
+        for row in dirty.rows
+        for leg in (row.call, row.put)
+        if leg is not None
+    ]
+    assert ours == theirs
+    assert any(computed.iv is not None for _, computed in ours), "nothing was solved"
