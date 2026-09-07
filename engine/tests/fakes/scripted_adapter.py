@@ -52,6 +52,11 @@ against this file rather than against the code under test. `Close` is observable
 `closes`, `connections` and `replays` instead, which is what a controller wrapped around
 this adapter would have to react to.
 
+**What it does report, since #38, is the protocol's `on_connection` signal** — the two
+facts about a socket, `OPENED` and `CLOSED`, and not a word about what they mean. `Close`
+fires `CLOSED` and then `OPENED`, in that order, because that is the shape of the verb:
+the connection dropped and came back.
+
 **It decodes with the real Delta decoder by default**, so replaying
 `tests/fixtures/ws-*.json` produces genuine `md.option_quote` and `md.option_reference`
 events rather than hand-written stand-ins. Pass `decode=` to script a different venue's
@@ -65,6 +70,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from deltapayoff.adapters.base import ConnectionListener, ConnectionSignal
 from deltapayoff.adapters.delta import DeltaAdapter
 from deltapayoff.events import Event, Instrument
 
@@ -117,6 +123,12 @@ class _NoFeed:
         self.sink = sink
 
     def subscribe(self, channel: str, symbols: Iterable[str]) -> None:
+        return None
+
+    def on_open(self, listener: Any) -> None:
+        return None
+
+    def on_close(self, listener: Any) -> None:
         return None
 
     async def run(self) -> None:
@@ -173,6 +185,9 @@ class ScriptedAdapter:
 
         self._last_frames: Frames | None = None
         self._stopping = False
+        #: Everyone told when the socket comes or goes. A list rather than one slot,
+        #: because the protocol says a register.
+        self._listeners: list[ConnectionListener] = []
 
     # --- describe itself ---------------------------------------------------------
 
@@ -189,6 +204,13 @@ class ScriptedAdapter:
             return
         for channel in ("ticker", "ob_l2"):
             self.registry.setdefault(channel, set()).update(symbols)
+
+    def on_connection(self, listener: ConnectionListener) -> None:
+        self._listeners.append(listener)
+
+    def _signal(self, signal: ConnectionSignal, detail: str) -> None:
+        for listener in self._listeners:
+            listener(signal, detail)
 
     # --- the script --------------------------------------------------------------
 
@@ -218,6 +240,7 @@ class ScriptedAdapter:
             self._emit(step, publish)
         elif isinstance(step, Close):
             self.closes += 1
+            self._signal(ConnectionSignal.CLOSED, step.reason)
             self._forget_decoder_state()
             self._open_connection()
         elif isinstance(step, Silence):
@@ -266,6 +289,10 @@ class ScriptedAdapter:
         self.replays.append(
             {channel: set(symbols) for channel, symbols in self.registry.items()}
         )
+        # After the replay, never before: `OPENED` promises a socket that has been
+        # resubscribed, and an adapter that claimed it earlier would be lying about the
+        # one thing the signal is for.
+        self._signal(ConnectionSignal.OPENED, "scripted connection")
 
     def stop(self) -> None:
         self._stopping = True

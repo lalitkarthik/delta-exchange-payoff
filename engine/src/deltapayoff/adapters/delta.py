@@ -54,7 +54,7 @@ from ..events import Event, IndexQuote, Instrument, OptionQuote, OptionReference
 from ..feed import BOOK_CHANNEL, TICKER_CHANNEL, DeltaFeed, VenueMessage
 from ..models import ChainResponse, ExpiriesResponse
 from ..wire import decode_ob_l2_top, decode_ticker, decode_ticker_extras
-from .base import Publish
+from .base import ConnectionListener, ConnectionSignal, Publish
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +228,17 @@ class DeltaAdapter:
             return
         self._feed.subscribe(TICKER_CHANNEL, symbols)
         self._feed.subscribe(BOOK_CHANNEL, symbols)
+
+    def on_connection(self, listener: ConnectionListener) -> None:
+        """Translate the socket owner's two facts into the protocol's vocabulary.
+
+        `DeltaFeed` reports "opened" and "closed" as bare callbacks because it must not
+        import the adapter package that imports it. Naming those two facts
+        `ConnectionSignal.OPENED` and `.CLOSED` is this class's job, in the same way
+        naming `sy` an `Instrument` is.
+        """
+        self._feed.on_open(lambda detail: listener(ConnectionSignal.OPENED, detail))
+        self._feed.on_close(lambda detail: listener(ConnectionSignal.CLOSED, detail))
 
     async def stream(self, publish: Publish) -> None:
         """Run the socket until stopped, publishing canonical events.

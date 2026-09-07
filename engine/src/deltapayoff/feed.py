@@ -1,6 +1,6 @@
 """The socket owner: one connection to Delta, decoded and fanned out.
 
-Four jobs, and the third and fourth are where the real failures live.
+Five jobs, and the third and fourth are where the real failures live.
 
 **Subscribe both channels.** `ob_l2` carries the top-of-book, refreshed every **508 ms**
 per contract on a live chain (measured, `tools/measure_feed.py`), and everything the
@@ -38,21 +38,30 @@ owner — so "the wire layout lives behind the adapter" was not true of the code
 publishes a `VenueMessage`: the frame verbatim, its channel, and the instant it arrived.
 `adapters.delta.DeltaAdapter` is the only thing that reads inside one.
 
-That leaves this module with exactly the four jobs above and no knowledge of what Delta's
-payloads mean, which is what lets #38 lift it under a connection controller without
-carrying a decoder along.
+**Report the connection.** #38 added a fifth job, and it is the smallest: say when the
+socket opened and when an attempt ended, through `on_open` and `on_close`. Two facts and
+no interpretation — whether "opened" means `connected` or `reconnecting` is
+`controller.ConnectionController`'s to decide, and a socket owner that answered that
+question would be a second state machine disagreeing with the first.
+
+That leaves this module with those five jobs and no knowledge of what Delta's payloads
+mean, which is what let #38 lift it under a connection controller without carrying a
+decoder along.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 PUBLIC_WS = "wss://public-socket.india.delta.exchange"
 
@@ -172,6 +181,18 @@ class DeltaFeed:
         #: one: `messages` simply stops moving and nothing says why.
         self.last_error: str | None = None
 
+        #: Who to tell when the socket comes and goes. **Added in #38**, because a
+        #: connection controller cannot run a state machine over a connection it cannot
+        #: observe, and this loop is the only thing that knows.
+        #:
+        #: Two plain registers of `(detail) -> None` rather than one carrying the
+        #: adapter protocol's `ConnectionSignal`: importing that here would make the
+        #: socket owner depend on `adapters`, which imports this module back, and this
+        #: module's whole point is that it knows nothing above itself. `DeltaAdapter`
+        #: translates these two facts into the protocol's vocabulary.
+        self._on_open: list[Callable[[str], None]] = []
+        self._on_close: list[Callable[[str], None]] = []
+
     @staticmethod
     def _default_connect(url: str):
         import websockets
@@ -190,6 +211,28 @@ class DeltaFeed:
                 "Delta retired v2/ticker, l1_orderbook and l2_orderbook on 31 July 2026."
             )
         self.registry.setdefault(channel, set()).update(symbols)
+
+    def on_open(self, listener: Callable[[str], None]) -> None:
+        """Be told when the socket is up **and resubscribed**. Safe before it exists."""
+        self._on_open.append(listener)
+
+    def on_close(self, listener: Callable[[str], None]) -> None:
+        """Be told when an attempt has ended, opened or not."""
+        self._on_close.append(listener)
+
+    @staticmethod
+    def _tell(listeners: list[Callable[[str], None]], detail: str) -> None:
+        """Tell every listener, and let none of them end the connection.
+
+        A listener that raises is a bug in the listener, and a socket reader is not the
+        place to discover it: swallowing here means a broken consumer cannot take the
+        feed down, which is the rule `publish` already follows.
+        """
+        for listener in listeners:
+            try:
+                listener(detail)
+            except Exception:  # pragma: no cover - a listener's own bug
+                logger.exception("a connection listener raised")
 
     def stop(self) -> None:
         self._stopping = True
@@ -236,6 +279,11 @@ class DeltaFeed:
         payload = self._subscribe_payload()
         if payload is not None:
             await socket.send(payload)
+        # After the replay, never before. "Open" promises a socket that has been
+        # resubscribed; announcing one before its subscriptions have gone out is exactly
+        # the healthy-connection-no-messages failure this module exists to prevent, and
+        # announcing it early would hide that failure behind a green badge.
+        self._tell(self._on_open, self.url)
 
         heartbeat = asyncio.create_task(self._heartbeat(socket))
         try:
@@ -290,6 +338,14 @@ class DeltaFeed:
                 raise
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"[:300]
+
+            # One attempt has ended, whether it ever opened or the dial failed outright.
+            # The failed dial is reported too: a controller told only about sockets that
+            # had opened would sit in `connecting` for the length of an endpoint outage,
+            # which reads on a badge as "starting up". A stop is not a drop, so a stop is
+            # not reported as one.
+            if not self._stopping:
+                self._tell(self._on_close, self.last_error or "closed by the venue")
 
             # Delivering data, not connecting, is what proves the endpoint works. Delta
             # can accept the handshake and close straight away — a rejected subscribe, a
