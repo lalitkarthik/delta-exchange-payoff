@@ -88,6 +88,10 @@ class ChainRow(BaseModel):
 class ChainResponse(BaseModel):
     underlying: str
     expiry: str
+    #: Delta's top-level `spot_price`, always present on the live path. Nullable because
+    #: `HistoricalChain` below is a `ChainResponse` too, and a stored minute with no
+    #: `spot-bars` row legitimately has neither this nor `atm_strike`.
+    #: `docs/chain-contract.md`, #47.
     spot: float | None = None
     atm_strike: float | None = None
     fetched_at: str
