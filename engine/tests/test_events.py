@@ -600,3 +600,37 @@ def test_the_bus_protocol_keeps_the_fan_outs_queue_semantics() -> None:
     assert lossless.over_capacity == 2
     assert bounded.queue.qsize() == 2
     assert bounded.dropped == 2
+
+
+# --------------------------------------------------------------------- aware stamps
+
+
+@pytest.mark.parametrize("field", ["ts_venue", "ts_received"])
+def test_a_stamp_with_no_timezone_is_refused(field: str) -> None:
+    """**A naive stamp is not assumed to be UTC.**
+
+    Pydantic parses an ISO string with no offset into a naive `datetime`, and a naive one
+    cannot be subtracted from an aware one — `bars._micros` raises `TypeError` on it,
+    inside the bar writer's drain loop, which does not guard. The writer task would die
+    and all four tables would stop, with one log line as the only symptom. So it is
+    refused at the boundary, where the traceback still names the producer.
+
+    Assuming UTC was the alternative and it is worse: the gap between the two stamps is
+    this project's arrival-lag column, and inventing a zone would put a number in it that
+    nobody measured.
+    """
+    payload = SAMPLES["md.option_quote"].model_dump(mode="json")
+    payload[field] = "2026-09-04T10:00:00"
+
+    with pytest.raises(ValidationError) as caught:
+        parse_event(payload)
+
+    assert "timezone" in str(caught.value)
+
+
+def test_the_aware_stamps_the_adapter_builds_are_accepted() -> None:
+    """Guard on the guard: the rule above must not refuse the producer's own events."""
+    event = SAMPLES["md.option_quote"]
+
+    assert event.ts_received.tzinfo is not None
+    assert parse_event(event.model_dump(mode="json")) == event

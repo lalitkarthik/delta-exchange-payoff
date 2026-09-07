@@ -637,14 +637,22 @@ def tick_from_option_quote(event: Any) -> Tick | None:
 
     **An event with no `ts_venue` is refused.** Bucketing it on our arrival time would be
     the one thing this module exists not to do. `lts` is carried and decides nothing.
+
+    **An instrument with no `venue_symbol` is refused too, and counted.** This table's row
+    identity is still the venue's symbol, which `_parse_symbol` reads underlying, expiry,
+    strike and option type out of — see `docs/design/lld/store.md` §6, which names that as
+    the remaining venue-shaped dependency and whose ticket it is. Falling back to the
+    canonical string was tried and is a trap: `_parse_symbol` refuses it, so the row would
+    be dropped one layer down as `unparseable` while this line read like a working
+    venue-neutral path. Refusing here makes the requirement visible.
     """
     if not isinstance(event, OptionQuote):
         return None
     instrument = event.instrument
-    if instrument is None or event.ts_venue is None:
+    if instrument is None or event.ts_venue is None or not instrument.venue_symbol:
         return None
     return Tick(
-        symbol=instrument.venue_symbol or instrument.canonical(),
+        symbol=instrument.venue_symbol,
         exchange_us=_micros(event.ts_venue),
         bid=event.bid,
         ask=event.ask,
@@ -967,11 +975,11 @@ def samples_from_reference(event: Any) -> ReferenceSample | None:
     if not isinstance(event, OptionReference):
         return None
     instrument = event.instrument
-    if instrument is None or event.ts_venue is None:
+    if instrument is None or event.ts_venue is None or not instrument.venue_symbol:
         return None
 
     stamp = _micros(event.ts_venue)
-    symbol = instrument.venue_symbol or instrument.canonical()
+    symbol = instrument.venue_symbol
 
     fallback = None
     if event.bid is not None or event.ask is not None:
