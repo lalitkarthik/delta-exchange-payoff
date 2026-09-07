@@ -28,15 +28,22 @@ testable without a clock or an event loop:
 `run()` wires the ones that need a clock to a real one and is the only async thing here.
 A test drives `poll` itself, and a twenty-second silence costs it nothing.
 
-## What is *not* here, and for how long
+## What is here since #39, and what it displaced
 
-**Backoff, the lifetime reconnect budget and subscription replay stay inside
-`feed.DeltaFeed`,** where they are correct and tested, until #39 lifts them. This ticket
-is the machine and the staleness that drives it. The consequence is visible in one place:
-the controller learns that a reconnect attempt was made only when it **succeeds**, so the
-`reconnecting -> connecting` move is emitted at the instant the socket opens rather than
-at the instant the attempt began. #39, owning backoff, can emit it when the attempt
-starts, and this module's table does not change.
+**Backoff, the lifetime reconnect budget and the decision to redial are here**, lifted out
+of `adapters/delta_socket.py` where they lived inside a `while` loop. They moved because
+the most important thing that loop decided — *we have given up* — was a loop condition one
+layer below the state machine that exists to describe the connection: nothing could
+observe it, nothing could publish it, and `/health` said `ok` on either side of it. Now it
+is a transition to `stopped` with an alert and an error record attached. Every value moved
+unchanged; `docs/design/lld/reconnect.md` is the design and carries the numbers.
+
+One consequence #38 predicted and this ticket delivered: `reconnecting -> connecting` is
+emitted **when the attempt begins**, not when the socket opens, because the dial is ours
+now. The table did not change; only the moment did.
+
+`adapter.stream` is correspondingly **one connection** — dial, replay, pump, return — and
+`run()` is the loop over it.
 
 ## The connection signal
 
@@ -46,7 +53,9 @@ its socket had come or gone, and then no way to stop listening. Two signals, `OP
 `CLOSED`; synchronous and non-blocking for the same reason `Publish` is, since the socket
 reader calls it between reads. `docs/design/lld/connection-signal.md` is the design.
 
-The full table and every number are in `docs/design/lld/controller.md`.
+The full table and every number are in `docs/design/lld/controller.md`; the reconnect half
+is `docs/design/lld/reconnect.md`; `supervisor.FeedSupervisor` owns one of these per
+adapter and answers `/health` for all of them.
 """
 
 from __future__ import annotations
