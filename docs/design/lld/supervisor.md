@@ -77,7 +77,8 @@ answer.
       "reconnects": 2,
       "budget_remaining": 8,
       "transitions": 7,
-      "empty_opens": 0
+      "empty_opens": 0,
+      "undecodable": 0
     }
   ]
 }
@@ -93,7 +94,12 @@ answer.
 | `reconnects` | Times this connection has entered `reconnecting`. A count, not a rate: a reader comparing two polls gets the rate, and a rate computed here needs a window nobody agreed on. |
 | `budget_remaining` | Reconnects left. A feed two drops from `stopped` and one that has never dropped are otherwise the same green badge. |
 | `transitions` | Every state change since start. A connection flapping between `connected` and `degraded` appears here and in no other field. |
-| `empty_opens` | Sockets opened with **nothing subscribed** — guaranteed to deliver nothing, the failure with no error. **`null`, never `0`, when the adapter has no socket owner to ask.** |
+| `empty_opens` | Sockets opened with **nothing subscribed** — guaranteed to deliver nothing, the failure with no error. |
+| `undecodable` | Frames that parsed as JSON and then made no sense. `delta.py` logs the first and counts the rest, and its own comment asked for this field: a systematic decode bug zeroes the event stream while the message counter climbs. |
+
+Both counters are **`null`, never `0`, when the adapter keeps none.** Each is a counter
+whose entire signal is being *above* zero, so a reader watching for that has to be able to
+tell "still nought" from "nobody is counting".
 
 **No field says `healthy`.** Whether a state is acceptable is the reader's judgement — a
 badge, an alert rule, an operator — and one boolean here would fix one of those readings

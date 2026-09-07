@@ -211,8 +211,11 @@ def test_the_health_route_reports_the_supervisor(monkeypatch) -> None:
     assert alpha["transitions"] == 2
     assert beta["state"] == "degraded"
     assert beta["last_message_age_seconds"] == 20.0
-    # A fake has no socket owner to ask, and an absent count is `null`, never `0`.
+    # A fake has no socket owner and no decoder counter to ask, and an absent count is
+    # `null`, never `0` — each of these is a counter whose whole signal is being above
+    # zero, so "still nought" and "nobody is counting" must not look the same.
     assert beta["empty_opens"] is None
+    assert beta["undecodable"] is None
 
 
 def test_a_process_with_no_feed_still_answers(monkeypatch) -> None:
@@ -327,3 +330,21 @@ def test_the_supervisor_does_not_restart_a_controller_that_gave_up() -> None:
     # stayed that way: the supervisor built no replacement for it.
     assert adapter.connections == 3
     assert supervisor.controllers[0] is controller
+
+
+def test_the_delta_adapters_silent_failure_counters_reach_the_report() -> None:
+    """**The promise `delta.py` made and nothing kept.** Its comment says a systematic
+    decode bug zeroes the event stream while the message counter climbs, and that
+    `undecodable` is not on `/health` until #39. It is now, beside `empty_opens`, and
+    both are real numbers rather than `null` when there is an adapter that counts them.
+    """
+    from deltapayoff.adapters import DeltaAdapter, DeltaFeed
+
+    adapter = DeltaAdapter(feed_factory=lambda sink, **kw: DeltaFeed(sink, **kw))
+    supervisor = _supervisor(adapter)
+    adapter.feed.empty_opens = 2
+    adapter.undecodable = 7
+
+    row = supervisor.report().adapters[0]
+
+    assert (row.empty_opens, row.undecodable) == (2, 7)
