@@ -7,7 +7,7 @@ venue — it subscribes by channel name — so it belongs in the package that ow
 than beside the modules that must never learn one. Nothing about it changed in the move
 except the retirement of the `Quote` record it used to publish.
 
-Four jobs, and the third and fourth are where the real failures live.
+Five jobs, and the third and fourth are where the real failures live.
 
 **Subscribe both channels.** `ob_l2` carries the top-of-book, refreshed every **508 ms**
 per contract on a live chain (measured, `tools/measure_feed.py`), and everything the
@@ -47,19 +47,28 @@ publishes a `VenueMessage`: the frame verbatim, its channel, and the instant it 
 the only thing that reads one at all — the record that used to carry a frame past it, to
 the chain cache and the bar writer, is gone and those two take canonical events.
 
-That leaves this module with exactly the four jobs above and no knowledge of what Delta's
-payloads mean, which is what lets #38 lift it under a connection controller without
-carrying a decoder along.
+**Report the connection.** #38 added a fifth job, and it is the smallest: say when the
+socket opened and when an attempt ended, through `on_open` and `on_close`. Two facts and
+no interpretation — whether "opened" means `connected` or `reconnecting` is
+`controller.ConnectionController`'s to decide, and a socket owner that answered that
+question would be a second state machine disagreeing with the first.
+
+That leaves this module with those five jobs and no knowledge of what Delta's payloads
+mean, which is what let #38 lift it under a connection controller without carrying a
+decoder along.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 PUBLIC_WS = "wss://public-socket.india.delta.exchange"
 
@@ -138,11 +147,28 @@ class DeltaFeed:
         self.messages = 0
         self.bytes_read = 0
         self.malformed = 0
+        #: Attempts that opened a socket with an **empty registry**, and so were not
+        #: announced as open. Counted rather than only logged because a feed whose every
+        #: connection is empty is a feed nobody subscribed, and a counter stuck above
+        #: zero is the signal that says so.
+        self.empty_opens = 0
         self.started_at: float | None = None
         #: Why the last connection ended. `None` means it has not ended yet. Without
         #: this a persistently failing feed is indistinguishable from a quiet healthy
         #: one: `messages` simply stops moving and nothing says why.
         self.last_error: str | None = None
+
+        #: Who to tell when the socket comes and goes. **Added in #38**, because a
+        #: connection controller cannot run a state machine over a connection it cannot
+        #: observe, and this loop is the only thing that knows.
+        #:
+        #: Two plain registers of `(detail) -> None` rather than one carrying the
+        #: adapter protocol's `ConnectionSignal`: importing that here would make the
+        #: socket owner depend on `adapters`, which imports this module back, and this
+        #: module's whole point is that it knows nothing above itself. `DeltaAdapter`
+        #: translates these two facts into the protocol's vocabulary.
+        self._on_open: list[Callable[[str], None]] = []
+        self._on_close: list[Callable[[str], None]] = []
 
     @staticmethod
     def _default_connect(url: str):
@@ -162,6 +188,55 @@ class DeltaFeed:
                 "Delta retired v2/ticker, l1_orderbook and l2_orderbook on 31 July 2026."
             )
         self.registry.setdefault(channel, set()).update(symbols)
+
+    def on_open(self, listener: Callable[[str], None]) -> None:
+        """Be told when the socket is up **and resubscribed**. Safe before it exists."""
+        self._on_open.append(listener)
+
+    def on_close(self, listener: Callable[[str], None]) -> None:
+        """Be told when an attempt has ended, opened or not."""
+        self._on_close.append(listener)
+
+    def off_open(self, listener: Callable[[str], None]) -> None:
+        """Stop telling this listener. **Quiet about one that is not registered.**
+
+        A register with no way out keeps whatever was ever put in it alive for the life
+        of the feed, and goes on calling it: a replaced controller would keep driving a
+        state machine nobody reads, off a socket it no longer owns.
+        """
+        self._forget(self._on_open, listener)
+
+    def off_close(self, listener: Callable[[str], None]) -> None:
+        """Stop telling this listener. Quiet about one that is not registered."""
+        self._forget(self._on_close, listener)
+
+    @staticmethod
+    def _forget(
+        listeners: list[Callable[[str], None]], listener: Callable[[str], None]
+    ) -> None:
+        """Remove one registration, and only one, leaving any duplicate in place.
+
+        Raising on an absent listener would make the tidy-up path of a supervisor that
+        cleans up on both success and failure into a second failure.
+        """
+        try:
+            listeners.remove(listener)
+        except ValueError:
+            pass
+
+    @staticmethod
+    def _tell(listeners: list[Callable[[str], None]], detail: str) -> None:
+        """Tell every listener, and let none of them end the connection.
+
+        A listener that raises is a bug in the listener, and a socket reader is not the
+        place to discover it: swallowing here means a broken consumer cannot take the
+        feed down, which is the rule `publish` already follows.
+        """
+        for listener in listeners:
+            try:
+                listener(detail)
+            except Exception:  # pragma: no cover - a listener's own bug
+                logger.exception("a connection listener raised")
 
     def stop(self) -> None:
         self._stopping = True
@@ -206,8 +281,25 @@ class DeltaFeed:
     async def _pump(self, socket) -> None:
         """Read until the connection ends. Publishes; never computes."""
         payload = self._subscribe_payload()
-        if payload is not None:
+        if payload is None:
+            # An empty registry sends no subscribe, so this socket is guaranteed to
+            # deliver nothing. **It is not announced as open.** "Open" promises a socket
+            # that has been resubscribed, and a green badge over a socket with no
+            # subscriptions on it is precisely the healthy-connection-zero-messages
+            # failure this module exists to prevent — the one case the resubscribe-
+            # everything rule is written against. Staying quiet leaves the controller in
+            # `connecting`, which reaches `reconnecting` at its own bound rather than
+            # sitting green for as long as the process runs.
+            self.empty_opens += 1
+            logger.warning(
+                "the socket opened with nothing subscribed; not reporting it as open"
+            )
+        else:
             await socket.send(payload)
+            # After the replay, never before. Announcing an open before its
+            # subscriptions have gone out would hide the same failure behind the same
+            # green badge, one moment earlier.
+            self._tell(self._on_open, self.url)
 
         heartbeat = asyncio.create_task(self._heartbeat(socket))
         try:
@@ -262,6 +354,14 @@ class DeltaFeed:
                 raise
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"[:300]
+
+            # One attempt has ended, whether it ever opened or the dial failed outright.
+            # The failed dial is reported too: a controller told only about sockets that
+            # had opened would sit in `connecting` for the length of an endpoint outage,
+            # which reads on a badge as "starting up". A stop is not a drop, so a stop is
+            # not reported as one.
+            if not self._stopping:
+                self._tell(self._on_close, self.last_error or "closed by the venue")
 
             # Delivering data, not connecting, is what proves the endpoint works. Delta
             # can accept the handshake and close straight away — a rejected subscribe, a
