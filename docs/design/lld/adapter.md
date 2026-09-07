@@ -7,7 +7,7 @@ authority on the names. Numbers carry the run that produced them.
 **Landed by #36, completed by #37.** #36 was the expand half of an expand–contract: the
 adapter emitted canonical events while a shim rebuilt the old quote record for two consumers
 that had not moved. #37 moved them, deleted the shim and the record, and added the four
-fields the shim existed to carry. #38 lifts reconnect into a controller.
+fields the shim existed to carry. #38 and #39 lift reconnect into a controller.
 
 ## 1. The files
 
@@ -39,10 +39,11 @@ venue, and putting them beside it means a second module learns a second venue.
 publishes and returns — the rule `fanout.py` exists to keep — and a generator would need a
 bridging queue to invert it.
 
-**Reconnect is not on the interface.** Backoff, the lifetime budget, subscription replay
-and the reason a connection ended stay inside `feed.DeltaFeed`, correct and tested. #38
-put the **state machine** around this protocol — which is why `on_connection` exists — and
-#39 lifts the rest up beside it. Moving them early meant writing the machine twice.
+**Reconnect is not on the interface, and since #39 not below it either.** `stream` is
+**one connection**: dial, replay every subscription, publish until the socket ends,
+return. Backoff, the lifetime budget and the decision to redial are
+[reconnect.md](reconnect.md)'s; the registry replay and the reason a connection ended stay
+in `DeltaFeed`, because both need a socket.
 
 **Conformance is structural**, for the reason `events/bus.py` records: an explicit subclass
 would inherit `...`-bodied stubs and pass. A test pins that the check can still fail.

@@ -4,13 +4,18 @@
 [../hld.md](../hld.md); what crosses out of one is [../events.md](../events.md), the
 authority on the event names and fields. Numbers carry the run that produced them.
 
-**Landed by #38, and half-finished on purpose.** This is the state machine, staleness and
-the events they emit. Backoff, the lifetime reconnect budget and subscription replay are
-still inside `feed.DeltaFeed`, where they are correct and tested; #39 lifts them up here
-and puts a supervisor over the result, and #41 adds the commands.
+**Landed by #38 and completed by #39.** This is the state machine, staleness and the
+events they emit. #41 adds the commands.
 
-**The signal this machine runs on is [connection-signal.md](connection-signal.md)**, split
-out when this design reached its 200-line bound.
+Two designs were split out of this one at its 200-line bound and are part of it:
+
+- **[connection-signal.md](connection-signal.md)** — what an adapter reports about its
+  socket, and the register it reports through (#38).
+- **[reconnect.md](reconnect.md)** — backoff, the lifetime budget, the dial loop and what
+  giving up sounds like (#39).
+
+Above it, **[supervisor.md](supervisor.md)** owns one controller per adapter and answers
+`/health` for all of them.
 
 ## 1. What it is for
 
@@ -54,9 +59,9 @@ both connected and reconnecting, and cannot reach `connected` without passing th
 | `degraded` | `reconnecting` | `silent` | `poll()` — silence past `reconnect_after` |
 | `connecting` | `reconnecting` | `closed` / `silent` | `connection_closed()`, or a `connecting` that delivers nothing |
 | `connected` | `reconnecting` | `closed` / `silent` | `connection_closed()`, or silence past `reconnect_after` before `degraded` was reached |
-| `reconnecting` | `connecting` | `backoff` | `connection_opened()` — an attempt succeeded; or `message_arrived()`, a frame off a socket believed gone |
+| `reconnecting` | `connecting` | `backoff` | **The backoff elapsed and a redial begins** (#39); or `connection_opened()`; or `message_arrived()`, a frame off a socket believed gone |
 | any of the four running states | `stopped` | `stopped` | `stop()` — a pause, or the adapter's stream returning |
-| `reconnecting` | `stopped` | (#39) | the lifetime budget exhausted |
+| `reconnecting` | `stopped` | `stopped` | **The lifetime budget is spent** — [reconnect.md](reconnect.md) §3 |
 
 **Two readings of the table this design fixed, and both are choices a later reader may
 disagree with.**
@@ -84,36 +89,25 @@ reported its opens late would otherwise sit in `connecting` while data flowed. T
 | `heartbeat_every` | 10 s | `assumed` | 8,640 heartbeats per adapter per day — fast enough for a badge, slow enough not to be a flood |
 | `poll_seconds` | 1 s | `assumed` | The staleness timer's resolution; a 15 s bound observed to the nearest second |
 
-`tools/measure_quiet_gap.py` subscribes every listed BTC option on both channels —
-exactly what the engine subscribes — and records the wall-clock gap between consecutive
-frames off the socket, which is precisely what the staleness timer measures.
+### What the two hours showed
 
-### What the hour showed
-
-**Run `20260907T135951Z`, 3610 s, 2026-09-07:** 492 symbols, both channels, 3,808,870
-messages, 0 malformed, **three connections** — so two reconnects, one of them a local
-network abort. The full record, with the two shorter runs beside it, is
-[../quiet-gap.md](../quiet-gap.md).
+The full record of every run, with the connection tagging #39 added, is
+[../quiet-gap.md](../quiet-gap.md). Two findings the bounds rest on:
 
 **Only the tail moves.** p99 (0.011 s), p95 (0.002 s) and the median (0.0 s) are identical
-across 35 seconds, 550 seconds and the hour; the maximum goes 0.321 → 3.355 → **44.785 s**.
+across 35 seconds, 550 seconds and an hour; the maximum goes 0.321 → 3.355 → **44.785 s**.
 The quiet gap is heavy-tailed, so a short window measures only the part of the distribution
 that was never in question — 35 seconds would have said 15 s is 47x the worst gap and been
 confidently wrong.
 
-**Both defaults stand, and one of them barely.** `degraded_after` was crossed twice, both
-times by an interruption rather than a quiet market, so it is not too tight — the ticket's
-worry that it would fire on a quiet minute did not happen. `reconnect_after` was **not**
-crossed, by 0.215 s; take a second hour on a quiet market before treating 45 s as
-comfortable, and changing it belongs to #39, which owns the reconnect path. **The flap this
-review fixed came that same 0.215 s from happening in production** — the old code demoted a
-reopened socket once the pre-drop age passed `reconnect_after`, and that age reached
-44.785 s here.
+**The flap this design's review fixed came 0.215 s from happening in production.** The old
+code demoted a reopened socket once the pre-drop age passed `reconnect_after`, and that age
+reached 44.785 s in the first hour.
 
 ## 5. The connection signal
 
-**Moved to [connection-signal.md](connection-signal.md)** when this design reached its
-bound. The number is kept so references into it still land.
+**Moved to [connection-signal.md](connection-signal.md).** The number is kept so
+references into it still land.
 
 ## 6. What drives it
 
@@ -129,8 +123,9 @@ without a clock or an event loop:
 | `transition(to, reason)` | The one place state changes. **Public**, because #39 drives `reconnecting -> stopped` on a spent budget and #41 drives the commands. |
 
 `run()` is the only async thing: it starts, launches the timer as a **separate task**, and
-awaits `adapter.stream(self.sink)`. The timer is a task rather than a read timeout because
-a controller that only woke when a message arrived could never notice that none had.
+then dials `adapter.stream(self.sink)` once per connection, backing off between attempts —
+[reconnect.md](reconnect.md) §4. The timer is a task rather than a read timeout because a
+controller that only woke when a message arrived could never notice that none had.
 
 **Two clocks, injected.** `clock` is monotonic and measures elapsed time — `time.time()`
 steps backwards under an NTP correction, which would make an age negative and a staleness
@@ -149,16 +144,16 @@ in the payload's `adapter` field. `instrument` is `null` throughout.
 - **`heartbeat`** — one per cadence whatever the state: `adapter`, `state`,
   `last_message_age_seconds`. **`null` before the first message ever arrives** — an
   unknown age, not an age of zero.
-- **`alert`** — `severity`, `code`, `detail`, `adapter`. Two codes, and no more from this
-  module: **`connection_silent`** when silence past `reconnect_after` forces
-  `-> reconnecting`, and **`poll_failing`** when the staleness watchdog's own polls keep
-  raising. `events.md` promised an alert when a connection goes stale and none was emitted
-  anywhere; this is that promise kept.
+- **`alert`** — `severity`, `code`, `detail`, `adapter`. Three codes, and no more from
+  this module: **`connection_silent`** when silence past `reconnect_after` forces
+  `-> reconnecting`; **`poll_failing`** when the staleness watchdog's own polls keep
+  raising; and **`reconnect_budget_spent`** (#39) when the feed gives up, which is the
+  loudest thing this engine says. `events.md` promised an alert when a connection goes
+  stale and none was emitted anywhere; this is that promise kept.
 
 **`degraded` deliberately does not alert.** Fifteen quiet seconds is a badge and a
 heartbeat, both of which already say it; an alert on every quiet minute is precisely the
-flood an alert exists to stand out from. The budget-exhausted alert is #39's, which owns
-the budget.
+flood an alert exists to stand out from.
 
 **`reason` is a short stable name**, not a sentence: `start`, `resume`, `open`, `message`,
 `stale`, `silent`, `closed`, `backoff`, `stopped`. #40 badges on them and #42 greps them,
@@ -172,7 +167,8 @@ the log line, where a person reads them.
 | A move outside the table | `IllegalTransition` raises. Never logged and continued: a machine that ignored a forbidden move would have more states than it admits to. |
 | A socket open that delivers nothing | Staleness is measured from the state's entry when no message has ever arrived, so `connecting` reaches `reconnecting` at `reconnect_after` rather than never. |
 | A connection listener raises | Swallowed and logged by `DeltaFeed`, the rule `publish` already follows: a broken consumer must not take the feed down. |
-| The adapter's `stream` returns | `run()` leaves the connection `stopped`. An adapter that is no longer streaming is not connecting. |
+| The adapter's `stream` returns | One connection has ended. `run()` redials it **only if the adapter reported its socket gone** — [reconnect.md](reconnect.md) §4 — and otherwise leaves the connection `stopped`. |
+| The reconnect budget is spent | `-> stopped`, one `alert` at error, one error log record, and the adapter is stopped with it. [reconnect.md](reconnect.md) §3. |
 | A message while `reconnecting` | Routed through `connecting` in two transitions, so the table is honoured and the machine cannot stick. |
 | A resume after a long pause | `start()` forgets the last-message age. Time spent stopped is our silence, not the venue's, and a resumed connection would otherwise arrive already past the reconnect bound. |
 | A reconnect after an outage | **Where the line falls, corrected by review.** "A reconnect keeps its age" is right *while* it is reconnecting — that gap was the venue's and it is what the bound exists to catch — and wrong the instant the replay completes. `connection_opened()` records `_opened_at`, and staleness is measured from the **later** of that and the last message, so the replayed socket gets the same grace a fresh start gets. Without it every outage longer than `reconnect_after` ended in a flap: the reopened socket was demoted on the very next poll for a gap belonging to the socket before it, at three spurious `feed.connection` events a second, on the badge #40 draws, during the incident an operator is watching. The heartbeat's `last_message_age_seconds` is untouched — that one is the venue's own silence and stays true across the reconnect. |
@@ -195,4 +191,6 @@ testing decisions. Every connection test is written in the fake's four verbs and
 is injected, so a suite exercising a twenty- and a sixty-second silence runs in under a
 second. `poll` is driven from the script's clock, and **one** test uses the real timer at
 millisecond intervals, so the wiring is proved as well as the machine. `caplog` covers the
-log line (seam 6); `tests/test_feed.py` covers the socket's two signals.
+log line (seam 6); `tests/test_feed.py` covers the socket's two signals. Since #39 the
+same file also drives the **real `DeltaFeed` over a scripted socket** for the dial itself —
+[reconnect.md](reconnect.md) §7.
