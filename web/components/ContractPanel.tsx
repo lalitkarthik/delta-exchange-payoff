@@ -25,22 +25,29 @@ const MODE_LABEL: Record<CandleMode, string> = { mid: "Mid", ltp: "Last trade" }
  * rather than today's, which would either be empty or would silently show a different
  * day than the ladder the strike was clicked on.
  *
- * **Only the live edge feeds the last candle.** `liveChain`/`onLive` come from
- * `ChainScreen` unchanged; `ContractChart` is handed a live quote only when `onLive` is
- * true, so dragging the slider off the right edge stops moving the last candle in the
+ * **Only the live edge feeds the last candle.** `liveChain`/`following` come from
+ * `ChainScreen` unchanged; `ContractChart` is handed a live quote only when `following`
+ * is true, so dragging the slider off the right edge stops moving the last candle in the
  * same instant it stops moving the ladder — one switch, not two.
+ *
+ * That switch is `following` and not `positionOf`'s `onLive`, which is the same switch
+ * the ladder above chooses its own chain with. `onLive` additionally requires a push to
+ * have been placed on the timeline, and taking the narrower of the two here would leave
+ * the chart's last candle frozen while the ladder beside it moved — see the note over
+ * `chain` in `ChainScreen`, and issue #49.
  */
 export default function ContractPanel({
   instrument,
   date,
   liveChain,
-  onLive,
+  following,
   onClose,
 }: {
   instrument: string;
   date: string;
   liveChain: ChainResponse | null;
-  onLive: boolean;
+  /** The ladder is following the stream, so the last candle should follow it too. */
+  following: boolean;
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<CandleMode>("mid");
@@ -77,12 +84,12 @@ export default function ContractPanel({
   const parsed = useMemo(() => parseCanonical(instrument), [instrument]);
 
   const live: LiveQuote | null = useMemo(() => {
-    if (!onLive || !liveChain || !parsed) return null;
+    if (!following || !liveChain || !parsed) return null;
     const row = liveChain.rows.find((r) => r.strike === parsed.strike);
     const leg = parsed.side === "call" ? row?.call : row?.put;
     if (!leg) return null;
     return { bid: leg.bid, ask: leg.ask };
-  }, [onLive, liveChain, parsed]);
+  }, [following, liveChain, parsed]);
 
   return (
     <aside className="contract-panel" aria-label={`Chart for ${instrument}`}>
