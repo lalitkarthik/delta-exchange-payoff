@@ -13,17 +13,15 @@ the caller (`main.chain_at`) turns `None` into the same "nothing here" shape `/w
 sends for `waiting`, and that is the only thing it may do with it.
 
 **A fourth table, `spot-bars`, is read too, and that is a deliberate widening of the
-three the ticket names.** `docs/chain-contract.md` fixes `spot` and `atm_strike` as plain
-numbers on `ChainResponse`, and `web/components/ChainLadder.tsx` reads `chain.spot` as a
-number without a null check — so a `None` there is not "absent data" rendered honestly,
-it is `strike < null`, which JavaScript coerces to `strike < 0` and washes the ladder
-backwards without raising anything. Reading the one extra table that already records the
-real spot for that minute is the honest answer; inventing one from the forward would
-conflate two figures `docs/chain-contract.md` is explicit are never the same number. When
-`spot-bars` itself has no row for the minute — possible for the same reason a computed
-bar can be missing while a quote bar exists, see `store.COMPUTED_SAMPLE_SECONDS` — `spot`
-and `atm_strike` are `None` and the pre-existing gap in `ChainLadder.tsx`'s null handling
-is inherited rather than newly created; see the LLD.
+three the ticket names.** `docs/chain-contract.md` types `spot` and `atm_strike`
+`number | null` on `ChainResponse` (#47) for exactly this reason. Reading the one extra
+table that already records the real spot for the minute is the honest answer; inventing
+one from the forward would conflate two figures `docs/chain-contract.md` is explicit are
+never the same number. When `spot-bars` has no row for the minute — possible for the
+same reason a computed bar can be missing while a quote bar exists, see
+`store.COMPUTED_SAMPLE_SECONDS` — `spot` and `atm_strike` are `None`, and
+`web/components/ChainLadder.tsx`'s `inTheMoney` guard (#47) renders that as no highlight
+on either side rather than the `strike < null` wash it used to be — see the LLD.
 """
 
 from __future__ import annotations

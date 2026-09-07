@@ -83,8 +83,16 @@ import { canonicalInstrument } from "@/lib/instrument";
 
 /** Both comparisons strict, so a strike sitting exactly on spot is in the money on
  *  neither side. The boundary belongs to nobody, which is the honest answer for a
- *  contract with no intrinsic value either way. */
-function inTheMoney(strike: number, spot: number, side: "call" | "put"): boolean {
+ *  contract with no intrinsic value either way. Exported so `tests/moneyness.test.ts`
+ *  can pin it directly — the pure seam, per the following.test.ts pattern.
+ *
+ *  **`spot === null` is never in the money, on either side, at any strike.** #47: the
+ *  historical route can answer a minute with nothing in `spot-bars`, and a coerced
+ *  `strike < 0` used to wash every put in-the-money and no call — silently, on the one
+ *  screen this project has for seeing where the money is. Not knowing where spot is
+ *  renders as not knowing: no highlight beats a highlight at a spot that isn't real. */
+export function inTheMoney(strike: number, spot: number | null, side: "call" | "put"): boolean {
+  if (spot === null) return false;
   return side === "call" ? strike < spot : strike > spot;
 }
 
@@ -112,7 +120,10 @@ function QuoteCells({
   leg: Leg | null;
   side: "call" | "put";
   strike: number;
-  spot: number;
+  /** `null` on the historical route when `spot-bars` has no row for the minute —
+   * `docs/historical-chain-contract.md`. `inTheMoney` above turns that into no
+   * highlight on either side, never a wash at zero. */
+  spot: number | null;
   previous: PriceMemory | null;
   underlying: string;
   expiry: string;
