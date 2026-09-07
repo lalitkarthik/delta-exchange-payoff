@@ -36,7 +36,7 @@ import polars as pl
 
 from .chain import nearest_strike
 from .models import ChainRow, ComputedLeg, HistoricalChain, Leg
-from .store import BarStore
+from .store import BarStore, scan_and_pending
 
 #: `2026-09-04T09:00:00Z` — the store's own spelling, matching `smile.MINUTE_FORMAT`
 #: exactly so a stamp round-trips through the URL, the minutes route and the ladder
@@ -129,16 +129,14 @@ def read_ladder_at(
 def _union(
     store: BarStore, underlying: str, expiry: str, *, day: Date | None = None
 ) -> pl.LazyFrame:
-    """Disk and buffer, filtered to one underlying and expiry, unioned. As `smile._rows`
-    does: the buffer holds up to a flush interval nothing on disk yet describes, and a
-    parquet-only read would answer "nothing here" for a minute the store already has."""
-    filtered = []
-    for source in (store.scan(), store.pending()):
-        clause = (pl.col("underlying") == underlying) & (pl.col("expiry") == expiry)
-        if day is not None:
-            clause = clause & (pl.col("date") == day)
-        filtered.append(source.filter(clause))
-    return pl.concat(filtered, how="vertical_relaxed")
+    """Disk and buffer, filtered to one underlying and expiry, unioned by
+    `store.scan_and_pending` — see that function for why the union matters. The buffer
+    holds up to a flush interval nothing on disk yet describes, and a parquet-only read
+    would answer "nothing here" for a minute the store already has."""
+    clause = (pl.col("underlying") == underlying) & (pl.col("expiry") == expiry)
+    if day is not None:
+        clause = clause & (pl.col("date") == day)
+    return scan_and_pending(store, clause)
 
 
 def _at(
@@ -154,18 +152,12 @@ def _spot_at(
 ) -> float | None:
     """`spot-bars` carries no `expiry` column at all — it is one row per underlying per
     minute, not per contract — so the filter here is narrower than `_union`'s."""
-    frame = (
-        store.scan()
-        .filter((pl.col("underlying") == underlying) & (pl.col("date") == day))
-        .filter(pl.col("minute") == minute)
-        .select("spot_close")
-    )
-    pending = store.pending().filter(
+    clause = (
         (pl.col("underlying") == underlying)
         & (pl.col("date") == day)
         & (pl.col("minute") == minute)
-    ).select("spot_close")
-    rows = pl.concat([frame, pending], how="vertical_relaxed").collect()
+    )
+    rows = scan_and_pending(store, clause).select("spot_close").collect()
     if rows.is_empty():
         return None
     return rows["spot_close"][0]

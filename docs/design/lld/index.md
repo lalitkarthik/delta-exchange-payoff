@@ -18,7 +18,7 @@ file, and change the row's status to a link. Do not write one ahead of the code.
 | The supervisor — aggregate state, lifespan, the health report | not yet written | #39 |
 | Logging — the JSON-lines formatter, the sinks, what is logged and at what level | not yet written | #42 |
 | The historical read path — the ladder at a stored minute, and the day's minutes | [historical-read-path.md](historical-read-path.md) | #45 |
-| The bars read path — one contract's minute bars for a date | not yet written | #46 |
+| The bars read path — one contract's minute bars for a date | [bars-read-path.md](bars-read-path.md) | #46 |
 
 ## What a low-level design should contain
 
