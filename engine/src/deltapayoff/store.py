@@ -10,7 +10,11 @@ a reader joins spot to quotes to our volatility on `date` and `underlying` with 
 translation.
 
 **And the fourth one is filled differently.** Tables A, B and D are folded from ticks the
-writer drains off the bus. Table C is **sampled** from `ChainStream`'s recompute cache —
+writer builds out of the three market-data events it drains off the bus: `md.option_quote`
+into A, `md.option_reference` into B and into A's fallback, `md.index_quote` into D. The
+catalogue's field names and this module's columns are not the same words, and the one
+place they are translated is `bars.samples_from_reference`; `docs/design/lld/store.md`
+tables it. Table C is **sampled** from `ChainStream`'s recompute cache —
 every ten seconds and again at each minute boundary — because our implied volatility and
 Greeks are produced there rather than arriving on the wire. That is
 `BarWriter._sample_computed`, and it is the one place in this module that reads something
@@ -107,8 +111,9 @@ from .bars import (
     ReferenceAggregator,
     SpotAggregator,
     computed_ticks_from_chain,
-    samples_from_ticker,
-    tick_from_quote,
+    samples_from_reference,
+    spot_from_index,
+    tick_from_option_quote,
 )
 from .iv_index import ContractIv
 from .realised_vol import Bar as RvBar
@@ -260,7 +265,7 @@ SPOT_SCHEMA: dict[str, Any] = {
     "spot_high": pl.Float64,
     "spot_low": pl.Float64,
     "spot_close": pl.Float64,
-    #: Roughly 7,056 a bar, because every contract's ticker frame carries spot. Well
+    #: Roughly 7,056 a bar, because every contract's reference frame carries spot. Well
     #: inside `UInt32` and far outside `UInt16`, which 7,056 would have fitted today and
     #: overflowed the moment ETH was turned on.
     "spot_ticks": pl.UInt32,
@@ -881,7 +886,7 @@ def compact_all(
 
 
 class BarWriter:
-    """The bus's second consumer: quotes in, bars on disk.
+    """The bus's second consumer: canonical events in, bars on disk.
 
     Subscribes **losslessly**. Drop-oldest is right for a screen and wrong here, and not
     because a drop leaves a hole — under bars it perturbs a bar rather than removing a
@@ -892,12 +897,12 @@ class BarWriter:
     It is not folded into `ChainStream`: that holds only the *latest* state per contract
     while this needs *every* state, and one structure serving both would make them fight.
 
-    **One writer, one subscription, four tables.** Both channels arrive on the same
-    queue, so a second writer would mean a second lossless subscription carrying the same
-    messages and two watermarks drifting apart on two clocks. The four aggregators seal
-    independently — they have different graces and different grains — but they are driven
-    from one drain loop and flushed in one thread hop, so the socket reader waits on one
-    disk trip an interval rather than four.
+    **One writer, one subscription, four tables.** All three market-data events arrive on
+    the same queue, so a second writer would mean a second lossless subscription carrying
+    the same messages and two watermarks drifting apart on two clocks. The four
+    aggregators seal independently — they have different graces and different grains — but
+    they are driven from one drain loop and flushed in one thread hop, so the socket
+    reader waits on one disk trip an interval rather than four.
 
     **Table C does not come off that queue at all.** Our implied volatility and Greeks
     are made by `ChainStream`'s recompute loop, so the writer *samples* that loop's cache
@@ -954,8 +959,9 @@ class BarWriter:
         self.tick_seconds = tick_seconds
         self._subscription = None
         self._last_flush: float | None = None
-        #: Bus records that were neither channel, or carried no `ts`. Counted, because
-        #: "the writer ignored most of the bus" should be a number and not a discovery.
+        #: Bus records this writer stored nothing from — an event of a type it does not
+        #: aggregate, or one carrying no venue stamp to bucket on. Counted, because "the
+        #: writer ignored most of the bus" should be a number and not a discovery.
         self.skipped = 0
         self.flush_errors = 0
         #: Bus records drained and dropped because recording was off. Distinct from
@@ -986,17 +992,23 @@ class BarWriter:
         self._subscription = fanout.subscribe(name, maxsize=maxsize, lossless=True)
         return self._subscription
 
-    def ingest(self, quote: Any) -> None:
-        """One bus record into whichever aggregators it feeds. Pure arithmetic; no IO.
+    def ingest(self, event: Any) -> None:
+        """One event into whichever aggregators it feeds. Pure arithmetic; no IO.
 
-        A book frame feeds the quote bars alone. A ticker frame feeds all three: the
-        reference bars and the spot bars own it outright, and the quote bars take its
-        `q` array as the **fallback** they use only if the book stays silent for that
-        contract-minute.
+        `md.option_quote` feeds the quote bars alone. `md.option_reference` feeds two: the
+        reference bars own it outright, and the quote bars take its own bid and ask as the
+        **fallback** they use only if the book stays silent for that contract-minute.
+        `md.index_quote` feeds the spot bars and nothing else — spot is a property of the
+        underlying, and the event carries no instrument to file it under a contract with.
 
-        The two converters do not overlap — `tick_from_quote` refuses `ticker` and
-        `samples_from_ticker` refuses `ob_l2` — so no frame can be counted twice into
-        one bar.
+        **The three converters cannot overlap**, because each refuses anything but its own
+        event type. Before #37 they discriminated on a channel string carried by one
+        record type, where a typo would route a frame to the wrong table silently; now a
+        mismatched event simply is not that class.
+
+        Anything else on the bus — a connection event, a heartbeat, an alert — is counted
+        in `skipped` and dropped. That is not a defect: this writer subscribes to the
+        whole bus and stores the market data on it.
         """
         if not self.recording:
             # **Drained, then dropped — and this is the whole of the pause.** The record
@@ -1007,12 +1019,17 @@ class BarWriter:
             self.discarded += 1
             return
 
-        tick = tick_from_quote(quote)
+        tick = tick_from_option_quote(event)
         if tick is not None:
             self.aggregator.add(tick)
             return
 
-        sample = samples_from_ticker(quote)
+        spot = spot_from_index(event)
+        if spot is not None:
+            self.spot.add(spot)
+            return
+
+        sample = samples_from_reference(event)
         if sample is None:
             self.skipped += 1
             return
@@ -1020,8 +1037,6 @@ class BarWriter:
             self.aggregator.add(sample.quote)
         if sample.reference is not None:
             self.reference.add(sample.reference)
-        if sample.spot is not None:
-            self.spot.add(sample.spot)
 
     async def run(self) -> None:
         """Drain, seal, flush, forever. Cancel to stop.
@@ -1084,7 +1099,7 @@ class BarWriter:
         are built from ticks arriving on the bus; our implied volatility and Greeks are
         produced by `ChainStream`'s 100 ms recompute loop and exist only in its cache, so
         the writer reads that cache instead of the queue. That also makes table C
-        independent of the ticker work: it needs no new subscription and no new frame.
+        independent of the reference work: it needs no new subscription and no new frame.
 
         **On a timer, and the interval is a cost decision.** The drain loop below spins
         on every message — measured, 1,322.9 a second — and flattening every listed

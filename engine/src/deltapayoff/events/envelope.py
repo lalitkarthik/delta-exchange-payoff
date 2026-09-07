@@ -46,6 +46,28 @@ class UnknownEventType(ValueError):
             super().__init__(f"no event type is registered as {type_name!r}")
 
 
+class UnknownSchemaVersion(ValueError):
+    """A payload of a known type at a version this build does not understand.
+
+    **The consumer decides what it knows, and what it knows is the version its own class
+    declares.** `docs/design/events.md` puts it plainly: a version is bumped when a field
+    *changes meaning*, so a payload at another version is one whose fields this build
+    would read with the wrong meaning — plausible, wrong, and silent. #35 left the check
+    out deliberately because no consumer existed to define "known"; #37 is that consumer.
+
+    Carries the type and both versions so a log record says what was actually on the wire.
+    """
+
+    def __init__(self, type_name: str, version: object, known: int) -> None:
+        self.type_name = type_name
+        self.version = version
+        self.known = known
+        super().__init__(
+            f"{type_name!r} arrived at schema_version {version!r}; "
+            f"this build understands {known!r}"
+        )
+
+
 class Event(BaseModel):
     """The base every catalogued event extends.
 
@@ -135,12 +157,29 @@ def registry() -> Mapping[str, type[Event]]:
     return dict(_REGISTRY)
 
 
+def known_schema_version(cls: type[Event]) -> int:
+    """The one `schema_version` this build understands for `cls`.
+
+    Read off the field default rather than kept in a second table, for the same reason
+    `register` reads the type name off its default: two places to write a version is two
+    places for it to disagree.
+    """
+    field = cls.model_fields.get("schema_version")
+    default = None if field is None else field.default
+    return default if isinstance(default, int) else 1
+
+
 def parse_event(payload: str | bytes | bytearray | Mapping[str, Any]) -> Event:
     """Bytes or a mapping to the right typed event, in one step.
 
     Raises `UnknownEventType` for a type nobody registered — including a payload with no
-    `type` at all — and pydantic's `ValidationError` for a registered type whose payload
-    does not fit.
+    `type` at all — `UnknownSchemaVersion` for a registered type at a version this build
+    does not understand, and pydantic's `ValidationError` for a payload that does not fit.
+
+    **Version is checked here and not in the model**, so that a producer inside this
+    process can still build its own events: construction is a component declaring what it
+    emits, while parsing is a consumer asking whether it understands what it was handed.
+    A payload that omits `schema_version` takes the class default and is therefore known.
     """
     if isinstance(payload, (str, bytes, bytearray)):
         data = json.loads(payload)
@@ -154,4 +193,11 @@ def parse_event(payload: str | bytes | bytearray | Mapping[str, Any]) -> Event:
     cls = _REGISTRY.get(type_name)
     if cls is None:
         raise UnknownEventType(type_name)
+    known = known_schema_version(cls)
+    version = data.get("schema_version", known)
+    # **An integer, and `bool` is not one.** `bool` subclasses `int` in Python and
+    # `True == 1`, so a payload spelling its version `true` would otherwise arrive as
+    # version 1; `1.0 == 1` likewise. A version is an integer or it is not a version.
+    if not isinstance(version, int) or isinstance(version, bool) or version != known:
+        raise UnknownSchemaVersion(type_name, version, known)
     return cls.model_validate(dict(data))

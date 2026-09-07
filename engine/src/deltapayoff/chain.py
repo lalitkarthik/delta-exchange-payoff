@@ -9,6 +9,7 @@ than a model.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -131,14 +132,52 @@ def nearest_strike(strikes: list[float], spot: float | None) -> float | None:
     return min(sorted(strikes), key=lambda strike: abs(strike - spot))
 
 
+def chain_from_legs(
+    underlying: str,
+    expiry: str,
+    legs: Iterable[tuple[float, str, Leg]],
+    spot: float | None,
+    fetched_at: datetime | None = None,
+) -> ChainResponse:
+    """`(strike, side, leg)` triples into the ladder, ascending by strike.
+
+    **The one fold**, and it is here because both callers need exactly it. The REST path
+    reaches it through :func:`build_chain`, which knows Delta's ticker dictionaries; the
+    live path reaches it from `stream.py`, which knows canonical events and no venue
+    spelling at all. Two folds would be two places for the call/put pairing and the ATM
+    lookup to drift, on the two transports this project already checks against each other.
+
+    `side` is `"call"` or `"put"` — this engine's own word, not a venue's. A repeated
+    `(strike, side)` keeps the **last** triple offered, which is what a caller iterating a
+    cache newest-last means by it.
+    """
+    sides: dict[float, dict[str, Leg]] = {}
+    for strike, side, leg in legs:
+        sides.setdefault(strike, {})[side] = leg
+
+    rows = [
+        ChainRow(strike=strike, call=pair.get("call"), put=pair.get("put"))
+        for strike, pair in sorted(sides.items())
+    ]
+    stamp = fetched_at or datetime.now(timezone.utc)
+    return ChainResponse(
+        underlying=underlying,
+        expiry=expiry,
+        spot=spot,
+        atm_strike=nearest_strike(list(sides), spot),
+        fetched_at=stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        rows=rows,
+    )
+
+
 def build_chain(
     underlying: str,
     expiry: str,
     tickers: list[dict[str, Any]],
     fetched_at: datetime | None = None,
 ) -> ChainResponse:
-    """Pivot a list of tickers into the ladder, ascending by strike."""
-    legs: dict[float, dict[str, Leg]] = {}
+    """Pivot a list of Delta ticker dictionaries into the ladder, ascending by strike."""
+    triples = []
     for ticker in tickers:
         strike = to_number(ticker.get("strike_price"))
         if strike is None:
@@ -150,19 +189,12 @@ def build_chain(
             side = "put"
         else:
             continue
-        legs.setdefault(strike, {})[side] = build_leg(ticker)
+        triples.append((strike, side, build_leg(ticker)))
 
-    rows = [
-        ChainRow(strike=strike, call=sides.get("call"), put=sides.get("put"))
-        for strike, sides in sorted(legs.items())
-    ]
-    spot = spot_from_tickers(tickers)
-    stamp = fetched_at or datetime.now(timezone.utc)
-    return ChainResponse(
-        underlying=underlying,
-        expiry=expiry,
-        spot=spot,
-        atm_strike=nearest_strike(list(legs), spot),
-        fetched_at=stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        rows=rows,
+    return chain_from_legs(
+        underlying,
+        expiry,
+        triples,
+        spot_from_tickers(tickers),
+        fetched_at=fetched_at,
     )

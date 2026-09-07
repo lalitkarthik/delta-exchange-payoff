@@ -39,6 +39,8 @@ from deltapayoff.events import (
     OptionReference,
     Right,
     UnknownEventType,
+    UnknownSchemaVersion,
+    known_schema_version,
     parse_event,
     registry,
 )
@@ -331,6 +333,53 @@ def test_parsing_a_payload_with_no_type_at_all_raises_the_same_error() -> None:
     del payload["type"]
     with pytest.raises(UnknownEventType):
         parse_event(payload)
+
+
+def test_parsing_a_version_this_build_does_not_know_raises() -> None:
+    """**#35 left this out on purpose and #37 is the consumer that fills it in.**
+
+    A version is bumped when a field *changes meaning*, so a payload at an unknown version
+    is one whose fields this build would read with the wrong meaning, silently. That is
+    the same objection to plausible-and-wrong that makes an unregistered `type` raise, and
+    `docs/design/events.md` says so: a consumer that does not know a version it receives
+    must fail loudly rather than guess.
+    """
+    payload = SAMPLES["md.option_quote"].model_dump(mode="json")
+    payload["schema_version"] = 2
+
+    with pytest.raises(UnknownSchemaVersion) as caught:
+        parse_event(payload)
+
+    message = str(caught.value)
+    assert "md.option_quote" in message
+    assert "2" in message and "1" in message, "the error names neither version"
+
+
+@pytest.mark.parametrize("version", [0, -1, "1", 1.0, True, None])
+def test_a_version_that_is_not_the_known_integer_raises(version) -> None:
+    """`True` is in this list because `bool` is an `int` in Python and `True == 1`, so a
+    payload spelling its version `true` would otherwise be accepted as version 1."""
+    payload = SAMPLES["md.option_quote"].model_dump(mode="json")
+    payload["schema_version"] = version
+
+    with pytest.raises(UnknownSchemaVersion):
+        parse_event(payload)
+
+
+def test_a_payload_omitting_the_version_takes_the_class_default() -> None:
+    """An older producer that never wrote the field is not an unknown version; it is a
+    producer at the version this class declares, which is what the default means."""
+    payload = SAMPLES["md.option_quote"].model_dump(mode="json")
+    del payload["schema_version"]
+
+    assert parse_event(payload).schema_version == 1
+
+
+@pytest.mark.parametrize("type_name", sorted(SAMPLES))
+def test_every_type_is_still_at_version_one(type_name: str) -> None:
+    """The nine fields #37 added to two events are all optional with defaults, which
+    `docs/design/events.md` calls a compatible change. Nothing was bumped."""
+    assert known_schema_version(registry()[type_name]) == 1
 
 
 def test_parse_accepts_the_bytes_a_transport_would_hand_it() -> None:
