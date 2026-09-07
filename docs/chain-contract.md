@@ -61,6 +61,12 @@ no reformatting anywhere in the stack.
 `rows` is ascending by strike. `atm_strike` is the listed strike closest to `spot` — a lookup,
 not a model. Either side of a row may be `null` when only one of the pair is listed.
 
+**`spot` and `atm_strike` are `number | null`, not `number` — #47.** This route always
+populates both: a live chain always carries Delta's own spot price. The type is nullable
+anyway because `ChainResponse` is the exact shape [`/chain/at`](historical-chain-contract.md)
+answers too, and a stored minute with nothing in `spot-bars` legitimately has neither. One
+type for one shape, honest about the case only the other route can hit.
+
 `forward` is **recovered from prices**, not assumed: an ordinary least-squares fit of `C - P`
 against `K` across every paired strike, whose slope is `-D` and whose zero crossing is `F`.
 `forward_method` names it — `F1` is that regression. `years_to_expiry` is ACT/365, and it is

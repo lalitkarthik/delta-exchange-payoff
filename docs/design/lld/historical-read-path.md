@@ -35,16 +35,19 @@ something.
 ## The fourth table
 
 The ticket's concept section names three tables. `spot-bars` is a fourth, read for
-`spot` and `atm_strike` alone, and the reason is `web/components/ChainLadder.tsx`:
-`docs/chain-contract.md` fixes both fields as plain numbers, and the component's
-`inTheMoney` compares `strike < spot` with no null guard. A `None` there is not
-"rendered as absent" — JavaScript's `<` coerces `null` to `0`, so every put would wash
-as in-the-money and every call would not, silently and with nothing on screen to say so.
-That is the exact "plausible and wrong" failure this whole project refuses elsewhere, so
-rather than leave it latent the fourth table is read. `spot` is honest when read — it is
-never derived from `forward`, which `docs/chain-contract.md` is explicit is a different
-number — and it is `None`, inherited rather than newly created, when `spot-bars` itself
-has nothing for the minute. That inheritance is the one open item below.
+`spot` and `atm_strike` alone. `spot` is honest when read — it is never derived from
+`forward`, which `docs/chain-contract.md` is explicit is a different number — and it is
+`None` when `spot-bars` itself has nothing for the minute.
+
+**That `None` used to be an open item; [#47](https://github.com/lalitkarthik/delta-exchange-payoff/issues/47)
+closed it.** `docs/chain-contract.md` fixed `spot` and `atm_strike` as plain numbers
+while this route could already answer `null`, and `web/components/ChainLadder.tsx`'s
+`inTheMoney` compared `strike < spot` with no null guard — JavaScript's `<` coerces
+`null` to `0`, so every put washed in-the-money and every call did not, silently. #47
+typed both fields `number | null` on the contract, guarded the comparison so a null spot
+highlights neither side, and pinned it on both seams:
+`engine/tests/test_historical.py::test_spot_is_null_when_table_d_has_nothing_for_this_minute`
+(already in place from this ticket) and the new `web/tests/moneyness.test.ts`.
 
 ## Where each field comes from
 
