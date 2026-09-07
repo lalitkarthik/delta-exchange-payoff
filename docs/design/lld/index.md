@@ -10,7 +10,7 @@ file, and change the row's status to a link. Do not write one ahead of the code.
 
 | Component | Design | Landed by |
 |---|---|---|
-| Events — the envelope, the registry, the instrument | not yet written | #35, #37 |
+| Events — the envelope, the registry, the instrument | [events.md](events.md) | #35, #37 |
 | The broker adapter — the protocol, the Delta implementation, the fake | not yet written | #36 |
 | The chain cache — invalidation, the recompute passes, watched pairs | not yet written | #37, #44 |
 | The store — the four tables, sealing, flushing, ETH | not yet written | #37, #43 |
