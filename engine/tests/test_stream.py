@@ -17,8 +17,11 @@ about the cache rather than the decoding.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from datetime import datetime, timezone
+
+import pytest
 
 from deltapayoff.black76 import call_price, put_price
 from deltapayoff.events import IndexQuote
@@ -277,6 +280,37 @@ def test_an_arriving_quote_marks_its_expiry_dirty() -> None:
     feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
 
     assert stream.dirty == {("BTC", EXPIRY)}
+
+
+def test_a_new_expiry_logs_the_recompute_set_changing_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#42's `compute.recompute_set`, at debug: a new `(underlying, expiry)` pair joining
+    the cache is rare and worth a quiet line — but ~1,323 frames a second on an expiry
+    already known must not repeat it, or the "debug, not per-message" promise breaks."""
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.stream")
+    stream = ChainStream()
+
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, ticker("C-BTC-77600-040926", 580, 585), "ticker")
+    feed(stream, ticker("C-BTC-78000-040926", 600, 605), "ticker")
+
+    records = [r for r in caplog.records if r.event == "compute.recompute_set"]
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    assert "BTC" in records[0].getMessage()
+    assert EXPIRY in records[0].getMessage()
+
+
+def test_a_second_expiry_logs_a_second_time(caplog: pytest.LogCaptureFixture) -> None:
+    """The set changing twice is logged twice — this is not a once-per-process latch."""
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.stream")
+    stream = ChainStream()
+
+    feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
+    feed(stream, ticker("C-BTC-77600-110926", 579, 584), "ticker")
+
+    records = [r for r in caplog.records if r.event == "compute.recompute_set"]
+    assert len(records) == 2, [r.getMessage() for r in caplog.records]
 
 
 def test_nothing_arriving_leaves_nothing_to_recompute() -> None:

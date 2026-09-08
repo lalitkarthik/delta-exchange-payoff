@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from deltapayoff import log_events
 from deltapayoff.adapters import DeltaAdapter, DeltaFeed, instrument_from_symbol
 from deltapayoff.adapters.base import ConnectionSignal
 from deltapayoff.controller import ConnectionController, IllegalTransition
@@ -1341,3 +1342,98 @@ def test_a_message_arriving_after_a_stop_does_not_restore_the_budget() -> None:
     assert controller.budget_remaining == 0, (
         "a stopped connection was handed its lifetime budget back by a stray frame"
     )
+
+
+# --- #42: structured logging ------------------------------------------------------
+
+
+def test_frames_silence_frames_logs_stale_warning_then_transition_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The acceptance scenario named in #42: frames, a 20 s silence, frames.
+
+    Entering `degraded` is `feed.stale` at warning with `conn_state: degraded`; coming
+    back is an ordinary `feed.transition` at info. This is the record that would have
+    made the three-day hole in the store visible the day it started.
+    """
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.controller")
+
+    run_script(
+        [Frames("ob_l2", [BOOK_FRAME]), Silence(20.0), Frames("ob_l2", [BOOK_FRAME])]
+    )
+
+    records = [r for r in caplog.records if r.name == "deltapayoff.controller"]
+    stale = [r for r in records if r.event == "feed.stale"]
+    assert len(stale) == 1, [r.getMessage() for r in records]
+    assert stale[0].levelno == logging.WARNING
+    assert stale[0].conn_state == "degraded"
+    assert stale[0].venue == "SCRIPT"
+
+    # The very next controller record is the recovery, back at info, as an ordinary
+    # transition rather than a second special-cased event.
+    after = records[records.index(stale[0]) + 1]
+    assert after.event == "feed.transition"
+    assert after.levelno == logging.INFO
+    assert after.conn_state == "connected"
+
+
+def test_a_reconnect_is_a_warning_not_an_info(caplog: pytest.LogCaptureFixture) -> None:
+    """Every move touching `reconnecting` — the drop and the redial — logs at warning
+    under `feed.reconnect`, distinct from the ordinary `feed.transition` info line."""
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.controller")
+
+    run_script([Frames("ob_l2", [BOOK_FRAME]), Close("1006")])
+
+    records = [r for r in caplog.records if r.name == "deltapayoff.controller"]
+    by_event = [(r.event, r.levelno) for r in records]
+    assert (log_events.FEED_RECONNECT, logging.WARNING) in by_event
+    # The close and the redial both count; the initial connect and the final stop do not.
+    assert by_event.count((log_events.FEED_RECONNECT, logging.WARNING)) == 2
+    assert (log_events.FEED_TRANSITION, logging.INFO) in by_event
+
+
+def test_a_spent_budget_is_logged_as_a_single_error_transition(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#42's "error when stopped by budget", folded into the one `feed.transition`
+    record `_spend_reconnect` already made loud — not a second log line beside it."""
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.controller")
+
+    run_script([Close("one"), Close("two"), Close("three")], reconnect_budget=2)
+
+    records = [r for r in caplog.records if r.name == "deltapayoff.controller"]
+    errors = [r for r in records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    assert errors[0].event == log_events.FEED_TRANSITION
+    assert errors[0].conn_state == "stopped"
+    assert "budget of 2 is spent" in errors[0].getMessage()
+
+
+def test_every_alert_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """`_alert` always writes a warning-level record, whatever the alert's own
+    `severity` — #42's "every alert (warning)"."""
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.controller")
+
+    run_script([Frames("ob_l2", [BOOK_FRAME]), Silence(60.0)])
+
+    records = [r for r in caplog.records if r.name == "deltapayoff.controller"]
+    alerts = [r for r in records if r.event == log_events.ALERT]
+    assert len(alerts) == 1, [r.getMessage() for r in records]
+    assert alerts[0].levelno == logging.WARNING
+    assert alerts[0].code == "connection_silent"
+
+
+def test_a_reconnect_only_logging_scenario_produces_a_bounded_number_of_records(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """**Volume, not just presence.** A single drop-and-recover produces a handful of
+    records, not a flood — the same shape `fanout`'s "every drop is counted" argues for
+    on the bus, applied to what a reconnect costs the log."""
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.controller")
+
+    run_script([Frames("ob_l2", [BOOK_FRAME]), Close("1006")])
+
+    records = [r for r in caplog.records if r.name == "deltapayoff.controller"]
+    # start, open, closed->reconnecting, backoff->connecting, open, stopped: six moves,
+    # six records — one reconnect costs six lines, not sixty.
+    assert len(records) == 6, [r.getMessage() for r in records]
