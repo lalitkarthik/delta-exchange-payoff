@@ -24,11 +24,41 @@ export function engineSocketUrl(underlying: Underlying, expiry: string): string 
   return `${base}/ws/chain?underlying=${underlying}&expiry=${encodeURIComponent(expiry)}`;
 }
 
+/**
+ * The venue connection's own state, #40. `docs/live-chain-contract.md` is the authority;
+ * this mirrors it field for field, as `engineSocketUrl`'s envelope above already does
+ * for `chain`/`waiting`/`error`.
+ *
+ * **A different fact from `LiveStatus` below, and the two must never be conflated on
+ * screen.** `LiveStatus` is this browser's own socket to *the engine*; `FeedState` is
+ * the engine's socket to *Delta*. They fail independently — the browser's connection to
+ * a perfectly healthy engine can read `live` while `state` here reads `reconnecting` —
+ * and that gap is the entire reason this type exists rather than folding its five values
+ * into `LiveStatus`'s five.
+ */
+export type FeedState = "connecting" | "connected" | "degraded" | "reconnecting" | "stopped";
+
+/** `docs/live-chain-contract.md`'s nine reasons. Kept as `string` rather than a union:
+ * a reason nobody has named yet must still render on hover rather than fail to parse. */
+export type FeedReason = string;
+
+export interface FeedStatus {
+  /** The venue name, e.g. `"DELTA"`. One adapter today — see the contract doc. */
+  adapter: string;
+  state: FeedState;
+  /** ISO 8601 UTC, second precision, `Z`-suffixed. When the engine last told a browser
+   * the feed entered `state` — not necessarily the instant it actually did; see the
+   * contract doc's "Coalescing". */
+  since: string;
+  reason: FeedReason;
+}
+
 /** What the socket can say. Mirrors the envelope in `engine/src/deltapayoff/main.py`. */
 export type LiveMessage =
   | { type: "chain"; data: ChainResponse }
   | { type: "waiting"; detail: string }
-  | { type: "error"; detail: string };
+  | { type: "error"; detail: string }
+  | { type: "feed"; data: FeedStatus };
 
 /**
  * Where a subscription is, for the header chip.
@@ -57,6 +87,51 @@ export const LIVE_STATUS_LABEL: Record<LiveStatus, string> = {
 export interface LiveHandlers {
   onChain: (chain: ChainResponse) => void;
   onStatus: (status: LiveStatus, detail?: string) => void;
+  /** The venue feed's own state, #40. Optional so every existing caller keeps
+   * compiling unchanged; a caller that omits it simply never learns the feed's state,
+   * exactly as before this ticket. */
+  onFeed?: (feed: FeedStatus) => void;
+}
+
+/** The ladder header's badge, or what one non-`connected` `FeedStatus` becomes. */
+export interface FeedBadge {
+  state: Exclude<FeedState, "connected">;
+  label: string;
+  reason: FeedReason;
+}
+
+/**
+ * What the badge says for each state that gets one. `connected` is deliberately absent
+ * — see `feedBadge` below — so a state added here without ever being read is a type
+ * error rather than a label nobody sees.
+ */
+const FEED_BADGE_LABEL: Record<Exclude<FeedState, "connected">, string> = {
+  connecting: "feed connecting…",
+  degraded: "feed degraded",
+  reconnecting: "feed reconnecting…",
+  stopped: "feed stopped",
+};
+
+/**
+ * What the ladder header's feed badge should show, or `null` for nothing at all.
+ *
+ * **`null` for `connected`, and only for `connected`.** The badge exists to say "the
+ * venue feed is not simply fine right now" — a `connected` feed does not need arguing
+ * for on screen, and showing a badge for it anyway would be the fixed-chain-with-no-
+ * indicator problem `docs/chain-contract.md` already solves for a fully quoted ladder,
+ * repeated on the header. `null` also for `feed === null`, which is every screen before
+ * the engine's first `feed` message has arrived, or against an engine old enough to
+ * never send one at all — the badge's absence there is silence, not a claim that the
+ * feed is fine.
+ *
+ * **Takes a `FeedStatus`, never a `LiveStatus`.** The whole reason two indicators exist
+ * — see this module's own header comment on `FeedState` — is that they can disagree; a
+ * caller that reached for the browser's own socket status here instead would be
+ * building the exact bug #40 exists to prevent, and the type signature refuses it.
+ */
+export function feedBadge(feed: FeedStatus | null): FeedBadge | null {
+  if (feed === null || feed.state === "connected") return null;
+  return { state: feed.state, label: FEED_BADGE_LABEL[feed.state], reason: feed.reason };
 }
 
 /** Backoff between reconnect attempts, in milliseconds. Capped so it stays responsive. */
@@ -104,6 +179,11 @@ export function subscribeChain(
         handlers.onChain(message.data);
       } else if (message.type === "waiting") {
         handlers.onStatus("waiting", message.detail);
+      } else if (message.type === "feed") {
+        // Never touches `delay`, `stopped` or `onStatus`: this is the *venue's*
+        // connection, not this browser's socket to the engine, and must not be read as
+        // proof of either — see this module's header comment on `FeedState`.
+        handlers.onFeed?.(message.data);
       } else {
         // A rejected underlying or expiry can never succeed, so this is not retried.
         stopped = true;
