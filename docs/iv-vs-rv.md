@@ -289,10 +289,19 @@ than rendering an empty chart.
   wedge sits inside the premium unlabelled.
 - **Historical IV cannot be backfilled.** Delta's history carries no IV and no bid/ask, so
   the implied side accumulates forward from 2026-09-03 and no earlier.
-- **The chart is hand-rolled SVG while the smile screen uses `recharts`.** Two charting
-  approaches in one app is a real cost. This one was finished before `recharts` landed, and
-  the argument that justified it — that a library would join across a gap — does not hold:
-  recharts defaults `connectNulls` to false. Porting it is worth doing.
+- ~~**The chart is hand-rolled SVG while the smile screen uses `recharts`.**~~ **Ported.**
+  The argument that justified hand-rolling — that a library would join across a gap — did
+  not hold: recharts defaults `connectNulls` to false. The chart now shares the smile's
+  grid, axis styling and `.chart-tip` readout, and gained the hover the hand-rolled one
+  never had. **The hover is where `returns` and `coverage` finally surface**: the payload
+  has carried them per point per estimator since the endpoint shipped and nothing drew
+  them, so a reader could not tell a figure resting on 29,549 returns from one resting on
+  40. That is part of what #31 asks for; the gap-width shading it also asks for is still
+  open.
+- **The implied side is drawn with dots, the realised without.** Not decoration. Implied
+  cannot be backfilled, so it exists only for minutes this engine was running — dozens
+  against thousands — and a line style suited to a dense series renders a sparse one as
+  almost nothing, which reads as a broken chart rather than as thin data.
 - **The optimal sampling interval has not been measured here.** The literature puts the
   bias/variance optimum near five minutes for equities; our series is a computed index rather
   than a traded price, so the number should be measured on this data. Until it is, the

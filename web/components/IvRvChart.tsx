@@ -1,53 +1,60 @@
 "use client";
 
 import { useMemo } from "react";
+import {
+  CartesianGrid,
+  Label,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 
+import { IvRvTooltip } from "@/components/IvRvTooltip";
 import {
   ESTIMATOR_LABEL,
+  ESTIMATORS,
   IV_KEY,
   type Estimator,
   type LineKey,
   type VolatilitySeries,
-  type VolPoint,
 } from "@/lib/ivrv";
 
 /**
- * Implied against realised volatility, drawn by hand in SVG.
+ * Implied against realised volatility, on the smile screen's own chart.
  *
- * **The one behaviour it must get right is breaking across a gap.** A missing minute
- * produces no row — never-forward-fill is the project's moral as well as its rule — so a
- * line drawn straight through a hole asserts a value nobody measured, in the one place
- * the reader has no way to tell.
+ * **This was hand-rolled and no longer is.** The original file drew SVG paths directly,
+ * for one reason: a missing minute produces no row — never-forward-fill is the project's
+ * moral as well as its rule — and a line drawn straight through a hole asserts a value
+ * nobody measured, in the one place a reader has no way to check. That argument does not
+ * survive contact with `recharts`, which defaults `connectNulls` to **false**
+ * (`recharts/lib/cartesian/Line.js`) and so breaks on a gap out of the box. What is left
+ * is the cost of two charting approaches in one app, and a hover the hand-rolled one
+ * never had.
  *
- * **This was hand-rolled when the app had no charting library, and it no longer has to
- * be.** `recharts` arrived with the smile screen, and its `<Line>` defaults
- * `connectNulls` to **false** — checked, `recharts/lib/cartesian/Line.js` — so it breaks
- * on a gap out of the box and the original argument for hand-rolling does not survive
- * contact with it. What is left is smaller: a zero-based axis, six independently toggled
- * series, and sixty lines that are already written and already verified against a
- * rendered page. **Porting this to `recharts` for consistency with `SmileChart` is worth
- * doing and is not done here** — two charting approaches in one app is a real cost, and
- * the reason this one stayed is that it was finished before the other landed.
+ * **The tick, the grid, the axis and the tooltip are `SmileChart`'s**, down to the CSS
+ * class names. Two charts on one screen that style their axes differently read as two
+ * screens, and the tabs are meant to be two views of one subject.
+ *
+ * **Implied is drawn with dots and realised without.** Not decoration: the implied side
+ * cannot be backfilled — Delta's history carries no IV and no bid/ask — so it exists
+ * only for the minutes this engine was running, which today is dozens against thousands.
+ * A line style that suits a dense series renders a sparse one as almost nothing, and the
+ * reader concludes the chart is broken rather than that the data is thin. Dots say
+ * "these are the minutes there are".
  *
  * **Nothing here is domain arithmetic.** The engine sends both series already scaled to
- * the window and already aligned; this file turns numbers into coordinates, which is
- * layout. The rule is that the web app does not compute what the chart *means*, not that
- * it may not work out where to put a pixel.
+ * the window and already aligned; this file turns numbers into coordinates.
  */
-
-const WIDTH = 1000;
-const HEIGHT = 420;
-const PAD = { top: 18, right: 18, bottom: 34, left: 56 };
-
-const PLOT_W = WIDTH - PAD.left - PAD.right;
-const PLOT_H = HEIGHT - PAD.top - PAD.bottom;
 
 /**
  * One colour per line, from the palette in `globals.css`.
  *
  * Implied wears the accent because it is the line the other five are being compared
  * *against* — the eye should find it first. The two return estimators are deliberately
- * neighbouring hues: they will overlap almost exactly on minute bars, and two nearly
+ * neighbouring hues: they overlap almost exactly on minute bars, and two nearly
  * identical colours make that overlap read as agreement rather than as one missing line.
  */
 const COLOUR: Record<LineKey, string> = {
@@ -64,15 +71,20 @@ export const LINE_LABEL: Record<LineKey, string> = {
   ...ESTIMATOR_LABEL,
 };
 
+/** One timestamp, flattened so Recharts can address each line by a `dataKey`. */
+export interface ChartRow {
+  at: number;
+  label: string;
+  iv: number | null;
+  coverage: Partial<Record<Estimator, number>>;
+  returns: Partial<Record<Estimator, number>>;
+  [key: string]: unknown;
+}
+
 interface Props {
   series: VolatilitySeries;
   /** Which of the six to draw. Everything else stays out of the extent as well. */
   visible: Set<LineKey>;
-}
-
-interface Segment {
-  key: LineKey;
-  path: string;
 }
 
 /** A value the chart can plot: finite, and actually present. */
@@ -80,127 +92,157 @@ function plottable(value: number | null | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-export function IvRvChart({ series, visible }: Props) {
-  const drawn = useMemo(() => {
-    const points = series.points;
-    if (points.length === 0) return null;
+/**
+ * A timestamp as the axis prints it.
+ *
+ * Date and time, because a lookback of weeks spans days and a chart labelled by
+ * clock alone would repeat every label. In UTC, like every other instant in this app —
+ * the store's minutes, the scrubber and the expiry stamps are all UTC, and one local
+ * axis among them would silently shift the comparison by the reader's offset.
+ */
+function stamp(at: number): string {
+  const date = new Date(at);
+  const day = date.toISOString().slice(5, 10).replace("-", "/");
+  const time = date.toISOString().slice(11, 16);
+  return `${day} ${time}`;
+}
 
-    const values: number[] = [];
-    for (const point of points) {
-      if (visible.has(IV_KEY) && plottable(point.iv)) values.push(point.iv);
-      for (const key of series.estimators) {
-        if (!visible.has(key)) continue;
-        const value = point.rv[key];
-        if (plottable(value)) values.push(value);
+function formatPercent(value: number): string {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+export function IvRvChart({ series, visible }: Props) {
+  const rows = useMemo<ChartRow[]>(
+    () =>
+      series.points.map((point) => {
+        const row: ChartRow = {
+          at: new Date(point.at).getTime(),
+          label: point.at,
+          iv: plottable(point.iv) ? point.iv : null,
+          coverage: point.coverage as Partial<Record<Estimator, number>>,
+          returns: point.returns as Partial<Record<Estimator, number>>,
+        };
+        for (const estimator of ESTIMATORS) {
+          const value = point.rv[estimator];
+          row[estimator] = plottable(value) ? value : null;
+        }
+        return row;
+      }),
+    [series],
+  );
+
+  // The extent covers only what is drawn, so hiding a series that ran an order of
+  // magnitude above the rest reclaims the axis rather than leaving it stretched around
+  // a line nobody can see. Zero-based, because these are standard deviations and an
+  // axis that starts at the smallest value makes a 2% spread look like a collapse.
+  const top = useMemo(() => {
+    let highest = 0;
+    for (const row of rows) {
+      for (const key of visible) {
+        const value = row[key];
+        if (typeof value === "number" && value > highest) highest = value;
       }
     }
-    if (values.length === 0) return null;
+    return highest > 0 ? highest * 1.08 : 1;
+  }, [rows, visible]);
 
-    const times = points.map((point) => Date.parse(point.at));
-    const tMin = Math.min(...times);
-    const tMax = Math.max(...times);
-    const span = tMax - tMin || 1;
-
-    // The y axis starts at zero. A volatility axis cropped to its own range makes a
-    // two-point move look like a collapse, and the whole subject here is the *size* of
-    // the gap between two lines — which only reads correctly against a true origin.
-    const top = Math.max(...values) * 1.08 || 1;
-
-    const x = (at: number) => PAD.left + ((at - tMin) / span) * PLOT_W;
-    const y = (value: number) => PAD.top + PLOT_H - (value / top) * PLOT_H;
-
-    const segments: Segment[] = [];
-    const build = (key: LineKey, read: (point: VolPoint) => number | null | undefined) => {
-      let path = "";
-      let pen = false;
-      points.forEach((point, index) => {
-        const value = read(point);
-        const at = times[index];
-        if (!plottable(value) || at === undefined) {
-          // The gap. Lifting the pen is the whole point: the next point starts a new
-          // sub-path with `M`, so nothing is drawn across the hole.
-          pen = false;
-          return;
-        }
-        const command = pen ? "L" : "M";
-        path += `${command}${x(at).toFixed(2)},${y(value).toFixed(2)}`;
-        pen = true;
-      });
-      if (path) segments.push({ key, path });
-    };
-
-    if (visible.has(IV_KEY)) build(IV_KEY, (point) => point.iv);
-    for (const key of series.estimators) {
-      if (visible.has(key)) build(key, (point) => point.rv[key]);
-    }
-
-    const ticks = [0, 0.25, 0.5, 0.75, 1].map((fraction) => ({
-      value: top * fraction,
-      y: PAD.top + PLOT_H - fraction * PLOT_H,
-    }));
-
-    const timeTicks = [0, 0.5, 1].map((fraction) => ({
-      at: tMin + span * fraction,
-      x: PAD.left + fraction * PLOT_W,
-    }));
-
-    return { segments, ticks, timeTicks, top };
-  }, [series, visible]);
-
-  if (!drawn) {
-    return (
-      <p className="notice">
-        Nothing to draw at this lookback. Every selected line is empty over the whole
-        range — which is an honest answer rather than a failure, and usually means the
-        window has not finished happening yet.
-      </p>
-    );
-  }
+  if (rows.length === 0) return null;
 
   return (
-    <svg
-      className="ivr-chart"
-      viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-      role="img"
-      aria-label={`Implied and realised volatility over ${series.lookback_days} days`}
-      preserveAspectRatio="none"
-    >
-      {drawn.ticks.map((tick) => (
-        <g key={tick.y}>
-          <line
-            x1={PAD.left}
-            x2={WIDTH - PAD.right}
-            y1={tick.y}
-            y2={tick.y}
-            className="ivr-grid"
+    <div className="plot">
+      <ResponsiveContainer width="100%" height={440}>
+        <LineChart data={rows} margin={{ top: 26, right: 26, bottom: 40, left: 4 }}>
+          <CartesianGrid stroke="var(--line)" strokeDasharray="0" />
+
+          <XAxis
+            type="number"
+            dataKey="at"
+            domain={["dataMin", "dataMax"]}
+            scale="time"
+            height={34}
+            tickFormatter={stamp}
+            minTickGap={56}
+            tick={{ fill: "var(--ink-faint)", fontSize: 11 }}
+            tickLine={{ stroke: "var(--line-strong)" }}
+            axisLine={{ stroke: "var(--line-strong)" }}
+          >
+            <Label
+              className="chart-axis-title"
+              fill="var(--ink-faint)"
+              value="TIME (UTC)"
+              position="insideBottom"
+              offset={-24}
+            />
+          </XAxis>
+
+          <YAxis
+            type="number"
+            domain={[0, top]}
+            width={68}
+            tickFormatter={formatPercent}
+            tick={{ fill: "var(--ink-faint)", fontSize: 11 }}
+            tickLine={{ stroke: "var(--line-strong)" }}
+            axisLine={{ stroke: "var(--line-strong)" }}
+          >
+            <Label
+              className="chart-axis-title"
+              fill="var(--ink-faint)"
+              value={`VOLATILITY OVER ${series.lookback_days.toFixed(1)}D`}
+              angle={-90}
+              position="insideLeft"
+              offset={14}
+            />
+          </YAxis>
+
+          <Tooltip
+            content={(props) => <IvRvTooltip {...props} visible={visible} />}
+            filterNull={false}
+            // `--line-strong` measured 1.40:1 dark against the plot — a pointer cue
+            // nobody can see is a pointer cue that was deleted. `--ink-faint` is 4.61:1.
+            cursor={{ stroke: "var(--ink-faint)", strokeWidth: 1 }}
+            isAnimationActive={false}
+            wrapperStyle={{ outline: "none" }}
           />
-          <text x={PAD.left - 8} y={tick.y + 4} className="ivr-axis ivr-axis-y">
-            {(tick.value * 100).toFixed(1)}%
-          </text>
-        </g>
-      ))}
 
-      {drawn.timeTicks.map((tick) => (
-        <text key={tick.x} x={tick.x} y={HEIGHT - 10} className="ivr-axis ivr-axis-x">
-          {new Date(tick.at).toISOString().slice(0, 16).replace("T", " ")}
-        </text>
-      ))}
+          {/* Realised first, so implied paints over it: the accent line is the subject
+              and the five estimators are the ground it is read against. */}
+          {ESTIMATORS.filter((estimator) => visible.has(estimator)).map((estimator) => (
+            <Line
+              key={estimator}
+              type="linear"
+              dataKey={estimator}
+              name={LINE_LABEL[estimator]}
+              stroke={COLOUR[estimator]}
+              strokeWidth={1.5}
+              isAnimationActive={false}
+              dot={false}
+              activeDot={{ r: 4, strokeWidth: 0 }}
+            />
+          ))}
 
-      {drawn.segments.map((segment) => (
-        <path
-          key={segment.key}
-          d={segment.path}
-          fill="none"
-          stroke={COLOUR[segment.key]}
-          strokeWidth={segment.key === IV_KEY ? 2.4 : 1.5}
-          strokeLinejoin="round"
-          strokeLinecap="round"
-          vectorEffect="non-scaling-stroke"
-        >
-          <title>{LINE_LABEL[segment.key]}</title>
-        </path>
-      ))}
-    </svg>
+          {visible.has(IV_KEY) ? (
+            <Line
+              type="linear"
+              dataKey="iv"
+              name={LINE_LABEL.iv}
+              stroke={COLOUR.iv}
+              strokeWidth={2}
+              isAnimationActive={false}
+              // Dots, because this series is sparse by construction and a bare line
+              // through a handful of points renders as nothing at all. See the note at
+              // the head of this file.
+              dot={{ r: 3, fill: COLOUR.iv, strokeWidth: 0 }}
+              activeDot={{
+                r: 5,
+                fill: COLOUR.iv,
+                stroke: "var(--surface)",
+                strokeWidth: 2,
+              }}
+            />
+          ) : null}
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
   );
 }
 

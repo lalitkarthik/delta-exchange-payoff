@@ -116,6 +116,7 @@ from .volatility import (
     SPOT_SOURCE,
     BoundsResponse,
     VolatilitySeries,
+    contract_ivs_from_chains,
     lookback_bounds,
     volatility_series,
 )
@@ -774,6 +775,40 @@ class StoreVolatilitySource:
     def contract_ivs(self, underlying: str, **kwargs: Any) -> Any:
         return read_contract_ivs(self.computed, underlying, **kwargs)
 
+    def live_contract_ivs(self, underlying: str) -> Any:
+        """The chain cache's solved ladders as one more implied minute — the live edge.
+
+        The store flushes every five minutes, so without this the implied series stops
+        at the last flush and a screen showing "now" can be five minutes stale. The
+        cache holds one frame per contract and no history, so this adds exactly one
+        minute and could never add more.
+        """
+        stream = getattr(app.state, "stream", None)
+        if stream is None:
+            return {}
+        chains = [
+            chain
+            for chain in stream.computed_chains()
+            if chain.underlying == underlying
+        ]
+        minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        return contract_ivs_from_chains(chains, at=minute)
+
+
+def _implied_rows(source: Any, underlying: str) -> Any:
+    """Stored implied minutes, plus the live one if the cache has a solved ladder.
+
+    Both routes call this rather than reading the store directly, so `/volatility/bounds`
+    cannot compute a floor from one set of minutes while `/volatility` draws from
+    another — the floor is a quantile over exactly these minutes, so a difference of one
+    would be a difference in the answer.
+    """
+    rows = dict(source.contract_ivs(underlying))
+    live = getattr(source, "live_contract_ivs", None)
+    if live is not None:
+        rows.update(live(underlying))
+    return rows
+
 
 def _realised_bars(source: Any, underlying: str) -> tuple[Any, str]:
     """The realised series and the name of the table it came from. **#54.**
@@ -1020,7 +1055,7 @@ async def volatility_bounds(
     bars, _ = _realised_bars(source, symbol)
     bounds = lookback_bounds(
         spot_bars=bars,
-        iv_rows=source.contract_ivs(symbol),
+        iv_rows=_implied_rows(source, symbol),
         interval=INTERVALS[interval],
     )
     return BoundsResponse(
@@ -1082,7 +1117,7 @@ async def volatility(
 
     step_interval = INTERVALS[interval]
     bars, realised_source = _realised_bars(source, symbol)
-    iv_rows = source.contract_ivs(symbol)
+    iv_rows = _implied_rows(source, symbol)
     bounds = lookback_bounds(
         spot_bars=bars, iv_rows=iv_rows, interval=step_interval
     )

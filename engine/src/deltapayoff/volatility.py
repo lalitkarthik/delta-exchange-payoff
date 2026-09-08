@@ -19,7 +19,9 @@ unavailable rather than merely discouraged.
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections.abc import Iterable
 from datetime import datetime, timedelta
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -164,6 +166,17 @@ class VolatilitySeries(BaseModel):
     points: list[VolPoint]
 
 
+#: What share of the recorded minutes a lookback has to be serviceable at before it is
+#: offered. **Not a taste setting — it is what separates a line from a dot.** `atm_iv`
+#: refuses to extrapolate below the shortest expiry *at that minute*, so a floor taken
+#: from the shortest expiry seen anywhere in the range is serviceable at whichever
+#: minutes happened to list it and at no others. Measured on the stored data
+#: 2026-09-08: a 10-day tenor resolved at 24 of 108 minutes, all 24 inside one
+#: half-hour; 11.5 days resolved at 99. The reader would have read the first as a broken
+#: chart, and would have been reading a bound they were allowed to pick badly.
+TENOR_COVERAGE = 0.9
+
+
 def _listed_tenors(iv_rows: dict[datetime, list[ContractIv]]) -> list[float]:
     """Every expiry's days-to-run seen anywhere in the range, past the seven-day floor."""
     tenors: set[float] = set()
@@ -173,6 +186,93 @@ def _listed_tenors(iv_rows: dict[datetime, list[ContractIv]]) -> list[float]:
             if days >= MIN_EXPIRY_DAYS:
                 tenors.add(days)
     return sorted(tenors)
+
+
+def _serviceable_floor(iv_rows: dict[datetime, list[ContractIv]]) -> float | None:
+    """The shortest tenor `TENOR_COVERAGE` of the recorded minutes can bracket.
+
+    Each minute can serve a constant-maturity index no shorter than its own nearest
+    expiry past the seven-day floor; below that the index would have to extrapolate, and
+    it declines instead. So the question a slider's lower bound answers is not "what is
+    the nearest expiry anyone ever listed" but "what is the shortest tenor that most
+    minutes could actually answer" — and the two differ by the width of a whole chart.
+
+    A quantile rather than the maximum, because one thin minute holding a single far
+    expiry would otherwise push the floor out past every useful lookback: the stored
+    data's per-minute minima run from 7.24 to 84.24 days, and the 84 is one minute with
+    45 contract rows in it.
+    """
+    per_minute: list[float] = []
+    for rows in iv_rows.values():
+        usable = [
+            row.years_to_expiry * DAYS_PER_YEAR
+            for row in rows
+            if row.years_to_expiry * DAYS_PER_YEAR >= MIN_EXPIRY_DAYS
+        ]
+        if usable:
+            per_minute.append(min(usable))
+    if not per_minute:
+        return None
+    per_minute.sort()
+    index = min(len(per_minute) - 1, int(TENOR_COVERAGE * (len(per_minute) - 1)))
+    return per_minute[index]
+
+
+def contract_ivs_from_chains(
+    chains: Iterable[Any], *, at: datetime
+) -> dict[datetime, list[ContractIv]]:
+    """Solved ladders from the live cache as one minute of `ContractIv` rows.
+
+    **One minute, and only ever one.** `ChainStream` keeps the newest frame per contract
+    and no history at all — it is a latest-state cache by design, because a four-second
+    old quote is worthless to the ladder it feeds. So this is a live right edge for the
+    implied line, not a source of past points, and no amount of reading it differently
+    would make it one.
+
+    What it buys: the store flushes every five minutes, so without this the implied
+    series stops at the last flush and the newest thing on a screen showing "now" can be
+    five minutes stale. With it the implied line reaches the same instant the ladder
+    does.
+
+    The forward and the time to expiry come from the chain that carried them and are
+    never recomputed — `docs/implied-vol.md` §2.1 measures the forward as the axis IV
+    disagreement actually turns on, so deriving it a second way here would be a second
+    answer to a question already answered upstream.
+
+    A leg the solver declined contributes **no row**. A strike with no volatility is not
+    a strike at volatility zero, and a fabricated zero would drag the index's strike
+    interpolation toward nothing.
+    """
+    rows: list[ContractIv] = []
+    for chain in chains:
+        for row in getattr(chain, "rows", []) or []:
+            iv = _leg_iv(row)
+            if iv is None:
+                continue
+            rows.append(
+                ContractIv(
+                    expiry=chain.expiry,
+                    strike=row.strike,
+                    iv=iv,
+                    forward=chain.forward,
+                    years_to_expiry=chain.years_to_expiry,
+                )
+            )
+    return {at: rows} if rows else {}
+
+
+def _leg_iv(row: Any) -> float | None:
+    """The strike's volatility, from whichever leg carries it.
+
+    IV is a property of the strike rather than of the leg — it is solved from the
+    out-of-the-money side and written to both — so either leg answers and the first
+    present one is taken rather than averaged.
+    """
+    for leg in (getattr(row, "call", None), getattr(row, "put", None)):
+        computed = getattr(leg, "computed", None) if leg is not None else None
+        if computed is not None and computed.iv is not None:
+            return computed.iv
+    return None
 
 
 def lookback_bounds(
@@ -215,9 +315,16 @@ def lookback_bounds(
             ),
         )
 
-    min_days = max(observation_floor, tenors[0])
-    if min_days == observation_floor and observation_floor > tenors[0]:
+    serviceable = _serviceable_floor(iv_rows) or tenors[0]
+    min_days = max(observation_floor, serviceable)
+    if min_days == observation_floor and observation_floor > serviceable:
         lower_reason = f"{MIN_OBSERVATIONS} returns at this sampling interval"
+    elif serviceable > tenors[0]:
+        lower_reason = (
+            f"the shortest tenor most recorded minutes can bracket, "
+            f"{serviceable:.2f} days — a nearer expiry was listed at some minutes "
+            f"({tenors[0]:.2f} days) but the index declines to extrapolate at the rest"
+        )
     else:
         lower_reason = f"the shortest listed expiry, {tenors[0]:.2f} days"
 

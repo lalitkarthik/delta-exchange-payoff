@@ -8,9 +8,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from deltapayoff.iv_index import ContractIv
+from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
 from deltapayoff.realised_vol import Bar
-from deltapayoff.volatility import lookback_bounds, volatility_series
+from deltapayoff.volatility import (
+    contract_ivs_from_chains,
+    lookback_bounds,
+    volatility_series,
+)
 
 MINUTE = timedelta(minutes=1)
 HOUR = timedelta(hours=1)
@@ -426,3 +433,139 @@ def test_a_year_is_365_days_here_and_not_252() -> None:
     assert implied is not None
     with_252 = 0.40 * (10 / 252) ** 0.5
     assert abs(implied - with_252) > 0.01
+
+
+# ---------------------------------------------------------------------------
+# The floor is a tenor that resolves, not the shortest expiry ever listed.
+# ---------------------------------------------------------------------------
+
+
+def _leg(symbol: str, *, iv: float | None) -> Leg:
+    """A leg the way the live path builds one: Delta's fields, plus ours under `computed`.
+
+    IV sits at `leg.computed.iv` and never at `leg.iv` — the top-level `*_iv` fields are
+    Delta's own and are reference columns this engine never reads
+    (`tests/test_no_delta_inputs.py` pins that). A helper here rather than inline so a
+    test cannot accidentally assert against the venue's figure.
+    """
+    return Leg(symbol=symbol, computed=ComputedLeg(iv=iv, iv_leg="call" if iv else None))
+
+
+def _minute_with_shortest(shortest_days: float, at: datetime) -> list[ContractIv]:
+    """One minute's contract rows whose shortest usable expiry is `shortest_days`."""
+    return [
+        ContractIv(
+            expiry=f"{days:.0f}d",
+            strike=strike,
+            iv=0.4,
+            forward=80_000.0,
+            years_to_expiry=days / 365.0,
+        )
+        for days in (shortest_days, shortest_days + 30.0)
+        for strike in (79_500.0, 80_500.0)
+    ]
+
+
+def test_the_floor_is_a_tenor_most_minutes_can_actually_serve() -> None:
+    """One minute listing a 7.5-day expiry must not set the floor for all of them.
+
+    `atm_iv` refuses to extrapolate below the shortest expiry **at that minute**, so a
+    lookback chosen from the shortest expiry ever *seen anywhere in the range* resolves
+    at the handful of minutes that happened to list it and nowhere else. On the stored
+    data that is the difference between an implied line of 99 points and one of 24, all
+    24 inside a single half-hour — which draws as a dot and reads as a broken chart
+    rather than as a bound the reader was allowed to pick badly.
+
+    Nineteen minutes here cannot serve a tenor under 11 days and one can serve 7.5. The
+    floor must follow the nineteen.
+    """
+    at = datetime(2026, 9, 4, 6, 0, tzinfo=timezone.utc)
+    iv_rows = {
+        at + timedelta(minutes=n): _minute_with_shortest(11.0, at + timedelta(minutes=n))
+        for n in range(19)
+    }
+    iv_rows[at + timedelta(minutes=19)] = _minute_with_shortest(7.5, at)
+
+    bounds = lookback_bounds(
+        spot_bars=walking_bars(60 * 24 * 40),
+        iv_rows=iv_rows,
+        interval=timedelta(hours=1),
+    )
+
+    assert bounds.min_days == pytest.approx(11.0), (
+        "the floor must be a tenor most minutes bracket, not the one minute that "
+        f"listed a nearer expiry (got {bounds.min_days})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The live edge: the chain cache's solved ladders as one more implied minute.
+# ---------------------------------------------------------------------------
+
+
+def test_the_live_chain_becomes_one_implied_minute() -> None:
+    """Solved ladders from the cache convert to the same rows the store yields.
+
+    **The cache holds one frame per contract and no history**, so this can only ever add
+    the newest minute — it is a live right edge, not a backfill, and the function is
+    named for what it does rather than for what a reader might hope. What it buys is
+    that the implied line reaches *now* instead of stopping at the last flush, which on
+    a five-minute flush cadence is the difference between a chart that looks current and
+    one that looks stalled.
+
+    The forward and the time to expiry are taken from the chain that carried them, never
+    recomputed here: `docs/implied-vol.md` §2.1 measures the forward as the axis IV
+    disagreement turns on, so a second derivation of it would be a second answer.
+    """
+    at = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+    chain = ChainResponse(
+        underlying="BTC",
+        expiry="18-09-2026",
+        fetched_at=at.isoformat(),
+        spot=80_000.0,
+        forward=80_120.0,
+        years_to_expiry=0.0274,
+        atm_strike=80_000.0,
+        discount=0.999,
+        forward_method="F1",
+        rows=[
+            ChainRow(strike=80_000.0, call=_leg("C-80000", iv=0.42)),
+        ],
+    )
+
+    rows = contract_ivs_from_chains([chain], at=at)
+
+    assert list(rows) == [at]
+    assert [r.iv for r in rows[at]] == [0.42]
+    assert [r.strike for r in rows[at]] == [80_000.0]
+    assert [r.forward for r in rows[at]] == [80_120.0]
+    assert [r.years_to_expiry for r in rows[at]] == [0.0274]
+
+
+def test_a_leg_the_solver_declined_contributes_no_row() -> None:
+    """No IV, no row. A strike with no volatility is not a strike at volatility zero.
+
+    The same rule the ladder obeys on screen and the store obeys on disk: a declined
+    solve is an absence, and inventing a row for it would put a zero into the index's
+    strike interpolation, dragging the at-the-money figure toward nothing.
+    """
+    at = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+    chain = ChainResponse(
+        underlying="BTC",
+        expiry="18-09-2026",
+        fetched_at=at.isoformat(),
+        spot=80_000.0,
+        forward=80_120.0,
+        years_to_expiry=0.0274,
+        atm_strike=80_000.0,
+        discount=0.999,
+        forward_method="F1",
+        rows=[
+            ChainRow(strike=80_000.0, call=_leg("C-80000", iv=None)),
+            ChainRow(strike=80_500.0, call=_leg("C-80500", iv=0.39)),
+        ],
+    )
+
+    rows = contract_ivs_from_chains([chain], at=at)
+
+    assert [r.strike for r in rows[at]] == [80_500.0]
