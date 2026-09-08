@@ -16,9 +16,12 @@ export default function SmileNote() {
       the dots are the volatilities the engine solved and the segments between them are
       straight, because a spline would put a number between two strikes in exactly the
       place a reader would take one off. A dotted vertical rule is a strike that arrived
-      with no solved volatility — the line breaks there and is never drawn through it,
-      and it breaks the same way at a strike this minute stored no row for at all.
-      Both x-axes are one linear scale in strike, read once as a strike and once as an
+      with no solved volatility — the line breaks there and is never drawn through it.
+      A strike this minute stored no row for at all breaks the line the same way but
+      draws a fainter, sparser rule than the solver&rsquo;s own — the coverage line above
+      the chart counts both kinds separately for the minute on screen, because one is a
+      claim about the solver and the other is only an admission that the record is
+      silent. Both x-axes are one linear scale in strike, read once as a strike and once as an
       offset from the forward, which is why their ticks are evenly spaced; the strike
       axis is the whole day&rsquo;s board, so it holds still while the scrubber moves.
       Hover any point for the strike, the volatility, its offset from the forward, the

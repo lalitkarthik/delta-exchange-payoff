@@ -10,7 +10,15 @@
  */
 import type { ChartOverlay } from "./overlay";
 import { linearTicks, logDomain, logTicks, offsetTicks, paddedDomain, tickDecimals } from "./scale";
-import { OVERLAY_COLUMN, solvedPercents, unsolvedStrikes, type SmileRow } from "./smile";
+import {
+  notStoredStrikes,
+  OVERLAY_COLUMN,
+  smileCoverage,
+  solvedPercents,
+  unsolvedStrikes,
+  type SmileCoverage,
+  type SmileRow,
+} from "./smile";
 
 /** Roughly how many ticks each axis wants. Chosen for a 900-ish pixel plot. */
 const STRIKE_TICK_TARGET = 8;
@@ -34,6 +42,10 @@ export interface SmileChartModel {
   useLog: boolean;
   ivDecimals: number;
   unsolved: number[];
+  /** Board strikes this minute never stored a row for — see `notStoredStrikes`. */
+  notStored: number[];
+  /** The minute's coverage of the board, for the caption beside the chart. */
+  coverage: SmileCoverage;
   byStrike: Map<number, SmileRow>;
 }
 
@@ -96,6 +108,10 @@ export function smileChartModel(
     // primary curve alone. An overlay's own refusals belong to another minute and
     // marking them here would put that minute's failures on this one's axis.
     unsolved: unsolvedStrikes(rows),
+    // Read off the primary curve for the same reason: a strike another minute never
+    // stored says nothing about this one's board coverage.
+    notStored: notStoredStrikes(rows),
+    coverage: smileCoverage(rows),
     byStrike: new Map(rows.map((row) => [row.strike, row])),
   };
 }
