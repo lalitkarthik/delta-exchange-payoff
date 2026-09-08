@@ -94,6 +94,11 @@ class SubscribedOnlySocket:
         #: Symbols this connection has been told about, from its own subscribe frames.
         self.subscribed: set[str] = set()
         self.delivered: list[str] = []
+        self.dropped = False
+
+    def drop(self) -> None:
+        """Pull the cable: the next read raises, as a real dropped connection does."""
+        self.dropped = True
 
     async def send(self, raw: str) -> None:
         message = json.loads(raw)
@@ -105,6 +110,8 @@ class SubscribedOnlySocket:
 
     async def recv(self) -> str:
         while True:
+            if self.dropped:
+                raise ConnectionResetError("scripted drop")
             for index, frame in enumerate(self.frames):
                 if frame["sy"] in self.subscribed:
                     del self.frames[index]
@@ -333,9 +340,8 @@ def test_a_relisted_contract_is_replayed_on_the_redial() -> None:
         adapter.subscribe([late])
         await asyncio.sleep(0.1)
         # The connection drops. The controller redials and the fresh socket is replayed.
-        await sockets[0].__aexit__()
-        adapter.feed._socket = None
-        await asyncio.sleep(0.2)
+        sockets[0].drop()
+        await asyncio.sleep(0.3)
         controller.stop()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -344,6 +350,11 @@ def test_a_relisted_contract_is_replayed_on_the_redial() -> None:
 
     assert adapter.feed.registry["ticker"] == {EARLY, LATE}
     assert sockets[0].subscribed == {EARLY, LATE}, "the live addition never went out"
+    assert len(handed) == 2, "the drop was not redialled, so nothing replayed"
+    assert sockets[1].subscribed == {EARLY, LATE}, (
+        "the replay lost the contract that arrived after the first open — a subset "
+        "replay is the healthy-connection-zero-messages failure with no error"
+    )
 
 
 # --- what it says out loud --------------------------------------------------------
