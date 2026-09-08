@@ -308,6 +308,13 @@ Three failure decisions worth knowing:
   `chain()`, which would move a chain build onto the writer's drain loop, and not the live
   dictionary, which the loop may be replacing entries in while the writer walks it.
 
+> **Stale since #44.** There are now two passes, not one. The 100 ms loop calls
+> `recompute_watched` and covers only the `(underlying, expiry)` pairs an open `/ws/chain`
+> connection has registered, plus a 30 s grace after the last leaves; a separate pass runs
+> once a minute over the rest and hands its ladders to the bar writer. The writer's own
+> periodic sample takes `live_computed_chains()`, the narrower list.
+> See [design/lld/chain-cache.md](design/lld/chain-cache.md) §4.
+
 ---
 
 ## 7. The pricing core
@@ -409,8 +416,9 @@ with no translation:
 | D | `spot-bars` | one row per minute per **underlying**, never per contract | `ticker` |
 
 **Table C is the odd one and for a good reason:** our numbers are not on the wire. They are
-made by the recompute loop, so the writer reads `ChainStream.computed_chains()` once as
-each minute closes rather than folding ticks. It is the one place in `store.py` that reads
+made by the recompute loop, so the writer reads the chain cache rather than folding ticks.
+(Since #44 it reads `live_computed_chains()` on its own timer and is handed the rest by the
+minute pass; see [design/lld/chain-cache.md](design/lld/chain-cache.md) §6.) It is the one place in `store.py` that reads
 something other than its own queue — and it is handed the stream's *reader*, not the
 stream, so the store never learns a chain cache exists.
 
