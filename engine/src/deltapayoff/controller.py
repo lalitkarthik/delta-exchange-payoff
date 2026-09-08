@@ -68,7 +68,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .adapters.base import Adapter, ConnectionSignal
-from .events import Alert, ConnectionState, Event, FeedConnection, Heartbeat
+from .events import (
+    Alert,
+    ConnectionState,
+    ControlCommand,
+    Event,
+    FeedConnection,
+    Heartbeat,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +125,11 @@ REASON_SILENT = "silent"
 REASON_CLOSED = "closed"
 REASON_BACKOFF = "backoff"
 REASON_STOPPED = "stopped"
+#: **A deliberate stop, and the tenth reason** — added by #41 with the commands. It is
+#: not `stopped` because the two are not the same fact: `stopped` is what a spent budget
+#: and a shutdown say, and an operator reading a badge needs to know that *this* one was
+#: asked for. A pause spends no budget and counts no drop for the same reason.
+REASON_PAUSED = "paused"
 
 
 class IllegalTransition(RuntimeError):
@@ -270,6 +282,29 @@ class ConnectionController:
         #: whether `run()` redials when `stream` returns. See `_attempt_forever`.
         self._socket_closed = False
 
+        #: The `reason` of the most recent transition, `None` before the first. On
+        #: `/health` since #41, because a report that says `stopped` and not *why* cannot
+        #: tell a paused connection from one whose budget is spent — and those are an
+        #: operator's own action against the loudest failure this engine has.
+        self._reason: str | None = None
+
+        #: Whether an operator's `pause` is in force. **The one thing that stops
+        #: `_attempt_forever` returning when the connection is `stopped`**: a paused
+        #: controller parks on `_resumed` with its adapter un-stopped and its
+        #: subscriptions intact, so a `resume` is a dial rather than a restart.
+        self._paused = False
+        #: Set by `resume`, cleared by `pause`. The park's own wake-up.
+        self._resumed = asyncio.Event()
+        #: The task running `adapter.stream`, while one is running. **The handle a
+        #: command needs to force a socket down** — see `_cut`.
+        self._stream: asyncio.Future[None] | None = None
+        #: Which command cut the current stream, until the loop has read it. **Not
+        #: `self._paused`**, because a `resume` can land in the window between the cancel
+        #: and its delivery: the loop would then find the flag already cleared and read a
+        #: paused stream as an adapter that had finished, and return out of `run()` with
+        #: the connection sitting in `connecting` and nothing dialling it.
+        self._cut_by: str | None = None
+
         #: Whether this controller is on the adapter's connection register. Tracked so
         #: that attaching and detaching are both idempotent.
         self._attached = False
@@ -316,6 +351,16 @@ class ConnectionController:
     def state(self) -> ConnectionState | None:
         """`None` only before `start()`. Every other moment is one of the five."""
         return self._state
+
+    @property
+    def reason(self) -> str | None:
+        """Why the connection is in the state it is in. `None` before the first move."""
+        return self._reason
+
+    @property
+    def paused(self) -> bool:
+        """Whether an operator's `pause` is in force. Only `resume` clears it."""
+        return self._paused
 
     @property
     def last_message_at(self) -> float | None:
@@ -376,6 +421,125 @@ class ConnectionController:
         if self._state is None or self._state is State.STOPPED:
             return
         self.transition(State.STOPPED, reason, detail)
+
+    # --- the three commands (#41) ---------------------------------------------------
+
+    def command(self, event: ControlCommand) -> bool:
+        """One `control.command`. **Ignores every command not addressed to us.**
+
+        Returns whether this controller took it, so `supervisor.FeedSupervisor` can hand
+        one command to every controller and stop at the one it names, rather than each
+        knowing about the others. A command for an adapter nobody runs is answered by the
+        route, which refuses an unknown name before anything is published at all.
+        """
+        if event.adapter != self.adapter_name:
+            return False
+        {"pause": self.pause, "resume": self.resume, "reconnect": self.reconnect}[
+            event.command
+        ]()
+        return True
+
+    def pause(self) -> None:
+        """Stop this connection **without spending any budget**. Idempotent.
+
+        A pause is a deliberate stop and the whole point of the verb is that it is not a
+        failure: the budget is a count of times a connection *failed* and came back, and
+        an operator pausing a venue for a maintenance window who found the feed one drop
+        nearer giving up would be punished for saying what they were about to do anyway.
+
+        **Nothing is torn down.** The adapter is not `stop()`ped — that flag is permanent
+        by design, `adapters/base.py` says so, and a paused feed has to be able to dial
+        again — so the socket is cut instead and the subscription registry survives
+        untouched, which is what makes `resume` a redial rather than a restart. The
+        transition is made **before** the cut, so that the `CLOSED` an adapter might
+        still report arrives at a machine already `stopped` and is refused there too.
+        """
+        if self._paused:
+            return
+        self._paused = True
+        self._resumed.clear()
+        if self._state is not None and self._state is not State.STOPPED:
+            self.transition(State.STOPPED, REASON_PAUSED)
+        self._cut(REASON_PAUSED, "paused by an operator")
+
+    def resume(self) -> None:
+        """Start a paused connection again: `stopped -> connecting`, reason `resume`.
+
+        **Only a paused connection resumes**, and that is a refusal rather than an
+        oversight. The other way to reach `stopped` is a spent budget, and that one has
+        already left `run()` — the dial loop returned, the adapter was stopped for good
+        and the listener detached. Moving such a controller to `connecting` would put a
+        state on `/health` and on the badge that nothing was working to make true: a feed
+        reported as coming up that will never dial. It says so in the log instead, and
+        `docs/design/lld/commands.md` records what reviving that one would take.
+
+        **The budget is restored in full and the backoff with it.** An operator's resume
+        is the same assertion a delivered frame makes — this endpoint is worth trying —
+        and it is the only assertion available while nothing is connected. Resuming with
+        three of ten left is a feed that gives up in the middle of the night over drops
+        that predate the person who asked for it.
+        """
+        if not self._paused:
+            logger.info(
+                "feed connection %s: resume ignored; it is %s and not paused",
+                self.adapter_name,
+                "unstarted" if self._state is None else self._state.value,
+            )
+            return
+        self._paused = False
+        self._budget_spent = 0
+        self._delay = self.retry_delay
+        self._socket_closed = False
+        self.start()
+        self._resumed.set()
+
+    def reconnect(self) -> None:
+        """Force the socket down and let the ordinary close handling take it from there.
+
+        **This is the member `docs/design/lld/reconnect.md` §4 said was missing.** A
+        connection the staleness watchdog has called `reconnecting` — open as far as TCP
+        is concerned and silent as far as we are concerned — sat there until the venue
+        or a restart ended it, because `stop()` is permanent and nothing else could reach
+        the socket. Now it can, and the recovery stops being a person's.
+
+        Nothing here decides anything: the cut produces the same `reconnecting ->
+        connecting -> connected` a real drop does, spends the same one of the budget,
+        and has it restored in full by the first frame off the new socket. A commanded
+        reconnect that could not be told from a real one in the events is the point —
+        `control.command` on the bus is what says a person asked.
+        """
+        if self._state is None or self._state is State.STOPPED:
+            logger.info(
+                "feed connection %s: reconnect ignored; it is %s",
+                self.adapter_name,
+                "unstarted" if self._state is None else self._state.value,
+            )
+            return
+        self._cut("reconnect", "reconnect asked for by an operator")
+        self.connection_closed("reconnect asked for by an operator")
+
+    def _cut(self, by: str, detail: str) -> None:
+        """Cancel the running `adapter.stream`, which drops the socket under it.
+
+        **Synchronous and non-blocking**, which is why the route can answer with a report
+        that is already true — see `main.feed_command`. Cancelling is the lever rather
+        than a new protocol member: `stream` owns its socket inside an `async with`, so a
+        cancellation unwinds it and closes the socket on the way out, and it works for
+        every adapter that implements the protocol at all rather than only the ones that
+        remembered to add a `drop`. `adapters/base.Adapter` is unchanged at eight members.
+
+        A cancelled `stream` reports **no close**, on every adapter, because the ending is
+        ours and not the venue's. That is what makes `pause` cost no budget without a
+        special case, and it is why `reconnect` reports the drop itself.
+        """
+        stream = self._stream
+        if stream is None or stream.done():
+            return
+        logger.info(
+            "feed connection %s: cutting the socket (%s)", self.adapter_name, detail
+        )
+        self._cut_by = by
+        stream.cancel()
 
     def message_arrived(self, now: float | None = None) -> None:
         """An event came off the adapter. Resets the age, the budget and the backoff.
@@ -622,7 +786,11 @@ class ConnectionController:
         The timer is a **separate task**, not a timeout on the read: a controller that
         only woke when a message arrived could never notice that none had.
         """
-        self.start()
+        # A controller paused before it ever ran stays unstarted rather than announcing
+        # `connecting` over a dial the loop is about to park instead of making. The
+        # supervisor reports an unstarted controller as `stopped`, which is what it is.
+        if not self._paused:
+            self.start()
         timer = asyncio.ensure_future(self._tick_forever())
         try:
             await self._attempt_forever()
@@ -664,12 +832,30 @@ class ConnectionController:
         `stop()` returns without reporting a close, on purpose, because a stop is not a
         drop; and a `reconnecting` the *staleness watchdog* reached — a socket the venue
         never closed and merely stopped speaking on — is a state, not a dead socket, and
-        redialling it would be dialling over a connection that is still open. Forcing
-        that one down needs a member the protocol does not have; it is #41's `reconnect`
-        command, and `docs/design/lld/reconnect.md` §4 records the gap.
+        redialling it would be dialling over a connection that is still open. **#41
+        forces that one down** — `reconnect` cuts the stream and reports the drop itself,
+        so it arrives here as an ordinary one. `_cut` is how, and it needed no new
+        protocol member after all; `docs/design/lld/reconnect.md` §4 recorded the gap.
+
+        **A pause parks here rather than returning**, which is #41's one change to this
+        loop. Returning would run `run()`'s `finally`, and that stops the adapter for
+        good and detaches the listener — so the resume that the whole verb exists for
+        would have nothing left to dial with. Parked, the controller keeps its
+        subscriptions, its adapter and its place on the connection register, and
+        `resume` is one `Event.set` away from the next attempt.
         """
         while True:
-            await self._adapter.stream(self.sink)
+            if self._paused:
+                await self._resumed.wait()
+            await self._stream_once()
+            cut_by, self._cut_by = self._cut_by, None
+            if cut_by == REASON_PAUSED or self._paused:
+                # A `pause` ended that stream. Back to the top, where this parks — and
+                # **not** through the endings below, which would read a deliberate stop
+                # as a drop or as the adapter being finished. Straight past the park if
+                # a `resume` has already landed, which is the whole reason the flag the
+                # loop reads is the cut and not `self._paused`.
+                continue
             if self._state is State.STOPPED or not self._socket_closed:
                 return
             # The wait grows per consecutive failed attempt and is restored in full by
@@ -695,6 +881,33 @@ class ConnectionController:
                 self.transition(
                     State.CONNECTING, REASON_BACKOFF, f"redialling after {waited:.1f}s"
                 )
+
+    async def _stream_once(self) -> None:
+        """One connection, run as a **task this controller can cancel**. #41's seam.
+
+        `_attempt_forever` used to await `adapter.stream` directly, which left nothing
+        holding the connection: the only way to end one early was `adapter.stop()`, and
+        that flag is permanent. Running it as a task gives `_cut` a handle, and the
+        cancellation unwinds `stream`'s own `async with` so the socket closes on the way
+        out — no protocol change, and it works for any adapter rather than the ones that
+        implemented a new member.
+
+        **`gather(..., return_exceptions=True)` and not a bare `except`**, for the
+        difference between the two cancellations: the *stream's*, which is ours and comes
+        back here as a value to ignore, and this coroutine's own — a shutdown cancelling
+        the controller's task — which `gather` re-raises, as it must. A bare
+        `except CancelledError` cannot tell them apart and would swallow the shutdown.
+        Anything else the adapter raised is re-raised unchanged, as before.
+        """
+        self._stream = asyncio.ensure_future(self._adapter.stream(self.sink))
+        try:
+            (ended,) = await asyncio.gather(self._stream, return_exceptions=True)
+        finally:
+            self._stream = None
+        if isinstance(ended, BaseException) and not isinstance(
+            ended, asyncio.CancelledError
+        ):
+            raise ended
 
     async def _tick_forever(self) -> None:
         """Poll until cancelled. **A poll that raises must not end the watchdog.**
@@ -744,6 +957,7 @@ class ConnectionController:
         if (from_state, to_state) not in ALLOWED:
             raise IllegalTransition(from_state, to_state)
         self._state = to_state
+        self._reason = reason
         self._entered_at = self._clock()
         self.transitions += 1
         event = FeedConnection(

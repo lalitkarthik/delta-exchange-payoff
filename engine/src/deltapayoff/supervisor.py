@@ -43,7 +43,7 @@ from datetime import UTC, datetime, timedelta
 
 from .adapters.base import Adapter
 from .controller import ConnectionController
-from .events import ConnectionState, Event
+from .events import ConnectionState, ControlCommand, Event
 from .models import AdapterHealth, HealthReport
 
 logger = logging.getLogger(__name__)
@@ -107,6 +107,7 @@ class FeedSupervisor:
         controllers exist and are listening from this moment; `aclose()` is what takes
         them back off, and it is why this class owns them rather than handing them out.
         """
+        self._publish = publish
         self._controllers = [
             controller_factory(adapter, publish, **controller_kwargs)
             for adapter in adapters
@@ -122,6 +123,31 @@ class FeedSupervisor:
     def state(self) -> ConnectionState:
         """The worst state among the controllers. **The feed's state.**"""
         return worst(controller.state for controller in self._controllers)
+
+    def names(self) -> list[str]:
+        """The adapters this supervisor runs, in configured order. For #41's route.
+
+        A route that has to refuse an unknown adapter by name needs to know which names
+        exist, and asking each controller for its own is the only place that is true —
+        the configured list and the running controllers cannot disagree if there is one
+        of them.
+        """
+        return [controller.adapter_name for controller in self._controllers]
+
+    def command(self, event: ControlCommand) -> bool:
+        """Put one `control.command` on the bus, then hand it to the adapter it names.
+
+        **The bus first, the effect second**, so that a log read in order shows the cause
+        before the `feed.connection` events it produced. Both happen inside this call —
+        see `docs/design/lld/commands.md` §3 for why delivery is synchronous rather than
+        a consumer task, and what that buys the route that publishes it.
+
+        Returns whether any controller took it. `False` cannot happen through the route,
+        which refuses an unknown adapter before publishing anything; it is here so that a
+        second caller — a replay, a future broker — is not left guessing.
+        """
+        self._publish(event)
+        return any(controller.command(event) for controller in self._controllers)
 
     def start(self) -> None:
         """One task per controller. Idempotent; a second call starts nothing new."""
@@ -190,6 +216,7 @@ def _adapter_health(controller: ConnectionController, now: datetime) -> AdapterH
     return AdapterHealth(
         adapter=controller.adapter_name,
         state=controller.state or UNSTARTED,
+        reason=controller.reason,
         last_message_at=None if age is None else now - timedelta(seconds=age),
         last_message_age_seconds=None if age is None else round(age, 3),
         reconnects=controller.reconnects,
