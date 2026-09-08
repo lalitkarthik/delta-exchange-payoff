@@ -47,11 +47,13 @@ indicator.
 | `adapter` | the venue name, e.g. `"DELTA"` — matches `/health`'s `adapters[].adapter` |
 | `state` | one of the five states below |
 | `since` | ISO 8601 UTC, second precision, `Z`-suffixed — when the engine last **told a browser** the feed entered this state (see "Coalescing", below; not necessarily the instant the controller itself transitioned) |
-| `reason` | one of the nine stable reasons below, or `""` |
+| `reason` | one of the ten stable reasons below, or `""` |
 
 Five states, `docs/design/events.md`'s `ConnectionState`: `connecting`, `connected`,
-`degraded`, `reconnecting`, `stopped`. Nine reasons, all stable and greppable:
-`start`, `resume`, `open`, `message`, `stale`, `silent`, `closed`, `backoff`, `stopped`.
+`degraded`, `reconnecting`, `stopped`. Ten reasons, all stable and greppable: `start`,
+`resume`, `open`, `message`, `stale`, `silent`, `closed`, `backoff`, `stopped`, and
+`paused` since #41 — a `stopped` an operator asked for rather than one the engine chose,
+which the badge shows on hover and `/health` now carries too.
 
 **Sent once on accept, with the feed's state as of that moment, before any `chain` or
 `waiting`.** A browser that connects mid-outage must not render a ladder for one push

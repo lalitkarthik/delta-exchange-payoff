@@ -272,6 +272,12 @@ class AdapterHealth(BaseModel):
     #: One of the five. `stopped` for a controller that was never started, because a
     #: connection nobody started is not running and `null` would be a sixth state.
     state: ConnectionState
+    #: Why it is in that state — the `reason` of its last transition, one of the short
+    #: stable names in `controller.py`. `null` before a controller has ever moved.
+    #: **Added by #41**, because `stopped` alone cannot tell an operator's own `pause`
+    #: from a spent reconnect budget, and those are the two ends of the range: one is
+    #: what somebody just asked for, the other the loudest failure this engine has.
+    reason: str | None = None
     #: When the last message arrived, wall clock, or `null` if none ever has. **Derived
     #: from the age at request time**, because the controller measures on a monotonic
     #: clock — the only kind a staleness bound can be measured on.

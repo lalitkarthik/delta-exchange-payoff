@@ -134,17 +134,20 @@ Eight travel outbound from a producer to the bus. One travels inbound.
   error.
 - **Payload** `severity`, `code` (a short stable name), `detail`, and `adapter` where one applies.
 - **Codes emitted so far.** The controller (#38): `connection_silent`, when silence passes
-  `reconnect_after` and forces `-> reconnecting`; and `poll_failing`, when the staleness
-  watchdog's own polls keep raising. **`degraded` does not alert** — fifteen quiet seconds is
-  already a badge and a heartbeat, and an alert on every quiet minute is the flood an alert
-  exists to stand out from. The budget codes are #39's, which owns the budget.
+  `reconnect_after` and forces `-> reconnecting`; and `poll_failing`, when the watchdog's own
+  polls keep raising. **`degraded` does not alert, and nor does a `pause`** — fifteen quiet
+  seconds is already a badge and a heartbeat, a pause is something a person just did, and an
+  alert on either is the flood an alert exists to stand out from. Budget codes are #39's.
 
 ### `control.command` — the one inbound event
 
-- **Direction** inbound. **Emitted by** an operator, over a route (#41).
-- **Consumed by** the supervisor, which hands it to the named controller.
-- **When** on demand. Effects: `pause` → `stopped` **without spending reconnect budget**;
-  `resume` → `connecting`; `reconnect` → close the socket and enter `reconnecting`.
+- **Direction** inbound. **By** an operator, over `POST /feed/{adapter}/{command}` (#41).
+- **Consumed by** `supervisor.FeedSupervisor`, which publishes it and then offers it to every
+  controller; the one whose adapter it names takes it. **Delivered synchronously inside that
+  publish, not through a queue** — `docs/design/lld/commands.md` §3 says why.
+- **When** on demand. Effects: `pause` → `stopped`, reason `paused`, **spending no reconnect
+  budget**; `resume` → `connecting`, budget restored in full; `reconnect` → cut the socket
+  and let ordinary close handling reach `reconnecting`.
 - **Payload** `adapter`, `command` (one of `pause`, `resume`, `reconnect`).
 
 ---
