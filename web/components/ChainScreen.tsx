@@ -16,7 +16,13 @@ import {
 } from "@/lib/contract";
 import { ENGINE_URL, loadChainAt, loadChainMinutes, loadExpiries } from "@/lib/engine";
 import { looksCanonical } from "@/lib/instrument";
-import { LIVE_STATUS_LABEL, subscribeChain, type LiveStatus } from "@/lib/live";
+import {
+  feedBadge,
+  LIVE_STATUS_LABEL,
+  subscribeChain,
+  type FeedStatus,
+  type LiveStatus,
+} from "@/lib/live";
 import { formatFetchedAt, formatFetchedClock, formatSpot } from "@/lib/format";
 import { positionOf } from "@/lib/position";
 import { clampIndex, lastIndex } from "@/lib/timeline";
@@ -109,6 +115,10 @@ export default function ChainScreen({
   const [liveChain, setLiveChain] = useState<ChainResponse | null>(null);
   const [liveStatus, setLiveStatus] = useState<LiveStatus>("connecting");
   const [liveStatusDetail, setLiveStatusDetail] = useState<string | null>(null);
+
+  /** The venue feed's own state, #40 — distinct from `liveStatus` above, which is this
+   * browser's socket to the engine. `null` until the engine's first `feed` message. */
+  const [feedStatus, setFeedStatus] = useState<FeedStatus | null>(null);
 
   const [historicalChain, setHistoricalChain] = useState<HistoricalChain | null>(null);
   const [historicalWaiting, setHistoricalWaiting] = useState(false);
@@ -206,12 +216,14 @@ export default function ChainScreen({
   useEffect(() => {
     if (!expiry || !following) return;
     setLiveChain(null);
+    setFeedStatus(null);
     return subscribeChain(underlying, expiry, {
       onChain: setLiveChain,
       onStatus: (next, detail) => {
         setLiveStatus(next);
         setLiveStatusDetail(detail ?? null);
       },
+      onFeed: setFeedStatus,
     });
   }, [underlying, expiry, following]);
 
@@ -308,6 +320,11 @@ export default function ChainScreen({
    */
   const chain = following ? liveChain : historicalChain;
 
+  /** `null` while standing on a stored minute: there is no subscription then, and
+   * `feedStatus` is whatever the live feed last reported before the reader pinned a
+   * minute — showing it would describe a connection this screen is no longer using. */
+  const badge = following ? feedBadge(feedStatus) : null;
+
   return (
     <div className="shell">
       <header className="header">
@@ -377,6 +394,17 @@ export default function ChainScreen({
         >
           {following ? LIVE_STATUS_LABEL[liveStatus] : "history"}
         </span>
+
+        {/* The venue feed's own state, #40 — beside the chip above and never merged
+            into it. That chip is this browser's socket to the engine; this badge is
+            the engine's socket to Delta, and the two are shown side by side because
+            they can disagree: the chip can read "live" while this reads "reconnecting".
+            Absent entirely for `connected` and whenever there is nothing to report. */}
+        {badge ? (
+          <span className="feed-badge" data-state={badge.state} title={badge.reason || undefined}>
+            {badge.label}
+          </span>
+        ) : null}
 
         <RecordingToggle />
 
