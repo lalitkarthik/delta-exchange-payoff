@@ -91,10 +91,10 @@ operator's attention, whether or not it succeeds.
 The venue was asked what it lists and something came back that was not subscribed yet.
 Info, carrying `underlying`, `listed` (how many were new) and `subscribed` (the registry's
 size after them). Once per underlying at start-up with the whole listing, then only when
-the venue lists something — a few times a day. **Warning on the other path**: the listing
-could not be read, so this cycle found nothing and the next retries — a gap in the record
-rather than a failure of the feed, which is why it is not `engine.error`. #51 cost six and
-a half hours of one night's strikes because neither sentence existed to be logged.
+the venue lists something — a few times a day. **Warning on the two failing paths**: the
+listing could not be read, or the subscribe did not reach an open socket. Both are gaps in
+the record rather than failures of the feed, which is why neither is `engine.error`. #51
+cost six and a half hours of one night's strikes because none of this existed to be read.
 
 ### `store.flush`
 

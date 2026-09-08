@@ -85,6 +85,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from .. import log_events
+from ..logging_setup import log_event
+
 logger = logging.getLogger(__name__)
 
 #: What an attempt that opened and delivered nothing is called, in the close it
@@ -254,6 +257,12 @@ class DeltaFeed:
         connection down over a subscribe that missed would turn a recoverable gap into an
         outage. The socket is passed in rather than read off `self`, so a send scheduled
         against one connection can never be delivered to its successor.
+
+        **Under `feed.instruments`, the same name `main` uses**, because this is the other
+        way the discovery can fail to land — and a failure that cannot be filtered for is
+        the failure #51 spent six hours being. It is the only `log_event` call in this
+        package; every other record here is a detail of one connection, and this one is a
+        gap in the record.
         """
         try:
             await socket.send(
@@ -262,11 +271,15 @@ class DeltaFeed:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.warning(
+            log_event(
+                logger,
+                logging.WARNING,
+                log_events.FEED_INSTRUMENTS,
                 "subscribing %d newly listed %s symbols on the open socket failed; "
                 "they stay in the registry and go out on the next open",
                 len(symbols),
                 channel,
+                listed=len(symbols),
                 exc_info=True,
             )
 
