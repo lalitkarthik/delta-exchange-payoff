@@ -274,7 +274,9 @@ class AdapterHealth(BaseModel):
     last_message_at: datetime | None = None
     #: Seconds since that message, or `null`. An unknown age, not an age of zero.
     last_message_age_seconds: float | None = None
-    #: Times this connection has entered `reconnecting` since the process started.
+    #: Times this connection has **dropped** since the process started — the count the
+    #: controller spends its budget against, not the number of entries into
+    #: `reconnecting`, which the staleness watchdog can reach without a drop.
     reconnects: int
     #: Reconnects left before the connection gives up for good. Restored in full by any
     #: message arriving, so a healthy feed sits at the configured budget.

@@ -358,8 +358,11 @@ class DeltaFeed:
         state machine is made of. `delivered` is still computed here — the counter is
         read across the whole attempt rather than returned by `_pump`, since a dropped
         connection leaves `_pump` by raising and a returned flag is lost on exactly the
-        path that matters most — and it is reported as `last_error` being cleared or set,
-        which is the fact the controller reads to decide whether the budget is restored.
+        path that matters most — and it becomes the `CLOSED` signal's detail, which is
+        what reaches a listener and the log. **The controller does not read `last_error`
+        at all**: the budget is restored in `message_arrived`, by frames arriving through
+        the sink, not by anything this module reports. An earlier draft of #39 said
+        otherwise and the code never did it.
 
         A `stop()` before this runs opens nothing, and the flag is never cleared, so a
         stopped feed stays stopped.

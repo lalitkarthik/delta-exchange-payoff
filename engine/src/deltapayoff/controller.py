@@ -250,7 +250,11 @@ class ConnectionController:
 
         #: Transitions since construction, for `/health` in #39.
         self.transitions = 0
-        #: Times this connection has entered `reconnecting`, for `/health`. A count and
+        #: Times this connection has **dropped**, for `/health` — incremented in
+        #: `connection_closed`, beside the budget it spends. Deliberately not a count of
+        #: entries into `reconnecting`: the watchdog reaches that state on its own over a
+        #: socket the venue has not closed, and a close arriving at a machine already
+        #: there still counts. A count and
         #: not a rate: a reader comparing two polls of `/health` gets the rate, and a
         #: rate computed here would need a window nobody agreed on.
         self.reconnects = 0
