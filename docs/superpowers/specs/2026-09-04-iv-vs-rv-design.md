@@ -222,7 +222,7 @@ Parent: **#24**.
 
 | | | | Landed as |
 |---|---|---|---|
-| **R1** | [#25](https://github.com/lalitkarthik/delta-exchange-payoff/issues/25) | Probe the index price history, and write down what it actually serves | `tools/probe_index_history.py`, `docs/index-history.md` — probe built, **venue unreachable from this machine, recorded as unreachable and not as absent** |
+| **R1** | [#25](https://github.com/lalitkarthik/delta-exchange-payoff/issues/25) | Probe the index price history, and write down what it actually serves | `tools/probe_index_history.py`, `docs/index-history.md` — **measured 2026-09-08**: `.DEXBTUSD` serves 1m candles back to ~2023-12-20 and **does not pad**. The earlier "venue unreachable" verdict was this machine's MTU, not Delta |
 | **R2** | [#26](https://github.com/lalitkarthik/delta-exchange-payoff/issues/26) | The five estimators, pure and test-first | `engine/src/deltapayoff/realised_vol.py` |
 | **R3** | [#27](https://github.com/lalitkarthik/delta-exchange-payoff/issues/27) | The constant-maturity ATM IV index | `engine/src/deltapayoff/iv_index.py` |
 | **R4** | [#28](https://github.com/lalitkarthik/delta-exchange-payoff/issues/28) | The endpoint that serves both series at one N | `engine/src/deltapayoff/volatility.py`, `GET /volatility` and `/volatility/bounds` |
