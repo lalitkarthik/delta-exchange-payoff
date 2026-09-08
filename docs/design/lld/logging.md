@@ -89,12 +89,12 @@ operator's attention, whether or not it succeeds.
 ### `feed.instruments`
 
 The venue was asked what it lists and something came back that was not subscribed yet.
-Info, carrying `underlying`, `listed` (how many were new) and `subscribed` (the registry's
-size after them). Once per underlying at start-up with the whole listing, then only when
-the venue lists something — a few times a day. **Warning on the two failing paths**: the
-listing could not be read, or the subscribe did not reach an open socket. Both are gaps in
-the record rather than failures of the feed, which is why neither is `engine.error`. #51
-cost six and a half hours of one night's strikes because none of this existed to be read.
+Info, carrying `underlying`, `listed` (how many were new) and `subscribed` (how many this
+engine has now subscribed for that underlying — not the socket registry, which is the
+union across them). Once per underlying at start-up, then only when the venue lists
+something. **Warning on two paths**: the listing could not be read, or an open socket
+refused the subscribe. Both are gaps in the record rather than failures of the feed, which
+is why neither is `engine.error`. #51 cost six and a half hours of one night's strikes.
 
 ### `store.flush`
 

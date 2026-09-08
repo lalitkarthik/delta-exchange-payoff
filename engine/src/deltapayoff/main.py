@@ -412,9 +412,10 @@ async def relist_instruments(stack: FeedStack) -> int:
     frame. The cost of keeping is a replay that grows by one day's expired contracts per
     day the process runs — `assumed` to be tolerable for a process restarted more often
     than weekly, and made visible rather than merely assumed: the `subscribed` count on
-    every record below is the registry's current size, so the growth is in the log where
-    an operator can see it. `docs/design/lld/relisting.md` §5 records the threshold at
-    which this has to be revisited.
+    every record below is how many contracts this engine holds for that underlying — not
+    the socket registry, which is their union per channel — so the growth is in the log,
+    beside the venue's own listing size it can be compared against.
+    `docs/design/lld/relisting.md` §5 records the threshold at which this is revisited.
 
     Returns how many contracts were newly subscribed. Raises whatever the venue read
     raises — the caller decides whether that is fatal, and the two callers differ.

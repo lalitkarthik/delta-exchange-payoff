@@ -256,15 +256,19 @@ def test_a_contract_listed_after_start_up_reaches_all_four_tables(
     socket = SubscribedOnlySocket(
         [book_frame(LATE, now_us), ticker_frame(LATE, now_us + 1_000)]
     )
-    wire_the_app(monkeypatch, tmp_path, socket)
+    wire_the_app(monkeypatch, tmp_path, socket, relist_interval=0.25)
 
     with TestClient(main.app) as client:
-        assert client.get("/health").status_code == 200
-        # The first listing knows nothing about it: the venue had not listed it yet.
+        # **First, before anything else in this block.** These two are pre-conditions and
+        # the re-list is already ticking, so every millisecond spent here — an HTTP round
+        # trip most of all — is a millisecond in which they can stop being true on a
+        # loaded machine, and a failure of a pre-condition reads as a failure of the
+        # thing under test.
         assert main.app.state.stack.listed == {"BTC": {EARLY}}
         assert LATE not in socket.subscribed
+        assert client.get("/health").status_code == 200
 
-        time.sleep(1.0)  # several re-list ticks and two shortened minute passes
+        time.sleep(2.0)  # several re-list ticks and a shortened minute pass or two
 
         assert LATE in socket.subscribed, "the late listing never reached the open socket"
         assert socket.delivered, "the venue delivered nothing for it"
@@ -441,11 +445,16 @@ def test_a_listing_that_cannot_be_read_warns_and_leaves_the_feed_alone(
 def test_an_unanswerable_venue_at_start_up_is_still_fatal() -> None:
     """The other half of the same decision, and why they cannot be one call site.
 
-    `start_feed_stack` documents that nothing is started when the venue cannot be asked
-    what it lists: a feed that connected with an empty registry is the silent failure the
-    socket owner exists to prevent. The periodic path deliberately swallows the same
-    error. So the first listing is `relist_instruments` called directly, not the loop's
-    first tick.
+    **Driven through `start_feed_stack`, not through `relist_instruments`**, because the
+    claim is about what does *not* get started: `relist_instruments` contains no exception
+    handling at all, so asserting that it propagates would pin nothing but the absence of
+    a `try` nobody wrote. What matters is that the supervisor was never started and no
+    background task exists — a feed that connected with an empty registry is the silent
+    failure the socket owner exists to prevent.
+
+    The periodic path deliberately swallows the same error. That is why the first listing
+    is a direct call and not the loop's first tick: one call site cannot be both fatal and
+    forgiving.
     """
 
     class _Unavailable:
@@ -458,10 +467,34 @@ def test_an_unanswerable_venue_at_start_up_is_still_fatal() -> None:
         def subscribe(self, instruments) -> None:  # pragma: no cover - never reached
             raise AssertionError("nothing was listed, so nothing may be subscribed")
 
+    class _Supervisor:
+        def __init__(self) -> None:
+            self.started = False
+
+        def start(self) -> None:
+            self.started = True
+
+    class _Runnable:
+        """A stream and a writer that would happily start, so that the assertions below
+        are what fails if start-up ever stops being fatal — not an `AttributeError` from
+        a double too thin to get that far."""
+
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+        def sample_chains(self, chains) -> None:  # pragma: no cover - never called
+            return None
+
+    supervisor = _Supervisor()
+    runnable = _Runnable()
     stack = main.FeedStack(
-        events=None, stream=None, writer=None, adapter=_Unavailable(),
-        supervisor=None, feed_cache=None,
+        events=None, stream=runnable, writer=runnable, adapter=_Unavailable(),
+        supervisor=supervisor, feed_cache=None,
     )
 
     with pytest.raises(TimeoutError):
-        asyncio.run(main.relist_instruments(stack))
+        asyncio.run(main.start_feed_stack(stack))
+
+    assert not supervisor.started, "the feed was connected with an empty registry"
+    assert stack.tasks == [], "background tasks were started over an unlisted venue"
+    assert stack.listed == {}
