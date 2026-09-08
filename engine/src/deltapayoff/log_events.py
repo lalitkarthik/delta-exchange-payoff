@@ -21,6 +21,12 @@ FEED_STALE = "feed.stale"
 #: bound, or an attempt being dialled. Warning, because a reconnect is always worth an
 #: operator's attention even when it succeeds.
 FEED_RECONNECT = "feed.reconnect"
+#: The venue was asked what it lists and something was subscribed as a result. Info,
+#: with the underlying, how many contracts were new and how many are now subscribed —
+#: and **warning when the listing could not be read at all**, which is a gap in the
+#: record rather than a failure of the feed. Issue #51 existed for six and a half hours
+#: of one night's data because nothing anywhere said either sentence.
+FEED_INSTRUMENTS = "feed.instruments"
 #: A `store.BarStore.flush()` wrote a file. Info, with the table, the rows, the file and
 #: the time it took — the numbers an operator wants after the three-day hole.
 STORE_FLUSH = "store.flush"
@@ -51,6 +57,7 @@ ALL = frozenset(
         FEED_TRANSITION,
         FEED_STALE,
         FEED_RECONNECT,
+        FEED_INSTRUMENTS,
         STORE_FLUSH,
         QUEUE_DROP,
         COMPUTE_RECOMPUTE_SET,
