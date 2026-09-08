@@ -297,12 +297,12 @@ class _NoFeed:
 # --- which underlyings are recorded ----------------------------------------------
 
 
-def test_btc_alone_unless_the_environment_says_otherwise(monkeypatch) -> None:
-    """ETH is #43, and #33 requires the feed's rate and bandwidth measured for sixty
-    seconds after it is enabled before the cost is called fine."""
+def test_btc_and_eth_unless_the_environment_says_otherwise(monkeypatch) -> None:
+    """#43 measured the feed's rate and bandwidth for sixty seconds with ETH enabled and
+    recorded it in the HLD, so the default recorded set is now both."""
     monkeypatch.delenv(main.LIVE_UNDERLYINGS_ENV, raising=False)
 
-    assert main.live_underlyings() == ("BTC",)
+    assert main.live_underlyings() == ("BTC", "ETH")
 
 
 def test_the_recorded_set_is_configuration(monkeypatch) -> None:
@@ -327,13 +327,14 @@ def test_an_underlying_delta_does_not_list_is_refused_loudly(
     assert any("DOGE" in record.getMessage() for record in caplog.records)
 
 
-def test_a_configuration_naming_nothing_valid_still_records_btc(
+def test_a_configuration_naming_nothing_valid_still_records_the_default(
     monkeypatch, caplog
 ) -> None:
-    """Recording BTC is a better answer to a bad config line than recording nothing."""
+    """Recording the default set is a better answer to a bad config line than recording
+    nothing."""
     monkeypatch.setenv(main.LIVE_UNDERLYINGS_ENV, "DOGE")
 
     with caplog.at_level(logging.ERROR, logger=main.logger.name):
-        assert main.live_underlyings() == ("BTC",)
+        assert main.live_underlyings() == ("BTC", "ETH")
 
     assert caplog.records, "it fell back silently"

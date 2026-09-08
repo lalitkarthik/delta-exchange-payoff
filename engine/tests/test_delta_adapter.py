@@ -137,6 +137,20 @@ def test_delta_s_symbol_becomes_a_canonical_instrument() -> None:
     assert instrument.canonical() == "DELTA-BTC-20260904-77600-C"
 
 
+def test_eth_s_symbol_becomes_a_canonical_instrument_too() -> None:
+    """The decode reads the underlying out of the symbol; it never assumed BTC. #43
+    changes which underlyings are subscribed, not this boundary — this pins that the
+    boundary already had no BTC-only assumption baked into it to find."""
+    instrument = instrument_from_symbol("P-ETH-3600-080926")
+
+    assert instrument is not None
+    assert instrument.underlying == "ETH"
+    assert instrument.expiry == date(2026, 9, 8)
+    assert instrument.strike == Decimal("3600")
+    assert instrument.right is Right.PUT
+    assert instrument.canonical() == "DELTA-ETH-20260908-3600-P"
+
+
 @pytest.mark.parametrize(
     "symbol",
     [
@@ -645,8 +659,10 @@ def test_the_protocol_check_can_actually_fail() -> None:
 
 
 def test_the_adapter_describes_itself() -> None:
-    """The recorded set is configuration, read at start-up. BTC alone for now: ETH is
-    #43 and the cost of adding it has not been measured."""
+    """The recorded set is configuration, read at start-up and passed in by the caller.
+    `DeltaAdapter`'s own constructor default is BTC alone — a safe fallback for a caller
+    that builds one without saying — which is a class default, not `main.py`'s: since #43
+    `main.live_underlyings()` always passes both explicitly."""
     delta = adapter(underlyings=("btc", "eth"))
 
     assert delta.venue == VENUE
