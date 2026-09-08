@@ -13,6 +13,7 @@ subscribes every live BTC option over a real websocket at start-up.
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 import pytest
@@ -230,3 +231,49 @@ def test_a_negative_interval_is_floored_too(live_stream) -> None:
         elapsed = time.perf_counter() - started
 
     assert elapsed >= MIN_PUSH_INTERVAL_SECONDS
+
+
+def test_the_socket_logs_attach_and_detach_at_debug(
+    live_stream, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#42: each websocket client attaching and detaching, at debug — one pair per
+    connection, not one line per push, however many chains were sent while it was open."""
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.main")
+    client = TestClient(app)
+
+    with client.websocket_connect(
+        f"/ws/chain?underlying=BTC&expiry={EXPIRY}&interval=0.02"
+    ) as socket:
+        socket.receive_text()
+        socket.receive_text()
+        socket.receive_text()
+
+    records = [
+        r
+        for r in caplog.records
+        if r.event in ("ws.client_attach", "ws.client_detach")
+    ]
+    assert [r.event for r in records] == ["ws.client_attach", "ws.client_detach"]
+    assert all(r.levelno == logging.DEBUG for r in records)
+    assert all(r.underlying == "BTC" for r in records)
+    assert all(r.expiry == EXPIRY for r in records)
+
+
+def test_a_refused_handshake_still_detaches(
+    live_stream, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bad parameter closes the socket before the push loop ever starts. The attach
+    already happened at `accept()`, so the detach must still fire, or a run of bad
+    requests would look like a run of connections that never closed."""
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.main")
+    client = TestClient(app)
+
+    with client.websocket_connect(f"/ws/chain?underlying=DOGE&expiry={EXPIRY}"):
+        pass
+
+    records = [
+        r
+        for r in caplog.records
+        if r.event in ("ws.client_attach", "ws.client_detach")
+    ]
+    assert [r.event for r in records] == ["ws.client_attach", "ws.client_detach"]

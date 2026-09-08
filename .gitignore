@@ -31,3 +31,7 @@ data/
 # local dev server logs
 *.log
 *.log.err
+
+# #42: the engine's structured JSON-lines logs, one file per UTC day. Operational
+# output, not source — never committed, the same reasoning as data/ above.
+logs/
