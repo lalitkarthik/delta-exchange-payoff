@@ -38,9 +38,25 @@ argument and returns, and a twenty-second silence costs a test nothing while sti
 assertable as twenty seconds. That is what makes staleness detection testable at all —
 #38's degraded bound is 15 s (`assumed`, `hld.md` §5), and no suite may sit through it.
 
-**`stream` returns when the script is exhausted.** A real adapter's `stream` returns when
-it is stopped or when its reconnect budget is spent; a script running out is the same kind
-of ending, and it means a test can simply `await adapter.stream(publish)` and then assert.
+**`stream` returns when the script is exhausted**, and a test can simply
+`await adapter.stream(publish)` and then assert.
+
+**Where this double and the real adapter deliberately part company, since #39.** A real
+`stream` is now *one connection*: it dials, replays, pumps, and returns when that socket
+ends — backoff, the lifetime budget and the decision to redial moved up into
+`controller.ConnectionController`. This double instead walks a whole script in one
+`stream` call, and its `Close` verb reconnects **inside itself**: `closes`, `connections`
+and `replays` all grow without the controller being asked for anything.
+
+That is on purpose and `docs/design/lld/reconnect.md` §7 records why — a fake that made
+the controller dial would be testing the controller's loop through a double of it. But it
+means **a reconnect asserted only against this file proves nothing about the code that
+dials**, which is why the redial tests in `test_controller.py` drive the real `DeltaFeed`
+over a scripted socket instead. Read `Close` here as "the connection dropped and came
+back", not as "the controller redialled".
+
+(This paragraph replaces one that still described the pre-#39 contract — that a real
+adapter's `stream` returns when its budget is spent. It does not have a budget any more.)
 
 ---
 

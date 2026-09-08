@@ -1393,9 +1393,28 @@ class _StubFeed:
     def __init__(self, fanout) -> None:
         self.fanout = fanout
         self.registry: dict[str, list[str]] = {}
+        self._stopping = False
 
     def subscribe(self, channel: str, symbols) -> None:
         self.registry.setdefault(channel, []).extend(symbols)
+
+    def on_open(self, listener) -> None:
+        return None
+
+    def on_close(self, listener) -> None:
+        return None
+
+    def off_open(self, listener) -> None:
+        return None
+
+    def off_close(self, listener) -> None:
+        return None
+
+    def stop(self) -> None:
+        """**Needed since #39**: the supervisor stops each controller on the way down,
+        and a controller stops the adapter under it. A double missing this member let
+        the shutdown path raise where the real feed would not."""
+        self._stopping = True
 
     async def run(self) -> None:
         await asyncio.Event().wait()
