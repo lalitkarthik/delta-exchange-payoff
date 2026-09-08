@@ -164,6 +164,149 @@ def test_symbols_registered_before_connecting_are_not_lost() -> None:
     assert sorted(symbols) == sorted(CHAIN)
 
 
+async def subscribe_while_connected(feed, channel, symbols, seconds=0.1, stop=True):
+    """Open the socket, subscribe `symbols` once it is up, then end the connection.
+
+    The sleep either side is what makes this a *live* subscribe rather than another
+    registration before the open: the first lets `_pump` reach its read, the second lets
+    the send this triggers actually run before the connection is torn down.
+
+    `stop=False` ends the attempt without setting the stop flag, because `stop()` is
+    deliberately permanent — a stopped feed stays stopped — and a test that wants a
+    second connection out of the same feed must not have asked for the first to be the
+    last.
+    """
+    task = asyncio.create_task(feed.run())
+    await asyncio.sleep(seconds)
+    feed.subscribe(channel, symbols)
+    await asyncio.sleep(seconds)
+    if stop:
+        feed.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+def subscribes(socket):
+    """Every subscribe message sent, one dict of channel to symbols per message."""
+    return [
+        {
+            entry["name"]: sorted(entry["symbols"])
+            for entry in message["payload"]["channels"]
+        }
+        for message in socket.sent
+        if message.get("type") == "subscribe"
+    ]
+
+
+def test_a_symbol_registered_while_the_socket_is_open_is_sent_to_the_venue() -> None:
+    """**Issue #51's other half.** The registry is not the subscription.
+
+    `subscribe` used to only accumulate: the frame that tells Delta about a symbol was
+    sent in `_pump`, once, at open. So a contract listed after the socket came up sat in
+    the registry unsubscribed until the next reconnect — and a healthy feed does not
+    reconnect. Re-listing on a cadence fixes nothing without this.
+
+    Only the newly added symbols go out. Re-sending the whole registry would work too —
+    Delta answers a subscribe with the book's current state — but it would answer for
+    every already-subscribed contract as well, which on a 782-contract feed is a burst of
+    snapshots to say nothing new.
+    """
+    socket = FakeSocket([])
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
+    feed.subscribe("ticker", CHAIN)
+
+    asyncio.run(subscribe_while_connected(feed, "ticker", ["C-BTC-78000-040926"]))
+
+    assert subscribes(socket) == [
+        {"ticker": sorted(CHAIN)},
+        {"ticker": ["C-BTC-78000-040926"]},
+    ], "the newly listed contract never reached the open socket"
+
+
+def test_a_symbol_already_in_the_registry_is_not_sent_again() -> None:
+    """Re-listing hands the same contracts back every cycle. Only the difference is new.
+
+    Without this the venue would be sent the whole chain every re-list, and every one of
+    them would be answered with a fresh snapshot — a periodic burst on a feed whose whole
+    design is that the socket reader is never made to wait.
+    """
+    socket = FakeSocket([])
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
+    feed.subscribe("ticker", CHAIN)
+
+    asyncio.run(subscribe_while_connected(feed, "ticker", CHAIN))
+
+    assert subscribes(socket) == [
+        {"ticker": sorted(CHAIN)}
+    ], "the same symbols went out twice"
+
+
+def test_a_symbol_registered_with_no_socket_open_is_sent_on_the_next_open() -> None:
+    """The pre-#51 behaviour, still intact: registering before the socket exists is safe
+    and is not a send. This is the branch that must not reach for a socket that is not
+    there — `subscribe` is called from `start_feed_stack` before anything dials."""
+    socket = FakeSocket([])
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
+    feed.subscribe("ticker", CHAIN)
+    feed.subscribe("ticker", ["C-BTC-78000-040926"])
+
+    assert socket.sent == []
+
+    asyncio.run(drive(feed))
+
+    assert subscribes(socket) == [{"ticker": sorted([*CHAIN, "C-BTC-78000-040926"])}]
+
+
+def test_a_symbol_added_while_connected_is_replayed_on_the_next_open() -> None:
+    """The addition joins the replay, which is what makes it survive a reconnect.
+
+    A live subscribe that reached the venue but not the registry would work until the
+    first drop and then silently stop — the same failure #51 is, one connection later.
+    """
+    first = FakeSocket([])
+    second = FakeSocket([])
+    feed = DeltaFeed(FanOut(), connect=connector([first, second]))
+    feed.subscribe("ticker", CHAIN)
+
+    asyncio.run(
+        subscribe_while_connected(feed, "ticker", ["C-BTC-78000-040926"], stop=False)
+    )
+    asyncio.run(drive(feed))
+
+    assert subscribes(second) == [{"ticker": sorted([*CHAIN, "C-BTC-78000-040926"])}]
+
+
+def test_a_live_subscribe_that_fails_leaves_the_feed_running_and_the_registry_intact(
+    caplog,
+) -> None:
+    """A send that misses is a gap, not an outage.
+
+    The symbols are in the registry before anything is sent, so the next open replays
+    them whatever happened here; letting the exception out would instead end a connection
+    that is otherwise delivering, which is a much worse trade than a delayed subscribe.
+    """
+
+    class RefusingSocket(FakeSocket):
+        async def send(self, raw):
+            message = json.loads(raw)
+            if message["payload"]["channels"][0]["symbols"] == ["C-BTC-78000-040926"]:
+                raise ConnectionResetError("scripted send failure")
+            self.sent.append(message)
+
+    socket = RefusingSocket([])
+    feed = DeltaFeed(FanOut(), connect=connector([socket]))
+    feed.subscribe("ticker", CHAIN)
+
+    with caplog.at_level("WARNING", logger="deltapayoff.adapters.delta_socket"):
+        asyncio.run(subscribe_while_connected(feed, "ticker", ["C-BTC-78000-040926"]))
+
+    assert feed.registry["ticker"] == {*CHAIN, "C-BTC-78000-040926"}
+    assert feed.last_error is None or "scripted send failure" not in feed.last_error
+    assert any(
+        "newly listed" in record.message for record in caplog.records
+    ), "a subscribe that never reached the venue said nothing"
+
+
 # --- reconnecting ----------------------------------------------------------------
 
 

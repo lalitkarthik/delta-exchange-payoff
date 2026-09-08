@@ -49,6 +49,13 @@ you get a healthy connection, zero messages, and a screen that quietly stops upd
 symbol rather than per message for the reason OpenAlgo gives: a message-keyed registry
 replays a whole batch when one symbol inside it is rejected.
 
+**Since #51 the replay is not the only send.** Registering used to be the whole of
+subscribing, so a contract the venue listed after the socket came up was never told to it
+— invisible until a reconnect happened to replay it, and a healthy feed does not
+reconnect. `subscribe` now sends the difference to the connection it is holding, if it is
+holding one. Still additive, still never cleared: the replay above is undisturbed and only
+ever carries more. `docs/design/lld/relisting.md` is the design.
+
 **Nothing here decodes anything, since #36.** This module used to turn a frame into a
 quote record by calling `wire`, which meant the venue's array offsets were read by the
 socket owner — so "the wire layout lives behind the adapter" was not true of the code. It
@@ -183,6 +190,17 @@ class DeltaFeed:
         self._on_open: list[Callable[[str], None]] = []
         self._on_close: list[Callable[[str], None]] = []
 
+        #: The socket currently being pumped, or `None` between connections. **Added in
+        #: #51**, and it exists for exactly one reason: `subscribe` has to be able to
+        #: tell whether a symbol it has just registered still has an open connection to
+        #: be told about. Before this, the registry was sent once per open and a contract
+        #: listed after that sat unsubscribed until the next reconnect — which on a
+        #: healthy feed never comes.
+        self._socket: Any | None = None
+        #: In-flight live subscribe sends, held so the loop cannot garbage-collect a task
+        #: nothing else refers to. Cancelled with the connection they belong to.
+        self._sends: set[asyncio.Task] = set()
+
     @staticmethod
     def _default_connect(url: str):
         import websockets
@@ -190,17 +208,67 @@ class DeltaFeed:
         return websockets.connect(url, open_timeout=20)
 
     def subscribe(self, channel: str, symbols: list[str]) -> None:
-        """Register symbols. Safe before the socket exists.
+        """Register symbols, and tell an open socket about the ones that are new.
 
         Accepting subscriptions before connecting removes a start-up race the caller
         would otherwise have to know about: they accumulate here and are sent on open.
+
+        **Since #51 registering is not the whole of subscribing.** The registry used to
+        be sent exactly once per connection, in `_pump`, so a contract the venue listed
+        after the socket came up was registered and never subscribed — invisible until a
+        reconnect happened to replay it, and a healthy feed does not reconnect. That is
+        issue #51's second half: re-listing on a cadence discovers nothing if the
+        discovery cannot reach the connection that is already up.
+
+        **Additive, and only the difference goes out.** The registry is still never
+        cleared and nothing is ever unsubscribed, so the replay a reconnect performs is
+        undisturbed — it simply carries more. Sending the whole registry again would also
+        work, but Delta answers a subscribe with the current book, so it would answer for
+        every contract already on the socket: a burst of several hundred snapshot frames
+        to say nothing new.
+
+        Synchronous and never blocking, as the callers require. The send is a task,
+        because a socket that is open is a socket a loop is running.
         """
         if channel not in CHANNELS:
             raise ValueError(
                 f"channel must be one of {', '.join(CHANNELS)}; got {channel!r}. "
                 "Delta retired v2/ticker, l1_orderbook and l2_orderbook on 31 July 2026."
             )
-        self.registry.setdefault(channel, set()).update(symbols)
+        registered = self.registry.setdefault(channel, set())
+        fresh = sorted(set(symbols) - registered)
+        registered.update(symbols)
+        socket = self._socket
+        if fresh and socket is not None:
+            task = asyncio.get_running_loop().create_task(
+                self._send_subscribe(socket, channel, fresh)
+            )
+            self._sends.add(task)
+            task.add_done_callback(self._sends.discard)
+
+    async def _send_subscribe(self, socket, channel: str, symbols: list[str]) -> None:
+        """One subscribe frame for one channel, on a connection that is already up.
+
+        **A failure here is a warning and nothing more.** The symbols are already in the
+        registry, so the next open replays them whatever happens to this send; taking the
+        connection down over a subscribe that missed would turn a recoverable gap into an
+        outage. The socket is passed in rather than read off `self`, so a send scheduled
+        against one connection can never be delivered to its successor.
+        """
+        try:
+            await socket.send(
+                self._subscribe_frame([{"name": channel, "symbols": symbols}])
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "subscribing %d newly listed %s symbols on the open socket failed; "
+                "they stay in the registry and go out on the next open",
+                len(symbols),
+                channel,
+                exc_info=True,
+            )
 
     def on_open(self, listener: Callable[[str], None]) -> None:
         """Be told when the socket is up **and resubscribed**. Safe before it exists."""
@@ -269,6 +337,12 @@ class DeltaFeed:
         ]
         if not channels:
             return None
+        return self._subscribe_frame(channels)
+
+    @staticmethod
+    def _subscribe_frame(channels: list[dict[str, Any]]) -> str:
+        """The venue's subscribe message. One spelling, used by the replay and by #51's
+        live additions, so the two cannot drift into two shapes of the same frame."""
         return json.dumps({"type": "subscribe", "payload": {"channels": channels}})
 
     @staticmethod
@@ -314,6 +388,11 @@ class DeltaFeed:
             # green badge, one moment earlier.
             self._tell(self._on_open, self.url)
 
+        # **After the replay, and not before.** From here a `subscribe` finds an open
+        # socket and sends the difference itself (#51); doing that before the replay had
+        # gone out would let a symbol be sent twice, or ahead of the set it belongs to.
+        self._socket = socket
+
         heartbeat = asyncio.create_task(self._heartbeat(socket))
         try:
             while not self._stopping:
@@ -333,8 +412,16 @@ class DeltaFeed:
                 if venue_message is not None:
                     self.sink.publish(venue_message)
         finally:
+            # This connection is over, so nothing may be sent on it again: a live
+            # subscribe still in flight would be writing to a closed socket, and one
+            # scheduled after this point must wait for the next open's replay instead.
+            self._socket = None
+            # A snapshot, because each task's own done callback removes it from the set.
+            sends = list(self._sends)
+            for send in sends:
+                send.cancel()
             heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+            await asyncio.gather(heartbeat, *sends, return_exceptions=True)
 
     async def _heartbeat(self, socket) -> None:
         while True:
