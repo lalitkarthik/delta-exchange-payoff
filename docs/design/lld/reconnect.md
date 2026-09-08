@@ -100,17 +100,18 @@ state alone would reconnect straight through a shutdown.
 
 ### The gap this leaves, and whose it is
 
-**A silence-driven `reconnecting` marks the state and alerts, but does not force the
-socket down.** Doing that needs a way to say "drop the connection you have and open
-another", and `adapters.base.Adapter` has no such member — `stop()` is permanent. So a
-connection that goes silent past `reconnect_after` without the venue closing it will sit
-in `reconnecting`, saying so on `/health` and on the badge, until the socket really does
-end or the process is restarted.
+**Closed by #41, and not the way this section predicted.** A silence-driven `reconnecting`
+marked the state and alerted but could not force the socket down, so a connection that went
+quiet without the venue closing it sat there until the socket really ended or the process
+was restarted. This section expected the fix to be a new member on `adapters.base.Adapter`,
+since `stop()` is permanent and nothing else reaches the socket.
 
-That is honest but incomplete, and **it belongs to #41**, which adds the commands: a
-`reconnect` command needs exactly this member, and adding it here would have been
-designing #41's protocol change from outside it. Until then the alert and the state are
-the report; the recovery is a person's.
+**No member was added.** `ConnectionController` now runs `adapter.stream` as a task it
+holds and cancels it, and the cancellation unwinds `stream`'s own `async with`, closing the
+socket on the way out — so the protocol stays at eight members and every adapter gets the
+behaviour rather than the ones that remembered a new method. The `reconnect` command is
+that cut plus the controller reporting the drop itself, because a cancelled stream reports
+no close. [commands.md](commands.md) §4 is the design.
 
 ## 5. Announcing the attempt, not its success
 

@@ -15,7 +15,7 @@ what it forbids.
 
 ---
 
-## The four causes
+## The five causes
 
 The machine is **synchronous** and driven by one method per cause, which is what makes it
 testable without a clock or an event loop:
@@ -24,6 +24,8 @@ testable without a clock or an event loop:
 * `connection_opened()` / `connection_closed(reason)` — the adapter's socket signal.
 * `poll(now)` — the staleness timer fired; also the heartbeat's cadence.
 * `stop(reason)` / `start()` — stopped or started by request.
+* `command(event)` — an operator's `pause`, `resume` or `reconnect`, off
+  `control.command`.
 
 `run()` wires the ones that need a clock to a real one and is the only async thing here.
 A test drives `poll` itself, and a twenty-second silence costs it nothing.
@@ -53,9 +55,18 @@ its socket had come or gone, and then no way to stop listening. Two signals, `OP
 `CLOSED`; synchronous and non-blocking for the same reason `Publish` is, since the socket
 reader calls it between reads. `docs/design/lld/connection-signal.md` is the design.
 
+## The three commands
+
+`pause`, `resume` and `reconnect` arrive as `control.command` and are #41's. A pause is a
+**deliberate** stop — reason `paused`, no budget spent, the socket cut and the
+subscriptions kept — so the dial loop parks instead of returning and a resume is a redial
+rather than a restart. Forcing a socket down needed no new protocol member in the end:
+`stream` runs as a task the controller cancels. `docs/design/lld/commands.md` is that
+design.
+
 The full table and every number are in `docs/design/lld/controller.md`; the reconnect half
 is `docs/design/lld/reconnect.md`; `supervisor.FeedSupervisor` owns one of these per
-adapter and answers `/health` for all of them.
+adapter, answers `/health` for all of them and routes the commands to them.
 """
 
 from __future__ import annotations
