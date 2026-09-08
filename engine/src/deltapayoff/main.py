@@ -182,10 +182,12 @@ LIVE_UNDERLYINGS_ENV = "DELTA_LIVE_UNDERLYINGS"
 #: gap this store can even express. Five minutes would lose five bars of every new strike
 #: for nothing but a saved REST call.
 #:
-#: Not faster, either. This is `/v2/tickers` with no expiry filter — the heaviest read
-#: this engine makes, `measured` 2026-09-08 by `tools/measure_relist.py` — against a
-#: listing that changes a few times a day. Below a minute it re-reads the same answer
-#: several times per bar it could not have improved.
+#: Not faster, either. This is `/v2/tickers` with no expiry filter, the heaviest read this
+#: engine makes: `measured` 2026-09-08 by `tools/probe_relist.py`, BTC is 520 contracts,
+#: 644.8 KB and 735 ms, ETH 278 contracts, 342.2 KB and 737 ms. At this cadence that is
+#: `derived` 987 KB a minute against the feed's own `measured` 843.4 KB/s — about 2% more
+#: traffic — for a listing that changes a few times a day. Below a minute it re-reads the
+#: same answer several times per bar it could not have improved.
 RELIST_INTERVAL_SECONDS = 60.0
 
 #: The most points `/volatility` will put in one response unless asked for fewer.
