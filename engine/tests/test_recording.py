@@ -420,6 +420,11 @@ def test_the_live_routes_keep_answering_while_recording_is_off(
         "/ws/chain?underlying=BTC&expiry=04-09-2026&interval=0.02"
     ) as socket:
         message = socket.receive_json()
+        # #40: a real supervisor answers `feed` first, ahead of the ladder — this test
+        # is about the ladder still being pushed, not about the envelope, so it reads
+        # past the one message the badge added rather than asserting on it here.
+        if message["type"] == "feed":
+            message = socket.receive_json()
     assert message["type"] in {"chain", "waiting"}, message
 
 
