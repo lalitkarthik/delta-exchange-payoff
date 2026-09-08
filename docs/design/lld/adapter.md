@@ -108,6 +108,9 @@ All `measured` from the 2026-09-03 captures; tags in §10.
   and 11 carry an open interest of exactly zero, so both halves of §4's rule are live.
 - **Two ticker body fields reach no event**: `pb`, the price band, and `m24hc` — seen and
   skipped. **The decode is not the hot path**: `derived` 1.3% of a core.
+- **ETH's `ob_l2` refreshes at BTC's own 502–508 ms** — `measured` 2026-09-08, no per-underlying
+  branch needed. `ticker` reads 4,999 ms for BTC and 5,330 ms for ETH over a 60 s window, a gap a
+  ~5 s period's noise at 12 samples cannot rule out; a longer run is what would tell the two apart.
 
 ## 6. The shim, and the four fields it existed for
 
@@ -198,3 +201,4 @@ function via `tests/fakes/decoder.py`, so none drifts from it.
 | Decode 30.6 µs per book frame, 43.6 µs per ticker frame | `measured` | 20 passes over the captures, this session |
 | ≈1.3% of one core to decode the live BTC feed — 4.9% against the contested higher rate in `hld.md` §5. The wire decode inside it already ran in the socket reader before #36; only the event construction is new | `derived` | the two above against `docs/ingestion.md`'s 267.7 and 117.6 msg/s |
 | Live: `/health` ok, `/ws/chain` a 21-row ladder after 5 `waiting` messages (spot 79634.8, forward 79642.12, 42 legs with our IV), 4 Parquet files at 412,100 bytes, 7,385 rows written | `measured` | engine run 2026-09-07T13:24:41Z, 410 s, BTC only |
+| BTC alone 504 contracts, 1,095.1 msg/s, 547.3 KB/s; BTC+ETH 782 contracts, 1,693.6 msg/s, 843.4 KB/s, both channels, 60 s each | `measured` | `tools/measure_feed.py --underlyings`, 2026-09-08, full detail in `../hld.md` §5 |
