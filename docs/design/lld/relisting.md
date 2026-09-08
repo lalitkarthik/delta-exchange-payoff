@@ -101,7 +101,10 @@ construction.
 
 The cost of keeping is a replay that grows by roughly one day's expired contracts per day
 the process runs. It is made visible rather than merely assumed: every `feed.instruments`
-record carries `subscribed`, the registry's current size, so the growth is in the log.
+record carries `subscribed`, how many contracts this engine has subscribed for that
+underlying. It is deliberately **per underlying and not the socket registry's size**,
+which is their union per channel, because the comparison the threshold below asks for —
+against the venue's own listing for that underlying — is the one an operator can make.
 
 **The threshold.** The largest subscribe frame anyone has measured Delta accepting is
 **520 symbols per channel** — the live re-list in §6, 2026-09-08 — over `probe_ws.py`'s

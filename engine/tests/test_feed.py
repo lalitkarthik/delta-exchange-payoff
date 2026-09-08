@@ -258,10 +258,14 @@ def test_a_symbol_registered_with_no_socket_open_is_sent_on_the_next_open() -> N
 
 
 def test_a_symbol_added_while_connected_is_replayed_on_the_next_open() -> None:
-    """The addition joins the replay, which is what makes it survive a reconnect.
+    """One addition, asserted **on both connections**: the live send and then the replay.
 
-    A live subscribe that reached the venue but not the registry would work until the
-    first drop and then silently stop — the same failure #51 is, one connection later.
+    Either assertion alone is weak. That the second socket receives the union is true of
+    the registry replay whether or not #51 ever happened, because `subscribe` writes the
+    registry unconditionally — so on its own it pins nothing this ticket added. That the
+    first socket was told live is #51's fix but says nothing about surviving a drop. The
+    pair is the claim: the contract reached the connection that was up, *and* it reached
+    the one that replaced it.
     """
     first = FakeSocket([])
     second = FakeSocket([])
@@ -273,7 +277,13 @@ def test_a_symbol_added_while_connected_is_replayed_on_the_next_open() -> None:
     )
     asyncio.run(drive(feed))
 
-    assert subscribes(second) == [{"ticker": sorted([*CHAIN, "C-BTC-78000-040926"])}]
+    assert subscribes(first) == [
+        {"ticker": sorted(CHAIN)},
+        {"ticker": ["C-BTC-78000-040926"]},
+    ], "the connection that was up was never told"
+    assert subscribes(second) == [
+        {"ticker": sorted([*CHAIN, "C-BTC-78000-040926"])}
+    ], "the connection that replaced it replayed a subset"
 
 
 def test_a_live_subscribe_that_fails_leaves_the_feed_running_and_the_registry_intact(
@@ -281,32 +291,117 @@ def test_a_live_subscribe_that_fails_leaves_the_feed_running_and_the_registry_in
 ) -> None:
     """A send that misses is a gap, not an outage.
 
-    The symbols are in the registry before anything is sent, so the next open replays
-    them whatever happened here; letting the exception out would instead end a connection
-    that is otherwise delivering, which is a much worse trade than a delayed subscribe.
+    **The frame below is the assertion that matters.** It is only released once the
+    subscribe has been refused, so its arrival proves the pump went on reading past a
+    failed send — the claim in this test's name. The registry, checked beside it, is
+    written before any send is attempted and would survive the exception either way; it
+    is here to say that the next open still replays the contract, not as evidence that
+    anything was caught.
     """
 
+    class Recorder:
+        """A sink that keeps what the pump published."""
+
+        def __init__(self) -> None:
+            self.messages: list = []
+
+        def publish(self, message) -> None:
+            self.messages.append(message)
+
     class RefusingSocket(FakeSocket):
+        """Refuses the live subscribe, and delivers one frame only after it has."""
+
+        def __init__(self, script):
+            super().__init__(script)
+            self.refused = asyncio.Event()
+
         async def send(self, raw):
             message = json.loads(raw)
             if message["payload"]["channels"][0]["symbols"] == ["C-BTC-78000-040926"]:
+                self.refused.set()
                 raise ConnectionResetError("scripted send failure")
             self.sent.append(message)
 
-    socket = RefusingSocket([])
-    feed = DeltaFeed(FanOut(), connect=connector([socket]))
+        async def recv(self):
+            await self.refused.wait()
+            if not self.script:
+                await asyncio.sleep(3600)  # idle; the test cancels
+            return json.dumps(self.script.pop(0))
+
+    sink = Recorder()
+    socket = RefusingSocket([book_frame(CHAIN[0], 70, 72)])
+    feed = DeltaFeed(sink, connect=connector([socket]))
     feed.subscribe("ticker", CHAIN)
 
     with caplog.at_level("WARNING", logger="deltapayoff.adapters.delta_socket"):
         asyncio.run(subscribe_while_connected(feed, "ticker", ["C-BTC-78000-040926"]))
 
+    assert [message.symbol for message in sink.messages] == [CHAIN[0]], (
+        "the pump stopped reading when a subscribe was refused, so a failed subscribe "
+        "took down a connection that was otherwise fine"
+    )
     assert feed.registry["ticker"] == {*CHAIN, "C-BTC-78000-040926"}
-    assert feed.last_error is None or "scripted send failure" not in feed.last_error
     # Under the same `event` name `main` logs a re-list with, because this is the other
     # way the discovery can fail to land and #42's whole point is filtering by that name.
     said = [r for r in caplog.records if getattr(r, "event", None) == "feed.instruments"]
     assert said, "a subscribe that never reached the venue said nothing"
     assert said[0].listed == 1
+
+
+def test_a_symbol_registered_during_the_open_replay_is_not_lost() -> None:
+    """**The window between the replay's snapshot and the socket becoming reachable.**
+
+    `_pump` reads the registry, awaits the send, and only then publishes the socket. A
+    `subscribe` landing on that await used to be registered too late for the snapshot and
+    too early for the live send — so it went out on neither, and `main.relist_instruments`
+    had already recorded the contract as known, so no later cycle would retry it. That is
+    exactly #51's failure, in the one window #51's fix left open, and it is unrecoverable
+    until a reconnect happens to replay it.
+
+    The fix makes the socket reachable **before** the snapshot and holds the live send
+    behind the replay, so the worst case is a symbol sent twice rather than not at all —
+    and a duplicate subscribe costs one extra snapshot, `measured` additive by
+    `tools/probe_relist.py`.
+    """
+
+    class SlowSocket(FakeSocket):
+        """A connection whose first send can be suspended by the test, mid-replay."""
+
+        def __init__(self, script):
+            super().__init__(script)
+            self.sending = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def send(self, raw):
+            self.sending.set()
+            await self.release.wait()
+            self.sent.append(json.loads(raw))
+
+    async def scenario():
+        socket = SlowSocket([])
+        feed = DeltaFeed(FanOut(), connect=connector([socket]))
+        feed.subscribe("ticker", CHAIN)
+        task = asyncio.create_task(feed.run())
+        # Suspended inside the replay's own send: the snapshot is taken and gone.
+        await asyncio.wait_for(socket.sending.wait(), timeout=2.0)
+        feed.subscribe("ticker", ["C-BTC-78000-040926"])
+        socket.release.set()
+        await asyncio.sleep(0.1)
+        feed.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return socket
+
+    socket = asyncio.run(scenario())
+
+    told = set()
+    for message in socket.sent:
+        for entry in message["payload"]["channels"]:
+            told.update(entry["symbols"])
+    assert told == {*CHAIN, "C-BTC-78000-040926"}, (
+        "a subscribe that landed during the replay reached neither the snapshot nor the "
+        "live send, and nothing will retry it"
+    )
 
 
 # --- reconnecting ----------------------------------------------------------------

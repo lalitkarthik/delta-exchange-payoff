@@ -200,8 +200,19 @@ class DeltaFeed:
         #: listed after that sat unsubscribed until the next reconnect — which on a
         #: healthy feed never comes.
         self._socket: Any | None = None
+        #: Set once the current connection's replay is on the wire. A live subscribe waits
+        #: on it, which is what lets `_socket` be published *before* the replay is
+        #: snapshotted — closing the window where a subscribe reached neither — without
+        #: ever putting two coroutines on one socket's `send`.
+        self._replayed: asyncio.Event | None = None
         #: In-flight live subscribe sends, held so the loop cannot garbage-collect a task
         #: nothing else refers to. Cancelled with the connection they belong to.
+        #:
+        #: **Not a complete record of what has been sent**: a task's own done callback
+        #: removes it as soon as it finishes, so `_pump`'s final `gather` sees only what
+        #: is still in flight. That is what it is for — the finished ones need no
+        #: cancelling — and it is safe only because `_send_subscribe` swallows its own
+        #: failures rather than leaving an exception for nobody to retrieve.
         self._sends: set[asyncio.Task] = set()
 
     @staticmethod
@@ -241,22 +252,30 @@ class DeltaFeed:
         registered = self.registry.setdefault(channel, set())
         fresh = sorted(set(symbols) - registered)
         registered.update(symbols)
-        socket = self._socket
-        if fresh and socket is not None:
+        socket, replayed = self._socket, self._replayed
+        if fresh and socket is not None and replayed is not None:
             task = asyncio.get_running_loop().create_task(
-                self._send_subscribe(socket, channel, fresh)
+                self._send_subscribe(socket, replayed, channel, fresh)
             )
             self._sends.add(task)
             task.add_done_callback(self._sends.discard)
 
-    async def _send_subscribe(self, socket, channel: str, symbols: list[str]) -> None:
+    async def _send_subscribe(
+        self,
+        socket,
+        replayed: asyncio.Event,
+        channel: str,
+        symbols: list[str],
+    ) -> None:
         """One subscribe frame for one channel, on a connection that is already up.
 
         **A failure here is a warning and nothing more.** The symbols are already in the
         registry, so the next open replays them whatever happens to this send; taking the
         connection down over a subscribe that missed would turn a recoverable gap into an
         outage. The socket is passed in rather than read off `self`, so a send scheduled
-        against one connection can never be delivered to its successor.
+        against one connection can never be delivered to its successor — and so is
+        `replayed`, which this waits on: a subscribe that arrived while the replay was
+        still going out must follow it rather than write beside it.
 
         **Under `feed.instruments`, the same name `main` uses**, because this is the other
         way the discovery can fail to land — and a failure that cannot be filtered for is
@@ -265,6 +284,7 @@ class DeltaFeed:
         gap in the record.
         """
         try:
+            await replayed.wait()
             await socket.send(
                 self._subscribe_frame([{"name": channel, "symbols": symbols}])
             )
@@ -380,6 +400,17 @@ class DeltaFeed:
 
     async def _pump(self, socket) -> None:
         """Read until the connection ends. Publishes; never computes."""
+        # **Reachable before the snapshot is taken, and that ordering is a bug fix.**
+        # The snapshot below is read, then awaited on the wire; a `subscribe` landing on
+        # that await used to be too late for the snapshot and too early for the live send,
+        # so it went out on neither — and `main.relist_instruments` had already recorded
+        # the contract as known, so nothing would ever retry it. That is #51's own failure
+        # inside #51's own fix. Publishing the socket first makes the worst case a symbol
+        # sent *twice*, which costs one extra snapshot frame and nothing else.
+        replayed = asyncio.Event()
+        self._socket = socket
+        self._replayed = replayed
+
         payload = self._subscribe_payload()
         if payload is None:
             # An empty registry sends no subscribe, so this socket is guaranteed to
@@ -401,10 +432,11 @@ class DeltaFeed:
             # green badge, one moment earlier.
             self._tell(self._on_open, self.url)
 
-        # **After the replay, and not before.** From here a `subscribe` finds an open
-        # socket and sends the difference itself (#51); doing that before the replay had
-        # gone out would let a symbol be sent twice, or ahead of the set it belongs to.
-        self._socket = socket
+        # The replay is on the wire, so a live subscribe may follow it. Every send this
+        # connection makes goes through here in order, which is what keeps two coroutines
+        # off one socket: a live subscribe scheduled during the replay waits here rather
+        # than writing beside it.
+        replayed.set()
 
         heartbeat = asyncio.create_task(self._heartbeat(socket))
         try:
@@ -429,6 +461,7 @@ class DeltaFeed:
             # subscribe still in flight would be writing to a closed socket, and one
             # scheduled after this point must wait for the next open's replay instead.
             self._socket = None
+            self._replayed = None
             # A snapshot, because each task's own done callback removes it from the set.
             sends = list(self._sends)
             for send in sends:
