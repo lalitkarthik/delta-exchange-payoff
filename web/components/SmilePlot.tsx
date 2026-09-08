@@ -6,7 +6,7 @@ import { SmileChart } from "@/components/SmileChart";
 import type { SmileMinute } from "@/lib/contract";
 import { formatFetchedClock, formatLocalClock, localZoneLabel } from "@/lib/format";
 import type { ChartOverlay } from "@/lib/overlay";
-import { solvedPercents, toRows } from "@/lib/smile";
+import { smileCoverage, solvedPercents, toRows } from "@/lib/smile";
 import type { VolScale } from "@/lib/smilemodel";
 import type { Timeline } from "@/lib/timeline";
 
@@ -52,6 +52,7 @@ export default function SmilePlot({
 }) {
   const rows = useMemo(() => (minute ? toRows(minute, grid) : []), [minute, grid]);
   const solved = solvedPercents(rows);
+  const coverage = useMemo(() => smileCoverage(rows), [rows]);
 
   if (error) return null;
 
@@ -116,6 +117,44 @@ export default function SmilePlot({
 
   return (
     <>
+      {/* The per-minute coverage figure the scrubber already gives for the whole day —
+          see `TimeScrubber`'s `{storedBars} stored · {emptyCount} missing`. This is the
+          same fact at the minute the reader is actually looking at, and it is what tells
+          them whether the floating dots on a thin minute are a rendering fault (they are
+          not) or a hole in the record (they are). `warn` only when there is a hole to
+          name; a full board says so plainly instead of looking like every other minute
+          for no stated reason. */}
+      <p className={`notice coverage${coverage.notStored > 0 ? " warn" : ""}`}>
+        <strong>
+          {coverage.stored} of {coverage.total} board strikes
+        </strong>{" "}
+        stored at this minute
+        {coverage.notStored > 0 ? (
+          <>
+            {" · "}
+            <strong>{coverage.notStored} never recorded</strong> — not this solver&rsquo;s
+            doing. A minute logged before{" "}
+            <a
+              href="https://github.com/lalitkarthik/delta-exchange-payoff/issues/51"
+              target="_blank"
+              rel="noreferrer"
+            >
+              #51
+            </a>{" "}
+            can be thin because the engine had not yet re-listed contracts mid-run, and
+            that gap is <strong>not recoverable</strong>: Delta&rsquo;s own history pads a
+            missing minute with the last trade without saying so, which this project
+            refuses to do.
+          </>
+        ) : null}
+        {coverage.declined > 0 ? (
+          <>
+            {" · "}
+            {coverage.declined} solver-declined
+          </>
+        ) : null}
+      </p>
+
       {minute.forward === null ? (
         <p className="notice warn">
           This minute has no fitted forward, so there is no offset axis and no reference
