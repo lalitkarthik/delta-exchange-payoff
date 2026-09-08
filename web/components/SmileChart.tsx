@@ -48,6 +48,11 @@ import { OVERLAY_COLUMN, toChartRows } from "@/lib/smile";
  * so the break reads as a strike we could not solve rather than as a strike that does not
  * exist. Joining across would invent a number in the one place someone would read one.
  *
+ * **The two absences are drawn differently, deliberately.** A strike the solver saw and
+ * declined gets the dotted rule above — a claim about the solver. A strike this minute
+ * never stored gets a fainter, sparser rule of its own (`model.notStored`): a claim only
+ * that the record is silent, which #53 exists because the two used to look identical.
+ *
  * **Nothing wears Recharts' own styling.** Every tick is a custom component
  * (`SmileAxisTicks`), the tooltip is replaced outright (`SmileTooltip`), the grid and axis lines take palette tokens, and there is no
  * legend — one series needs no key, and the library's default one is grey Helvetica.
@@ -227,7 +232,7 @@ export function SmileChart({
               nothing about where the volatility would have been. */}
           {model.unsolved.map((strike) => (
             <ReferenceLine
-              key={`gap-${strike}`}
+              key={`declined-${strike}`}
               xAxisId="strike"
               yAxisId="iv"
               x={strike}
@@ -237,6 +242,22 @@ export function SmileChart({
               stroke="var(--ink-faint)"
               strokeWidth={1}
               strokeDasharray="2 5"
+            />
+          ))}
+
+          {/* Each strike this minute never stored a row for — not the solver's doing, so
+              it does not get the solver's mark. Thinner and sparser than the declined
+              rule above so the two read as different claims at a glance: this one says
+              only "the record is silent here", never "the solver looked and refused". */}
+          {model.notStored.map((strike) => (
+            <ReferenceLine
+              key={`not-stored-${strike}`}
+              xAxisId="strike"
+              yAxisId="iv"
+              x={strike}
+              stroke="var(--line-strong)"
+              strokeWidth={0.75}
+              strokeDasharray="1 4"
             />
           ))}
 

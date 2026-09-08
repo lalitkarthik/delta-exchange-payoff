@@ -193,12 +193,61 @@ export function solvedPercents(rows: readonly SmileDatum[]): number[] {
  * The strikes that **arrived** with no volatility. The line breaks at each of them and a
  * dotted rule says the solver refused it.
  *
- * A strike this minute did not store is excluded: the line still breaks there, because
- * its `ivPct` is null too, but no rule is drawn. The rule is a claim about the solver,
- * and there is no claim to make about a row that was never written.
+ * A strike this minute did not store is excluded — see `notStoredStrikes` for that set.
+ * The two are drawn with different rules for the same reason `SmileDatum.stored` exists:
+ * one is a claim about the solver, the other is an admission that the solver never saw
+ * the strike at all, and conflating them would put a claim on a row that was never
+ * written.
  */
 export function unsolvedStrikes(rows: readonly SmileDatum[]): number[] {
   return rows.filter((row) => row.stored && row.ivPct === null).map((row) => row.strike);
+}
+
+/**
+ * The strikes the board lists that **this minute never stored a row for** — see
+ * `NOT_STORED`. Distinct from `unsolvedStrikes`: those arrived and were refused, these
+ * never arrived. Also distinct from the day-level gap the scrubber marks — this is one
+ * minute's gap in the board, not a whole minute the store holds nothing for at all.
+ */
+export function notStoredStrikes(rows: readonly SmileDatum[]): number[] {
+  return rows.filter((row) => !row.stored).map((row) => row.strike);
+}
+
+/**
+ * How much of the board this minute actually holds — the figure the scrubber gives for
+ * the day, given here for the one minute on screen.
+ *
+ * `stored` is `solved + declined`: every row this minute wrote, whether or not the
+ * solver could do anything with it. `notStored` is the board's strikes minus that — the
+ * gap `strikeGrid` exists to reveal. A minute recorded before #51 can be thin here
+ * through no fault of the solver, and that gap is **not recoverable**: the engine that
+ * wrote it had not yet re-listed contracts mid-run, so no later fix can put a row where
+ * none was ever written — see #51 and #53.
+ */
+export interface SmileCoverage {
+  /** Every strike on the board for this expiry — `strikeGrid.length`. */
+  total: number;
+  /** Strikes this minute wrote a row for, solved or not. */
+  stored: number;
+  /** Strikes the board lists that this minute never stored — a gap in the record. */
+  notStored: number;
+  /** Stored strikes the solver declined — a statement about the option, not a gap. */
+  declined: number;
+  /** Stored strikes that solved. */
+  solved: number;
+}
+
+export function smileCoverage(rows: readonly SmileDatum[]): SmileCoverage {
+  let stored = 0;
+  let declined = 0;
+  let solved = 0;
+  for (const row of rows) {
+    if (!row.stored) continue;
+    stored++;
+    if (row.ivPct === null) declined++;
+    else solved++;
+  }
+  return { total: rows.length, stored, notStored: rows.length - stored, declined, solved };
 }
 
 /**
