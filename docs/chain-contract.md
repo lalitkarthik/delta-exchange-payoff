@@ -20,6 +20,10 @@ fixed before either exists. Change it by changing this file first.
 > `/bars` — one contract's minute candles, for the chart panel a clicked strike opens —
 > has its own file too: [bars-contract.md](bars-contract.md). A third read path is a
 > third subject, not an appendix to the first two.
+>
+> `/ws/chain`'s **envelope** — the four things the socket can say, `chain` among them —
+> has its own file too: [live-chain-contract.md](live-chain-contract.md). This file names
+> the route; that one is the authority for what arrives on it.
 
 Delta has **no option-chain endpoint**. A chain is `GET /v2/tickers` filtered by underlying and
 expiry, with the rows pivoted so a call and a put sharing a strike land on one line. The engine

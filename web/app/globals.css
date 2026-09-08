@@ -305,6 +305,59 @@ html, body {
   white-space: nowrap;
 }
 
+/*
+ * The venue feed's own state, #40 — same pill shape as `.chip` beside it, so the two
+ * read as a pair, and its own tokens so the two never look like restatements of one
+ * fact. `.chip` is this browser's socket to the engine; this is the engine's socket to
+ * Delta, and they are shown side by side on purpose because they can disagree — see
+ * `lib/live.ts`'s `FeedState` comment. There is deliberately no rule for `connected`:
+ * `feedBadge` never returns one, so no state here can render with the wrong recipe by
+ * falling through to a default.
+ *
+ * **Severity is carried by the same two recipes the rest of this file already uses for
+ * "fine, degraded, wrong"** — no new colour is invented for this one control.
+ * `connecting` is the calm case (a start-up or a resume, not yet a problem) and gets the
+ * dashed, dim treatment `.rec-toggle[data-state="unknown"]` uses for "nothing to act on
+ * yet". `degraded` is the amber-wash recipe `.notice.warn` and `.atm` share — the feed
+ * is still delivering, only late. `reconnecting` and `stopped` both get the put-red
+ * recipe `.notice.error` and `.rec-toggle[data-state="off"]` share; `stopped` is bolder
+ * because it is the loudest thing this badge can say — the feed will not come back on
+ * its own.
+ */
+.feed-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  color: var(--ink-soft);
+  background: var(--bg);
+  white-space: nowrap;
+  cursor: default;
+}
+
+.feed-badge[data-state="connecting"] {
+  color: var(--ink-faint);
+  border-style: dashed;
+}
+
+.feed-badge[data-state="degraded"] {
+  background: var(--atm);
+  border-color: var(--atm-line);
+  color: var(--ink);
+}
+
+.feed-badge[data-state="reconnecting"],
+.feed-badge[data-state="stopped"] {
+  background: var(--itm);
+  border-color: var(--put);
+  color: var(--ink);
+}
+
+.feed-badge[data-state="stopped"] {
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
 /* ------------------------------------------------------------- pickers */
 
 /* The Underlying and Expiry dropdowns. Shaped as a `.stat` deliberately: they sit in the
