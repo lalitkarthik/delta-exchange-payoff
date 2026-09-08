@@ -89,10 +89,14 @@ reported its opens late would otherwise sit in `connecting` while data flowed. T
 | `heartbeat_every` | 10 s | `assumed` | 8,640 heartbeats per adapter per day — fast enough for a badge, slow enough not to be a flood |
 | `poll_seconds` | 1 s | `assumed` | The staleness timer's resolution; a 15 s bound observed to the nearest second |
 
-### What the two hours showed
+### What the hour showed
 
-The full record of every run, with the connection tagging #39 added, is
-[../quiet-gap.md](../quiet-gap.md). Two findings the bounds rest on:
+**One hour has been measured, not two** — this heading claimed two before either existed.
+#39 added connection tagging to `tools/measure_quiet_gap.py`, so a gap that spanned a drop
+can now be told from a quiet market, but **no run has been taken with it yet**: the hour
+below predates it. #39 also found the tools stopped recording at the first drop while still
+reporting a full window, so any run taken before that fix landed is truncated and must not
+be quoted. Full record: [../quiet-gap.md](../quiet-gap.md). Two findings the bounds rest on:
 
 **Only the tail moves.** p99 (0.011 s), p95 (0.002 s) and the median (0.0 s) are identical
 across 35 seconds, 550 seconds and an hour; the maximum goes 0.321 → 3.355 → **44.785 s**.

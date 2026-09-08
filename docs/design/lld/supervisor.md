@@ -91,7 +91,7 @@ answer.
 | `adapters` | **A list, not a map keyed by name.** #44 adds the watched set: extending a record is not changing what a key means, and the order is the configured one rather than a dictionary's. |
 | `last_message_at` | **Derived from the age at request time**, not stamped per message. The controller measures on a monotonic clock, the only kind a staleness bound can be measured on; taking a `datetime` on a `measured` 1,322.9 messages/second hot path to avoid one subtraction per request is the wrong trade. |
 | `last_message_age_seconds` | `null` when nothing has ever arrived — an unknown age, not an age of zero. `last_message_at` is `null` with it. |
-| `reconnects` | Times this connection has entered `reconnecting`. A count, not a rate: a reader comparing two polls gets the rate, and a rate computed here needs a window nobody agreed on. |
+| `reconnects` | Times this connection has **dropped** — incremented in `connection_closed` beside the budget it spends, not on entry to `reconnecting`, which the watchdog can reach without a drop. A count, not a rate: a reader comparing two polls gets the rate, and a rate computed here needs a window nobody agreed on. |
 | `budget_remaining` | Reconnects left. A feed two drops from `stopped` and one that has never dropped are otherwise the same green badge. |
 | `transitions` | Every state change since start. A connection flapping between `connected` and `degraded` appears here and in no other field. |
 | `empty_opens` | Sockets opened with **nothing subscribed** — guaranteed to deliver nothing, the failure with no error. |

@@ -46,9 +46,11 @@ whose central transition is made by code it cannot see.
   before that was fixed: 21 attempts in 0.3 s with a budget of 3, still going.
 
 So **delivering data is the only thing that proves the endpoint works**, and it is the
-only thing that restores the budget. `DeltaFeed` still decides that fact, because it is
-the only thing that counts frames: an attempt that delivered clears `last_error`, and one
-that did not sets it.
+only thing that restores the budget. The controller restores it in `message_arrived` —
+frames arriving through the sink, nothing else. `DeltaFeed.last_error` records whether an
+attempt delivered, but that string is only ever the `CLOSED` signal's detail: **the
+controller never reads it.** An earlier draft of this note said the budget was decided
+from it; the code has never worked that way.
 
 **Checked before it is spent, not after.** A budget of two allows two reconnects and the
 third drop is the one that stops. Any other reading makes the number a person configures
