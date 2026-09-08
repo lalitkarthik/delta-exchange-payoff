@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -104,6 +105,7 @@ from typing import Any
 
 import polars as pl
 
+from . import log_events
 from .bars import (
     BUCKET_US,
     BarAggregator,
@@ -116,7 +118,10 @@ from .bars import (
     tick_from_option_quote,
 )
 from .iv_index import ContractIv
+from .logging_setup import log_event
 from .realised_vol import Bar as RvBar
+
+logger = logging.getLogger(__name__)
 
 #: One directory per table. All four of #5's now exist.
 #:
@@ -498,6 +503,12 @@ class BarStore:
         can never collide. An empty buffer writes nothing at all — a flush over a quiet
         five minutes must not leave an empty file behind, which would be all overhead and
         no rows.
+
+        **One `store.flush` log record per file written**, at info, carrying the table,
+        the rows in that file, the file itself and how long it took — #42's answer to a
+        three-day hole in this exact store that nothing had logged. Never on the
+        per-message path: this runs once per `flush_seconds` interval at most, not once
+        per tick, so the record costs nothing the flush interval was not already costing.
         """
         if not self._buffer:
             return 0
@@ -516,8 +527,25 @@ class BarStore:
             directory.mkdir(parents=True, exist_ok=True)
             earliest = min(bar.minute for bar in bars)
             name = f"{earliest.strftime('%Y%m%dT%H%M%SZ')}-{self.flushes:06d}.parquet"
-            self._frame(bars).write_parquet(directory / name)
+            file_path = directory / name
+            started = time.monotonic()
+            self._frame(bars).write_parquet(file_path)
+            duration = time.monotonic() - started
             written += len(bars)
+            log_event(
+                logger,
+                logging.INFO,
+                log_events.STORE_FLUSH,
+                "store flush %s: %d rows to %s in %.3fs",
+                self.dataset,
+                len(bars),
+                file_path,
+                duration,
+                table=self.dataset,
+                rows=len(bars),
+                file=str(file_path),
+                duration_seconds=round(duration, 6),
+            )
 
         self.rows_written += written
         return written

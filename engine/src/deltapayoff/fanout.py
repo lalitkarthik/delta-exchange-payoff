@@ -46,7 +46,13 @@ kind of faithful.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
+
+from . import log_events
+from .logging_setup import log_event
+
+logger = logging.getLogger(__name__)
 
 
 class Subscription:
@@ -92,12 +98,32 @@ class Subscription:
         seconds ago is worthless rather than merely worse.
 
         Under lossless nothing is refused at all; the depth is counted instead.
+
+        **The `except` below should be unreachable.** `subscribe()` gives a lossless
+        queue `maxsize=0` — asyncio's spelling of unbounded — so `put_nowait` here never
+        raises `QueueFull` under this module's own construction. It is guarded anyway
+        and logged at error if it ever fires, because "impossible" is a claim about the
+        code as written today, not a promise about every future change to it, and
+        `events.Alert`'s own docstring already names this the other case an error-level
+        log is for.
         """
         if self.lossless:
             depth = self.queue.qsize()
             if depth >= self.capacity:
                 self.over_capacity += 1
-            self.queue.put_nowait(record)
+            try:
+                self.queue.put_nowait(record)
+            except asyncio.QueueFull:
+                self.dropped += 1
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    log_events.QUEUE_DROP,
+                    "a record was dropped off the lossless subscription %r; this "
+                    "should be impossible",
+                    self.name,
+                )
+                return
             # Read after the put, so the peak is the true depth including this record.
             self.backlog_peak = max(self.backlog_peak, depth + 1)
             self.offered += 1
