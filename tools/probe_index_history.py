@@ -25,7 +25,7 @@ offline and runs without a network.
     python tools/probe_index_history.py compare          # offline, needs data/
 
 Sections
-    symbol       enumerate spot indices, then try every plausible candle spelling
+    symbol       enumerate BTC indices, then try every plausible candle spelling
     resolutions  which resolutions the index series accepts
     depth        how far back 1m and 1d actually reach
     padding      whether the series repeats a price where nothing happened
@@ -117,7 +117,7 @@ def request(path: str, *, retries: int = 3) -> tuple[int, object]:
                 return exc.code, json.loads(body)
             except ValueError:
                 return exc.code, body[:200]
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - any transport failure is status 0
             if attempt == retries - 1:
                 return 0, f"transport error: {type(exc).__name__}: {exc}"
             time.sleep(1.0)
@@ -179,18 +179,26 @@ def section_symbol() -> list[str]:
     """Name the symbol that serves BTC index history, and record what each try did."""
     head("SYMBOL - what Delta calls its BTC index, and which spelling candles accepts")
 
-    sub("enumerate spot indices from /v2/products")
-    status, body = request("/v2/products?contract_types=spot_index&page_size=200")
+    sub("enumerate BTC indices from /v2/indices")
+    # Not `/v2/products?contract_types=spot_index`, which this probe asked for first and
+    # which 400s: `spot_index` is not in Delta's contract_types enum. Indices are not
+    # products and are served by their own route. Measured 2026-09-08.
+    status, body = request("/v2/indices?page_size=500")
     _sleep()
     listed: list[str] = []
     if status == 200 and isinstance(body, dict):
-        for product in body.get("result") or []:
-            symbol = product.get("symbol")
+        for index in body.get("result") or []:
+            symbol = index.get("symbol")
             if symbol and "BT" in symbol.upper():
                 listed.append(symbol)
-                print(f"    {symbol:16s} {product.get('description', '')}")
+                composite = index.get("constituent_indices") or {}
+                built = composite.get("expression", "")
+                for name, part in (composite.get("indices") or {}).items():
+                    built = built.replace(f"${{{name}}}", part)
+                how = f"{index.get('price_method', '?')}{', ' + built if built else ''}"
+                print(f"    {symbol:16s} {index.get('description', '')}  [{how}]")
         if not listed:
-            print("    (no BTC spot_index products returned)")
+            print("    (no BTC indices returned)")
     elif unreachable(status, body):
         note_unreachable(body)
     else:
@@ -200,7 +208,12 @@ def section_symbol() -> list[str]:
     now = now_ts()
     start = now - 3600
     working: list[str] = []
-    tried = list(dict.fromkeys([*listed, *CANDIDATE_SYMBOLS]))
+    # `CANDIDATE_SYMBOLS` leads, because its first entry is the one `docs/settlement.md`
+    # measured on a settled product and the enumeration is not ordered by relevance: it
+    # returns the INR-quoted index and `.DEAIXBTUSD`, a different asset whose ticker
+    # merely contains "BT". Whichever serves first becomes the probe's default, so the
+    # order decides which series every section below reports on.
+    tried = list(dict.fromkeys([*CANDIDATE_SYMBOLS, *listed]))
     print(f"    {'symbol':16s} {'status':>6s} {'bars':>6s}  note")
     for symbol in tried:
         status, result = candles(symbol, "1m", start, now)
