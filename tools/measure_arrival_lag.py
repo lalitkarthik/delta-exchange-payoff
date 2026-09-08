@@ -43,7 +43,10 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+
+from _window import run_window  # noqa: E402
 from deltapayoff.fanout import FanOut  # noqa: E402
 from deltapayoff.adapters import DeltaFeed  # noqa: E402
 
@@ -101,15 +104,20 @@ async def measure(channel: str, names: list[str], seconds: float) -> list[float]
     feed = DeltaFeed(bus)
     feed.subscribe(channel, names)
 
-    task = asyncio.create_task(feed.run())
-    await asyncio.sleep(2.0)  # connect and subscribe before the clock starts
-    while not sink.queue.empty():  # discard the subscribe burst
-        sink.queue.get_nowait()
+    # **Redials for the whole window.** Since #39 `feed.run()` returns at the first
+    # drop; the old task-and-sleep collected lags up to that drop and reported them as
+    # the window. `tools/_window.py` carries the whole story.
+    warmup = 2.0  # connect and subscribe before the clock starts
 
-    await asyncio.sleep(seconds)
-    feed.stop()
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    async def discard_burst() -> None:
+        await asyncio.sleep(warmup)
+        while not sink.queue.empty():
+            sink.queue.get_nowait()
+
+    burst = asyncio.create_task(discard_burst())
+    window = await run_window(feed, warmup + seconds)
+    await asyncio.gather(burst, return_exceptions=True)
+    window.warn_if_truncated()
 
     lags: list[float] = []
     lts_gaps: list[float] = []
@@ -132,6 +140,11 @@ async def measure(channel: str, names: list[str], seconds: float) -> list[float]
             f"(min {ordered[0]:.1f}, max {ordered[-1]:.1f}) — NOT USED, meaning "
             "unverified"
         )
+    print(
+        f"           window: {window.elapsed_seconds:.1f}s of "
+        f"{window.requested_seconds:.1f}s requested, {window.attempts} connection(s)"
+        + ("" if window.complete else f" — ENDED EARLY: {window.ended_early_because}")
+    )
     print(f"           feed: {feed.messages} messages, malformed {feed.malformed}, "
           f"backlog peak {sink.backlog_peak}, dropped {sink.dropped}")
     return lags

@@ -73,12 +73,14 @@ from .chain import (
 from .compute import enrich
 from .contract_bars import ContractBarsResponse, read_contract_bars
 from .delta_client import DeltaClient, DeltaUnavailable
+from .events import ConnectionState
 from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
 from .historical import list_minutes, read_ladder_at
 from .models import (
     ChainResponse,
     ExpiriesResponse,
+    HealthReport,
     HistoricalMinutes,
     RecordingRequest,
     RecordingState,
@@ -99,6 +101,7 @@ from .store import (
     read_spot_bars,
 )
 from .stream import ChainStream, recompute_forever
+from .supervisor import FeedSupervisor
 from .volatility import (
     ALIGNMENTS,
     INTERVALS,
@@ -224,7 +227,13 @@ class FeedStack:
     #: The venue, behind `adapters.base.Adapter`. Everything venue-specific is inside it,
     #: including the two REST reads `/expiries` and `/chain` are answered from.
     adapter: Any
+    #: **Who owns the connection**, since #39. One `ConnectionController` per adapter,
+    #: started and stopped with the application, and the thing `/health` asks. Built
+    #: unconditionally, like the writer, so a process with no live feed still has a
+    #: report to give rather than a route that raises.
+    supervisor: FeedSupervisor
     #: The background tasks, empty until `start_feed_stack` runs. Cancelled on shutdown.
+    #: **The feed is no longer among them** — the supervisor owns that task.
     tasks: list[asyncio.Task] = field(default_factory=list)
 
     @property
@@ -263,15 +272,20 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     stream.attach(events)
     writer = BarWriter(BarStore(), chains=stream.computed_chains)
     writer.attach(events)
+    adapter = DeltaAdapter(
+        client=client,
+        underlyings=live_underlyings(),
+        feed_factory=DeltaFeed,
+    )
     return FeedStack(
         events=events,
         stream=stream,
         writer=writer,
-        adapter=DeltaAdapter(
-            client=client,
-            underlyings=live_underlyings(),
-            feed_factory=DeltaFeed,
-        ),
+        adapter=adapter,
+        # One adapter today and a list from the start, because the supervisor's whole
+        # reason to exist is the second one — and a single-adapter shortcut here is the
+        # thing that would have to be undone to add it.
+        supervisor=FeedSupervisor([adapter], events.publish),
     )
 
 
@@ -290,10 +304,13 @@ async def start_feed_stack(stack: FeedStack) -> None:
     for underlying in stack.adapter.underlyings:
         stack.adapter.subscribe(await stack.adapter.instruments(underlying))
 
+    # **The feed is started through the supervisor**, not as a task of its own. The
+    # controller wraps the adapter, so the events reach the bus through its sink and
+    # every `feed.connection`, `heartbeat` and `alert` reaches it beside them — which is
+    # the wiring #38 built and did not connect, and the reason nothing had ever observed
+    # a transition from a live controller.
+    stack.supervisor.start()
     stack.tasks = [
-        asyncio.create_task(
-            stack.adapter.stream(stack.events.publish), name="delta-feed"
-        ),
         asyncio.create_task(stack.stream.run(), name="chain-stream"),
         asyncio.create_task(recompute_forever(stack.stream), name="chain-recompute"),
         asyncio.create_task(stack.writer.run(), name="bar-writer"),
@@ -310,6 +327,10 @@ async def stop_feed_stack(stack: FeedStack) -> None:
     for tidiness; doing it here rather than from inside the cancelled task means the
     flush is not itself racing a cancellation.
     """
+    # The supervisor first, and it is awaited rather than cancelled: it stops each
+    # controller, cancels its task and **detaches it from its adapter**, which a bare
+    # cancellation of the task cannot be relied on to reach.
+    await stack.supervisor.aclose()
     for task in stack.tasks:
         task.cancel()
     if not stack.tasks:
@@ -345,6 +366,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.stream = stack.stream
     app.state.writer = stack.writer
     app.state.feed = stack.feed
+    app.state.supervisor = stack.supervisor
     app.state.tasks = stack.tasks
 
     if live_feed_enabled():
@@ -525,10 +547,35 @@ def get_historical_source() -> HistoricalSource:
     )
 
 
-@app.get("/health")
-async def health() -> dict[str, str]:
-    """Liveness only. Says nothing about Delta."""
-    return {"status": "ok"}
+def get_supervisor() -> FeedSupervisor | None:
+    """The supervisor, or `None` in a process whose lifespan never ran.
+
+    `None` rather than a 503, which is the opposite call to `get_bar_writer`'s and for
+    a reason: `/health` is the route a monitor hits to find out whether anything is
+    wrong, and a health check that fails because there is no feed to describe tells the
+    monitor the engine is down when it is up and merely not recording. So the report is
+    still given, with no adapters in it and `feed` reading `stopped` — which is exactly
+    true of a process with no feed.
+    """
+    return getattr(app.state, "supervisor", None)
+
+
+@app.get("/health", response_model=HealthReport)
+async def health(
+    supervisor: Annotated[FeedSupervisor | None, Depends(get_supervisor)],
+) -> HealthReport:
+    """Liveness **and** readiness, and the difference between them.
+
+    This route used to answer `{"status": "ok"}` and mean the first while being read as
+    the second: a process whose socket died at 02:00 answered `ok` all night. `status` is
+    still there and still means liveness — nothing that reads it breaks — and everything
+    beside it is readiness, per adapter and rolled up into `feed`. The shape is
+    `models.HealthReport`, and it is the seam #40's badge, #41's commands and #44's
+    watched set all read through.
+    """
+    if supervisor is None:
+        return HealthReport(feed=ConnectionState.STOPPED)
+    return supervisor.report()
 
 
 @app.get("/expiries", response_model=ExpiriesResponse)

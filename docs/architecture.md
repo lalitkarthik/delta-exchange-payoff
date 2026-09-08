@@ -151,6 +151,10 @@ exists. On start-up it creates, in order: one `DeltaClient`, one `FanOut`, one
 fetches the full symbol list over REST, subscribes every symbol on **both** channels, and
 launches four tasks — `delta-feed`, `chain-stream`, `chain-recompute`, `bar-writer`.
 
+> **Stale since #39.** There is no `delta-feed` task: the feed is driven by a
+> `ConnectionController` under a `FeedSupervisor`, whose task is named `feed-<venue>`.
+> See [design/lld/supervisor.md](design/lld/supervisor.md).
+
 **One connection for the whole process, not one per consumer.** Three consumers each
 opening their own would burn Delta's 150-connections-per-5-minutes budget and — worse —
 give three inconsistent views of one market. A second browser tab costs a queue, not a
@@ -166,6 +170,11 @@ finishes without being cancelled, because `DeltaFeed.run` returns *normally* onc
 budget is exhausted — and a task that simply returns raises nothing. Without that callback
 the feed can give up permanently while `/health` still says ok and the only symptom is
 `waiting` forever.
+
+> **Stale since #39.** `DeltaFeed.run` is now one connection and returns when that socket
+> ends; the retry budget belongs to the controller. And a feed that gives up can no longer
+> hide: `/health` reports every adapter's state, so budget exhaustion shows as `stopped`
+> rather than as `waiting` forever.
 
 **Shutdown flushes the open minute.** Tasks are cancelled and gathered first, then
 `writer.aclose()` runs — after the cancellations, not inside them, so the flush is not
@@ -456,7 +465,7 @@ Four routes, and `docs/chain-contract.md` is the authority over three of them.
 
 | | |
 |---|---|
-| `GET /health` | Liveness only. Says nothing about Delta |
+| `GET /health` | **Since #39:** the feed report — overall state plus, per adapter, state, last-message age, drops, budget remaining. `status: "ok"` is preserved as one field |
 | `GET /expiries?underlying=BTC` | Every listed expiry, ascending **by parsed date** — sorted as text, `30-10-2026` would land after `27-11-2026` |
 | `GET /chain?underlying=BTC&expiry=04-09-2026` | The pivoted ladder, **enriched** |
 | `WS /ws/chain?underlying=…&expiry=…` | The same object, pushed once a second |
