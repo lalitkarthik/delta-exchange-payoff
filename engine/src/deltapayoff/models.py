@@ -307,6 +307,30 @@ class AdapterHealth(BaseModel):
     undecodable: int | None = None
 
 
+class WatchedPair(BaseModel):
+    """One `(underlying, expiry)` the live solve is running for — #44.
+
+    **What the engine is solving right now, and why.** The 100 ms pass no longer covers
+    the venue's listing; it covers this list. A pair is here because a browser is on it
+    (`viewers` above zero) or because one just left and the grace has not elapsed
+    (`viewers` zero and `grace_remaining_seconds` set). Exactly one of the two is true,
+    which is why the grace field is `null` rather than `0` while anyone is watching: no
+    countdown is running, and `0` would read as one that had just finished.
+
+    An expiry absent from this list is **not** unsolved. It is solved once a minute by
+    the pass that fills the store, which runs whether or not any browser exists.
+    """
+
+    underlying: str
+    expiry: str
+    #: How many open `/ws/chain` connections are on this pair. Zero only in grace.
+    viewers: int
+    #: Seconds of grace left after the last viewer left, or `null` if it is being
+    #: watched. Rounded to the millisecond — the field is for a person reading a
+    #: report, and a full float of seconds is noise.
+    grace_remaining_seconds: float | None = None
+
+
 class HealthReport(BaseModel):
     """`GET /health`. **Liveness and readiness, side by side and not confused.**
 
@@ -330,3 +354,8 @@ class HealthReport(BaseModel):
     #: Readiness. The worst state among the adapters; `stopped` when there are none.
     feed: ConnectionState
     adapters: list[AdapterHealth] = []
+    #: The pairs the live solve is running for — #44. Empty when nothing is watched,
+    #: which is the ordinary state of an engine recording with no browser open, and is
+    #: **not** a fault: the minute pass still covers every listed expiry. Empty by
+    #: default so a process with no chain cache still answers the same shape.
+    watched: list[WatchedPair] = []
