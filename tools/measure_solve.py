@@ -38,6 +38,7 @@ import json
 import shutil
 import statistics
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -294,7 +295,12 @@ async def main() -> None:
     )
 
     if args.mode == "cpu":
-        root = Path(__file__).resolve().parents[1] / ".measure-solve-scratch"
+        # **Outside the repository, deliberately.** A scratch store under the checkout
+        # is one `git add -A` away from a Parquet file in the history, and this project
+        # has already had a junction left pointing at the live store. `cpu_cost` removes
+        # it either way; putting it in the system temp directory means a run killed
+        # halfway leaves nothing a commit could sweep up.
+        root = Path(tempfile.gettempdir()) / "measure-solve-scratch"
         result = await cpu_cost(underlyings, args.seconds, args.which, root)
     else:
         result = await solve_costs(underlyings, args.fill, args.repeats)
