@@ -276,22 +276,34 @@ export default function IvRvPanel({ underlying }: { underlying: Underlying }) {
         ) : null}
 
         <p className="note">
-          Both series are expressed <strong>over the lookback window</strong> and neither is
-          annualised: the chart reads &ldquo;the market expected an 11.5% move over N days;
-          it delivered 9%&rdquo;. Annualising is the convention and it hides N inside a
+          Neither series is annualised: each is expressed{" "}
+          <strong>over its own horizon</strong>, so the chart reads &ldquo;the market
+          expected an 11.5% move over the life of that expiry; the index delivered 9% over
+          N days&rdquo;. Annualising is the convention and it hides the horizon inside a
           constant, so two charts at different lookbacks would carry identical-looking axes
           while answering different questions. A year is 365 days everywhere here, because
           crypto trades weekends and this venue lists weekend expiries.{" "}
+          <strong>The two horizons are not the same, and that is deliberate.</strong> The
+          realised side spans N. The implied side is the{" "}
+          <strong>nearest expiry past the seven-day floor</strong>, so it spans whatever
+          that expiry has left to run — hover any point for the figure. It was once a
+          constant-maturity index built at N, which meant interpolating between the two
+          expiries either side of N and declining whenever the board held no such pair;
+          that was most minutes, and the implied series arrived as three points on a chart
+          of four hundred. A line that follows the term structure is worth more than a
+          correct refusal nobody can read, and the cost is that a step at a roll is the
+          nearest expiry changing rather than the market changing its mind. The floor stays
+          because vega collapses into expiry — the front contract has printed 400% four
+          hours out, which is a dying contract and not an opinion.{" "}
           <strong>The line breaks across a gap</strong> rather than joining over it — a
           minute with no arrivals produces no row, never a repeat of the previous close, so
           a break is a hole in the record and not a value of zero. In lag-aligned mode the
           most recent N days have no realised figure at all, because that window has not
           finished happening; that is drawn as an honest blank. The implied line is{" "}
           <strong>ATM only</strong> — interpolated between the two strikes bracketing the
-          forward, and between the two expiries bracketing N in total variance rather than
-          in volatility. It is <em>not</em> a DVOL equivalent and will disagree with a
-          published DVOL print, because DVOL integrates the whole strike range and this
-          tracks the level alone.
+          forward. It is <em>not</em> a DVOL equivalent and will disagree with a published
+          DVOL print, because DVOL integrates the whole strike range and this tracks the
+          level alone.
         </p>
     </>
   );

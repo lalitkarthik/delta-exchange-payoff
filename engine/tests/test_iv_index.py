@@ -6,7 +6,14 @@ assertion cannot agree with the implementation merely by sharing its arithmetic.
 
 from __future__ import annotations
 
-from deltapayoff.iv_index import ContractIv, atm_iv
+import pytest
+
+from deltapayoff.iv_index import (
+    ContractIv,
+    atm_iv,
+    atm_iv_for_expiry,
+    atm_iv_nearest,
+)
 
 FORWARD = 78_400.0
 
@@ -218,3 +225,107 @@ def test_the_forward_decides_the_strikes_not_the_spot() -> None:
     assert at_78400 is not None and at_78100 is not None
     assert abs(at_78400.iv - 0.42) < 1e-12
     assert abs(at_78100.iv - 0.48) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# The nearest expiry, read directly. No interpolation, so nothing to refuse.
+# ---------------------------------------------------------------------------
+
+
+def _expiry_rows(*, days: float, level: float) -> list[ContractIv]:
+    """One expiry whose two strikes straddle the forward at the same volatility.
+
+    Flat across the strikes on purpose: these tests are about *which expiry* is read,
+    and a smile would make the expected value depend on the strike interpolation that
+    `test_atm_iv_interpolates_between_the_two_strikes_bracketing_the_forward` already
+    covers.
+    """
+    strikes = {FORWARD - 500.0: level, FORWARD + 500.0: level}
+    return expiry_rows(f"{days:g}d", days, strikes)
+
+
+def test_the_nearest_expiry_answers_where_a_constant_maturity_index_declines() -> None:
+    """A tenor no pair of expiries brackets still has a nearest expiry.
+
+    This is the whole reason the mode exists. `atm_iv` blends between the two expiries
+    either side of a target and refuses when there is no pair — which on the recorded
+    data was most minutes, because the target came from a slider and the term structure
+    is whatever Delta happened to list. The implied series came back as three points on a
+    chart of 433 and read as a broken instrument rather than as a refusal.
+
+    Reading the nearest expiry outright has no target and therefore nothing to bracket,
+    so it answers at every minute that has one solvable expiry at all.
+    """
+    rows = _expiry_rows(days=11.0, level=0.40) + _expiry_rows(days=41.0, level=0.44)
+
+    # No pair brackets eight days: every listed expiry is further out than that.
+    assert atm_iv(rows, tenor_days=8.0) is None
+
+    nearest = atm_iv_nearest(rows)
+    assert nearest is not None
+    assert nearest.iv == pytest.approx(0.40)
+    assert nearest.tenor_days == pytest.approx(11.0)
+
+
+def test_the_nearest_expiry_skips_the_dying_front_contract() -> None:
+    """The seven-day floor still applies, and it is not a detail.
+
+    Vega collapses as time to expiry goes to zero, so a one-tick price change moves the
+    solved volatility by tens of points — the smile screen measures a median of 62.5% and
+    a maximum of **400.5%** on a front expiry 4.4 hours out, against a median near 40%
+    everywhere else on the board. "Nearest expiry" taken literally would make the implied
+    line a plot of that instability, rolling to a fresh dying contract every day or two,
+    and the reader would be looking at expiry mechanics rather than at what the market
+    expects.
+    """
+    rows = (
+        _expiry_rows(days=0.2, level=3.90)
+        + _expiry_rows(days=11.0, level=0.40)
+        + _expiry_rows(days=41.0, level=0.44)
+    )
+
+    nearest = atm_iv_nearest(rows)
+
+    assert nearest is not None
+    assert nearest.tenor_days == pytest.approx(11.0)
+    assert nearest.excluded_under_floor == 1
+
+
+def test_nothing_past_the_floor_is_nothing_rather_than_the_front_contract() -> None:
+    """A board holding only a dying contract yields no reading at all.
+
+    Falling back to the excluded expiry would put the 400% figure on the chart precisely
+    when there was nothing to check it against.
+    """
+    assert atm_iv_nearest(_expiry_rows(days=0.2, level=3.90)) is None
+
+
+def test_one_named_expiry_is_read_at_every_minute() -> None:
+    """The series tracks a contract, not whichever expiry happens to be nearest.
+
+    **Reading "the nearest" per minute makes the line a plot of recording gaps.** The
+    tenor scales the figure by `sqrt(T/365)`, so a minute whose thin record happened to
+    capture only a 21-day expiry prints 8.7% where its neighbour, holding a 7-day one at
+    the same 36% annualised, prints 5.2%. Measured on the stored data: a near-vertical
+    stroke spanning 70% of the axis inside half an hour, none of which was the market.
+
+    Naming the expiry once and reading it at every minute removes the artefact entirely,
+    and is what someone watching a volatility term actually does — they follow a
+    contract.
+    """
+    rows = _expiry_rows(days=11.0, level=0.40) + _expiry_rows(days=41.0, level=0.44)
+
+    assert atm_iv_for_expiry(rows, "11d").iv == pytest.approx(0.40)
+    assert atm_iv_for_expiry(rows, "41d").iv == pytest.approx(0.44)
+
+
+def test_a_minute_missing_the_named_expiry_yields_nothing() -> None:
+    """No fallback to a different contract. That is the artefact coming back.
+
+    A minute the chosen expiry is absent from is a hole, and a hole in this series is
+    already drawn as a break — the same discipline as a leg with no volatility carrying
+    no Greeks.
+    """
+    rows = _expiry_rows(days=41.0, level=0.44)
+
+    assert atm_iv_for_expiry(rows, "11d") is None

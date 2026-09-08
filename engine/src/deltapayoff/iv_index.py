@@ -141,6 +141,70 @@ def _term_structure(
     return sorted(points), excluded
 
 
+def atm_iv_for_expiry(rows: list[ContractIv], expiry: str) -> AtmIv | None:
+    """The ATM implied volatility of **one named expiry**, or nothing.
+
+    The series follows a contract rather than whichever expiry is nearest at each minute,
+    and the difference is not cosmetic. The figure is scaled by `sqrt(T/365)` to the
+    tenor it belongs to, so switching contracts between neighbouring minutes changes the
+    printed number without anything having happened: measured on the stored data, a
+    minute whose thin record captured only a 21-day expiry printed 8.7% beside a
+    neighbour holding a 7-day one at the same 36% annualised, which printed 5.2%. The
+    line drew a near-vertical stroke across 70% of the axis inside half an hour, none of
+    it market.
+
+    A minute the named expiry is absent from returns `None` — a hole, drawn as a break.
+    Falling back to a different contract is the artefact coming back.
+    """
+    named = [row for row in rows if row.expiry == expiry]
+    if not named:
+        return None
+    return atm_iv_nearest(named)
+
+
+def atm_iv_nearest(rows: list[ContractIv]) -> AtmIv | None:
+    """The ATM implied volatility of the **nearest listed expiry** past the floor.
+
+    The sibling of `atm_iv`, and the difference is what it does not do. `atm_iv` builds a
+    constant-maturity reading at a tenor the caller names, which means blending between
+    the two expiries either side of it — and refusing outright when the board holds no
+    such pair. On the recorded data that refusal was the common case rather than the edge
+    one: a ten-day target resolved at 24 of 108 minutes, because the target came from a
+    slider and the term structure is whatever Delta happened to list that day. The
+    implied series arrived as three points on a chart of 433, which reads as a broken
+    instrument rather than as an honest decline.
+
+    Reading the nearest expiry has no target, so there is nothing to bracket and nothing
+    to refuse. It answers at every minute holding one solvable expiry.
+
+    **The seven-day floor stays, and it is not a detail.** Vega collapses as time to
+    expiry goes to zero, so a one-tick price change moves the solved volatility by tens
+    of points: `docs/smile.md` measures a median of 62.5% and a **maximum of 400.5%** on
+    a front expiry 4.4 hours out, against a median near 40% everywhere else on the board.
+    "Nearest expiry" taken literally would draw that instability and roll to a fresh
+    dying contract every day or two, and a reader would be watching expiry mechanics
+    rather than what the market expects.
+
+    **What is given up is the constant maturity.** The tenor is now whatever the nearest
+    surviving expiry happens to be — 11.05 days one day and 10.11 the next, stepping when
+    a contract expires. `AtmIv.tenor_days` reports it per point precisely because it
+    moves, and the screen has to say so: a level change at a roll is the term structure
+    being resampled, not the market changing its mind.
+    """
+    points, excluded = _term_structure(rows)
+    if not points:
+        return None
+    near_days, near_iv = points[0]
+    return AtmIv(
+        tenor_days=near_days,
+        iv=near_iv,
+        near_days=near_days,
+        far_days=near_days,
+        near_weight=1.0,
+        excluded_under_floor=excluded,
+    )
+
+
 def atm_iv(rows: list[ContractIv], *, tenor_days: float) -> AtmIv | None:
     """The ATM implied volatility at exactly `tenor_days`, or nothing.
 

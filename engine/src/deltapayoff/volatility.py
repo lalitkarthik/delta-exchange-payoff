@@ -25,7 +25,11 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .iv_index import MIN_EXPIRY_DAYS, ContractIv, atm_iv
+from .iv_index import (
+    MIN_EXPIRY_DAYS,
+    ContractIv,
+    atm_iv_for_expiry,
+)
 from .realised_vol import (
     ESTIMATORS,
     Bar,
@@ -88,6 +92,11 @@ class VolPoint(BaseModel):
 
     at: datetime
     iv: float | None
+    #: Days to run of the expiry the implied figure came from. **It moves**, because the
+    #: nearest expiry rolls — 11.05 days one day and 10.11 the next, stepping when a
+    #: contract expires. Reported per point so a level change at a roll can be read as
+    #: the term structure being resampled rather than as the market changing its mind.
+    iv_tenor_days: float | None = None
     rv: dict[str, float | None]
     #: Returns (or bars, for the range estimators) behind each realised figure.
     returns: dict[str, int]
@@ -166,17 +175,6 @@ class VolatilitySeries(BaseModel):
     points: list[VolPoint]
 
 
-#: What share of the recorded minutes a lookback has to be serviceable at before it is
-#: offered. **Not a taste setting — it is what separates a line from a dot.** `atm_iv`
-#: refuses to extrapolate below the shortest expiry *at that minute*, so a floor taken
-#: from the shortest expiry seen anywhere in the range is serviceable at whichever
-#: minutes happened to list it and at no others. Measured on the stored data
-#: 2026-09-08: a 10-day tenor resolved at 24 of 108 minutes, all 24 inside one
-#: half-hour; 11.5 days resolved at 99. The reader would have read the first as a broken
-#: chart, and would have been reading a bound they were allowed to pick badly.
-TENOR_COVERAGE = 0.9
-
-
 def _listed_tenors(iv_rows: dict[datetime, list[ContractIv]]) -> list[float]:
     """Every expiry's days-to-run seen anywhere in the range, past the seven-day floor."""
     tenors: set[float] = set()
@@ -188,34 +186,36 @@ def _listed_tenors(iv_rows: dict[datetime, list[ContractIv]]) -> list[float]:
     return sorted(tenors)
 
 
-def _serviceable_floor(iv_rows: dict[datetime, list[ContractIv]]) -> float | None:
-    """The shortest tenor `TENOR_COVERAGE` of the recorded minutes can bracket.
+def tracked_expiry(iv_rows: dict[datetime, list[ContractIv]]) -> str | None:
+    """The expiry the implied line follows: the nearest past the floor, most recently.
 
-    Each minute can serve a constant-maturity index no shorter than its own nearest
-    expiry past the seven-day floor; below that the index would have to extrapolate, and
-    it declines instead. So the question a slider's lower bound answers is not "what is
-    the nearest expiry anyone ever listed" but "what is the shortest tenor that most
-    minutes could actually answer" — and the two differ by the width of a whole chart.
+    **Chosen once for the whole series**, from the newest minute that has one, because
+    re-choosing per minute makes the line a plot of which expiries a thin minute happened
+    to record rather than of anything the market did — see `atm_iv_for_expiry`.
 
-    A quantile rather than the maximum, because one thin minute holding a single far
-    expiry would otherwise push the floor out past every useful lookback: the stored
-    data's per-minute minima run from 7.24 to 84.24 days, and the 84 is one minute with
-    45 contract rows in it.
+    The newest minute rather than a vote across all of them: it is the one whose board is
+    current, and a reader looking at a live screen is asking about the contract that is
+    nearest *now*. The consequence is that the tracked expiry changes when the series is
+    re-fetched after a roll, which is visible because `iv_tenor_days` is on every point.
     """
-    per_minute: list[float] = []
-    for rows in iv_rows.values():
-        usable = [
-            row.years_to_expiry * DAYS_PER_YEAR
-            for row in rows
-            if row.years_to_expiry * DAYS_PER_YEAR >= MIN_EXPIRY_DAYS
-        ]
-        if usable:
-            per_minute.append(min(usable))
-    if not per_minute:
-        return None
-    per_minute.sort()
-    index = min(len(per_minute) - 1, int(TENOR_COVERAGE * (len(per_minute) - 1)))
-    return per_minute[index]
+    for minute in sorted(iv_rows, reverse=True):
+        points, _ = _term_structure_of(iv_rows[minute])
+        if points:
+            return points[0]
+    return None
+
+
+def _term_structure_of(rows: list[ContractIv]) -> tuple[list[str], int]:
+    """Expiry names past the seven-day floor, nearest first, and how many fell under."""
+    by_expiry: dict[str, float] = {}
+    excluded = 0
+    for row in rows:
+        days = row.years_to_expiry * DAYS_PER_YEAR
+        if days < MIN_EXPIRY_DAYS:
+            excluded += 1
+            continue
+        by_expiry.setdefault(row.expiry, days)
+    return [name for name, _ in sorted(by_expiry.items(), key=lambda kv: kv[1])], excluded
 
 
 def contract_ivs_from_chains(
@@ -283,17 +283,26 @@ def lookback_bounds(
 ) -> LookbackBounds:
     """What `N` may be at this sampling interval, and what is stopping it being more.
 
-    Three constraints, and **only the engine knows the third**:
+    **`N` now bounds the realised side only.** It once bounded both: the implied series
+    was a constant-maturity index built *at* `N`, so `N` had to sit inside the listed term
+    structure or the index would extrapolate and declined instead. Since the implied side
+    reads the **nearest expiry** (`atm_iv_nearest`) there is no target to bracket, so the
+    term structure constrains nothing and a lookback shorter than the shortest expiry is
+    no longer a lookback the implied side must refuse.
 
-    * the **observation floor** — below `MIN_OBSERVATIONS` sampling intervals a window
-      has too few returns to estimate anything;
-    * the **term structure** — outside the listed expiries the index extrapolates, which
-      R3 refuses, so `N` cannot go past the longest expiry nor under the shortest;
+    That leaves two constraints:
+
+    * the **observation floor** — below `MIN_OBSERVATIONS` sampling intervals a window has
+      too few returns to estimate anything;
     * the **history held** — a thirty-day window needs thirty days of bars, and in the
-      first month of recording this is much the tightest of the three.
+      first month of recording this is much the tighter of the two.
 
-    The binding one is named so the screen can print *"limited by available history"*
-    rather than rendering an empty chart that reads as a bug.
+    One precondition survives: at least one expiry must clear the seven-day floor
+    somewhere in the range, or there is no implied series to compare against at any `N`
+    whatsoever.
+
+    The binding constraint is named so the screen can print *"limited by available
+    history"* rather than rendering an empty chart that reads as a bug.
     """
     tenors = _listed_tenors(iv_rows)
     ordered = sorted(spot_bars, key=lambda bar: bar.at)
@@ -315,38 +324,33 @@ def lookback_bounds(
             ),
         )
 
-    serviceable = _serviceable_floor(iv_rows) or tenors[0]
-    min_days = max(observation_floor, serviceable)
-    if min_days == observation_floor and observation_floor > serviceable:
-        lower_reason = f"{MIN_OBSERVATIONS} returns at this sampling interval"
-    elif serviceable > tenors[0]:
-        lower_reason = (
-            f"the shortest tenor most recorded minutes can bracket, "
-            f"{serviceable:.2f} days — a nearer expiry was listed at some minutes "
-            f"({tenors[0]:.2f} days) but the index declines to extrapolate at the rest"
-        )
-    else:
-        lower_reason = f"the shortest listed expiry, {tenors[0]:.2f} days"
+    min_days = observation_floor
+    lower_reason = f"{MIN_OBSERVATIONS} returns at this sampling interval"
 
-    if history_days <= tenors[-1]:
-        binding = "history"
-        max_days = history_days
-        detail = (
-            f"limited by available history: {history_days:.2f} days of bars are held, "
-            f"against a term structure reaching {tenors[-1]:.2f} days. "
-            f"Lower bound set by {lower_reason}."
-        )
-    else:
-        binding = "term_structure"
-        max_days = tenors[-1]
-        detail = (
-            f"limited by the listed term structure: the longest expiry is "
-            f"{tenors[-1]:.2f} days out, and past it the index would extrapolate. "
-            f"Lower bound set by {lower_reason}."
-        )
-
+    # The expiry the series actually tracks, not the shortest one listed anywhere in the
+    # range: those differ by days, and printing the second beside a line drawn from the
+    # first puts a number on screen that no point on the chart carries.
+    tracked = tracked_expiry(iv_rows)
+    tracked_days = next(
+        (
+            row.years_to_expiry * DAYS_PER_YEAR
+            for minute in sorted(iv_rows, reverse=True)
+            for row in iv_rows[minute]
+            if row.expiry == tracked
+        ),
+        tenors[0],
+    )
     return LookbackBounds(
-        min_days=min_days, max_days=max_days, binding=binding, detail=detail
+        min_days=min_days,
+        max_days=history_days,
+        binding="history",
+        detail=(
+            f"limited by available history: {history_days:.2f} days of bars are held. "
+            f"The implied line follows one expiry past the seven-day floor, "
+            f"{tracked_days:.2f} days out at the newest minute, so it moves with the "
+            f"term structure rather than with the lookback. "
+            f"Lower bound set by {lower_reason}."
+        ),
     )
 
 
@@ -493,11 +497,19 @@ def volatility_series(
     tenor_days = lookback.total_seconds() / 86_400.0
 
     minutes = sorted(iv_rows)
-    # One sampling interval, or a minute, whichever is longer. At `1m` sampling that is a
-    # minute — the resolution the store actually holds — and it grows with the interval
-    # so a reader asking for four-hourly points is not refused an opinion three hours old
-    # when three hours old is the best that interval could ever mean.
-    tolerance = max(interval, timedelta(minutes=1))
+    # One **plotted step**, or a minute, whichever is longer.
+    #
+    # `step` and not `interval`, and the difference was a bug worth naming. The route
+    # thins a long range to at most `MAX_POINTS` by plotting every `stride`-th interval,
+    # so at 1m sampling over thirty days the points land seven minutes apart while the
+    # tolerance stayed at one minute — six of every seven recorded implied minutes were
+    # unreachable, not because they were stale but because no timestamp came near enough
+    # to ask. The implied series arrived as a handful of dots and read as an instrument
+    # that had failed.
+    #
+    # It is still bounded, and still not a forward-fill: an opinion is carried at most as
+    # far as the next point, never past it.
+    tolerance = max(step, timedelta(minutes=1))
 
     timestamps: list[datetime] = []
     at = start
@@ -510,18 +522,31 @@ def volatility_series(
         lookback=lookback, timestamps=timestamps, alignment=alignment,
     )
 
+    # One contract for the whole series. See `tracked_expiry`.
+    tracked = tracked_expiry(iv_rows)
+
     points: list[VolPoint] = []
     for index, when in enumerate(timestamps):
         rows = _implied_at(minutes, iv_rows, when, tolerance)
-        implied = atm_iv(rows, tenor_days=tenor_days) if rows else None
+        implied = (
+            atm_iv_for_expiry(rows, tracked) if rows and tracked is not None else None
+        )
         points.append(
             VolPoint(
                 at=when,
+                # **Scaled to the nearest expiry's own tenor, not to `N`.** The figure is
+                # that expiry's annualised volatility, so the move it forecasts spans its
+                # own days-to-run; scaling it by the realised window instead would print
+                # a number the market never quoted. The realised side stays on `N`, and
+                # the two therefore describe different lengths of time — which is the
+                # price of a continuous implied line and is stated on the screen rather
+                # than buried here. See `iv_tenor_days` on the response.
                 iv=(
-                    implied_over_window(implied.iv, tenor_days)
+                    implied_over_window(implied.iv, implied.tenor_days)
                     if implied is not None
                     else None
                 ),
+                iv_tenor_days=implied.tenor_days if implied is not None else None,
                 rv={
                     name: scale_to_window(
                         realised[name][index].value, interval=interval, window=lookback

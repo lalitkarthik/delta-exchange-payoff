@@ -1152,6 +1152,23 @@ async def volatility(
     first, last = bars[0].at, bars[-1].at
     start = first + lookback if alignment == "contemporaneous" else first
     end = last
+
+    # **The range starts where a comparison becomes possible, not where the bars do.**
+    #
+    # Realised is backfilled — thirty days of index candles and growing. Implied cannot
+    # be: Delta's history carries no IV and no bid/ask, so it exists only for minutes
+    # this engine was running. Drawing the union means twenty-five days of chart on which
+    # one of the two lines cannot exist, and the cost is not merely blank space. The route
+    # thins the range to at most `MAX_POINTS`, so a span dominated by realised-only days
+    # sets a stride of twenty-one minutes and the implied minutes that *do* exist fall
+    # between the plotted points — the series arrives as a handful of dots and reads as a
+    # broken instrument rather than as a young record.
+    #
+    # Clamping to the first implied minute costs a reader nothing they could have used
+    # and buys every implied minute a timestamp near enough to reach it.
+    implied_minutes = sorted(iv_rows)
+    if implied_minutes:
+        start = max(start, implied_minutes[0])
     if start > end:
         raise HTTPException(
             status_code=400,

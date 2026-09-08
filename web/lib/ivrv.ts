@@ -65,8 +65,18 @@ export type Alignment = (typeof ALIGNMENTS)[number];
 /** One timestamp, both series, and what each was computed from. */
 export interface VolPoint {
   at: string;
-  /** Constant-maturity ATM implied volatility at the lookback. `null` where unsolved. */
+  /**
+   * ATM implied volatility of the **nearest expiry past the seven-day floor**, scaled to
+   * that expiry's own days-to-run. `null` where no expiry cleared the floor.
+   *
+   * Not a constant-maturity index at the lookback any more: that had to interpolate
+   * between the two expiries either side of `N` and declined whenever the board held no
+   * such pair, which was most minutes. See `ivTenorDays`, which moves for the same
+   * reason.
+   */
   iv: number | null;
+  /** Days to run of the expiry `iv` came from. **Moves**, because the nearest rolls. */
+  iv_tenor_days: number | null;
   /** Per estimator. The **key is always present**; the value may be `null`. */
   rv: Partial<Record<Estimator, number | null>>;
   /** Returns (or bars, for the range estimators) behind each realised figure. */

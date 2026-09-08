@@ -194,10 +194,15 @@ def test_bounds_are_limited_by_the_history_held_when_that_is_the_shorter() -> No
     assert bounds.usable
 
 
-def test_bounds_are_limited_by_the_term_structure_when_that_is_the_shorter() -> None:
-    """Ninety days of bars against a term structure reaching sixty: the market wins.
+def test_the_term_structure_no_longer_caps_the_lookback() -> None:
+    """Ninety days of bars against a term structure reaching sixty: the bars win.
 
-    Past the longest listed expiry the index would be extrapolating, which R3 refuses.
+    **This reverses a rule.** While the implied side was a constant-maturity index built
+    *at* `N`, a lookback past the longest listed expiry asked the index to extrapolate and
+    it declined, so the term structure capped `N`. The implied side now reads the nearest
+    expiry and has no target to bracket, so the longest expiry constrains nothing: a
+    ninety-day realised window is a perfectly good question to ask, and the implied line
+    beside it answers a different-length one, which is what `iv_tenor_days` is for.
     """
     bounds = lookback_bounds(
         spot_bars=walking_bars(90 * 24),
@@ -205,16 +210,22 @@ def test_bounds_are_limited_by_the_term_structure_when_that_is_the_shorter() -> 
         interval=INTERVAL,
     )
 
-    assert abs(bounds.max_days - 60.0) < 1e-9
-    assert bounds.binding == "term_structure"
+    assert bounds.max_days > 60.0
+    assert bounds.binding == "history"
 
 
-def test_the_lower_bound_never_goes_under_the_shortest_listed_expiry() -> None:
-    """`N` drives the implied tenor too, so below the front expiry there is no IV.
+def test_the_lower_bound_is_the_observation_floor_and_not_the_front_expiry() -> None:
+    """A lookback shorter than the front expiry is now a perfectly good lookback.
 
-    The observation floor alone would allow a lookback of a few hours here. The index
-    would return nothing for it, and the chart would draw one line and call it a
-    comparison.
+    **This reverses a rule too, and it is the one that made the screen look broken.**
+    While `N` drove the implied tenor, a lookback under the shortest listed expiry left
+    the index nothing to interpolate from and the chart drew one line while calling
+    itself a comparison — so the floor was pinned to the front expiry. Reading the
+    nearest expiry instead means the implied side answers whatever `N` is, so the only
+    thing left down here is arithmetic: below `MIN_OBSERVATIONS` intervals a window has
+    too few returns to estimate from.
+
+    Thirty hourly returns is 1.25 days, and that is the whole of the lower bound now.
     """
     bounds = lookback_bounds(
         spot_bars=walking_bars(480),
@@ -222,19 +233,22 @@ def test_the_lower_bound_never_goes_under_the_shortest_listed_expiry() -> None:
         interval=INTERVAL,
     )
 
-    assert bounds.min_days >= 8.0
+    assert bounds.min_days == pytest.approx(30 * 60 * 60 / 86_400)
+    assert "30 returns" in bounds.detail
 
 
 def test_bounds_say_so_when_nothing_at_all_is_usable() -> None:
-    """Half an hour of spot against a term structure starting at eight days.
+    """Thirty hours of bars, sampled daily: thirty daily returns need thirty days.
 
-    This is the store as it actually stands on 2026-09-06 — thirty minutes of bars — and
-    the honest answer is that no lookback works yet, said in a form the screen can print.
+    The honest answer is that no lookback works yet, said in a form the screen can print
+    rather than as an empty chart. With the term structure no longer capping anything,
+    this is the one way left to be unusable — the history held is shorter than the
+    shortest window the observation floor permits at this sampling interval.
     """
     bounds = lookback_bounds(
         spot_bars=walking_bars(30),
         iv_rows=iv_by_bucket(30),
-        interval=MINUTE,
+        interval=DAY,
     )
 
     assert not bounds.usable
@@ -382,8 +396,8 @@ def test_implied_is_not_carried_forward_across_a_long_silence() -> None:
     assert all(point.iv is None for point in series.points)
 
 
-def test_implied_is_scaled_from_its_annualised_solve_to_the_lookback_window() -> None:
-    """A 40% annualised IV over a ten-day window is `0.40 * sqrt(10/365)` = 6.62%.
+def test_implied_is_scaled_from_its_annualised_solve_to_its_own_tenor() -> None:
+    """A 40% annualised IV on an eight-day expiry is `0.40 * sqrt(8/365)` = 5.92%.
 
     Implied volatility is a Black-76 parameter and is annualised **by construction** —
     the model only balances when sigma and T share a calendar. Realised volatility here is
@@ -391,11 +405,18 @@ def test_implied_is_scaled_from_its_annualised_solve_to_the_lookback_window() ->
     second would put a 40% line above a 7% line and call the gap a risk premium, when the
     entire gap would be a unit mismatch.
 
-    Oracle: `0.40 * sqrt(10/365) = 0.06620847108818943`, worked by hand.
+    **Scaled to eight days and not to the ten-day lookback.** The figure is the eight-day
+    expiry's own volatility, so the move it forecasts spans eight days; scaling it by the
+    realised window would print a number the market never quoted. The consequence — that
+    the two lines now describe different lengths of time — is real, is the price of an
+    implied line that is continuous rather than three points, and is stated on the screen
+    rather than hidden here.
+
+    Oracle: `0.40 * sqrt(8/365) = 0.05921865681580843`.
     """
     series = volatility_series(
         spot_bars=walking_bars(480),
-        iv_rows=iv_by_bucket(480),  # a flat 40% term structure
+        iv_rows=iv_by_bucket(480),  # flat 40% at 8 and 60 days
         lookback=10 * DAY,
         interval=INTERVAL,
         estimators=["log"],
@@ -407,7 +428,7 @@ def test_implied_is_scaled_from_its_annualised_solve_to_the_lookback_window() ->
 
     implied = series.points[0].iv
     assert implied is not None
-    assert abs(implied - 0.06620847108818943) < 1e-12
+    assert abs(implied - 0.05921865681580843) < 1e-12
 
 
 def test_a_year_is_365_days_here_and_not_252() -> None:
@@ -435,67 +456,15 @@ def test_a_year_is_365_days_here_and_not_252() -> None:
     assert abs(implied - with_252) > 0.01
 
 
-# ---------------------------------------------------------------------------
-# The floor is a tenor that resolves, not the shortest expiry ever listed.
-# ---------------------------------------------------------------------------
-
-
 def _leg(symbol: str, *, iv: float | None) -> Leg:
     """A leg the way the live path builds one: Delta's fields, plus ours under `computed`.
 
     IV sits at `leg.computed.iv` and never at `leg.iv` — the top-level `*_iv` fields are
     Delta's own and are reference columns this engine never reads
-    (`tests/test_no_delta_inputs.py` pins that). A helper here rather than inline so a
-    test cannot accidentally assert against the venue's figure.
+    (`tests/test_no_delta_inputs.py` pins that). A helper rather than inline so a test
+    cannot accidentally assert against the venue's figure.
     """
     return Leg(symbol=symbol, computed=ComputedLeg(iv=iv, iv_leg="call" if iv else None))
-
-
-def _minute_with_shortest(shortest_days: float, at: datetime) -> list[ContractIv]:
-    """One minute's contract rows whose shortest usable expiry is `shortest_days`."""
-    return [
-        ContractIv(
-            expiry=f"{days:.0f}d",
-            strike=strike,
-            iv=0.4,
-            forward=80_000.0,
-            years_to_expiry=days / 365.0,
-        )
-        for days in (shortest_days, shortest_days + 30.0)
-        for strike in (79_500.0, 80_500.0)
-    ]
-
-
-def test_the_floor_is_a_tenor_most_minutes_can_actually_serve() -> None:
-    """One minute listing a 7.5-day expiry must not set the floor for all of them.
-
-    `atm_iv` refuses to extrapolate below the shortest expiry **at that minute**, so a
-    lookback chosen from the shortest expiry ever *seen anywhere in the range* resolves
-    at the handful of minutes that happened to list it and nowhere else. On the stored
-    data that is the difference between an implied line of 99 points and one of 24, all
-    24 inside a single half-hour — which draws as a dot and reads as a broken chart
-    rather than as a bound the reader was allowed to pick badly.
-
-    Nineteen minutes here cannot serve a tenor under 11 days and one can serve 7.5. The
-    floor must follow the nineteen.
-    """
-    at = datetime(2026, 9, 4, 6, 0, tzinfo=timezone.utc)
-    iv_rows = {
-        at + timedelta(minutes=n): _minute_with_shortest(11.0, at + timedelta(minutes=n))
-        for n in range(19)
-    }
-    iv_rows[at + timedelta(minutes=19)] = _minute_with_shortest(7.5, at)
-
-    bounds = lookback_bounds(
-        spot_bars=walking_bars(60 * 24 * 40),
-        iv_rows=iv_rows,
-        interval=timedelta(hours=1),
-    )
-
-    assert bounds.min_days == pytest.approx(11.0), (
-        "the floor must be a tenor most minutes bracket, not the one minute that "
-        f"listed a nearer expiry (got {bounds.min_days})"
-    )
 
 
 # ---------------------------------------------------------------------------

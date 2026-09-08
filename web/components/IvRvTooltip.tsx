@@ -44,9 +44,21 @@ export function IvRvTooltip({
             <dt style={{ color: SERIES_COLOUR.iv }}>{LINE_LABEL.iv}</dt>
             <dd>
               {row.iv === null ? (
-                <span className="chart-tip-diff">no expiry brackets this tenor</span>
+                <span className="chart-tip-diff">no expiry past the 7d floor</span>
               ) : (
-                percent(row.iv)
+                <>
+                  {percent(row.iv)}
+                  {/* The tenor, because it moves. The nearest expiry rolls — 11.05 days
+                      one day and 10.11 the next — so a step in the line can be the term
+                      structure being resampled rather than the market changing its mind,
+                      and only this figure tells the two apart. */}
+                  {row.ivTenorDays !== null ? (
+                    <span className="chart-tip-diff">
+                      {" "}
+                      {row.ivTenorDays.toFixed(1)}d expiry
+                    </span>
+                  ) : null}
+                </>
               )}
             </dd>
           </>

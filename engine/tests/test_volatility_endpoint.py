@@ -124,7 +124,7 @@ def test_the_response_names_the_bounds_and_the_constraint_that_binds(
     bounds = body["bounds"]
     assert bounds["binding"] == "history"
     assert "history" in bounds["detail"]
-    assert bounds["min_days"] >= 8.0
+    assert bounds["min_days"] == pytest.approx(1.25)  # 30 hourly returns
     assert bounds["max_days"] < 20.0
 
 
@@ -168,10 +168,16 @@ def test_a_lookback_above_the_upper_bound_is_a_400_that_says_which_bound(
 def test_a_lookback_below_the_lower_bound_is_a_400_that_says_which_bound(
     client: TestClient,
 ) -> None:
-    """Under the shortest listed expiry there is no implied volatility to compare with."""
+    """Under thirty returns a window has too little in it to estimate anything from.
+
+    Half a day at hourly sampling is twelve returns. **This bound used to be the front
+    expiry** — while `N` drove the implied tenor, anything under it left the index
+    nothing to interpolate from. Reading the nearest expiry instead retired that reason,
+    and what is left down here is the arithmetic one.
+    """
     response = client.get(
         "/volatility",
-        params={"underlying": "BTC", "lookback_days": 2, "interval": "1h"},
+        params={"underlying": "BTC", "lookback_days": 0.5, "interval": "1h"},
     )
 
     assert response.status_code == 400
@@ -295,14 +301,14 @@ def test_the_bounds_can_be_asked_for_without_asking_for_a_series(
     assert response.status_code == 200
     body = response.json()
     assert body["binding"] == "history"
-    assert body["min_days"] >= 8.0
+    assert body["min_days"] == pytest.approx(1.25)  # 30 hourly returns
     assert body["max_days"] < 20.0
     assert body["usable"] is True
     assert "1h" in body["intervals"]
 
 
 def test_the_bounds_endpoint_says_so_when_nothing_is_usable() -> None:
-    """Half a day of bars against a term structure starting at eight days.
+    """One day of bars, sampled daily: thirty daily returns need thirty days.
 
     A 200 carrying `usable: false` rather than an error: the screen has a real answer to
     print, and "no lookback works yet" is information rather than a failure.
@@ -311,7 +317,7 @@ def test_the_bounds_endpoint_says_so_when_nothing_is_usable() -> None:
     app.dependency_overrides[get_volatility_source] = lambda: source
     try:
         body = TestClient(app).get(
-            "/volatility/bounds", params={"underlying": "BTC", "interval": "1m"}
+            "/volatility/bounds", params={"underlying": "BTC", "interval": "1d"}
         ).json()
     finally:
         app.dependency_overrides.clear()

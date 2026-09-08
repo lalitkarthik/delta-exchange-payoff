@@ -302,6 +302,32 @@ than rendering an empty chart.
   cannot be backfilled, so it exists only for minutes this engine was running — dozens
   against thousands — and a line style suited to a dense series renders a sparse one as
   almost nothing, which reads as a broken chart rather than as thin data.
+- **The implied side follows one expiry, not a constant maturity.** The index was built
+  *at* `N`, which meant interpolating between the two expiries either side of it and
+  declining whenever the board held no such pair. **Measured 2026-09-08**: a ten-day
+  target resolved at 24 of 108 recorded minutes, all inside one half-hour, while 11.5
+  days resolved at 99. The series arrived as three points on a chart of four hundred, and
+  a correct refusal nobody can read is worth less than a line that follows the term
+  structure. `atm_iv` is kept and tested; `atm_iv_for_expiry` is what the screen calls.
+  Two consequences, both on screen: `N` no longer bounds the implied side at all, so the
+  lower bound is the observation floor and the term structure caps nothing; and the two
+  lines now describe **different lengths of time**, which the axis, the note and the
+  hover all say.
+- **The expiry is chosen once for the series.** Re-choosing per minute drew a
+  near-vertical stroke across 70% of the axis inside half an hour — the figure is scaled
+  by `sqrt(T/365)`, so a thin minute that recorded only a 21-day expiry printed 8.7%
+  beside a neighbour holding a 7-day one at the same 36% annualised, which printed 5.2%.
+  None of that was the market. Holding one contract put the whole series inside
+  6.3%–7.3%.
+- **The staleness tolerance follows the plotted step, not the sampling interval.** The
+  route thins a long range to `MAX_POINTS`, so at 1m sampling over thirty days the points
+  land twenty-one minutes apart while the tolerance stayed at one minute: six of every
+  seven recorded implied minutes were unreachable, not stale. It is still bounded and
+  still not a forward-fill — an opinion is carried at most as far as the next point.
+- **The range starts where a comparison becomes possible.** Realised is backfilled and
+  implied cannot be, so the union is twenty-five days on which one of the two lines
+  cannot exist — and because the range sets the stride, those empty days were what
+  pushed the implied minutes between the plotted points.
 - **The optimal sampling interval has not been measured here.** The literature puts the
   bias/variance optimum near five minutes for equities; our series is a computed index rather
   than a traded price, so the number should be measured on this data. Until it is, the

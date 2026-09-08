@@ -76,6 +76,7 @@ export interface ChartRow {
   at: number;
   label: string;
   iv: number | null;
+  ivTenorDays: number | null;
   coverage: Partial<Record<Estimator, number>>;
   returns: Partial<Record<Estimator, number>>;
   [key: string]: unknown;
@@ -119,6 +120,7 @@ export function IvRvChart({ series, visible }: Props) {
           at: new Date(point.at).getTime(),
           label: point.at,
           iv: plottable(point.iv) ? point.iv : null,
+          ivTenorDays: plottable(point.iv_tenor_days) ? point.iv_tenor_days : null,
           coverage: point.coverage as Partial<Record<Estimator, number>>,
           returns: point.returns as Partial<Record<Estimator, number>>,
         };
@@ -187,7 +189,9 @@ export function IvRvChart({ series, visible }: Props) {
             <Label
               className="chart-axis-title"
               fill="var(--ink-faint)"
-              value={`VOLATILITY OVER ${series.lookback_days.toFixed(1)}D`}
+              // Not "over N days": only the realised side spans N. The implied side
+              // spans its own expiry, which the hover reports per point.
+              value="VOLATILITY OVER ITS HORIZON"
               angle={-90}
               position="insideLeft"
               offset={14}
