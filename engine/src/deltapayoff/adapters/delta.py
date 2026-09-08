@@ -139,9 +139,9 @@ class DeltaAdapter:
 
         It is a parameter rather than a hard reference so the application module keeps the
         seam its lifespan tests already drive — they replace `main.DeltaFeed` with a stub
-        that registers subscriptions and never dials out. `connect=` and the retry
-        settings pass through in `feed_kwargs`, which is the seam `tests/test_feed.py`
-        drives.
+        that registers subscriptions and never dials out. `connect=` passes through in
+        `feed_kwargs`, which is the seam `tests/test_feed.py` drives. The retry settings
+        are no longer among them: #39 moved them to the controller.
         """
         self._client = client if client is not None else DeltaClient()
         self._underlyings = tuple(name.strip().upper() for name in underlyings if name)
@@ -261,7 +261,11 @@ class DeltaAdapter:
                 return
 
     async def stream(self, publish: Publish) -> None:
-        """Run the socket until stopped, publishing canonical events.
+        """**One connection**, publishing canonical events until it ends.
+
+        Since #39 this returns when the socket closes rather than reconnecting behind the
+        caller's back: backoff, the lifetime budget and the decision to redial belong to
+        `controller.ConnectionController`. The values did not change, only who runs them.
 
         `publish` is held for the duration and cleared on the way out, so an adapter that
         has returned cannot publish into a bus the caller has finished with.
@@ -309,9 +313,10 @@ class DeltaAdapter:
             self.undecodable += 1
             if self.undecodable == 1:
                 # **The first one only.** A systematic decode bug would otherwise zero
-                # the whole event stream while `feed.messages` kept climbing, and
-                # `undecodable` is not on `/health` until #39 — a silent failure with a
-                # counter nobody reads. Logging every frame would flood at 1,323 msg/s,
+                # the whole event stream while `feed.messages` kept climbing. **#39 put
+                # this counter on `/health`**, beside `empty_opens`, so it is a silent
+                # failure with a reader now. Logging every frame would flood at 1,323
+                # msg/s,
                 # so the first says what happened and the counter carries the rest.
                 logger.warning(
                     "the first undecodable %s frame for %r; the count carries the rest",
