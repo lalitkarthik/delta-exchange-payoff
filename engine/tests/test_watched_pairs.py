@@ -120,14 +120,24 @@ def test_one_viewer_leaving_does_not_stop_the_solve_for_the_other(clocked) -> No
 def test_a_release_with_no_matching_watch_cannot_drive_the_count_negative(
     clocked,
 ) -> None:
-    """The handler's `finally` runs on paths that never registered. A negative count
-    would then swallow the next real `watch` and stop the solve silently."""
+    """A doubled release must not leave the count below zero.
+
+    The handler's `finally` runs on paths that never registered, and one release too
+    many is the shape of every refcount bug there has ever been. Without a floor the
+    count goes to -1, the next real viewer only brings it back to zero, and its expiry
+    is silently never solved — a ladder that renders and does not move, with `/health`
+    reporting nothing watched. Driven through a real `watch` first, because a release
+    against a pair with no entry at all returns early and could never test the floor.
+    """
+    clocked.watch("BTC", EXPIRY)
     clocked.unwatch("BTC", EXPIRY)
     clocked.unwatch("BTC", EXPIRY)
 
     clocked.watch("BTC", EXPIRY)
 
     assert clocked.watching() == [("BTC", EXPIRY, 1, None)]
+    feed(clocked, "C-BTC-77600-040927")
+    assert clocked.recompute_watched() == 1, "the returning viewer is not being solved"
 
 
 # --------------------------------------------------------------- the grace window
