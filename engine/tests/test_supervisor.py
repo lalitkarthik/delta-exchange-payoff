@@ -242,10 +242,19 @@ def test_a_process_with_no_feed_still_answers(monkeypatch) -> None:
     is down when it is up.** So the report is still given, with `feed` reading `stopped`
     — which is exactly true of a process with no feed — rather than a 503."""
     monkeypatch.setattr(main.app.state, "supervisor", None, raising=False)
+    monkeypatch.setattr(main.app.state, "stream", None, raising=False)
 
     body = TestClient(main.app).get("/health").json()
 
-    assert body == {"status": "ok", "feed": "stopped", "adapters": []}
+    # `watched` is #44's addition and empty here for the same reason `adapters` is:
+    # nothing is running. The whole body is asserted rather than a few keys, so a field
+    # appearing or disappearing is a test failure and not a discovery.
+    assert body == {
+        "status": "ok",
+        "feed": "stopped",
+        "adapters": [],
+        "watched": [],
+    }
 
 
 def test_the_report_carries_the_reconnect_count_and_what_is_left_of_the_budget() -> None:
