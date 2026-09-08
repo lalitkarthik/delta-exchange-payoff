@@ -143,16 +143,21 @@ PUSH_INTERVAL_SECONDS = 1.0
 MIN_PUSH_INTERVAL_SECONDS = 0.02
 
 #: Underlyings the live feed subscribes at start-up **when nothing says otherwise**.
-#: Every listed BTC option, both channels — about 600 messages and 300 KB a second,
-#: measured. That buys instant expiry switching with no subscribe round trip. Narrowing
-#: the book subscription to the watched expiry would cut it to roughly a third; see
-#: `docs/ingestion.md`.
+#: Every listed option on each, both channels. That buys instant expiry switching with no
+#: subscribe round trip. Narrowing the book subscription to the watched expiry would cut
+#: it to roughly a third; see `docs/ingestion.md`.
 #:
-#: **BTC alone, deliberately.** ETH is #43's ticket and the cost of adding it has not been
-#: measured — #33 requires the feed's rate and bandwidth measured for sixty seconds after
-#: ETH is enabled before it is called fine, and `docs/design/hld.md` §5 records that the
-#: BTC-only figure is itself contested between two runs.
-LIVE_UNDERLYINGS = ("BTC",)
+#: **This comment used to claim ~600 msg/s and ~300 KB/s for BTC alone. That number was
+#: never run** — #33's spec had quoted it from here rather than from a probe, and #43
+#: found no run behind it anywhere in the repository's history. `tools/measure_feed.py`,
+#: run for both configurations on 2026-09-08, put it right: BTC alone (504 contracts)
+#: is `measured` 1,095.1 msg/s at 547.3 KB/s; BTC+ETH together (782 contracts) is
+#: `measured` 1,693.6 msg/s at 843.4 KB/s. Both are the same subscription shape this line
+#: builds — every listed contract, both channels — so the two never disagreed about what
+#: was subscribed, only about whether anyone had measured it. `docs/design/hld.md` §5 has
+#: the full run detail; this comment now points there instead of repeating a number that
+#: drifts with the live contract count.
+LIVE_UNDERLYINGS = ("BTC", "ETH")
 
 #: Comma-separated, e.g. `BTC,ETH`. Read at start-up rather than at import, so which
 #: assets are recorded is a deployment decision and not a code change.
