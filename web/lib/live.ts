@@ -38,8 +38,9 @@ export function engineSocketUrl(underlying: Underlying, expiry: string): string 
  */
 export type FeedState = "connecting" | "connected" | "degraded" | "reconnecting" | "stopped";
 
-/** `docs/live-chain-contract.md`'s nine reasons. Kept as `string` rather than a union:
- * a reason nobody has named yet must still render on hover rather than fail to parse. */
+/** `docs/live-chain-contract.md`'s ten reasons. Kept as `string` rather than a union:
+ * a reason nobody has named yet must still render on hover rather than fail to parse —
+ * which is what let #41's `paused` reach the badge with no change on this side. */
 export type FeedReason = string;
 
 export interface FeedStatus {
