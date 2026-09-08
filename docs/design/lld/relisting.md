@@ -29,7 +29,9 @@ hold 24, which is what broke the volatility smile's left wing into disconnected 
 
 **Re-listing** is `relist_forever` → `relist_instruments`: ask
 `adapter.instruments(underlying)`, subtract what `FeedStack.listed` already holds, and
-`adapter.subscribe` the difference.
+`adapter.subscribe` the difference. Only the difference, because Delta answers a subscribe
+with the current book — re-sending the whole registry would answer for every contract
+already on the socket, several hundred snapshot frames to say nothing new.
 
 **Reaching the open connection** is `DeltaFeed.subscribe`. Registering was never the same
 as subscribing: the registry was sent to the venue exactly once per connection, inside
@@ -50,13 +52,22 @@ hole one bar — the smallest gap this store can express. Five minutes would los
 of every new strike to save four REST reads.
 
 Not faster, either. `instruments()` is `/v2/tickers` with no expiry filter, the heaviest
-read this engine makes, against a listing that changes a few times a day: below a minute
-it re-reads the same answer several times per bar it could not have improved. The measured
-cost of one read is in §6.
+read this engine makes — `measured` 2026-09-08, BTC 520 contracts in 644.8 KB and 735 ms,
+ETH 278 in 342.2 KB and 737 ms — against a listing that changes a few times a day. At this
+cadence that is `derived` 987 KB a minute beside the feed's own `measured` 843.4 KB/s,
+about 2% more traffic. Below a minute it re-reads the same answer several times per bar it
+could not have improved.
 
 **It is not on any hot path.** The feed runs at `measured` 1,693.6 msg/s with BTC+ETH
 (`tools/measure_feed.py`, 2026-09-08); this is a REST call on its own task, the slowest of
 the five `start_feed_stack` runs, and the socket reader never waits on it.
+
+**A second subscribe is additive, and that is measured rather than assumed.** If Delta
+replaced a connection's subscription set instead of adding to it, sending the difference
+would silently unsubscribe everything it did not name — #51 again, and worse.
+`tools/probe_relist.py`, 2026-09-08: two contracts subscribed and delivering over a 15 s
+window, two more subscribed on the same open socket, and over the next 15 s **all four**
+delivered (33, 33, 32, 32 frames).
 
 ## 4. Failure modes
 
@@ -92,13 +103,13 @@ The cost of keeping is a replay that grows by roughly one day's expired contract
 the process runs. It is made visible rather than merely assumed: every `feed.instruments`
 record carries `subscribed`, the registry's current size, so the growth is in the log.
 
-**The threshold.** `tools/probe_ws.py` measured on 2026-09-03 that Delta accepted and
-acknowledged **300 symbols** in a single subscribe message on both channels. That is a
-floor, not a ceiling — the probe did not find where the limit is — and a BTC+ETH engine
-already replays 782 symbols per channel. **Revisit this decision when either the ceiling
-is measured, or `subscribed` is seen materially above the live listing's own size**; the
-right fix then is a prune inside `relist_instruments`, where the current listing is
-already in hand, guarded so the registry can never be emptied.
+**The threshold.** The largest subscribe frame anyone has measured Delta accepting is
+**520 symbols per channel** — the live re-list in §6, 2026-09-08 — over `probe_ws.py`'s
+earlier 300. Both are floors: neither run found where the limit is, and a BTC+ETH engine
+already replays 798 symbols per channel on every reconnect. **Revisit this decision when
+either the ceiling is measured, or `subscribed` is seen materially above the live
+listing's own size.** The right fix then is a prune inside `relist_instruments`, where the
+current listing is already in hand, guarded so the registry can never be emptied.
 
 ## 6. Numbers
 
@@ -108,6 +119,10 @@ already in hand, guarded so the registry can never be emptied.
 | Feed throughput the re-list must not disturb, BTC+ETH: 1,693.6 msg/s | `measured` | `tools/measure_feed.py`, 2026-09-08 |
 | Symbols accepted in one subscribe message, both channels: ≥ 300 | `measured` | `tools/probe_ws.py`, 2026-09-03 |
 | The hole #51 left on 2026-09-07: 4 strikes of one expiry missing 06:32Z of 824 minutes | `measured` | the store, 2026-09-08 |
+| One listing: BTC 520 contracts, 644.8 KB, 735 ms; ETH 278, 342.2 KB, 737 ms | `measured` | `tools/probe_relist.py`, 2026-09-08 |
+| A second subscribe on a live socket is additive | `measured` | `tools/probe_relist.py`, 2026-09-08, two 15 s windows |
+| Symbols accepted in one **live** subscribe frame, per channel: ≥ 520 | `measured` | the live re-list below, 2026-09-08 |
+| A live re-list subscribing 518 contracts on an open socket: 482 ms, and 521 symbols delivering 4,240 frames in the next 20 s against 3 before | `measured` | live against `api.india.delta.exchange`, 2026-09-08 07:09Z |
 
 **The existing hole is unrecoverable and is not backfilled.** Delta's own history pads
 with the last trade and does not say so; this project's rule is that a minute with no
