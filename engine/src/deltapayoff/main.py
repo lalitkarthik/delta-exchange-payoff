@@ -73,7 +73,7 @@ from .chain import (
 from .compute import enrich
 from .contract_bars import ContractBarsResponse, read_contract_bars
 from .delta_client import DeltaClient, DeltaUnavailable
-from .events import ConnectionState
+from .events import ConnectionState, Event, FeedConnection
 from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
 from .historical import list_minutes, read_ladder_at
@@ -206,6 +206,37 @@ def live_underlyings() -> tuple[str, ...]:
 
 
 @dataclass
+class FeedConnectionCache:
+    """The latest `feed.connection` transition per adapter. #40's badge reads this.
+
+    **Why this exists rather than reading `ConnectionController.state` directly.** The
+    controller (#38) exposes *which* state it is in but not *since when*, in wall-clock
+    terms — `_entered_at` is on its monotonic clock, held privately, and there is no
+    accessor for it. A websocket that connects between two transitions still has to open
+    with an accurate "since" for whatever state the feed was already in, and the only
+    place that timestamp exists at all is on the `FeedConnection` event the controller
+    published when it made that transition. So this remembers the event, not the state.
+
+    **Updated synchronously, not through a subscription.** `build_feed_stack` wraps the
+    `publish` callable handed to `FeedSupervisor` so this is written *before* the event
+    reaches the bus, in the same call — no queue, no task, no lag, and critically no new
+    consumer on the market-data bus: a raw `FanOut` subscription would receive every
+    `md.option_quote` and `md.option_reference` too, at roughly 600 messages a second,
+    to catch a `feed.connection` event that arrives a few times an hour.
+    """
+
+    latest: dict[str, FeedConnection] = field(default_factory=dict)
+
+    def apply(self, event: Event) -> None:
+        """Note `event` if it is a transition. Anything else passes unremembered."""
+        if isinstance(event, FeedConnection):
+            self.latest[event.adapter] = event
+
+    def get(self, adapter: str) -> FeedConnection | None:
+        return self.latest.get(adapter)
+
+
+@dataclass
 class FeedStack:
     """Every moving part of the live feed, wired to the bus and to each other.
 
@@ -232,6 +263,9 @@ class FeedStack:
     #: unconditionally, like the writer, so a process with no live feed still has a
     #: report to give rather than a route that raises.
     supervisor: FeedSupervisor
+    #: **#40's badge reads this.** The latest `feed.connection` per adapter, kept in step
+    #: with the supervisor's own `publish` — see `FeedConnectionCache`.
+    feed_cache: FeedConnectionCache
     #: The background tasks, empty until `start_feed_stack` runs. Cancelled on shutdown.
     #: **The feed is no longer among them** — the supervisor owns that task.
     tasks: list[asyncio.Task] = field(default_factory=list)
@@ -277,6 +311,17 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
         underlyings=live_underlyings(),
         feed_factory=DeltaFeed,
     )
+    # #40's badge needs an accurate "since" for whatever state a browser's own websocket
+    # connects into, and the controller keeps no wall-clock record of that — see
+    # `FeedConnectionCache`. So the cache is updated **synchronously, in front of the
+    # real bus**, rather than through a subscription of its own: the same `publish`
+    # `FeedSupervisor` was already being handed, with one line added before it.
+    feed_cache = FeedConnectionCache()
+
+    def publish(event: Event) -> None:
+        feed_cache.apply(event)
+        events.publish(event)
+
     return FeedStack(
         events=events,
         stream=stream,
@@ -285,7 +330,8 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
         # One adapter today and a list from the start, because the supervisor's whole
         # reason to exist is the second one — and a single-adapter shortcut here is the
         # thing that would have to be undone to add it.
-        supervisor=FeedSupervisor([adapter], events.publish),
+        supervisor=FeedSupervisor([adapter], publish),
+        feed_cache=feed_cache,
     )
 
 
@@ -367,6 +413,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.writer = stack.writer
     app.state.feed = stack.feed
     app.state.supervisor = stack.supervisor
+    app.state.feed_cache = stack.feed_cache
     app.state.tasks = stack.tasks
 
     if live_feed_enabled():
@@ -384,6 +431,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await stop_feed_stack(stack)
         await client.aclose()
+        # **Undo every assignment above.** `app.state` is a plain namespace on a
+        # module-level singleton and Starlette does not clear it on shutdown, so a test
+        # that runs the real lifespan and then exits `TestClient`'s `with` block leaves
+        # every name here pointing at a *closed* stack — a supervisor whose controllers
+        # are detached, a writer whose store is gone. #40's `get_feed_cache` was the
+        # first dependency this ever visibly broke: a later test on a bare
+        # `TestClient(app)`, never expecting a supervisor at all, read a stale one back
+        # and got a `feed` message built from the previous test's shutdown. Setting these
+        # back to the "no lifespan has run" value — `None`, which every reader here
+        # already treats as "nothing to report" rather than an error — makes shutdown
+        # actually mean shutdown for whichever test runs next.
+        for name in (
+            "delta",
+            "stack",
+            "events",
+            "adapter",
+            "stream",
+            "writer",
+            "feed",
+            "supervisor",
+            "feed_cache",
+            "tasks",
+        ):
+            setattr(app.state, name, None)
 
 
 app = FastAPI(
@@ -558,6 +629,13 @@ def get_supervisor() -> FeedSupervisor | None:
     true of a process with no feed.
     """
     return getattr(app.state, "supervisor", None)
+
+
+def get_feed_cache() -> FeedConnectionCache | None:
+    """The badge's own source, sibling of `get_supervisor`. `None` for the same reason:
+    a process whose lifespan never ran has no cache to read, and `/ws/chain` simply
+    sends no `feed` message rather than raising — see `live_chain`."""
+    return getattr(app.state, "feed_cache", None)
 
 
 @app.get("/health", response_model=HealthReport)
@@ -1000,22 +1078,44 @@ async def set_recording(
     return _recording_state(writer)
 
 
+#: Second precision, `Z`-suffixed — `chain.py`'s `fetched_at` spelling, and now `feed`'s
+#: `since`. One format for every wall-clock stamp this engine puts on the wire.
+_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _feed_message(event: FeedConnection) -> dict[str, Any]:
+    """A `FeedConnection` event, in the shape `docs/live-chain-contract.md` fixes."""
+    return {
+        "type": "feed",
+        "data": {
+            "adapter": event.adapter,
+            "state": event.to_state.value,
+            "since": event.ts_received.strftime(_TIMESTAMP_FORMAT),
+            "reason": event.reason,
+        },
+    }
+
+
 @app.websocket("/ws/chain")
 async def live_chain(
     websocket: WebSocket,
     underlying: str,
     expiry: str,
     stream: Annotated[ChainStream, Depends(get_chain_stream)],
+    supervisor: Annotated[FeedSupervisor | None, Depends(get_supervisor)],
+    feed_cache: Annotated[FeedConnectionCache | None, Depends(get_feed_cache)],
     interval: float = PUSH_INTERVAL_SECONDS,
 ) -> None:
     """Push the chain for one underlying and expiry until the browser goes away.
 
     The payload is the same `ChainResponse` `/chain` returns, wrapped in an envelope so
-    the three things the socket can say are distinguishable:
+    the four things the socket can say are distinguishable — `docs/live-chain-contract.md`
+    is the authority:
 
         {"type": "chain",   "data": {...}}   here is the ladder
         {"type": "waiting", "detail": "..."} nothing has arrived for this expiry yet
         {"type": "error",   "detail": "..."} the request cannot ever succeed
+        {"type": "feed",    "data": {...}}   the venue connection's own state — #40
 
     **`waiting` is not an empty chain.** A `ChainResponse` with no rows renders as a
     blank ladder and reads as "Delta lists nothing", when the truth is that the socket
@@ -1024,6 +1124,14 @@ async def live_chain(
     A websocket cannot return 400, so a bad parameter is reported in an `error` message
     before closing. Closing silently would leave the browser reconnecting forever
     against a request that can never work.
+
+    **`feed` is unrelated to this connection succeeding or not.** It reports the
+    engine's own socket to Delta, read off `feed_cache` — see that class for why a cache
+    rather than a fresh bus subscription — for whichever adapter the supervisor holds.
+    `None` (no supervisor, no cache, or a supervisor with nothing registered — every test
+    that does not override `get_supervisor`) means the caller cannot answer the question,
+    and the socket simply never sends `feed`, exactly as it always behaved before this
+    ticket.
     """
     await websocket.accept()
     interval = max(interval, MIN_PUSH_INTERVAL_SECONDS)
@@ -1035,8 +1143,35 @@ async def live_chain(
         await websocket.close()
         return
 
+    # **One adapter today** — see `docs/live-chain-contract.md`'s "one adapter today".
+    # `underlying`/`expiry` do not select among adapters because there is only the one
+    # to choose from; a second venue would need this to change.
+    adapter_name: str | None = None
+    if supervisor is not None and supervisor.controllers:
+        adapter_name = supervisor.controllers[0].adapter_name
+
+    #: The state last actually sent to *this* connection, so a `feed` message goes out
+    #: only when it says something new — see `docs/live-chain-contract.md`'s
+    #: "Coalescing". `None` before the first one, which is distinct from every real
+    #: `ConnectionState.value` and so cannot be mistaken for one having already gone out.
+    last_sent_state: str | None = None
+
+    async def push_feed_update() -> None:
+        nonlocal last_sent_state
+        if adapter_name is None or feed_cache is None:
+            return
+        event = feed_cache.get(adapter_name)
+        if event is None or event.to_state.value == last_sent_state:
+            return
+        last_sent_state = event.to_state.value
+        await websocket.send_json(_feed_message(event))
+
     try:
         while True:
+            # Before `chain`/`waiting`, every pass — including the first, which is what
+            # puts `feed` ahead of the very first ladder on a fresh connection.
+            await push_feed_update()
+
             chain = stream.chain(symbol, date)
             if chain is None:
                 await websocket.send_json(
