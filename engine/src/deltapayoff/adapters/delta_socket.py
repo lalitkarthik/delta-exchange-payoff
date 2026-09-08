@@ -166,7 +166,6 @@ class DeltaFeed:
         #: connection is empty is a feed nobody subscribed, and a counter stuck above
         #: zero is the signal that says so.
         self.empty_opens = 0
-        self.started_at: float | None = None
         #: Why the last connection ended. `None` means it has not ended yet. Without
         #: this a persistently failing feed is indistinguishable from a quiet healthy
         #: one: `messages` simply stops moving and nothing says why.
@@ -367,9 +366,6 @@ class DeltaFeed:
         """
         if self._stopping:
             return
-        if self.started_at is None:
-            self.started_at = time.perf_counter()
-
         before = self.messages
         # **This attempt's own error, in a local.** `last_error` is instance state that
         # survives across `run()` calls, and since #39 there are many calls where there

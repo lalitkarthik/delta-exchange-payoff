@@ -19,8 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from deltapayoff import main
-from deltapayoff.controller import ConnectionController
-from deltapayoff.events import ConnectionState
+from deltapayoff.events import Alert, ConnectionState
 from deltapayoff.supervisor import SEVERITY, FeedSupervisor, worst
 from fakes.scripted_adapter import Close, Frames, ScriptedAdapter, Silence
 
@@ -124,7 +123,13 @@ def test_closing_takes_every_controller_off_its_adapter() -> None:
 
 def test_closing_twice_is_not_an_error() -> None:
     """A lifespan that fails part way tidies up on both paths and must not be handed a
-    second failure by the tidy-up."""
+    second failure by the tidy-up.
+
+    **This test asserts nothing, deliberately: the second `aclose()` not raising is the
+    whole claim.** Said out loud because an assertionless test otherwise reads as one
+    somebody forgot to finish. It fails by raising — `aclose` iterating a list it has
+    already emptied, or `detach` being handed a controller already off its adapter.
+    """
     supervisor = _supervisor(ScriptedAdapter())
 
     async def scenario() -> None:
@@ -141,16 +146,30 @@ def test_starting_runs_every_controller_and_stopping_ends_them() -> None:
         ScriptedAdapter(venue="BETA", script=[Frames("ob_l2", [BOOK_FRAME])]),
     ]
     supervisor = _supervisor(*adapters, poll_seconds=0.01)
+    seen: dict[str, object] = {}
 
     async def scenario() -> None:
         supervisor.start()
+        # Captured while it is running, because `aclose()` stops every controller
+        # unconditionally — so a `STOPPED` asserted *after* it is guaranteed by
+        # construction and passes with the whole supervisor deleted. What can fail is
+        # that starting actually connected both adapters.
+        #
+        # Not the state, though, at either end. `start()` is synchronous and only
+        # creates the tasks, so the supervisor reads `stopped` until the first of them
+        # runs; and by the time the sleep is over these scripts have run out, so it
+        # reads `stopped` again for a reason that has nothing to do with the lifespan.
+        # The tasks are what this test is about, so the tasks are what it asserts.
+        seen["tasks"] = list(supervisor._tasks)
         await asyncio.sleep(0.05)
         await supervisor.aclose()
 
     asyncio.run(scenario())
 
     assert [a.connections for a in adapters] == [1, 1]
-    assert supervisor.state is ConnectionState.STOPPED
+    assert len(seen["tasks"]) == len(adapters), "one task per adapter"
+    assert all(task.done() for task in seen["tasks"]), "none left running after"
+    assert supervisor._tasks == []
 
 
 # --- the report --------------------------------------------------------------------
@@ -322,14 +341,29 @@ def test_the_supervisor_does_not_restart_a_controller_that_gave_up() -> None:
     asyncio.run(scenario())
 
     controller = supervisor.controllers[0]
-    assert isinstance(controller, ConnectionController)
-    assert supervisor.state is ConnectionState.STOPPED
+    # **The alert, not the state.** Three assertions were here that could not fail: an
+    # `isinstance` guaranteed by the default factory, an identity check on a list
+    # nothing in the supervisor mutates, and `state is STOPPED` after an `aclose()` that
+    # stops every controller unconditionally. The last one is the trap — it also passes
+    # when the budget is disabled outright, because this script runs out and the
+    # controller stops for that reason instead. Verified by disabling the budget check
+    # and watching all three still pass.
+    #
+    # What the budget actually produces, and nothing else here does, is one alert.
+    spent = [
+        event
+        for event in published
+        if isinstance(event, Alert) and event.code == "reconnect_budget_spent"
+    ]
+    assert len(spent) == 1, "the spent budget was not announced exactly once"
     assert controller.budget_remaining == 0
     # The fake reconnects inside its own `Close`, so three opens is the script running
     # out — not a fourth attempt. What matters is that the controller is `stopped` and
-    # stayed that way: the supervisor built no replacement for it.
+    # stayed that way: the supervisor built no replacement for it, which is what the
+    # connection count says. (An `isinstance` on the controller and an identity check on
+    # the list were here and are gone: the default factory guarantees the first and
+    # nothing in the supervisor can mutate the second, so neither could ever fail.)
     assert adapter.connections == 3
-    assert supervisor.controllers[0] is controller
 
 
 def test_the_delta_adapters_silent_failure_counters_reach_the_report() -> None:

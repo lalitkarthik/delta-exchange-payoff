@@ -1303,3 +1303,41 @@ def test_an_announced_redial_is_not_immediately_called_silent() -> None:
         f"{len(alerts)} silence alerts fired during one outage — an alert per redial is "
         "the flood an alert exists to stand out from"
     )
+
+
+def test_a_message_arriving_after_a_stop_does_not_restore_the_budget() -> None:
+    """**A stopped connection is stopped, and nothing a socket says changes that.**
+
+    `message_arrived` restored the budget, the backoff and the age before it looked at
+    the state at all, so a frame off a socket winding down — or, from #41, a frame that
+    arrives between a stop and the reader noticing — silently handed a `stopped`
+    connection its whole lifetime budget back. The transitions were guarded and the
+    counters were not, which is the more dangerous half: `/health` would report a feed
+    that had given up as having a full budget in hand, and #41's resume would start from
+    a number nobody spent.
+    """
+    clock = FakeClock()
+    published: list = []
+    controller = ConnectionController(
+        ScriptedAdapter(),
+        published.append,
+        reconnect_budget=1,
+        clock=clock.read,
+        heartbeat_every=1_000.0,
+    )
+    controller.start()
+    controller.connection_opened()
+    controller.message_arrived()
+    controller.connection_closed("1006")
+    controller.connection_closed("1006")
+
+    assert controller.state is ConnectionState.STOPPED
+    assert controller.budget_remaining == 0
+
+    clock.now = 5.0
+    controller.message_arrived()
+
+    assert controller.state is ConnectionState.STOPPED
+    assert controller.budget_remaining == 0, (
+        "a stopped connection was handed its lifetime budget back by a stray frame"
+    )

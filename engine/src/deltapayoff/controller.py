@@ -382,7 +382,16 @@ class ConnectionController:
         month, with no failure anywhere to point at. The inverse — restoring on the
         socket merely opening — is worse, because Delta can accept a handshake and close
         immediately and a budget restored every pass never exhausts at all.
+
+        **A stopped connection ignores this entirely.** The transitions below were
+        guarded by state and the counters above them were not, so a frame off a socket
+        winding down handed a `stopped` connection its whole lifetime budget back — and
+        `/health` then reported a feed that had given up as having a full budget in hand.
+        Harmless while nothing restarts a controller; #41's resume is what makes it a
+        hazard, so it is refused here rather than left for that ticket to discover.
         """
+        if self._state is State.STOPPED:
+            return
         self._last_message_at = self._clock() if now is None else now
         self._budget_spent = 0
         self._delay = self.retry_delay
