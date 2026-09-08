@@ -275,11 +275,15 @@ than rendering an empty chart.
   nothing about coverage.** The payload carries it per point per estimator; the screen does
   not yet draw it. A window computed from 60% coverage currently looks identical to one from
   100%.
-- **The index price history is verified, and argues these estimators read the wrong source.**
-  [`index-history.md`](index-history.md) — `.DEXBTUSD` does not pad and reaches back ~2.7
-  years, but its per-minute range is wider than ours on **16 of 16** overlapping minutes.
-  Feeding the range estimators the venue's bars instead of `spot-bars` is the cheapest test
-  of the discretisation hypothesis in §4.
+- **The discretisation hypothesis in §4 is supported, and the estimators now read the
+  venue's bars.** #54 backfilled `.DEXBTUSD` into `index-bars` and switched the realised
+  series onto it. **Measured 2026-09-08** over the window both sources cover: the spread
+  across the four estimators falls from **99% to 33%**, and it is the range estimators that
+  move — Parkinson 1.58x, Garman-Klass 1.70x, Rogers-Satchell 1.72x, against close-to-close
+  at 1.14x. That is discretisation's own signature: the estimators that read extremes were
+  the ones a coarsely sampled path was starving. **It does not close.** A third of a spread
+  survives on a source with a bar every minute and nothing else obvious to blame, and what
+  is left is a better question than the one it replaced.
 - **`spot_price` versus `settlement_index_price` is unconfirmed.** If they differ, realised
   volatility measures a slightly different asset than implied volatility implies, and the
   wedge sits inside the premium unlabelled.

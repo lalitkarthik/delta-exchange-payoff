@@ -64,11 +64,25 @@ class StubSource:
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
-    source = StubSource()
-    app.dependency_overrides[get_volatility_source] = lambda: source
-    yield TestClient(app)
+def client_factory() -> Iterator[object]:
+    """A client over whichever source the test supplies. Overrides cleared after.
+
+    #54 needs two sources — one holding a backfill and one without — where every test
+    before it needed only the default, so the fixture became a factory rather than
+    growing a parameter every existing test would have to pass.
+    """
+
+    def build(source: object) -> TestClient:
+        app.dependency_overrides[get_volatility_source] = lambda: source
+        return TestClient(app)
+
+    yield build
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client(client_factory) -> TestClient:
+    return client_factory(StubSource())
 
 
 def test_both_series_arrive_for_one_lookback(client: TestClient) -> None:
@@ -305,3 +319,88 @@ def test_the_bounds_endpoint_says_so_when_nothing_is_usable() -> None:
     assert body["usable"] is False
     assert body["binding"] == "history"
     assert "history" in body["detail"]
+
+
+# ---------------------------------------------------------------------------
+# #54: the realised series moves to the venue's own index candles.
+# ---------------------------------------------------------------------------
+
+
+class IndexSource(StubSource):
+    """A store that holds backfilled `index-bars` as well as recorded `spot-bars`.
+
+    The two series are given visibly different prices so a test cannot pass by reading
+    the wrong one: the index bars sit 1,000 higher and move twice as far.
+    """
+
+    def index_bars(self, underlying: str, **_: object) -> list[Bar]:
+        self.calls.append(f"index:{underlying}")
+        return [
+            Bar(
+                at=START + n * MINUTE,
+                open=81_000.0 + (20.0 if n % 2 else 0.0),
+                high=81_030.0,
+                low=80_990.0,
+                close=81_000.0 + (20.0 if n % 2 else 0.0),
+            )
+            for n in range(self.days * 1440)
+        ]
+
+
+def test_the_realised_series_prefers_the_index_and_says_so(client_factory) -> None:
+    """Both tables populated: the index wins, and the payload names it.
+
+    R1 measured the venue's per-minute range wider than ours on 16 of 16 overlapping
+    minutes (`docs/index-history.md` §5), consistent with our ~7,600 ticker frames a
+    minute carrying only a few dozen *distinct* observations. The venue's bars are the
+    less biased source for a range estimator, so they are preferred — and a reader must
+    be able to tell which produced the line, because the two give measurably different
+    answers to Parkinson and Garman-Klass.
+    """
+    client = client_factory(IndexSource())
+    response = client.get(
+        "/volatility",
+        params={"underlying": "BTC", "lookback_days": 8.0, "interval": "1h"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["realised_source"] == "index-bars"
+
+
+def test_without_a_backfill_the_recorded_series_still_answers(client_factory) -> None:
+    """An empty `index-bars` falls back to `spot-bars` **whole**, and says so.
+
+    Falling back is not mixing: the series is one source or the other end to end. A
+    window straddling a seam between them would return an answer that depended on where
+    it fell, and nothing on the point would attribute it.
+    """
+    client = client_factory(StubSource())
+    response = client.get(
+        "/volatility",
+        params={"underlying": "BTC", "lookback_days": 8.0, "interval": "1h"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["realised_source"] == "spot-bars"
+
+
+def test_the_payload_states_how_thin_the_implied_side_is(client_factory) -> None:
+    """Months of realised against minutes of implied, in figures, on the response.
+
+    After the backfill the chart draws a long realised line against an implied line that
+    is null nearly everywhere — `_implied_at`'s tolerance is `max(interval, 1 minute)`
+    and refuses anything staler, deliberately, so that it cannot become a forward-fill.
+    One confident line on a screen whose title promises a comparison is the exact
+    misreading the screen exists to prevent, so the asymmetry is part of the contract
+    rather than something the client is left to infer from counting nulls.
+    """
+    client = client_factory(IndexSource())
+    body = client.get(
+        "/volatility",
+        params={"underlying": "BTC", "lookback_days": 8.0, "interval": "1h"},
+    ).json()
+
+    assert body["implied_points"] + body["realised_points"] > 0
+    assert body["implied_points"] <= len(body["points"])
+    assert body["realised_points"] <= len(body["points"])

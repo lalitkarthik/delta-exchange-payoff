@@ -95,6 +95,8 @@ from .smile import read_smile
 from .store import (
     COMPUTED_DATASET,
     COMPUTED_SCHEMA,
+    INDEX_DATASET,
+    INDEX_SCHEMA,
     REFERENCE_DATASET,
     REFERENCE_SCHEMA,
     SPOT_DATASET,
@@ -102,13 +104,16 @@ from .store import (
     BarStore,
     BarWriter,
     read_contract_ivs,
+    read_index_bars,
     read_spot_bars,
 )
 from .stream import ChainStream, recompute_every_minute, recompute_forever
 from .supervisor import FeedSupervisor
 from .volatility import (
     ALIGNMENTS,
+    INDEX_SOURCE,
     INTERVALS,
+    SPOT_SOURCE,
     BoundsResponse,
     VolatilitySeries,
     lookback_bounds,
@@ -754,6 +759,7 @@ class StoreVolatilitySource:
 
     def __init__(self, root: Any = None) -> None:
         self.spot = BarStore(root, dataset=SPOT_DATASET, schema=SPOT_SCHEMA)
+        self.index = BarStore(root, dataset=INDEX_DATASET, schema=INDEX_SCHEMA)
         self.computed = BarStore(
             root, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA
         )
@@ -761,8 +767,34 @@ class StoreVolatilitySource:
     def spot_bars(self, underlying: str, **kwargs: Any) -> Any:
         return read_spot_bars(self.spot, underlying, **kwargs)
 
+    def index_bars(self, underlying: str, **kwargs: Any) -> Any:
+        """#54. Empty until `tools/backfill_index_bars.py` has been run."""
+        return read_index_bars(self.index, underlying, **kwargs)
+
     def contract_ivs(self, underlying: str, **kwargs: Any) -> Any:
         return read_contract_ivs(self.computed, underlying, **kwargs)
+
+
+def _realised_bars(source: Any, underlying: str) -> tuple[Any, str]:
+    """The realised series and the name of the table it came from. **#54.**
+
+    The venue's own index candles when they have been backfilled, ours otherwise —
+    **one source end to end, never a mixture.** R1 measured the two disagreeing on the
+    per-minute range on 16 of 16 overlapping minutes (`docs/index-history.md` §5), so a
+    rolling window straddling a seam between them would return an answer that depended
+    on where it happened to fall, with nothing on the row to attribute it to. Preferring
+    the index is the same finding read the other way: ours are narrower on every minute
+    compared, consistent with the discretisation bias in `docs/iv-vs-rv.md` §4.
+
+    Both routes call this rather than choosing for themselves, so `/volatility/bounds`
+    cannot compute a range against one table while `/volatility` draws from the other.
+    """
+    reader = getattr(source, "index_bars", None)
+    if reader is not None:
+        bars = reader(underlying)
+        if bars:
+            return bars, INDEX_SOURCE
+    return source.spot_bars(underlying), SPOT_SOURCE
 
 
 def get_volatility_source() -> StoreVolatilitySource:
@@ -985,8 +1017,9 @@ async def volatility_bounds(
             status_code=400,
             detail=f"interval must be one of {', '.join(INTERVALS)}, not {interval!r}",
         )
+    bars, _ = _realised_bars(source, symbol)
     bounds = lookback_bounds(
-        spot_bars=source.spot_bars(symbol),
+        spot_bars=bars,
         iv_rows=source.contract_ivs(symbol),
         interval=INTERVALS[interval],
     )
@@ -1048,7 +1081,7 @@ async def volatility(
         )
 
     step_interval = INTERVALS[interval]
-    bars = source.spot_bars(symbol)
+    bars, realised_source = _realised_bars(source, symbol)
     iv_rows = source.contract_ivs(symbol)
     bounds = lookback_bounds(
         spot_bars=bars, iv_rows=iv_rows, interval=step_interval
@@ -1099,6 +1132,7 @@ async def volatility(
 
     return volatility_series(
         spot_bars=bars,
+        realised_source=realised_source,
         iv_rows=iv_rows,
         lookback=lookback,
         interval=step_interval,

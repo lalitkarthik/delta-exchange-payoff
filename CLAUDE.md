@@ -91,9 +91,12 @@ would put five plausible numbers on screen that describe nothing.
 F1–F4 for the forward. They exist to be compared (`agreement.py`, `docs/implied-vol.md`,
 `docs/forward.md`), not because four were needed.
 
-**The store: four tables, four dataset roots**, under a gitignored `<repo>/data/`.
-`quote-bars` (what the book did), `reference-bars` (what the venue said), `spot-bars`, and
-`computed-bars` (what we made of it). Hive-partitioned `date=/underlying=` — expiry, strike and
+**The store: five tables, five dataset roots**, under a gitignored `<repo>/data/`.
+`quote-bars` (what the book did), `reference-bars` (what the venue said), `spot-bars`,
+`computed-bars` (what we made of it), and `index-bars` (the venue's own index candles,
+backfilled by `tools/backfill_index_bars.py` rather than observed — kept apart from
+`spot-bars` because the two disagree on the per-minute range, `docs/index-history.md` §5).
+Hive-partitioned `date=/underlying=` — expiry, strike and
 option type are **columns**, because expiry as a partition level explodes into thousands of
 directories of a handful of rows. **Polars is not allowed to lay out the tree**:
 `write_parquet(partition_by=...)` names its output `00000000.parquet` every call, so the 10:00

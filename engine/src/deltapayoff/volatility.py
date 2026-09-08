@@ -39,6 +39,12 @@ DAYS_PER_YEAR = 365.0
 
 ALIGNMENTS = ("contemporaneous", "lag")
 
+#: The two tables a realised series can come from, named on the response. `index-bars`
+#: is the venue's own candles, backfilled; `spot-bars` is what our ticker channel
+#: recorded. Never both in one series — see `VolatilitySeries.realised_source`.
+INDEX_SOURCE = "index-bars"
+SPOT_SOURCE = "spot-bars"
+
 #: The fewest returns a window may rest on before the lower bound refuses it.
 #:
 #: A standard deviation from a handful of observations is mostly noise about itself, and
@@ -139,6 +145,22 @@ class VolatilitySeries(BaseModel):
     #: index is an open question, so the choice belongs to the reader.
     valid_intervals: list[str]
     bounds: LookbackBounds
+    #: Which table the realised series was computed from — `index-bars` when the venue's
+    #: own candles have been backfilled, `spot-bars` otherwise. **One or the other, end
+    #: to end.** R1 measured the two disagreeing on the per-minute range on 16 of 16
+    #: overlapping minutes, so a window straddling a seam between them would give an
+    #: answer that depended on where it fell, with nothing on the point to attribute it.
+    #: Named on the response rather than inferred, because Parkinson and Garman-Klass
+    #: give measurably different figures from the two and a reader has to know which.
+    realised_source: str
+    #: How many of `points` carry a realised figure for at least one estimator, and how
+    #: many carry an implied one. **The asymmetry is the point.** Realised can be
+    #: backfilled for years; implied cannot be backfilled at all — Delta's history
+    #: carries no IV and no bid/ask — so after a backfill this reads as thousands
+    #: against dozens. A screen promising a comparison must say that in figures rather
+    #: than leave a reader to infer it from a line that is mostly not there.
+    realised_points: int
+    implied_points: int
     points: list[VolPoint]
 
 
@@ -348,6 +370,7 @@ def volatility_series(
     step: timedelta,
     underlying: str = "BTC",
     bounds: LookbackBounds | None = None,
+    realised_source: str = SPOT_SOURCE,
 ) -> VolatilitySeries:
     """Both series over `[start, end]`, one point every `step`."""
     if alignment not in ALIGNMENTS:
@@ -418,5 +441,13 @@ def volatility_series(
             min_days=tenor_days, max_days=tenor_days,
             binding="none", detail="bounds not computed",
         ),
+        realised_source=realised_source,
+        # Counted from the points themselves rather than tracked while building them:
+        # one definition of "carries a figure", applied after the fact, cannot drift
+        # from what the payload actually contains the way a running tally could.
+        realised_points=sum(
+            1 for point in points if any(v is not None for v in point.rv.values())
+        ),
+        implied_points=sum(1 for point in points if point.iv is not None),
         points=points,
     )

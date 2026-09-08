@@ -138,6 +138,16 @@ REFERENCE_DATASET = "reference-bars"
 SPOT_DATASET = "spot-bars"
 COMPUTED_DATASET = "computed-bars"
 
+#: Table E. The venue's own index candles, backfilled rather than observed, and a root of
+#: its own for the reason `docs/index-history.md` §5 measured: Delta's per-minute range is
+#: wider than ours on 16 of 16 overlapping minutes while the closes agree to a part in
+#: 10^5. Two measurements of one index, not two halves of one series. A range estimator
+#: reads whichever it is handed, so a window straddling a seam between them would return
+#: an answer that depended on where it fell — an artefact with nothing on the row to
+#: attribute it to, since `spot-bars` carries no provenance column and could not grow one
+#: retrospectively for rows already written.
+INDEX_DATASET = "index-bars"
+
 #: Every five minutes. This number **is** the crash-loss budget: the engine has no
 #: graceful stop, so whatever sits in the buffer when the process dies is gone. Five
 #: minutes rather than sixty because that loss has been paid three times in one day —
@@ -275,6 +285,25 @@ SPOT_SCHEMA: dict[str, Any] = {
     #: overflowed the moment ETH was turned on.
     "spot_ticks": pl.UInt32,
 }
+
+#: Table E. No tick count: `volume` is null on every candle the index serves, because
+#: nothing trades *as* the index — it is computed from resting books
+#: (`price_method: orderbook`). A zero there would be a real zero by this repo's own rule
+#: and would say the venue observed nothing, which is the opposite of the truth.
+#:
+#: `symbol` is carried because the venue serves several BTC indices — `.DEXBTUSD`,
+#: `.DEXBTUSDT`, `.DEXBTINR` and `.DEXBTUSD_Syn` all answer, and `.DEAIXBTUSD` is a
+#: different asset whose ticker merely contains "BT". A row that did not say which one
+#: produced it could not be told from a row that did.
+INDEX_SCHEMA: dict[str, Any] = {
+    "minute": pl.Datetime("us", "UTC"),
+    "symbol": pl.String,
+    "index_open": pl.Float64,
+    "index_high": pl.Float64,
+    "index_low": pl.Float64,
+    "index_close": pl.Float64,
+}
+
 
 #: Table C. **Our** numbers, under the bare names, beside nothing of Delta's — their
 #: figures are table B's `venue_` columns and the separation is what makes any agreement
@@ -1430,6 +1459,60 @@ def read_spot_bars(
             high=row["spot_high"],
             low=row["spot_low"],
             close=row["spot_close"],
+        )
+        for row in rows.iter_rows(named=True)
+    ]
+
+
+def read_index_bars(
+    store: BarStore,
+    underlying: str,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    symbol: str | None = None,
+) -> list[RvBar]:
+    """`index-bars` as the estimators' own bar type, ascending, gaps left as gaps.
+
+    Sibling of `read_spot_bars` and deliberately identical in shape, so that switching
+    the realised series from one source to the other is a change of function and nothing
+    else. The filter is pushed into the lazy scan for the same reason: the partition
+    directories answer the date part of it before a file is opened.
+
+    **`symbol` filters rather than defaults.** Several BTC indices answer this venue and
+    they disagree — `.DEXBTUSD` is `orderbook`-priced while `.DEXBTUSDT_LTP` is struck
+    from last trades — so a store holding two of them must be asked which one is wanted.
+    Left `None`, every symbol present is returned, which is right for a store holding one
+    and visibly wrong for a store holding two: the bars interleave and a caller sees it
+    immediately, rather than silently receiving whichever sorted first.
+
+    **A minute with a null price is dropped, not defaulted**, exactly as `read_spot_bars`
+    drops one: `null` is not `0`, and a bar built on a zero would be a 100% return into
+    and out of it.
+    """
+    frame = store.scan().filter(pl.col("underlying") == underlying)
+    if symbol is not None:
+        frame = frame.filter(pl.col("symbol") == symbol)
+    if start is not None:
+        frame = frame.filter(pl.col("minute") >= start)
+    if end is not None:
+        frame = frame.filter(pl.col("minute") <= end)
+
+    rows = (
+        frame.select(
+            "minute", "index_open", "index_high", "index_low", "index_close"
+        )
+        .drop_nulls()
+        .sort("minute")
+        .collect()
+    )
+    return [
+        RvBar(
+            at=row["minute"],
+            open=row["index_open"],
+            high=row["index_high"],
+            low=row["index_low"],
+            close=row["index_close"],
         )
         for row in rows.iter_rows(named=True)
     ]

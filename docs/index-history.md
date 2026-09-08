@@ -283,12 +283,22 @@ this document said "Delta does not serve index history", R4 would have been buil
 
 ## 7. What to do next
 
-1. **Backfill RV from `.DEXBTUSD`.** It is the change §3 argues for and the one that unblocks the
-   slider. 4,000 bars a page, 66.7 hours at 1m, weight 3 per call against 20,000 per five minutes.
-2. **Point the range estimators at the venue's bars, not ours** — §5. Then re-run the estimator
-   spread in `docs/iv-vs-rv.md` §4 and see whether the 107% gap closes. That is the cheapest
-   available test of the discretisation hypothesis.
-3. **Fix the MTU** (§6) before anything else needs the network.
+1. ~~**Backfill RV from `.DEXBTUSD`.**~~ **Done** — #54, `tools/backfill_index_bars.py`,
+   writing table E `index-bars`. 30 days fetched in 11 pages: 43,200 rows for 43,200 minutes,
+   no gap and no duplicate, and a re-run over the same range adds only the minute that ticked
+   over while it ran. `/volatility/bounds` reports `usable: true` for the first time since the
+   screen shipped, `max_days` 30.00 against `min_days` 7.24.
+2. ~~**Point the range estimators at the venue's bars, not ours.**~~ **Done, and the hypothesis
+   holds.** Measured over the window both sources cover: the spread across the four estimators
+   falls from **99% to 33%**, and the movement is concentrated exactly where discretisation
+   predicts — Parkinson 1.58x, Garman-Klass 1.70x, Rogers-Satchell 1.72x, close-to-close 1.14x.
+   The estimators that read extremes were the ones being starved. A third of a spread survives
+   and is now the open question; see `docs/iv-vs-rv.md` §4.
+3. **Fix the MTU** (§6) before anything else needs the network. Still outstanding: the backfill
+   above was run with a `TCP_MAXSEG` clamp rather than a corrected interface.
+4. **Grow the implied side.** It is now the binding constraint and cannot be backfilled at all —
+   Delta's history carries no IV and no bid/ask. 481 realised points against **1** implied one on
+   a ten-day lookback. Only engine uptime moves that number.
 
 ## 8. Open, and deliberately not closed here
 

@@ -679,6 +679,36 @@ class SpotTick:
     spot: float | None
 
 
+@dataclass(slots=True)
+class IndexBar:
+    """One minute of the venue's own index, backfilled from `/v2/history/candles`.
+
+    **Not produced by the feed.** Every other bar type in this module is folded from
+    arriving frames by an aggregator; this one is fetched after the fact by
+    `tools/backfill_index_bars.py` and has no aggregator at all. It lives here anyway
+    because `BarStore` partitions on `underlying` and `minute` and needs the same two
+    attributes under the same two names, and because a reader looking for the store's row
+    types should find all five in one place.
+
+    `symbol` rather than a bare underlying: `.DEXBTUSD`, `.DEXBTUSDT`, `.DEXBTINR` and
+    `.DEXBTUSD_Syn` all serve BTC candles and disagree, so which one produced a row is
+    part of the row.
+
+    There is no tick count. `volume` is null on every candle the index serves — nothing
+    trades as the index — and a `0` here would be a real zero under this repo's own rule,
+    claiming the venue observed nothing.
+    """
+
+    underlying: str
+    minute: datetime
+    symbol: str
+
+    index_open: float | None
+    index_high: float | None
+    index_low: float | None
+    index_close: float | None
+
+
 @dataclass(frozen=True, slots=True)
 class SpotBar:
     """One underlying's minute. 1,440 rows a day per underlying and no more.
