@@ -67,8 +67,10 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from . import log_events
 from .adapters.base import Adapter, ConnectionSignal
 from .events import Alert, ConnectionState, Event, FeedConnection, Heartbeat
+from .logging_setup import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -364,18 +366,29 @@ class ConnectionController:
         self._attach()
         self.transition(State.CONNECTING, reason)
 
-    def stop(self, reason: str = REASON_STOPPED, detail: str = "") -> None:
+    def stop(
+        self,
+        reason: str = REASON_STOPPED,
+        detail: str = "",
+        *,
+        log_level: int | None = None,
+    ) -> None:
         """Stopped by request, and the adapter is asked to stop with it.
 
         Idempotent: stopping a stopped connection is not an error and emits nothing,
         because a `stopped -> stopped` event describes no change. **The adapter is asked
         to stop either way** — including before a `start()`, where there is no state to
         move out of but there is still an adapter that must not go on to open a socket.
+
+        `log_level` is `_spend_reconnect`'s way of saying **this** stop is the loudest
+        thing the engine says — #42's "error when stopped by budget" — without every
+        other caller of `stop()` having to know that distinction exists. Left `None`,
+        `transition()` decides the level the way it decides one for any other move.
         """
         self._adapter.stop()
         if self._state is None or self._state is State.STOPPED:
             return
-        self.transition(State.STOPPED, reason, detail)
+        self.transition(State.STOPPED, reason, detail, log_level=log_level)
 
     def message_arrived(self, now: float | None = None) -> None:
         """An event came off the adapter. Resets the age, the budget and the backoff.
@@ -424,12 +437,17 @@ class ConnectionController:
         self._opened_at = self._clock()
         self._socket_closed = False
         if self._state in (State.CONNECTED, State.DEGRADED):
-            logger.info(
+            log_event(
+                logger,
+                logging.INFO,
+                log_events.FEED_TRANSITION,
                 "feed connection %s: open while already %s; the staleness clock is "
                 "rebased and the state is unchanged%s",
                 self.adapter_name,
                 self._state.value,
                 f" ({detail})" if detail else "",
+                venue=self.adapter_name,
+                conn_state=self._state.value,
             )
             return
         if self._state is State.RECONNECTING:
@@ -481,15 +499,18 @@ class ConnectionController:
         )
         if detail:
             spent = f"{spent} ({detail})"
-        # An error record and not a warning, and the only one this module logs at error
-        # besides a dead watchdog. A feed that has given up produces no other symptom:
-        # the screens simply stop moving.
-        logger.error("feed connection %s: %s", self.adapter_name, spent)
         self._alert(ALERT_RECONNECT_BUDGET, spent)
         # `stop()` rather than a bare transition, because the adapter must be told too —
         # a controller that gave up while its adapter went on dialling would be spending
         # a venue's connection allowance on a feed nobody is watching.
-        self.stop(REASON_STOPPED, spent)
+        #
+        # `log_level=logging.ERROR` is #42's "error when stopped by budget": the one
+        # `feed.transition` record this module ever raises above info, because a feed
+        # that has given up produces no other symptom — the screens simply stop moving.
+        # `transition()` folds `spent` into its own message as `detail` already does for
+        # every other move, so this is still the single log line for this stop, not a
+        # second one beside it.
+        self.stop(REASON_STOPPED, spent, log_level=logging.ERROR)
 
     def connection_signal(self, signal: ConnectionSignal, detail: str = "") -> None:
         """The adapter's `on_connection` listener. Registered in `__init__`."""
@@ -564,25 +585,51 @@ class ConnectionController:
             self.transition(State.DEGRADED, REASON_STALE, f"{age:.1f}s silent")
 
     def _alert(self, code: str, detail: str, severity: str = "error") -> None:
-        """Publish one `alert`, and never let publishing it be the thing that raises.
+        """Publish one `alert`, log it, and never let publishing it be the thing that
+        raises.
 
-        The guard is not decoration: the caller most likely to need an alert is the poll
-        that just failed **because `_publish` raised**, and an alert that re-raised into
-        the watchdog would kill the watchdog with the report of its own illness.
+        **Logged before the publish is attempted**, so an operator has the record even
+        on the one path most likely to need it: the poll that just failed *because*
+        `_publish` raised. Always a warning here, regardless of `severity` — that field
+        describes the alert itself for whatever reads it off the bus, and #42 fixes the
+        log record for every alert at warning, the same as every other reconnect-family
+        record this module writes.
+
+        The guard on `_publish` is not decoration: an alert that re-raised into the
+        watchdog would kill the watchdog with the report of its own illness.
         """
+        alert = Alert(
+            source=SOURCE,
+            ts_received=self._wall_clock(),
+            adapter=self.adapter_name,
+            severity=severity,
+            code=code,
+            detail=detail,
+        )
+        log_event(
+            logger,
+            logging.WARNING,
+            log_events.ALERT,
+            "feed alert %s: %s (%s)",
+            self.adapter_name,
+            code,
+            detail,
+            venue=self.adapter_name,
+            event_id=alert.event_id,
+            code=code,
+            severity=severity,
+        )
         try:
-            self._publish(
-                Alert(
-                    source=SOURCE,
-                    ts_received=self._wall_clock(),
-                    adapter=self.adapter_name,
-                    severity=severity,
-                    code=code,
-                    detail=detail,
-                )
-            )
+            self._publish(alert)
         except Exception:
-            logger.exception("publishing an alert raised; the alert is lost")
+            log_event(
+                logger,
+                logging.ERROR,
+                log_events.ENGINE_ERROR,
+                "publishing an alert raised; the alert is lost",
+                venue=self.adapter_name,
+                exc_info=True,
+            )
 
     def _beat(self, now: float) -> None:
         """One `heartbeat` per cadence, whatever the state. Not a message from the venue.
@@ -636,10 +683,14 @@ class ConnectionController:
             if isinstance(ended, BaseException) and not isinstance(
                 ended, asyncio.CancelledError
             ):
-                logger.error(
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    log_events.ENGINE_ERROR,
                     "the staleness timer for %s ended in an exception; staleness was "
                     "not being watched",
                     self.adapter_name,
+                    venue=self.adapter_name,
                     exc_info=ended,
                 )
                 self._alert(
@@ -714,11 +765,16 @@ class ConnectionController:
                 self.poll()
             except Exception:
                 failures += 1
-                logger.exception(
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    log_events.ENGINE_ERROR,
                     "the staleness poll for %s raised (%d in a row); the watchdog "
                     "keeps ticking",
                     self.adapter_name,
                     failures,
+                    venue=self.adapter_name,
+                    exc_info=True,
                 )
                 if failures == POLL_FAILURES_BEFORE_ALERT:
                     self._alert(
@@ -731,7 +787,12 @@ class ConnectionController:
     # --- the one place the state changes ------------------------------------------
 
     def transition(
-        self, to_state: ConnectionState, reason: str, detail: str = ""
+        self,
+        to_state: ConnectionState,
+        reason: str,
+        detail: str = "",
+        *,
+        log_level: int | None = None,
     ) -> FeedConnection:
         """The only place the state changes, and the only place the event is built.
 
@@ -739,6 +800,15 @@ class ConnectionController:
         `reconnecting -> stopped` when the lifetime budget is spent, and #41 drives the
         pause, resume and reconnect commands. Both are moves this ticket has no cause
         method for, and neither should reach around the table to make them.
+
+        **#42's level and event, decided here and nowhere else, so every caller gets it
+        for free.** Entering `degraded` is `feed.stale` at warning — the staleness
+        question this whole project exists to answer. Any move that touches
+        `reconnecting`, on either side, is `feed.reconnect` at warning — a socket
+        closing, silence past the longer bound, or an attempt being dialled are all
+        "a reconnect is happening" to an operator. Everything else is `feed.transition`
+        at info, unless `log_level` says otherwise — `_spend_reconnect` is the one
+        caller that does, for the one move louder than the rest.
         """
         from_state = self._state
         if (from_state, to_state) not in ALLOWED:
@@ -754,13 +824,37 @@ class ConnectionController:
             to_state=to_state,
             reason=reason,
         )
-        logger.info(
+        touches_reconnecting = State.RECONNECTING in (from_state, to_state)
+        if log_level is not None:
+            # `_spend_reconnect`'s override. The loudest thing this engine says is its
+            # own category — `feed.transition` at error — even though it happens to
+            # leave from `reconnecting`, because "the budget is spent" is a different
+            # fact from "an attempt is being made" and an operator grepping one must not
+            # have to also read the other.
+            log_name = log_events.FEED_TRANSITION
+            level = log_level
+        elif reason == REASON_STALE:
+            log_name = log_events.FEED_STALE
+            level = logging.WARNING
+        elif touches_reconnecting:
+            log_name = log_events.FEED_RECONNECT
+            level = logging.WARNING
+        else:
+            log_name = log_events.FEED_TRANSITION
+            level = logging.INFO
+        log_event(
+            logger,
+            level,
+            log_name,
             "feed connection %s: %s -> %s (%s)%s",
             self.adapter_name,
             "start" if from_state is None else from_state.value,
             to_state.value,
             reason,
             f" {detail}" if detail else "",
+            venue=self.adapter_name,
+            conn_state=to_state.value,
+            event_id=event.event_id,
         )
         self._publish(event)
         return event

@@ -14,6 +14,7 @@ its current dependencies.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -275,3 +276,30 @@ def test_drop_oldest_remains_the_default() -> None:
     assert lossless is False
     assert dropped == 3
     assert drained == [3, 4, 5]
+
+
+def test_a_lossless_drop_is_impossible_but_logged_if_it_ever_happens(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#42's acceptance line: a drop on a lossless queue is error-level and named
+    `queue.drop`.
+
+    `subscribe()`'s own `maxsize=0` makes this unreachable through the public API — this
+    test reaches around it, replacing the queue with a bounded one, precisely to prove
+    the guard fires rather than merely existing.
+    """
+    caplog.set_level(logging.ERROR, logger="deltapayoff.fanout")
+    bus = FanOut()
+    writer = bus.subscribe("writer", maxsize=4, lossless=True)
+    # Force the "impossible" branch: a bounded queue, already full, under the lossless
+    # code path that believes it can never be.
+    writer.queue = asyncio.Queue(maxsize=1)
+    writer.queue.put_nowait("already here")
+
+    bus.publish("dropped")
+
+    assert writer.dropped == 1
+    records = [r for r in caplog.records if r.event == "queue.drop"]
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    assert records[0].levelno == logging.ERROR
+    assert "writer" in records[0].getMessage()
