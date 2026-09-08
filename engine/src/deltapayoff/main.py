@@ -173,6 +173,21 @@ LIVE_UNDERLYINGS = ("BTC", "ETH")
 #: assets are recorded is a deployment decision and not a code change.
 LIVE_UNDERLYINGS_ENV = "DELTA_LIVE_UNDERLYINGS"
 
+#: How often the venue is asked what it lists, so contracts it lists **after** start-up
+#: are subscribed rather than missed for the life of the process. `assumed`; the full
+#: reasoning is `docs/design/lld/relisting.md` §3.
+#:
+#: One minute, because the store's resolution is one minute: a cadence of 60 s bounds the
+#: hole in a newly listed contract's history at roughly one bar, which is the smallest
+#: gap this store can even express. Five minutes would lose five bars of every new strike
+#: for nothing but a saved REST call.
+#:
+#: Not faster, either. This is `/v2/tickers` with no expiry filter — the heaviest read
+#: this engine makes, `measured` 2026-09-08 by `tools/measure_relist.py` — against a
+#: listing that changes a few times a day. Below a minute it re-reads the same answer
+#: several times per bar it could not have improved.
+RELIST_INTERVAL_SECONDS = 60.0
+
 #: The most points `/volatility` will put in one response unless asked for fewer.
 #:
 #: A year at one-minute resolution is 525,600 points per series, and six series of that is
@@ -287,6 +302,14 @@ class FeedStack:
     #: The background tasks, empty until `start_feed_stack` runs. Cancelled on shutdown.
     #: **The feed is no longer among them** — the supervisor owns that task.
     tasks: list[asyncio.Task] = field(default_factory=list)
+    #: Venue symbols already handed to `adapter.subscribe`, per underlying. **Added in
+    #: #51**, and kept here rather than read back off the adapter because "what has this
+    #: engine subscribed" is a question of the protocol's eight members, and none of them
+    #: answers it: the registry lives inside `DeltaFeed`, which is a Delta detail, and a
+    #: second venue would keep its own in its own shape. This is the set the re-list
+    #: subtracts to find what is new, and it only ever grows — see `relist_instruments`
+    #: for why a settled contract is not taken back out.
+    listed: dict[str, set[str]] = field(default_factory=dict)
 
     @property
     def feed(self) -> Any:
@@ -359,8 +382,108 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     )
 
 
+async def relist_instruments(stack: FeedStack) -> int:
+    """Ask the venue what it lists and subscribe whatever is not subscribed yet.
+
+    **The whole of issue #51's first half.** This used to happen once, inline in
+    `start_feed_stack`, and nothing ever asked again — so every contract Delta listed
+    after the process started was never subscribed, never stored, and absent from every
+    historical screen, while the live path went on answering `/chain` from a fresh REST
+    read and looked perfectly healthy. Measured on the night of 2026-09-07: four strikes
+    of one expiry first appear in the store at 06:32, when a *second* engine started, and
+    one of them sits between two strikes recorded from midnight.
+
+    **Additive, and additive is the whole safety argument.** `subscribe` registers rather
+    than replaces and the registry is never cleared, so this can only ever make the
+    reconnect replay larger. There is no moment at which the registry is empty, which
+    matters because an empty registry is deliberately not announced as `OPENED` (#38,
+    #39) — a re-list that briefly emptied it would put the connection badge through a
+    false reconnect for as long as it took to fill again.
+
+    **Settled contracts are kept, deliberately.** A contract that has expired drops out
+    of the venue's listing but stays in `stack.listed` and in the socket registry, and is
+    replayed on every reconnect for the life of the process. Dropping it would mean
+    unsubscribing on a cadence, and the cadence is the problem: a contract leaves the
+    listing at settlement, while its last book updates are still the most valuable and
+    least repeatable rows in the record, and a re-list that fired in that window would
+    take the subscription away mid-settlement to save a few hundred bytes of subscribe
+    frame. The cost of keeping is a replay that grows by one day's expired contracts per
+    day the process runs — `assumed` to be tolerable for a process restarted more often
+    than weekly, and made visible rather than merely assumed: the `subscribed` count on
+    every record below is the registry's current size, so the growth is in the log where
+    an operator can see it. `docs/design/lld/relisting.md` §5 records the threshold at
+    which this has to be revisited.
+
+    Returns how many contracts were newly subscribed. Raises whatever the venue read
+    raises — the caller decides whether that is fatal, and the two callers differ.
+    """
+    added = 0
+    for underlying in stack.adapter.underlyings:
+        listed = await stack.adapter.instruments(underlying)
+        known = stack.listed.setdefault(underlying, set())
+        fresh = [
+            instrument
+            for instrument in listed
+            if instrument.venue_symbol and instrument.venue_symbol not in known
+        ]
+        if not fresh:
+            continue
+        stack.adapter.subscribe(fresh)
+        known.update(instrument.venue_symbol for instrument in fresh)
+        added += len(fresh)
+        log_event(
+            logger,
+            logging.INFO,
+            log_events.FEED_INSTRUMENTS,
+            "subscribed %d newly listed %s contracts; %d subscribed in total",
+            len(fresh),
+            underlying,
+            len(known),
+            venue=stack.adapter.venue,
+            underlying=underlying,
+            listed=len(fresh),
+            subscribed=len(known),
+        )
+    return added
+
+
+async def relist_forever(
+    stack: FeedStack,
+    interval: float = RELIST_INTERVAL_SECONDS,
+    sleep: Callable[[float], Any] = asyncio.sleep,
+) -> None:
+    """Re-list on the cadence until cancelled. **A failed listing is not an outage.**
+
+    The venue's REST endpoint is a different service from its websocket and fails
+    separately: it times out, it rate-limits, it is redeployed. None of that is a reason
+    to end a feed that is delivering, so a failure here is a warning and a retry on the
+    next tick — the cost of one missed cycle is that a contract listed in the last minute
+    waits another minute, which is the same bounded cost the cadence already carries.
+
+    An unbounded `except` for the same reason `recompute_forever` has one: a loop that
+    dies leaves the engine recording the set it started with and saying nothing, which is
+    the exact failure this task was written to end.
+    """
+    while True:
+        await sleep(interval)
+        try:
+            await relist_instruments(stack)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log_event(
+                logger,
+                logging.WARNING,
+                log_events.FEED_INSTRUMENTS,
+                "could not re-list instruments; retrying in %gs",
+                interval,
+                venue=stack.adapter.venue,
+                exc_info=True,
+            )
+
+
 async def start_feed_stack(stack: FeedStack) -> None:
-    """Subscribe every listed contract and start the four background tasks.
+    """Subscribe every listed contract and start the five background tasks.
 
     **Which underlyings is the adapter's own answer**, not a second argument: the adapter
     was built with the configured set and `underlyings` is on the protocol precisely so
@@ -369,10 +492,11 @@ async def start_feed_stack(stack: FeedStack) -> None:
     Raises `DeltaUnavailable` if the venue cannot be asked what it lists — the caller
     decides whether that is fatal. Nothing is started when it raises, because the
     subscriptions happen first: a feed that connected with an empty registry is the
-    silent failure `feed.py` exists to prevent.
+    silent failure `feed.py` exists to prevent. **That is why the first listing is this
+    call and not the loop's first tick**: at start-up an unanswerable venue is fatal, and
+    an hour later it is a warning, so the two cannot be the same call site.
     """
-    for underlying in stack.adapter.underlyings:
-        stack.adapter.subscribe(await stack.adapter.instruments(underlying))
+    await relist_instruments(stack)
 
     # **The feed is started through the supervisor**, not as a task of its own. The
     # controller wraps the adapter, so the events reach the bus through its sink and
@@ -393,6 +517,12 @@ async def start_feed_stack(stack: FeedStack) -> None:
             name="chain-minute-pass",
         ),
         asyncio.create_task(stack.writer.run(), name="bar-writer"),
+        # **The third cadence, and the one #51 was missing.** The two above recompute
+        # what is already subscribed; this one asks the venue what it lists now, so a
+        # strike that did not exist when this process started is subscribed within a
+        # minute instead of never. It is deliberately the slowest thing here — a REST
+        # read on a loop that a feed running at `measured` 1,693.6 msg/s must not notice.
+        asyncio.create_task(relist_forever(stack), name="instrument-relist"),
     ]
     for task in stack.tasks:
         task.add_done_callback(_report_finished_task)
