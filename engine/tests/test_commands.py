@@ -336,7 +336,13 @@ def test_a_command_for_another_adapter_is_not_taken() -> None:
 def test_pause_and_reconnect_are_idempotent_and_quiet_when_there_is_nothing_to_do() -> (
     None
 ):
-    """A verb an operator repeats must not be an error, and must not move anything."""
+    """A verb an operator repeats must not be an error, and must not move anything.
+
+    What this pins is the **state guard** in each verb, not a flag: a second pause with
+    no refusal to leave `stopped` raises `IllegalTransition` on a `stopped -> stopped`
+    move, and a reconnect on a stopped connection would report a drop against a socket
+    that does not exist. Red-green verified by removing that guard from `pause`.
+    """
     published: list[Event] = []
     controller = ConnectionController(ScriptedAdapter(), published.append)
     controller.start()

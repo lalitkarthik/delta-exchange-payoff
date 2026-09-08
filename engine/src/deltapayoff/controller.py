@@ -453,9 +453,15 @@ class ConnectionController:
         untouched, which is what makes `resume` a redial rather than a restart. The
         transition is made **before** the cut, so that the `CLOSED` an adapter might
         still report arrives at a machine already `stopped` and is refused there too.
+
+        **Idempotent, and by the state guard below rather than by a `_paused` check.**
+        An early return on `self._paused` was written first and then removed: every line
+        it skipped was already a no-op on a paused connection — the event is clear, the
+        stream is gone — so it was a guard no test could make fail, which this suite has
+        now produced four separate batches of. What idempotence actually rests on is the
+        refusal to transition out of `stopped`; without it a second pause raises
+        `IllegalTransition` on a `stopped -> stopped` move that describes no change.
         """
-        if self._paused:
-            return
         self._paused = True
         self._resumed.clear()
         if self._state is not None and self._state is not State.STOPPED:
