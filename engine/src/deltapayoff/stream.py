@@ -24,12 +24,17 @@ holds the newest event per contract anyway, which is exactly what a dropped olde
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 
+from . import log_events
 from .chain import EXPIRY_FORMAT, chain_from_legs
 from .compute import enrich
 from .events import IndexQuote, Instrument, OptionQuote, OptionReference
+from .logging_setup import log_event
 from .models import ChainResponse, Leg
+
+logger = logging.getLogger(__name__)
 
 #: How often the recompute loop drains the dirty set. Frames arrive at ~1,323 a second
 #: and a full pass over every listed expiry is ~10 ms of arithmetic, so at 100 ms the
@@ -176,7 +181,23 @@ class ChainStream:
         target[key] = (instrument, event) if target is self._reference else event
         self.applied += 1
         pair = _pair(instrument)
-        self._expiries.setdefault(pair[0], set()).add(pair[1])
+        expiries_for_underlying = self._expiries.setdefault(pair[0], set())
+        # **Debug, and deliberately not on every event.** Every one of ~1,323 messages a
+        # second touches `dirty`, which #42 explicitly rules off the per-message path.
+        # The set of expiries this cache has ever seen a contract for changes only when
+        # one lists for the first time — rare, and the fact worth a quiet line rather
+        # than a flood: `compute.recompute_set`.
+        if pair[1] not in expiries_for_underlying:
+            log_event(
+                logger,
+                logging.DEBUG,
+                log_events.COMPUTE_RECOMPUTE_SET,
+                "%s %s joins the recompute set",
+                pair[0],
+                pair[1],
+                instrument=key,
+            )
+        expiries_for_underlying.add(pair[1])
         self.dirty.add(pair)
 
     async def run(self) -> None:

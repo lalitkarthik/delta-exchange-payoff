@@ -14,6 +14,7 @@ a read-time threshold — a timing assertion would be flaky and would not be the
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from collections.abc import Callable
@@ -363,6 +364,43 @@ def test_a_second_flush_adds_to_a_partition_rather_than_overwriting_it(
     frame = store.scan().collect().sort("minute")
     assert frame.height == 2
     assert frame["minute"].dt.hour().to_list() == [9, 10]
+
+
+def test_a_flush_logs_table_rows_file_and_duration(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#42's acceptance line: a flush on a temporary store produces an info record with
+    table, rows, file and duration."""
+    caplog.set_level(logging.INFO, logger="deltapayoff.store")
+    store = BarStore(tmp_path)
+    store.add([bar(minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc))])
+
+    written = store.flush()
+
+    assert written == 1
+    records = [r for r in caplog.records if r.event == "store.flush"]
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    record = records[0]
+    assert record.levelno == logging.INFO
+    assert record.table == "quote-bars"
+    assert record.rows == 1
+    assert Path(record.file).exists()
+    assert Path(record.file).suffix == ".parquet"
+    assert record.duration_seconds >= 0.0
+
+
+def test_a_quiet_flush_with_nothing_buffered_logs_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An empty flush already writes no file; it must not write a log line either — a
+    quiet five minutes must cost the log nothing, the same way it costs the disk
+    nothing."""
+    caplog.set_level(logging.DEBUG, logger="deltapayoff.store")
+    store = BarStore(tmp_path)
+
+    assert store.flush() == 0
+
+    assert [r for r in caplog.records if r.event == "store.flush"] == []
 
 
 def test_an_empty_store_scans_to_no_rows_rather_than_raising(tmp_path: Path) -> None:

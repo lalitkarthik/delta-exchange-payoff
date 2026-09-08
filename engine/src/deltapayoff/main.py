@@ -63,6 +63,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import log_events
 from .adapters import Adapter, DeltaAdapter, DeltaFeed
 from .chain import (
     UNDERLYINGS,
@@ -77,6 +78,7 @@ from .events import ConnectionState, Event, FeedConnection
 from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
 from .historical import list_minutes, read_ladder_at
+from .logging_setup import configure_logging, log_event
 from .models import (
     ChainResponse,
     ExpiriesResponse,
@@ -121,6 +123,12 @@ ALLOWED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
 #: the payload carries anything user-specific, and neither needs a code change here.
 
 logger = logging.getLogger(__name__)
+
+# **Every logger under `"deltapayoff"` inherits this the moment `main` is imported**,
+# which is every test file in this suite and every real process. Idempotent — see
+# `logging_setup.configure_logging` — so importing `main` more than once, which pytest
+# does per test file, attaches the file and console handlers exactly once each.
+configure_logging()
 
 #: How often a connected browser is sent the chain. One second is well under what anyone
 #: reads and far above what the eye needs, and it is one JSON push regardless of how many
@@ -201,7 +209,10 @@ def live_underlyings() -> tuple[str, ...]:
     known = [name for name in wanted if name in UNDERLYINGS]
     unknown = [name for name in wanted if name not in UNDERLYINGS]
     if unknown:
-        logger.error(
+        log_event(
+            logger,
+            logging.ERROR,
+            log_events.ENGINE_ERROR,
             "%s names %s, which Delta does not list; recording %s",
             LIVE_UNDERLYINGS_ENV,
             ", ".join(unknown),
@@ -392,7 +403,13 @@ async def stop_feed_stack(stack: FeedStack) -> None:
     except Exception:
         # A failed final flush costs the open minute and nothing else. It must not take
         # the shutdown with it and leave the HTTP client unclosed.
-        logger.exception("the final bar flush failed")
+        log_event(
+            logger,
+            logging.ERROR,
+            log_events.ENGINE_ERROR,
+            "the final bar flush failed",
+            exc_info=True,
+        )
 
 
 @asynccontextmanager
@@ -511,7 +528,10 @@ def _report_finished_task(task: asyncio.Task) -> None:
     """
     if task.cancelled():
         return  # shutdown, which is the one legitimate way for these to end
-    logger.error(
+    log_event(
+        logger,
+        logging.ERROR,
+        log_events.ENGINE_ERROR,
         "background task %s ended unexpectedly: %s",
         task.get_name(),
         task.exception() or "returned without raising",
@@ -1140,57 +1160,90 @@ async def live_chain(
     """
     await websocket.accept()
     interval = max(interval, MIN_PUSH_INTERVAL_SECONDS)
+
+    # **Debug, both directions, bracketing the whole connection.** A browser tab opening
+    # and closing is routine — #42 rules this off info precisely because volume is what
+    # turns a log into noise nobody reads — and on no per-message path either: once per
+    # connection, not once per push. Logged against the **raw** query values, because a
+    # refused handshake (below) never gets as far as parsing them, and attach/detach
+    # must still bracket that connection or a run of bad requests looks like a run that
+    # never closed.
+    log_event(
+        logger,
+        logging.DEBUG,
+        log_events.WS_CLIENT_ATTACH,
+        "ws /ws/chain attached: %s %s",
+        underlying,
+        expiry,
+        underlying=underlying,
+        expiry=expiry,
+    )
     try:
-        symbol = normalise_underlying(underlying)
-        date = validate_expiry(expiry)
-    except ValidationError as exc:
-        await websocket.send_json({"type": "error", "detail": str(exc)})
-        await websocket.close()
-        return
-
-    # **One adapter today** — see `docs/live-chain-contract.md`'s "one adapter today".
-    # `underlying`/`expiry` do not select among adapters because there is only the one
-    # to choose from; a second venue would need this to change.
-    adapter_name: str | None = None
-    if supervisor is not None and supervisor.controllers:
-        adapter_name = supervisor.controllers[0].adapter_name
-
-    #: The state last actually sent to *this* connection, so a `feed` message goes out
-    #: only when it says something new — see `docs/live-chain-contract.md`'s
-    #: "Coalescing". `None` before the first one, which is distinct from every real
-    #: `ConnectionState.value` and so cannot be mistaken for one having already gone out.
-    last_sent_state: str | None = None
-
-    async def push_feed_update() -> None:
-        nonlocal last_sent_state
-        if adapter_name is None or feed_cache is None:
+        try:
+            symbol = normalise_underlying(underlying)
+            date = validate_expiry(expiry)
+        except ValidationError as exc:
+            await websocket.send_json({"type": "error", "detail": str(exc)})
+            await websocket.close()
             return
-        event = feed_cache.get(adapter_name)
-        if event is None or event.to_state.value == last_sent_state:
+
+        # **One adapter today** — see `docs/live-chain-contract.md`'s "one adapter
+        # today". `underlying`/`expiry` do not select among adapters because there is
+        # only the one to choose from; a second venue would need this to change.
+        adapter_name: str | None = None
+        if supervisor is not None and supervisor.controllers:
+            adapter_name = supervisor.controllers[0].adapter_name
+
+        #: The state last actually sent to *this* connection, so a `feed` message goes
+        #: out only when it says something new — see `docs/live-chain-contract.md`'s
+        #: "Coalescing". `None` before the first one, which is distinct from every real
+        #: `ConnectionState.value` and so cannot be mistaken for one already sent.
+        last_sent_state: str | None = None
+
+        async def push_feed_update() -> None:
+            nonlocal last_sent_state
+            if adapter_name is None or feed_cache is None:
+                return
+            event = feed_cache.get(adapter_name)
+            if event is None or event.to_state.value == last_sent_state:
+                return
+            last_sent_state = event.to_state.value
+            await websocket.send_json(_feed_message(event))
+
+        try:
+            while True:
+                # Before `chain`/`waiting`, every pass — including the first, which is
+                # what puts `feed` ahead of the very first ladder on a fresh connection.
+                await push_feed_update()
+
+                chain = stream.chain(symbol, date)
+                if chain is None:
+                    await websocket.send_json(
+                        {
+                            "type": "waiting",
+                            "detail": f"no live quotes yet for {symbol} expiring {date}",
+                        }
+                    )
+                else:
+                    await websocket.send_json(
+                        {"type": "chain", "data": chain.model_dump(mode="json")}
+                    )
+                await asyncio.sleep(interval)
+        except WebSocketDisconnect:
+            # The browser closed the tab. Ordinary, not a failure — and nothing to
+            # clean up, because this connection owns no subscription of its own.
             return
-        last_sent_state = event.to_state.value
-        await websocket.send_json(_feed_message(event))
-
-    try:
-        while True:
-            # Before `chain`/`waiting`, every pass — including the first, which is what
-            # puts `feed` ahead of the very first ladder on a fresh connection.
-            await push_feed_update()
-
-            chain = stream.chain(symbol, date)
-            if chain is None:
-                await websocket.send_json(
-                    {
-                        "type": "waiting",
-                        "detail": f"no live quotes yet for {symbol} expiring {date}",
-                    }
-                )
-            else:
-                await websocket.send_json(
-                    {"type": "chain", "data": chain.model_dump(mode="json")}
-                )
-            await asyncio.sleep(interval)
-    except WebSocketDisconnect:
-        # The browser closed the tab. Ordinary, not a failure — and nothing to clean up,
-        # because this connection owns no subscription of its own.
-        return
+    finally:
+        # However the connection ended — a bad parameter, a disconnect, or anything
+        # else — the attach above gets its other half. `finally` runs on every `return`
+        # above too.
+        log_event(
+            logger,
+            logging.DEBUG,
+            log_events.WS_CLIENT_DETACH,
+            "ws /ws/chain detached: %s %s",
+            underlying,
+            expiry,
+            underlying=underlying,
+            expiry=expiry,
+        )
