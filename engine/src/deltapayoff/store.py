@@ -1186,8 +1186,29 @@ class BarWriter:
         self._sampled_minute_us = minute_us
         self._sampled_at = now
 
+        return self.sample_chains(self.chains())
+
+    def sample_chains(self, chains: Iterable[Any]) -> int:
+        """Fold these ladders into table C. Returns how many ticks were taken.
+
+        **The way #44's minute pass reaches this table**, and the reason it is a public
+        method rather than something the periodic sample would find on its own. That
+        pass solves the expiries nobody is watching, half a second before the minute
+        boundary, and hands over what it produced in the same call. Leaving the writer
+        to notice on its next drain would put the ladder on the far side of the seal —
+        table C's grace is zero, so the minute closes the instant the clock passes it —
+        and the minute would carry no row for that expiry with nothing to say why.
+
+        `_sample_computed` is this method over `self.chains()`, which since #44 is the
+        **live** ladders only: the ones the 100 ms loop is keeping fresh. The two
+        cadences therefore reach this table by two paths and neither re-folds the
+        other's work, which is what keeps `late` a number about lost observations
+        rather than about how often an unwatched expiry was looked at.
+        """
+        if not self.recording:
+            return 0
         taken = 0
-        for chain in self.chains():
+        for chain in chains:
             for tick in computed_ticks_from_chain(chain):
                 self.computed.add(tick)
                 taken += 1

@@ -2250,12 +2250,18 @@ def test_a_writer_with_no_chain_source_writes_no_computed_rows(tmp_path: Path) -
 
 
 def test_the_running_app_stores_our_computed_values_too(monkeypatch, tmp_path) -> None:
-    """The fourth table through the real application.
+    """The fourth table through the real application, **with no browser open at all**.
 
-    A ticker frame on the live bus is enriched by the recompute loop, and the writer
-    samples that loop's own cache rather than the queue — which is the whole structural
-    difference between this table and the other three. The row lands because shutdown
-    takes a final sample of the open minute, exactly as it flushes a partial quote bar.
+    A ticker frame on the live bus is enriched and reaches the writer without anything
+    on the bus carrying it — which is the whole structural difference between this table
+    and the other three. Since #44 the path is the **minute pass**: the 100 ms loop
+    solves only what a `/ws/chain` connection has registered, and no connection is
+    opened here, so if the minute pass were not running this table would stay empty
+    however long the feed ran. That is the acceptance line "the volatility screen keeps
+    working with no chain page open", driven at the seam.
+
+    The pass is given a 0.2 s cadence rather than its real minute so the test does not
+    wait one out; everything else about it is the code the application runs.
 
     The assertion is on **content**, not on a row count, because a real minute boundary
     may fall inside the window and legitimately split the sample across two minutes.
@@ -2265,23 +2271,33 @@ def test_the_running_app_stores_our_computed_values_too(monkeypatch, tmp_path) -
     from fastapi.testclient import TestClient
 
     from deltapayoff import main
+    from deltapayoff import stream as stream_module
 
     monkeypatch.setenv("DELTA_LIVE_FEED", "1")
     monkeypatch.setattr(main, "DeltaClient", _StubDeltaClient)
     monkeypatch.setattr(main, "DeltaFeed", _StubFeed)
     monkeypatch.setattr(main, "BarStore", lambda *a, **k: BarStore(tmp_path))
 
+    real_pass = stream_module.recompute_every_minute
+    monkeypatch.setattr(
+        main,
+        "recompute_every_minute",
+        lambda chain_stream, sink: real_pass(chain_stream, sink, interval=0.2, lead=0.0),
+    )
+
     symbol = "C-BTC-77600-040926"
     with TestClient(main.app) as client:
         assert client.get("/health").status_code == 200
         writer, stream = main.app.state.writer, main.app.state.stream
         assert writer.computed_store.root == tmp_path
-        assert writer.chains == stream.computed_chains, "the writer samples nothing"
+        assert writer.chains == stream.live_computed_chains, "the writer samples nothing"
+        assert client.get("/health").json()["watched"] == [], "something is watching"
 
         now = time.time()
         publish(main.app.state.events, "ticker", ticker_frame(symbol, int(now * 1e6)))
-        time.sleep(0.4)  # the recompute loop runs every 100 ms
-        assert stream.computed_chains(), "the loop computed nothing to sample"
+        time.sleep(0.6)  # two of the shortened minute passes
+        assert stream.minute_passes >= 1, "the minute pass never ran"
+        assert writer.computed.stats()["ticks"] > 0, "nothing reached the aggregator"
 
     computed = (
         BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)

@@ -358,8 +358,12 @@ implied volatility and Greeks never arrive on the wire: they are made by `ChainS
 Restart, and there was no way to answer what the screen had said at a given minute.
 
 So the writer **samples** rather than folds. Every ten seconds, and again as each minute
-boundary passes, it reads `ChainStream.computed_chains()` — the chains the loop has
-*already* built — and flattens each into one row per listed leg. The minute keeps the
+boundary passes, it reads `ChainStream.live_computed_chains()` — the chains the 100 ms loop
+has *already* built, for the expiries somebody is watching — and flattens each into one row
+per listed leg. Since #44 the expiries nobody is watching are solved once a minute instead,
+by `stream.recompute_closing_minute()`, and handed straight to `writer.sample_chains()` half
+a second before the boundary they close. Two cadences, one table, and neither re-folds the
+other's work: `docs/design/lld/chain-cache.md` §4 and §6. The minute keeps the
 freshest of those samples, which is the `_Last` fold on the chain's own clock that
 `ComputedAggregator` has always documented. Three consequences follow, and each is a
 decision rather than an accident:
