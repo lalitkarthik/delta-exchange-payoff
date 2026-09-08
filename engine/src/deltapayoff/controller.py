@@ -803,10 +803,15 @@ class ConnectionController:
         The timer is a **separate task**, not a timeout on the read: a controller that
         only woke when a message arrived could never notice that none had.
         """
-        # A controller paused before it ever ran stays unstarted rather than announcing
-        # `connecting` over a dial the loop is about to park instead of making. The
-        # supervisor reports an unstarted controller as `stopped`, which is what it is.
-        if not self._paused:
+        # **Started only if nothing has started it.** A controller paused before it ever
+        # ran stays unstarted rather than announcing `connecting` over a dial the loop is
+        # about to park instead of making — the supervisor reports an unstarted controller
+        # as `stopped`, which is what it is. And a pause *and* a resume before `run()` —
+        # reachable through the route on a supervisor built but not yet started — has
+        # already moved the machine to `connecting`, so starting again raised
+        # `IllegalTransition` on a `connecting -> connecting` move, out of `run()`, which
+        # killed the controller's task at start-up. The loop picks it up as it stands.
+        if not self._paused and self._state is None:
             self.start()
         timer = asyncio.ensure_future(self._tick_forever())
         try:

@@ -356,6 +356,38 @@ def test_pause_and_reconnect_are_idempotent_and_quiet_when_there_is_nothing_to_d
     assert published == [], "a repeated pause described a change that did not happen"
 
 
+def test_a_pause_and_a_resume_before_run_do_not_start_the_machine_twice() -> None:
+    """Both verbs are reachable on a supervisor that is built and not yet started.
+
+    `FeedSupervisor` constructs its controllers in `build_feed_stack` and only starts them
+    in the lifespan, so a `pause` followed by a `resume` in that window leaves the machine
+    already in `connecting`. `run()` used to call `start()` unconditionally, which is a
+    `connecting -> connecting` move: `IllegalTransition`, raised out of `run()`, killing
+    the controller's task at start-up with the connection never dialled. Found by probing
+    the edge rather than by a report, and it fails with that exception without the guard.
+    """
+
+    async def scenario() -> None:
+        published: list[Event] = []
+        adapter = subscribed_adapter(script=held_open())
+        controller = controller_over(adapter, published)
+        controller.pause()
+        controller.resume()
+        assert controller.state is ConnectionState.CONNECTING
+
+        task = asyncio.create_task(controller.run())
+        try:
+            await until(
+                lambda: controller.state is ConnectionState.CONNECTED,
+                "the connection to open rather than run() raising",
+            )
+            assert adapter.connections == 1, "it dialled once, not twice"
+        finally:
+            await shut_down(controller, task)
+
+    asyncio.run(scenario())
+
+
 # --- the route (seam 1: the app under TestClient) ------------------------------------
 
 
