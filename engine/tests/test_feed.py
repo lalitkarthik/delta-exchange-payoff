@@ -302,9 +302,11 @@ def test_a_live_subscribe_that_fails_leaves_the_feed_running_and_the_registry_in
 
     assert feed.registry["ticker"] == {*CHAIN, "C-BTC-78000-040926"}
     assert feed.last_error is None or "scripted send failure" not in feed.last_error
-    assert any(
-        "newly listed" in record.message for record in caplog.records
-    ), "a subscribe that never reached the venue said nothing"
+    # Under the same `event` name `main` logs a re-list with, because this is the other
+    # way the discovery can fail to land and #42's whole point is filtering by that name.
+    said = [r for r in caplog.records if getattr(r, "event", None) == "feed.instruments"]
+    assert said, "a subscribe that never reached the venue said nothing"
+    assert said[0].listed == 1
 
 
 # --- reconnecting ----------------------------------------------------------------
