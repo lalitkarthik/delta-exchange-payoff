@@ -73,11 +73,12 @@ from .chain import (
 from .compute import enrich
 from .contract_bars import ContractBarsResponse, read_contract_bars
 from .delta_client import DeltaClient, DeltaUnavailable
-from .events import ConnectionState, Event, FeedConnection
+from .events import ConnectionState, ControlCommand, Event, FeedConnection
 from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
 from .historical import list_minutes, read_ladder_at
 from .models import (
+    AdapterHealth,
     ChainResponse,
     ExpiriesResponse,
     HealthReport,
@@ -659,6 +660,73 @@ async def health(
     if supervisor is None:
         return HealthReport(feed=ConnectionState.STOPPED)
     return supervisor.report()
+
+
+#: The three verbs, in the order they read. The same tuple the catalogue's
+#: `ControlCommand.command` literal fixes — kept here as a plain tuple so the route can
+#: name the one it refused rather than handing back pydantic's own message about a
+#: literal, which is about a type and not about a feed.
+FEED_COMMANDS = ("pause", "resume", "reconnect")
+
+
+@app.post("/feed/{adapter}/{command}", response_model=AdapterHealth)
+async def feed_command(
+    adapter: str,
+    command: str,
+    supervisor: Annotated[FeedSupervisor | None, Depends(get_supervisor)],
+) -> AdapterHealth:
+    """Pause, resume or reconnect one adapter. **The engine's second mutating route.**
+
+    The route is thin on purpose: it checks the two names, builds one `control.command`
+    and hands it to the supervisor, which puts it on the bus and gives it to the
+    controller that owns the adapter. Everything a command *does* is the controller's,
+    and `docs/design/lld/commands.md` is where it is written down.
+
+    **It answers with the adapter's health line after the command has been applied, not
+    before.** The ticket asks which of the two this is, because the report a route
+    returns for an event delivered through a queue is a report from before the effect —
+    a `POST .../pause` answering `connected` is technically true and reads as a failure.
+    Delivery here is **synchronous**, in the same call, for the reason #40's
+    `FeedConnectionCache` is: a consumer task on the market-data bus would be draining
+    roughly 1,300 messages a second to catch an event that arrives a few times a day. So
+    there is no window to wait out and nothing to poll — the three verbs are each a flag
+    and a transition, none of them blocks, and by the time this returns the state has
+    already moved. What has *not* finished is what happens next: `resume` answers
+    `connecting`, truthfully, and the dial that follows it takes as long as it takes.
+
+    Unknown adapter is a **404** naming it, because the thing addressed does not exist.
+    Unknown verb is a **422** naming it, because the address is fine and the instruction
+    is not. Both are checked before anything is published: a command nobody can carry out
+    must not reach the bus, where a later reader would find it and assume it happened.
+    """
+    names = supervisor.names() if supervisor is not None else []
+    matched = next((name for name in names if name.upper() == adapter.upper()), None)
+    if supervisor is None or matched is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no adapter named {adapter!r}; this engine runs "
+                f"{', '.join(names) if names else 'none'}"
+            ),
+        )
+    if command not in FEED_COMMANDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{command!r} is not a feed command; use "
+                f"{', '.join(FEED_COMMANDS[:-1])} or {FEED_COMMANDS[-1]}"
+            ),
+        )
+    supervisor.command(
+        ControlCommand(
+            source="operator",
+            ts_received=datetime.now(timezone.utc),
+            adapter=matched,
+            command=command,  # type: ignore[arg-type]  # checked against FEED_COMMANDS
+        )
+    )
+    report = supervisor.report()
+    return next(line for line in report.adapters if line.adapter == matched)
 
 
 @app.get("/expiries", response_model=ExpiriesResponse)
