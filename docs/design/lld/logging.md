@@ -109,11 +109,11 @@ the code as written today and not a promise about every later change to it.
 
 ### `compute.recompute_set`
 
-A new `(underlying, expiry)` pair joins the set `ChainStream` has ever seen a contract
-for. Debug — rare, once per expiry the venue ever lists, and useful only to someone
-reading closely. Explicitly **not** on `dirty` changing, which happens on nearly every
-one of the feed's ~1,323 messages a second and would be exactly the per-message record
-this ticket rules out.
+The set the live pass solves changed: a pair joined the cache for the first time, or —
+since #44 — a browser registered interest in one, released it, or let its grace elapse.
+Debug: once per expiry the venue ever lists, and once per websocket connection per end.
+Explicitly **not** on `dirty` changing, which happens on nearly every one of the feed's
+~1,323 messages a second and would be exactly the per-message record #42 rules out.
 
 ### `ws.client_attach`
 

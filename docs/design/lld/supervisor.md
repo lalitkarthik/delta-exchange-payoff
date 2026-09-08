@@ -80,6 +80,20 @@ answer.
       "empty_opens": 0,
       "undecodable": 0
     }
+  ],
+  "watched": [
+    {
+      "underlying": "BTC",
+      "expiry": "11-09-2026",
+      "viewers": 2,
+      "grace_remaining_seconds": null
+    },
+    {
+      "underlying": "ETH",
+      "expiry": "11-09-2026",
+      "viewers": 0,
+      "grace_remaining_seconds": 21.418
+    }
   ]
 }
 ```
@@ -95,6 +109,7 @@ answer.
 | `budget_remaining` | Reconnects left. A feed two drops from `stopped` and one that has never dropped are otherwise the same green badge. |
 | `transitions` | Every state change since start. A connection flapping between `connected` and `degraded` appears here and in no other field. |
 | `empty_opens` | Sockets opened with **nothing subscribed** — guaranteed to deliver nothing, the failure with no error. |
+| `watched` | **#44's addition, and not the supervisor's.** What the 100 ms live solve is running for — a pair per open `/ws/chain` connection, plus any inside its grace. Built in the route from `ChainStream.watching()`, because the supervisor owns connections and what is being solved is not a property of any adapter. Empty is the ordinary state of an engine recording with no browser open and is **not** a fault: every listed expiry is still solved once a minute by the pass that fills the store. `grace_remaining_seconds` is `null` while anyone is watching — no countdown is running, and `0` would read as one that had just finished. `docs/design/lld/chain-cache.md` §5. |
 | `undecodable` | Frames that parsed as JSON and then made no sense. `delta.py` logs the first and counts the rest, and its own comment asked for this field: a systematic decode bug zeroes the event stream while the message counter climbs. |
 
 Both counters are **`null`, never `0`, when the adapter keeps none.** Each is a counter

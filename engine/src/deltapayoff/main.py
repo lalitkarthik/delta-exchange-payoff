@@ -88,6 +88,7 @@ from .models import (
     RecordingRequest,
     RecordingState,
     SmileResponse,
+    WatchedPair,
 )
 from .realised_vol import ESTIMATORS
 from .smile import read_smile
@@ -103,7 +104,7 @@ from .store import (
     read_contract_ivs,
     read_spot_bars,
 )
-from .stream import ChainStream, recompute_forever
+from .stream import ChainStream, recompute_every_minute, recompute_forever
 from .supervisor import FeedSupervisor
 from .volatility import (
     ALIGNMENTS,
@@ -309,6 +310,12 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     on the wire. The writer is handed the stream's reader, not the stream, so the store
     never learns that a chain cache exists.
 
+    Since #44 that reader is `live_computed_chains` — the pairs a browser is watching —
+    and the rest of the board reaches the same table once a minute through
+    `recompute_every_minute`, which hands its ladders to `writer.sample_chains`. Two
+    cadences, two paths, and neither re-folds the other's work; see that method for why
+    the periodic sample must not meet an unwatched expiry's ladder five times over.
+
     `BarStore()` names the quote table only; the writer derives the other two roots from
     it, so there is exactly one place that decides where market data lands.
 
@@ -321,7 +328,7 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     events = FanOut()
     stream = ChainStream()
     stream.attach(events)
-    writer = BarWriter(BarStore(), chains=stream.computed_chains)
+    writer = BarWriter(BarStore(), chains=stream.live_computed_chains)
     writer.attach(events)
     adapter = DeltaAdapter(
         client=client,
@@ -376,6 +383,15 @@ async def start_feed_stack(stack: FeedStack) -> None:
     stack.tasks = [
         asyncio.create_task(stack.stream.run(), name="chain-stream"),
         asyncio.create_task(recompute_forever(stack.stream), name="chain-recompute"),
+        # **The second cadence, and it does not depend on a browser.** The task above
+        # solves what somebody is looking at; this one closes each minute for every
+        # expiry that had a frame in it and hands the ladders straight to the writer, so
+        # table C — and with it the volatility screen — covers the whole board whether
+        # or not the chain page is open anywhere. See `recompute_every_minute`.
+        asyncio.create_task(
+            recompute_every_minute(stack.stream, stack.writer.sample_chains),
+            name="chain-minute-pass",
+        ),
         asyncio.create_task(stack.writer.run(), name="bar-writer"),
     ]
     for task in stack.tasks:
@@ -576,6 +592,19 @@ def get_bar_writer() -> BarWriter:
     return writer
 
 
+def get_watched_stream() -> ChainStream | None:
+    """The chain cache for `/health`, or `None` in a process whose lifespan never ran.
+
+    A sibling of `get_supervisor` and `None` for the same reason: `/health` is what a
+    monitor hits to find out whether anything is wrong, and a report that 500s because
+    there is no chain cache to describe tells it the engine is down when it is up. It is
+    deliberately **not** `get_chain_stream`, which raises: that one serves `/ws/chain`,
+    where a missing cache genuinely is a failure, and the tests override it with a
+    hand-fed stream that has nothing to do with what the running app is solving.
+    """
+    return getattr(app.state, "stream", None)
+
+
 def get_chain_stream() -> ChainStream:
     """Overridden in tests, which feed the stream by hand instead of over a socket."""
     return app.state.stream
@@ -667,6 +696,7 @@ def get_feed_cache() -> FeedConnectionCache | None:
 @app.get("/health", response_model=HealthReport)
 async def health(
     supervisor: Annotated[FeedSupervisor | None, Depends(get_supervisor)],
+    stream: Annotated[ChainStream | None, Depends(get_watched_stream)],
 ) -> HealthReport:
     """Liveness **and** readiness, and the difference between them.
 
@@ -677,9 +707,25 @@ async def health(
     `models.HealthReport`, and it is the seam #40's badge, #41's commands and #44's
     watched set all read through.
     """
-    if supervisor is None:
-        return HealthReport(feed=ConnectionState.STOPPED)
-    return supervisor.report()
+    report = (
+        HealthReport(feed=ConnectionState.STOPPED)
+        if supervisor is None
+        else supervisor.report()
+    )
+    if stream is not None:
+        # #44's watched set. Built here rather than in `supervisor.report()` because the
+        # supervisor owns connections and knows nothing about a chain cache — and what
+        # is being solved is not a property of any adapter.
+        report.watched = [
+            WatchedPair(
+                underlying=underlying,
+                expiry=expiry,
+                viewers=viewers,
+                grace_remaining_seconds=grace,
+            )
+            for underlying, expiry, viewers, grace in stream.watching()
+        ]
+    return report
 
 
 #: The three verbs, in the order they read. The same tuple the catalogue's
@@ -1278,6 +1324,13 @@ async def live_chain(
             last_sent_state = event.to_state.value
             await websocket.send_json(_feed_message(event))
 
+        # **Interest, registered on accept and released on close.** This is what puts
+        # the pair in the 100 ms live pass and on `/health`'s watched set; an expiry no
+        # connection has registered is solved once a minute and not otherwise. Taken
+        # *after* the parameters are validated, because a pair spelled wrongly is not a
+        # pair and would sit in the watched set for its grace saying the engine was
+        # solving something it cannot.
+        stream.watch(symbol, date)
         try:
             while True:
                 # Before `chain`/`waiting`, every pass — including the first, which is
@@ -1301,6 +1354,13 @@ async def live_chain(
             # The browser closed the tab. Ordinary, not a failure — and nothing to
             # clean up, because this connection owns no subscription of its own.
             return
+        finally:
+            # **However this connection ends, its interest goes.** A `return` above, a
+            # disconnect, a cancelled task or an exception all land here, and a release
+            # that did not happen would pin an expiry into the live pass for the life of
+            # the process — the exact cost this ticket exists to stop paying. The pair
+            # is not dropped: the grace starts, so reopening it is instant.
+            stream.unwatch(symbol, date)
     finally:
         # However the connection ended — a bad parameter, a disconnect, or anything
         # else — the attach above gets its other half. `finally` runs on every `return`
