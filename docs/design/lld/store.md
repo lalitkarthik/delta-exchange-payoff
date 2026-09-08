@@ -5,8 +5,11 @@ writes bars to hive-partitioned Parquet and is the only module in the engine tha
 file. Neither knows a venue.
 
 Landed by #37, which moved the writer off the retired quote record and onto the canonical
-events. #43 adds ETH. What the tables mean and why they are shaped this way is
-`docs/storage.md`; this document is the part a reader would otherwise reconstruct from code.
+events. #43 adds ETH — no change here: `HIVE_SCHEMA`'s `date/underlying` partitioning already
+took the underlying's name off the event, not off a BTC-shaped assumption, so a second
+underlying is a second value in a column that already existed, not a new code path. What the
+tables mean and why they are shaped this way is `docs/storage.md`; this document is the part
+a reader would otherwise reconstruct from code.
 
 ---
 
@@ -136,3 +139,6 @@ HTTP, and `tests/test_composition.py` a scripted socket into the writer's counte
 | Flush every 5 minutes, 288 files per table per day before compaction | `derived` | #16, from the measured hourly file sizes |
 | ~7,056 spot observations a minute against ~118 for one contract's book | `measured` | `tools/measure_feed.py`, 2026-09-03 |
 | 2,460 quote-bar rows, all carrying `last_lts`, over 410 s | `measured` | #36's live run, 2026-09-07T13:24:41Z |
+| One production-interval (300 s) flush, BTC alone: 7,535 rows, 8 files, 877,975 bytes across the four tables | `measured` | #37's live run |
+| The same flush shape, BTC+ETH: scheduled flush 11,740 rows/8 files/699,591 bytes; plus the trailing open-minute flush, 14,088 rows/16 files/909,237 bytes total. File count doubles cleanly — one `underlying=` partition per table per flush, per underlying; rows and bytes do not, because the two runs cover different minutes and market activity, not only a different recorded set | `measured` | `tools/measure_store.py`'s `capture()`, generalised to two underlyings, scratch root, 2026-09-08 — full breakdown in `docs/storage.md` |
+| Every one of the four tables holds an ETH partition with rows after two flush intervals | `measured` | same run |

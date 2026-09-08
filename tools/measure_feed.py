@@ -32,15 +32,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _window import run_window  # noqa: E402
 from deltapayoff.fanout import FanOut  # noqa: E402
 from deltapayoff.adapters import DeltaFeed  # noqa: E402
+from deltapayoff.adapters.delta_socket import BOOK_CHANNEL, TICKER_CHANNEL  # noqa: E402
 
 REST = "https://api.india.delta.exchange"
 RUN_SECONDS = 20.0
 
 
-def symbols(expiry: str | None = None) -> list[str]:
+def symbols(underlying: str = "BTC", expiry: str | None = None) -> list[str]:
     url = (
         f"{REST}/v2/tickers?contract_types=call_options,put_options"
-        "&underlying_asset_symbols=BTC"
+        f"&underlying_asset_symbols={underlying}"
     )
     if expiry:
         url += f"&expiry_date={expiry}"
@@ -128,9 +129,159 @@ async def fanout_cost() -> None:
 
 
 
+async def production_throughput(underlyings: list[str], seconds: float) -> None:
+    """What `main.py` actually subscribes, for the given recorded set: **both** channels,
+    over **every** listed contract, on one connection — not the two separate,
+    differently-scoped runs `throughput()` above checks against ticket #4's baseline.
+
+    #43 runs this once per recorded set, on the same day, to settle which subscription a
+    quoted msg/s and KB/s figure describes — `docs/design/hld.md` §5 named the two
+    disagreeing by ~2.2x with neither run's subscription set stated.
+    """
+    per_underlying = {name: symbols(name) for name in underlyings}
+    names = sorted({s for group in per_underlying.values() for s in group})
+
+    bus = FanOut()
+    bus.subscribe("measure", maxsize=200_000)
+    feed = DeltaFeed(bus)
+    feed.subscribe(TICKER_CHANNEL, names)
+    feed.subscribe(BOOK_CHANNEL, names)
+
+    # **Two markers, timed off the wall clock, not off `run_window` returning.**
+    # Measured while building this: a plain `note_start()` + "read the counters once
+    # `run_window` is back" over-counts elapsed by a fixed ~10 s on every run (20 s asked
+    # became 30 s, 60 s became 70 s) — the `websockets` close handshake that runs during
+    # `feed.run()`'s teardown after cancellation, not receiving time. Dividing by that
+    # inflated denominator would under-report every rate in this function by roughly a
+    # sixth. Sampling `feed.messages`/`feed.bytes_read` at fixed offsets from our own
+    # start, rather than after the window's cleanup completes, sidesteps it. `throughput()`
+    # above has the same shape and is likely to share this bias; not touched here because
+    # it validates against a different, already-published baseline.
+    warmup = 1.0
+    started = time.perf_counter()
+    start_counts: dict[str, float] = {}
+    end_counts: dict[str, float] = {}
+
+    async def mark(delay: float, dest: dict[str, float]) -> None:
+        await asyncio.sleep(delay)
+        dest["messages"] = feed.messages
+        dest["bytes"] = feed.bytes_read
+        dest["at"] = time.perf_counter()
+
+    start_marker = asyncio.create_task(mark(warmup, start_counts))
+    end_marker = asyncio.create_task(mark(warmup + seconds, end_counts))
+    window = await run_window(feed, warmup + seconds)
+    await asyncio.gather(start_marker, end_marker, return_exceptions=True)
+
+    if "at" not in end_counts:
+        # The window ended early enough that our own end marker never fired — a drop,
+        # not the close handshake. Fall back to reading the feed now; `window.complete`
+        # below already says this window is not what was asked for.
+        end_counts = {
+            "messages": feed.messages,
+            "bytes": feed.bytes_read,
+            "at": time.perf_counter(),
+        }
+
+    elapsed = end_counts["at"] - start_counts.get("at", started)
+    messages = end_counts["messages"] - start_counts.get("messages", 0)
+    read = end_counts["bytes"] - start_counts.get("bytes", 0)
+    window.warn_if_truncated()
+
+    label = "+".join(underlyings)
+    per_underlying_counts = ", ".join(
+        f"{name} {len(group)}" for name, group in per_underlying.items()
+    )
+    print(
+        f"{label:8} {len(names):5} contracts ({per_underlying_counts}), both channels  "
+        f"{messages / elapsed:7.1f} msg/s  {read / 1024 / elapsed:7.1f} KB/s  "
+        f"{elapsed:6.1f} s elapsed  {window.attempts} connection(s)"
+        + ("" if window.complete else "  ** WINDOW ENDED EARLY, see above **")
+    )
+
+
+async def channel_cadence(channel: str, underlying: str, seconds: float) -> None:
+    """One underlying, one channel, every listed contract — how often each symbol
+    actually refreshes, with the same unbiased window `production_throughput` uses.
+
+    #43's ticket asks whether ETH refreshes at BTC's 508 ms book / 5,001 ms ticker
+    cadence. `throughput()` above answers a related question over a 20 s window, too
+    short against a ~5 s ticker period to give more than four samples per symbol; this
+    runs long enough (60 s asked) to average that noise out, one channel at a time.
+    """
+    names = symbols(underlying)
+    channel_const = TICKER_CHANNEL if channel == "ticker" else BOOK_CHANNEL
+
+    bus = FanOut()
+    sink = bus.subscribe("measure", maxsize=200_000)
+    feed = DeltaFeed(bus)
+    feed.subscribe(channel_const, names)
+
+    warmup = 1.0
+    started = time.perf_counter()
+    start_counts: dict[str, float] = {}
+    end_counts: dict[str, float] = {}
+
+    async def mark(delay: float, dest: dict[str, float]) -> None:
+        await asyncio.sleep(delay)
+        dest["messages"] = feed.messages
+        dest["at"] = time.perf_counter()
+
+    start_marker = asyncio.create_task(mark(warmup, start_counts))
+    end_marker = asyncio.create_task(mark(warmup + seconds, end_counts))
+    window = await run_window(feed, warmup + seconds)
+    await asyncio.gather(start_marker, end_marker, return_exceptions=True)
+    if "at" not in end_counts:
+        end_counts = {"messages": feed.messages, "at": time.perf_counter()}
+
+    elapsed = end_counts["at"] - start_counts.get("at", started)
+    messages = end_counts["messages"] - start_counts.get("messages", 0)
+    window.warn_if_truncated()
+
+    seen: set[str] = set()
+    while not sink.queue.empty():
+        seen.add(sink.queue.get_nowait().symbol)
+
+    per_symbol_ms = len(seen) / (messages / elapsed) * 1000 if messages else 0.0
+    print(
+        f"{underlying:4} {channel:6} {len(names):5} symbols  "
+        f"{messages / elapsed:7.1f} msg/s  {per_symbol_ms:7.1f} ms/symbol  "
+        f"{len(seen):4} distinct  {elapsed:5.1f} s elapsed  "
+        f"{window.attempts} connection(s)"
+        + ("" if window.complete else "  ** WINDOW ENDED EARLY, see above **")
+    )
+
+
 async def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--underlyings",
+        default="",
+        help="comma-separated, e.g. BTC or BTC,ETH — runs production_throughput and "
+        "exits, skipping the per-channel and fan-out measurements below",
+    )
+    parser.add_argument("--seconds", type=float, default=60.0)
+    parser.add_argument(
+        "--cadence",
+        default="",
+        help="CHANNEL:UNDERLYING, e.g. ticker:ETH — runs channel_cadence and exits",
+    )
+    args = parser.parse_args()
+
+    if args.cadence:
+        channel, _, underlying = args.cadence.partition(":")
+        await channel_cadence(channel.strip(), underlying.strip().upper(), args.seconds)
+        return
+
+    if args.underlyings:
+        wanted = [name.strip().upper() for name in args.underlyings.split(",") if name]
+        await production_throughput(wanted, args.seconds)
+        return
+
     every = symbols()
-    chain = symbols("04-09-2026")
+    chain = symbols(expiry="04-09-2026")
     print(f"{len(every)} live BTC options, {len(chain)} in the 04-09-2026 chain\n")
     print("THROUGHPUT")
     await throughput("ticker", every)

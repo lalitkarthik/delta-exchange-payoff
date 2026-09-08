@@ -111,7 +111,7 @@ Every drop is counted. **No broker is deployed:** the interface is the seam, the
 - **Bar writer and store** — `bars.py`, `store.py`. Ticks folded into sealed one-minute bars,
   written as hive-partitioned Parquet in four tables. **A minute with no arrivals produces no
   row** — not nulls, never the previous close — and that survives the refactor. Will consume
-  events (#37) and record ETH beside BTC (#43).
+  events (#37). Records ETH beside BTC since #43, each under its own `underlying=` partition.
 - **Pricing core** — `forward.py`, `solvers.py`, `black76.py`, `black_scholes.py`, `greeks.py`,
   `compute.py`. Pure. The venue's IV and Greeks travel beside ours as reference columns, never
   as inputs.
@@ -176,14 +176,21 @@ Fields, emitters, consumers and timing are in [events.md](events.md).
 | Number | Tag | Run |
 |---|---|---|
 | `ob_l2` refreshes every 508 ms per contract, `ticker` every 5,001 ms; both channels on BTC alone carry 1,322.9 msg/s at 636.5 KB/s | `measured` | `tools/measure_feed.py`, 2026-09-03 |
+| Both channels, every listed contract, **BTC alone**: 504 contracts, 1,095.1 msg/s, 547.3 KB/s. **BTC+ETH**: 782 contracts (BTC 504, ETH 278), 1,693.6 msg/s, 843.4 KB/s | `measured` | `tools/measure_feed.py --underlyings ... --seconds 60`, 60 s each, back to back, 2026-09-08 04:09–04:11 UTC (~09:39 IST) |
+| BTC ladder unchanged within noise: push interval (nominal 1.0 s) median 1,011.7→1,015.0 ms, p95 1,027.7→1,063.1 ms with ETH also live; one-expiry solve pass (`enrich()`) median 0.966→0.983 ms | `measured` | live `/ws/chain` client (24 pushes each) + 200-run `time_it` on real data, 2026-09-08 |
 | Staleness before `degraded` 15 s (three ticker refreshes); grace after the last viewer leaves an expiry 30 s | `assumed` | #33. The staleness half is now measured against a live hour and stands — longest quiet gap 44.785 s, `design/quiet-gap.md`. The grace half is still untested |
 | Store gap 2026-09-04 09:38Z to 2026-09-07 09:45Z, unnoticed | `measured` | store file timestamps |
 
-**Two numbers are deliberately absent:** the live cost of one expiry's solve, which #33 requires
-re-measured against the running engine before it may appear in any design document; and the feed's
-rate and bandwidth with ETH enabled, which #43 measures and records here.
-**One is contested.** #33 quotes the BTC-only feed at `measured` ~600 msg/s and ~300 KB/s, against
-1,322.9 msg/s and 636.5 KB/s above for the same subscription. Not reconciled; #43 settles it.
+**The contested number is settled: never a subscription mismatch, only measured vs. not.** #33's
+spec quoted `main.py`'s own comment, ~600 msg/s and ~300 KB/s for BTC alone — never actually run,
+no probe output behind it anywhere in this repository's history. 1,322.9 msg/s at 636.5 KB/s
+(2026-09-03) names the identical subscription, not a different one; #43's run above is a third
+point on it, differing by the day's contract count and activity, exactly as §8 of
+`docs/architecture.md` predicts. `main.py`'s comment now points here rather than repeat a number.
+
+**One number stays absent on purpose:** #33 wants one expiry's solve cost measured against the
+*running engine*, not a direct call — the solve-pass row above answers #43's narrower question
+only, whether ETH changes it, and says nothing about event-loop contention under load.
 
 ## 6. Out of scope, and why
 
