@@ -336,7 +336,13 @@ class ChainStream:
         """
         now = self.clock() if now is None else now
         out: list[tuple[str, str, int, float | None]] = []
-        for (underlying, expiry), entry in sorted(self._watch.items()):
+        # Keyed explicitly: sorting bare `(pair, Watch)` tuples would fall through
+        # to comparing two `Watch` objects on a tie, and `Watch` is not orderable.
+        # Dict keys cannot tie, so it is safe today and would stop being safe the
+        # day this is keyed by anything else.
+        for (underlying, expiry), entry in sorted(
+            self._watch.items(), key=lambda item: item[0]
+        ):
             if entry.viewers > 0:
                 out.append((underlying, expiry, entry.viewers, None))
                 continue
