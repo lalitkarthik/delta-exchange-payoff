@@ -26,14 +26,13 @@ constructs and inherits `...`-bodied stubs returning `None` — a missing `strea
 stop raising `AttributeError` and start delivering silence. Conformance is checked by
 `isinstance` against the structural protocol, which does fail when a member goes missing.
 
-**Reconnect is not in this interface, and that is deliberate for exactly one ticket
-more.** Backoff, the lifetime budget and subscription replay live inside the Delta
-adapter still, because that is where `feed.py` already has them, correct and tested. #38
-put the **state machine** over this protocol — `controller.ConnectionController` — and
-took staleness with it, which is why `on_connection` exists: a machine needs to observe
-the connection it describes. #39 lifts backoff, the budget and replay up beside it and
-puts a supervisor over the result. Moving them early would have meant writing the state
-machine twice.
+**Reconnect is not in this interface, and since #39 it is not below it either.** #38 put
+the **state machine** over this protocol — `controller.ConnectionController` — and took
+staleness with it, which is why `on_connection` exists: a machine needs to observe the
+connection it describes. #39 lifted backoff, the lifetime budget and the decision to
+redial up beside it, and put `supervisor.FeedSupervisor` over the result. So `stream` is
+now one connection and nothing here retries: an adapter dials, replays and reads, and the
+layer that can say *we have given up* out loud is the layer that decides it.
 """
 
 from __future__ import annotations
@@ -149,11 +148,18 @@ class Adapter(Protocol):
         ...
 
     async def stream(self, publish: Publish) -> None:
-        """Emit canonical events into `publish` until `stop` is called.
+        """**Connect once and stream until the connection closes.** Then return.
 
-        Returns rather than raises when the adapter gives up — an exhausted reconnect
-        budget is an ordinary end, and the caller learns of it by the coroutine
-        finishing.
+        Changed in #39, and it is the one contract change that ticket makes. It used to
+        mean "stream until stopped or until you give up", which put the decision *we gave
+        up* inside a `while` condition below the state machine that is supposed to
+        describe it. Now one call is one connection: dial, replay every subscription,
+        publish until the socket ends, return. Whether there is another attempt, how long
+        to wait for it, and whether any budget is left are the controller's.
+
+        **Returns rather than raises**, on every ending. A `stop()` returns without
+        reporting a close through `on_connection`, because a stop is not a drop and the
+        controller reads exactly that difference to decide whether to redial.
         """
         ...
 

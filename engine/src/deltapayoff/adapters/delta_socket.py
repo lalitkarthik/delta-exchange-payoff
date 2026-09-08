@@ -22,15 +22,25 @@ underneath it move.
 Delta's documented 60 s idle disconnect did not reproduce in a 75 s test on this project,
 so it is treated as unverified and pings are sent regardless — 30 s, OpenAlgo's interval.
 
-**Reconnect with a budget that resets on data, not on connecting.** A cumulative retry
-counter looks correct and dies after a month: OpenAlgo's comment records that a
-long-lived feed reconnecting once a day silently exhausts a lifetime budget and never
-comes back. So a connection that **delivered a message** restores the counter.
+**One connection, and since #39 only one.** `run()` dials once, replays the registry,
+pumps until the socket ends, and returns. **Backoff, the lifetime reconnect budget and
+the decision to redial left this module in #39** and belong to
+`controller.ConnectionController`, with every value unchanged — the rules they encode did
+not move, only the code that runs them:
 
-Resetting on the connection merely opening is the same bug inverted, and it is worse —
-Delta can accept a handshake and close immediately, and a budget that resets every pass
-never exhausts at all. Measured before the fix: 21 attempts in 0.3 s with `max_retries=3`
-and no sign of stopping.
+* A budget that **resets on data, not on connecting.** A cumulative retry counter looks
+  correct and dies after a month: OpenAlgo's comment records that a long-lived feed
+  reconnecting once a day silently exhausts a lifetime budget and never comes back. So a
+  connection that **delivered a message** restores it. Resetting on the connection merely
+  opening is the same bug inverted, and worse — Delta can accept a handshake and close
+  immediately, and a budget that resets every pass never exhausts at all. Measured before
+  that was fixed: 21 attempts in 0.3 s with a budget of 3 and no sign of stopping.
+* A delay that doubles to a minute, restored the moment data arrives.
+
+They moved because the controller cannot own a state machine whose central move — *we
+gave up* — was decided by a `while` condition one layer below it, where nothing could
+observe it and nothing could say so. What is left here is the half that needs a socket:
+the dial, the replay and the read.
 
 **Resubscribe everything.** This is the one that produces no error. A reconnected socket
 is a fresh, empty socket and Delta has forgotten every subscription; skip the replay and
@@ -70,6 +80,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: What an attempt that opened and delivered nothing is called, in the close it
+#: reports and in `last_error`. One spelling, because the controller's budget rule
+#: and an operator reading a log line are looking at the same fact.
+NOTHING_DELIVERED = "connected but closed without delivering a message"
+
 PUBLIC_WS = "wss://public-socket.india.delta.exchange"
 
 #: Delta's two channel names, and **the only place either string appears** outside the
@@ -85,9 +100,13 @@ BOOK_CHANNEL = "ob_l2"
 CHANNELS = (TICKER_CHANNEL, BOOK_CHANNEL)
 
 HEARTBEAT_SECONDS = 30.0
-RETRY_DELAY_SECONDS = 1.0
-MAX_RETRY_DELAY_SECONDS = 60.0
-MAX_RETRIES = 10
+
+#: **Moved to `controller.py` in #39, unchanged in value.** They are named here as
+#: pointers and not as numbers, because two modules holding the same constant is how the
+#: two quietly stop agreeing. `RETRY_DELAY_SECONDS = 1.0`,
+#: `MAX_RETRY_DELAY_SECONDS = 60.0` and `MAX_RETRIES = 10` are now
+#: `controller.RETRY_DELAY_SECONDS`, `controller.MAX_RETRY_DELAY_SECONDS` and
+#: `controller.RECONNECT_BUDGET`.
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,8 +144,6 @@ class DeltaFeed:
         connect: Callable[[str], Any] | None = None,
         url: str = PUBLIC_WS,
         heartbeat_seconds: float = HEARTBEAT_SECONDS,
-        retry_delay: float = RETRY_DELAY_SECONDS,
-        max_retries: int = MAX_RETRIES,
     ) -> None:
         #: Anything with a non-blocking `publish`. Named `sink` rather than `fanout`
         #: since #36: the running engine passes the adapter's frame sink, and only
@@ -134,8 +151,6 @@ class DeltaFeed:
         self.sink = sink
         self.url = url
         self.heartbeat_seconds = heartbeat_seconds
-        self.retry_delay = retry_delay
-        self.max_retries = max_retries
         self._connect = connect or self._default_connect
 
         #: Channel to symbols. **Never cleared.** This is the reconnect replay.
@@ -143,7 +158,6 @@ class DeltaFeed:
         self._stopping = False
 
         self.connections = 0
-        self.consecutive_failures = 0
         self.messages = 0
         self.bytes_read = 0
         self.malformed = 0
@@ -152,7 +166,6 @@ class DeltaFeed:
         #: connection is empty is a feed nobody subscribed, and a counter stuck above
         #: zero is the signal that says so.
         self.empty_opens = 0
-        self.started_at: float | None = None
         #: Why the last connection ended. `None` means it has not ended yet. Without
         #: this a persistently failing feed is indistinguishable from a quiet healthy
         #: one: `messages` simply stops moving and nothing says why.
@@ -337,54 +350,75 @@ class DeltaFeed:
                 return
 
     async def run(self) -> None:
-        """Connect, pump, reconnect. Returns when stopped or the budget is exhausted."""
-        self.started_at = time.perf_counter()
-        delay = self.retry_delay
+        """**One connection.** Dial, replay the registry, pump, return when it ends.
 
-        while not self._stopping and self.consecutive_failures <= self.max_retries:
-            # Read the counter across the whole attempt rather than taking a return
-            # value from `_pump`: a dropped connection leaves `_pump` by raising, so a
-            # returned flag is lost on exactly the path that matters most.
-            before = self.messages
-            try:
-                async with self._connect(self.url) as socket:
-                    self.connections += 1
-                    await self._pump(socket)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.last_error = f"{type(exc).__name__}: {exc}"[:300]
+        Since #39 this returns after a single attempt rather than looping: whether there
+        is another attempt, how long to wait for it and whether the budget allows one at
+        all are `controller.ConnectionController`'s, because they are the questions the
+        state machine is made of. `delivered` is still computed here — the counter is
+        read across the whole attempt rather than returned by `_pump`, since a dropped
+        connection leaves `_pump` by raising and a returned flag is lost on exactly the
+        path that matters most — and it becomes the `CLOSED` signal's detail, which is
+        what reaches a listener and the log. **The controller does not read `last_error`
+        at all**: the budget is restored in `message_arrived`, by frames arriving through
+        the sink, not by anything this module reports. An earlier draft of #39 said
+        otherwise and the code never did it.
 
-            # One attempt has ended, whether it ever opened or the dial failed outright.
-            # The failed dial is reported too: a controller told only about sockets that
-            # had opened would sit in `connecting` for the length of an endpoint outage,
-            # which reads on a badge as "starting up". A stop is not a drop, so a stop is
-            # not reported as one.
-            if not self._stopping:
-                self._tell(self._on_close, self.last_error or "closed by the venue")
+        A `stop()` before this runs opens nothing, and the flag is never cleared, so a
+        stopped feed stays stopped.
+        """
+        if self._stopping:
+            return
+        before = self.messages
+        # **This attempt's own error, in a local.** `last_error` is instance state that
+        # survives across `run()` calls, and since #39 there are many calls where there
+        # used to be one loop. Reading it below to describe *this* ending would let a
+        # previous attempt's dial failure be reported as the reason this socket closed.
+        # Nothing constructs that today — every ending here raises, so the assignment
+        # below always lands first — but it is one refactor away, and a local costs
+        # nothing to make it impossible.
+        attempt_error: str | None = None
+        try:
+            async with self._connect(self.url) as socket:
+                self.connections += 1
+                await self._pump(socket)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            attempt_error = f"{type(exc).__name__}: {exc}"[:300]
+            self.last_error = attempt_error
 
-            # Delivering data, not connecting, is what proves the endpoint works. Delta
-            # can accept the handshake and close straight away — a rejected subscribe, a
-            # throttled IP, an endpoint draining — and treating that as healthy resets
-            # the budget every pass so the loop never gives up. Measured before this
-            # was fixed: 21 attempts in 0.3s with max_retries=3, still going. At the
-            # production one-second delay that exhausts the 150-per-5-minutes connection
-            # budget in about two and a half minutes and keeps hammering.
-            delivered = self.messages > before
-            if delivered:
-                self.last_error = None
-            elif self.last_error is None:
-                self.last_error = "connected but closed without delivering a message"
+        delivered = self.messages > before
+        # **The diagnosis, resolved before anyone is told rather than after.** An attempt
+        # that opened and delivered nothing is the healthy-socket-zero-messages failure
+        # this whole module exists to refuse, and it is the fact the budget rule turns
+        # on. It used to be computed below the `_tell`, so a listener heard only
+        # `ConnectionResetError` — which is also what a healthy socket dropping in a
+        # storm reports. Two very different incidents, one indistinguishable detail.
+        if delivered:
+            ending = attempt_error or "closed by the venue"
+        elif attempt_error is None:
+            ending = NOTHING_DELIVERED
+        else:
+            ending = f"{attempt_error}; {NOTHING_DELIVERED}"
 
-            if self._stopping:
-                break
-            if delivered:
-                # This connection carried data, so the endpoint works. Restoring the
-                # budget is what stops a feed that reconnects daily from exhausting a
-                # lifetime allowance and never returning — OpenAlgo's recorded bug.
-                self.consecutive_failures = 0
-                delay = self.retry_delay
-            else:
-                self.consecutive_failures += 1
-                delay = min(delay * 2, MAX_RETRY_DELAY_SECONDS)
-            await asyncio.sleep(delay)
+        # The attempt has ended, whether it ever opened or the dial failed outright.
+        # The failed dial is reported too: a controller told only about sockets that had
+        # opened would sit in `connecting` for the length of an endpoint outage, which
+        # reads on a badge as "starting up". A stop is not a drop, so a stop is not
+        # reported as one — and the controller reads exactly this signal to tell the two
+        # endings apart, so staying quiet on a stop is what stops it redialling.
+        if not self._stopping:
+            self._tell(self._on_close, ending)
+
+        # Delivering data, not connecting, is what proves the endpoint works. Delta can
+        # accept the handshake and close straight away — a rejected subscribe, a
+        # throttled IP, an endpoint draining — and treating that as healthy resets the
+        # budget every pass so nothing ever gives up. Measured before that was fixed: 21
+        # attempts in 0.3 s with a budget of 3, still going. At the production
+        # one-second delay that exhausts the 150-per-5-minutes connection budget in
+        # about two and a half minutes and keeps hammering.
+        if delivered:
+            self.last_error = None
+        elif self.last_error is None:
+            self.last_error = NOTHING_DELIVERED

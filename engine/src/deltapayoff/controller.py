@@ -28,15 +28,22 @@ testable without a clock or an event loop:
 `run()` wires the ones that need a clock to a real one and is the only async thing here.
 A test drives `poll` itself, and a twenty-second silence costs it nothing.
 
-## What is *not* here, and for how long
+## What is here since #39, and what it displaced
 
-**Backoff, the lifetime reconnect budget and subscription replay stay inside
-`feed.DeltaFeed`,** where they are correct and tested, until #39 lifts them. This ticket
-is the machine and the staleness that drives it. The consequence is visible in one place:
-the controller learns that a reconnect attempt was made only when it **succeeds**, so the
-`reconnecting -> connecting` move is emitted at the instant the socket opens rather than
-at the instant the attempt began. #39, owning backoff, can emit it when the attempt
-starts, and this module's table does not change.
+**Backoff, the lifetime reconnect budget and the decision to redial are here**, lifted out
+of `adapters/delta_socket.py` where they lived inside a `while` loop. They moved because
+the most important thing that loop decided — *we have given up* — was a loop condition one
+layer below the state machine that exists to describe the connection: nothing could
+observe it, nothing could publish it, and `/health` said `ok` on either side of it. Now it
+is a transition to `stopped` with an alert and an error record attached. Every value moved
+unchanged; `docs/design/lld/reconnect.md` is the design and carries the numbers.
+
+One consequence #38 predicted and this ticket delivered: `reconnecting -> connecting` is
+emitted **when the attempt begins**, not when the socket opens, because the dial is ours
+now. The table did not change; only the moment did.
+
+`adapter.stream` is correspondingly **one connection** — dial, replay, pump, return — and
+`run()` is the loop over it.
 
 ## The connection signal
 
@@ -46,7 +53,9 @@ its socket had come or gone, and then no way to stop listening. Two signals, `OP
 `CLOSED`; synchronous and non-blocking for the same reason `Publish` is, since the socket
 reader calls it between reads. `docs/design/lld/connection-signal.md` is the design.
 
-The full table and every number are in `docs/design/lld/controller.md`.
+The full table and every number are in `docs/design/lld/controller.md`; the reconnect half
+is `docs/design/lld/reconnect.md`; `supervisor.FeedSupervisor` owns one of these per
+adapter and answers `/health` for all of them.
 """
 
 from __future__ import annotations
@@ -149,9 +158,30 @@ POLL_SECONDS = 1.0
 #: whose every tick fails is a watchdog that is not watching.
 POLL_FAILURES_BEFORE_ALERT = 3
 
+#: **Moved here from `adapters/delta_socket.py` in #39, unchanged in value.** The first
+#: wait after a drop, doubling per consecutive failure to the ceiling below, and restored
+#: to this the moment a connection delivers anything.
+RETRY_DELAY_SECONDS = 1.0
+#: The ceiling the doubling stops at. A minute is long enough that a venue outage costs
+#: one dial a minute rather than a flood, and short enough that a feed is back within a
+#: minute of the venue returning.
+MAX_RETRY_DELAY_SECONDS = 60.0
+#: **The lifetime reconnect budget**, spent one per drop and **restored in full the
+#: moment a message arrives**. Delivering data, not connecting, is what proves the
+#: endpoint works: Delta can accept a handshake and close immediately, and a budget
+#: restored on merely connecting never exhausts at all. It is a budget rather than an
+#: infinite retry because a feed that has failed eleven times running without ever
+#: delivering a frame is not going to succeed on the twelfth, and Delta's connection
+#: allowance is 150 per five minutes.
+RECONNECT_BUDGET = 10
+
 #: `alert` codes. Short and stable, for the same reason a `reason` is.
 ALERT_CONNECTION_SILENT = "connection_silent"
 ALERT_POLL_FAILING = "poll_failing"
+#: The spent budget. **The loudest thing this engine says**: the feed has given up and
+#: will not come back without a `resume`, and every screen downstream is about to go
+#: quiet with no other symptom.
+ALERT_RECONNECT_BUDGET = "reconnect_budget_spent"
 
 
 class ConnectionController:
@@ -166,6 +196,8 @@ class ConnectionController:
         reconnect_after: float = RECONNECT_AFTER_SECONDS,
         heartbeat_every: float = HEARTBEAT_SECONDS,
         poll_seconds: float = POLL_SECONDS,
+        retry_delay: float = RETRY_DELAY_SECONDS,
+        reconnect_budget: int = RECONNECT_BUDGET,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], Any] = asyncio.sleep,
@@ -184,6 +216,8 @@ class ConnectionController:
         self.reconnect_after = reconnect_after
         self.heartbeat_every = heartbeat_every
         self.poll_seconds = poll_seconds
+        self.retry_delay = retry_delay
+        self.reconnect_budget = reconnect_budget
         self._clock = clock
         self._wall_clock = wall_clock
         self._sleep = sleep
@@ -201,9 +235,40 @@ class ConnectionController:
         #: `None` until the first poll. That poll beats whenever it comes — under
         #: `run()`, one `poll_seconds` after the start rather than at the instant of it.
         self._last_beat_at: float | None = None
+        #: When the current **dial attempt** began, on the monotonic clock. The third
+        #: thing staleness can be measured from, and new in the review of #39.
+        #:
+        #: `_opened_at` gives a reopened socket its own grace; this gives the *attempt*
+        #: its own grace, and it is needed for the same reason one step earlier. Since
+        #: #39 `reconnecting -> connecting` is announced when a dial begins, so
+        #: `connecting` is now reachable without a socket ever existing — under #38 it
+        #: was only ever entered by `connection_opened`, which sets `_opened_at`. Without
+        #: this, every announced attempt in an outage longer than `reconnect_after` was
+        #: demoted with reason `silent` on the very next poll, and raised an alert about
+        #: a socket that was never open. See `_attempt_forever`.
+        self._attempt_at: float | None = None
 
         #: Transitions since construction, for `/health` in #39.
         self.transitions = 0
+        #: Times this connection has **dropped**, for `/health` — incremented in
+        #: `connection_closed`, beside the budget it spends. Deliberately not a count of
+        #: entries into `reconnecting`: the watchdog reaches that state on its own over a
+        #: socket the venue has not closed, and a close arriving at a machine already
+        #: there still counts. A count and
+        #: not a rate: a reader comparing two polls of `/health` gets the rate, and a
+        #: rate computed here would need a window nobody agreed on.
+        self.reconnects = 0
+        #: Budget spent, never earned back except by a message arriving. The remaining
+        #: figure is what `/health` reports; this is what the arithmetic is done on, so
+        #: that "spent 3 of 10" and "7 left" cannot drift apart.
+        self._budget_spent = 0
+        #: The next backoff wait. Doubles per failed attempt, restored by a message.
+        self._delay = retry_delay
+        #: Whether the **adapter** last said its socket was gone. Not the same question
+        #: as `state is RECONNECTING`, which the staleness watchdog can also reach with
+        #: a socket that is still open and merely silent — and the difference decides
+        #: whether `run()` redials when `stream` returns. See `_attempt_forever`.
+        self._socket_closed = False
 
         #: Whether this controller is on the adapter's connection register. Tracked so
         #: that attaching and detaching are both idempotent.
@@ -266,6 +331,16 @@ class ConnectionController:
             return None
         return (self._clock() if now is None else now) - self._last_message_at
 
+    @property
+    def budget_remaining(self) -> int:
+        """Reconnects left before this connection gives up. Never below zero.
+
+        Reported by `/health` because a feed two drops from `stopped` and a feed that has
+        never dropped are the same green badge, and the difference is the whole point of
+        having a budget.
+        """
+        return max(0, self.reconnect_budget - self._budget_spent)
+
     # --- the causes ---------------------------------------------------------------
 
     def start(self) -> None:
@@ -282,6 +357,7 @@ class ConnectionController:
         reason = REASON_RESUME if self._state is State.STOPPED else REASON_START
         self._last_message_at = None
         self._opened_at = None
+        self._attempt_at = None
         # A controller `run()` detached on its way out is deaf until it is put back, and
         # a resumed connection that never heard its socket open would sit in
         # `connecting` until the staleness bound moved it. #41's resume is the caller.
@@ -302,8 +378,27 @@ class ConnectionController:
         self.transition(State.STOPPED, reason, detail)
 
     def message_arrived(self, now: float | None = None) -> None:
-        """An event came off the adapter. Resets the age, and may end a silence."""
+        """An event came off the adapter. Resets the age, the budget and the backoff.
+
+        **Delivering data is what restores the budget**, and it is restored in full
+        rather than by one. OpenAlgo's comment records the bug the other way round: a
+        cumulative counter that never resets kills a feed reconnecting once a day after a
+        month, with no failure anywhere to point at. The inverse — restoring on the
+        socket merely opening — is worse, because Delta can accept a handshake and close
+        immediately and a budget restored every pass never exhausts at all.
+
+        **A stopped connection ignores this entirely.** The transitions below were
+        guarded by state and the counters above them were not, so a frame off a socket
+        winding down handed a `stopped` connection its whole lifetime budget back — and
+        `/health` then reported a feed that had given up as having a full budget in hand.
+        Harmless while nothing restarts a controller; #41's resume is what makes it a
+        hazard, so it is refused here rather than left for that ticket to discover.
+        """
+        if self._state is State.STOPPED:
+            return
         self._last_message_at = self._clock() if now is None else now
+        self._budget_spent = 0
+        self._delay = self.retry_delay
         if self._state is State.RECONNECTING:
             # A frame off a socket the controller believed gone. The table forbids
             # `reconnecting -> connected`, so it takes the same two steps an open does.
@@ -327,6 +422,7 @@ class ConnectionController:
         against a connection that no longer exists.
         """
         self._opened_at = self._clock()
+        self._socket_closed = False
         if self._state in (State.CONNECTED, State.DEGRADED):
             logger.info(
                 "feed connection %s: open while already %s; the staleness clock is "
@@ -346,10 +442,54 @@ class ConnectionController:
 
         They do not go in `reason`, which stays the short stable `closed` so that #40 can
         badge on it and #42 can grep it without matching a thousand distinct sentences.
+
+        **This is where the lifetime budget is spent**, since #39: a drop is what a
+        reconnect budget counts, and this is the one place a drop is known. When there is
+        nothing left to spend the connection does not go on to `reconnecting` and sit
+        there — it is taken to `stopped` through it, which is the move #38 left in the
+        table for exactly this, with one `alert` and one error-level log beside it.
         """
-        if self._state is None or self._state in (State.STOPPED, State.RECONNECTING):
+        self._socket_closed = True
+        if self._state is None or self._state is State.STOPPED:
             return
-        self.transition(State.RECONNECTING, REASON_CLOSED, detail)
+        # **The budget is spent on the drop, not on the transition**, and the two are not
+        # the same event. The staleness watchdog reaches `reconnecting` on its own, over
+        # a socket the venue has not closed yet; when that socket then really dies, the
+        # close arrives at a machine already in `reconnecting`. Counting only the
+        # transition made that drop free — an unbounded reconnect loop in precisely the
+        # case the budget exists for, with a full budget on the books throughout.
+        if self._state is not State.RECONNECTING:
+            self.transition(State.RECONNECTING, REASON_CLOSED, detail)
+        self.reconnects += 1
+        self._spend_reconnect(detail)
+
+    def _spend_reconnect(self, detail: str) -> None:
+        """Take one off the budget, or stop if there was none to take.
+
+        Checked **before** spending rather than after, so that a budget of two allows two
+        reconnects and the third drop is the one that stops — "two reconnects" meaning
+        two, which is the only reading of the number that a person setting it would
+        expect.
+        """
+        if self.budget_remaining > 0:
+            self._budget_spent += 1
+            return
+        spent = (
+            f"the reconnect budget of {self.reconnect_budget} is spent after "
+            f"{self.reconnects} drops; this connection will not come back without a "
+            f"resume"
+        )
+        if detail:
+            spent = f"{spent} ({detail})"
+        # An error record and not a warning, and the only one this module logs at error
+        # besides a dead watchdog. A feed that has given up produces no other symptom:
+        # the screens simply stop moving.
+        logger.error("feed connection %s: %s", self.adapter_name, spent)
+        self._alert(ALERT_RECONNECT_BUDGET, spent)
+        # `stop()` rather than a bare transition, because the adapter must be told too —
+        # a controller that gave up while its adapter went on dialling would be spending
+        # a venue's connection allowance on a feed nobody is watching.
+        self.stop(REASON_STOPPED, spent)
 
     def connection_signal(self, signal: ConnectionSignal, detail: str = "") -> None:
         """The adapter's `on_connection` listener. Registered in `__init__`."""
@@ -404,6 +544,13 @@ class ConnectionController:
             since = self._entered_at
         if self._opened_at is not None and self._opened_at > since:
             since = self._opened_at
+        # And an **attempt** that has not opened yet is younger still. A dial in flight
+        # is measured from when it was dialled, not from a socket that is already gone;
+        # otherwise every announced redial past `reconnect_after` is called silent on the
+        # next poll. The heartbeat's age is untouched, as above — that one is the venue's
+        # own silence and stays true across the whole outage.
+        if self._attempt_at is not None and self._attempt_at > since:
+            since = self._attempt_at
         age = now - since
         if age >= self.reconnect_after:
             detail = f"{age:.1f}s silent"
@@ -466,11 +613,11 @@ class ConnectionController:
     # --- running it ----------------------------------------------------------------
 
     async def run(self) -> None:
-        """Start, drive the adapter's stream, and tick the staleness timer beside it.
+        """Start, dial the adapter until it is done, and tick the staleness timer beside.
 
-        Returns when the adapter's `stream` returns — which a real adapter does when it
-        is stopped or when its reconnect budget is spent — and leaves the connection
-        `stopped`, because an adapter that is no longer streaming is not connecting.
+        Returns when the adapter is finished — stopped by request, or out of budget — and
+        leaves the connection `stopped`, because an adapter that is no longer streaming
+        is not connecting.
 
         The timer is a **separate task**, not a timeout on the read: a controller that
         only woke when a message arrived could never notice that none had.
@@ -478,7 +625,7 @@ class ConnectionController:
         self.start()
         timer = asyncio.ensure_future(self._tick_forever())
         try:
-            await self._adapter.stream(self.sink)
+            await self._attempt_forever()
         finally:
             timer.cancel()
             # **The result is read, not discarded.** `return_exceptions=True` retrieves
@@ -502,6 +649,52 @@ class ConnectionController:
             # Finished with this adapter, and holding on to nothing of it. `start()`
             # puts the listener back, so a resume is not left deaf.
             self.detach()
+
+    async def _attempt_forever(self) -> None:
+        """One connection at a time, with the backoff between them. **#39's move.**
+
+        `adapter.stream` is one connection since #39 — dial, replay, pump, return — so
+        the loop that decides there is another attempt lives here, where the state
+        machine can see it. That is the whole reason it moved: *we gave up* was a `while`
+        condition inside the socket owner, one layer below anything that could observe it
+        or say so, and now it is a transition to `stopped` with an alert attached.
+
+        **A returned stream is only a reason to redial if the adapter said its socket was
+        gone.** Two other endings reach the same line and neither is ours to retry: a
+        `stop()` returns without reporting a close, on purpose, because a stop is not a
+        drop; and a `reconnecting` the *staleness watchdog* reached — a socket the venue
+        never closed and merely stopped speaking on — is a state, not a dead socket, and
+        redialling it would be dialling over a connection that is still open. Forcing
+        that one down needs a member the protocol does not have; it is #41's `reconnect`
+        command, and `docs/design/lld/reconnect.md` §4 records the gap.
+        """
+        while True:
+            await self._adapter.stream(self.sink)
+            if self._state is State.STOPPED or not self._socket_closed:
+                return
+            # The wait grows per consecutive failed attempt and is restored in full by
+            # the first message off a connection, which is the same rule the budget
+            # follows and for the same reason.
+            # The delay actually waited, kept before it is doubled, so the log line
+            # and the event's detail say what happened rather than what will happen next.
+            waited = self._delay
+            await self._sleep(waited)
+            self._delay = min(self._delay * 2, MAX_RETRY_DELAY_SECONDS)
+            if self._state is State.STOPPED:
+                return
+            if self._state is State.RECONNECTING:
+                # **The attempt gets its own grace.** Set before the transition, because
+                # the transition publishes and a consumer that polls on the way through
+                # must not see the attempt measured against the socket it replaced.
+                self._attempt_at = self._clock()
+                # **Emitted when the attempt begins, not when it succeeds.** #38 could
+                # only move here at the instant a socket opened, because it did not own
+                # the dial; a badge that showed `reconnecting` for the whole of a
+                # thirty-second outage and never showed a try in progress is the
+                # difference.
+                self.transition(
+                    State.CONNECTING, REASON_BACKOFF, f"redialling after {waited:.1f}s"
+                )
 
     async def _tick_forever(self) -> None:
         """Poll until cancelled. **A poll that raises must not end the watchdog.**

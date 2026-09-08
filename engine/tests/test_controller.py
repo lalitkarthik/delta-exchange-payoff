@@ -13,11 +13,12 @@ from typing import Any
 
 import pytest
 
-from deltapayoff.adapters import instrument_from_symbol
+from deltapayoff.adapters import DeltaAdapter, DeltaFeed, instrument_from_symbol
 from deltapayoff.adapters.base import ConnectionSignal
 from deltapayoff.controller import ConnectionController, IllegalTransition
 from deltapayoff.events import Alert, ConnectionState, FeedConnection, Heartbeat
 from fakes.scripted_adapter import Close, Frames, ScriptedAdapter, Silence
+from test_feed import FakeSocket, connector, ticker_frame
 
 
 class FakeClock:
@@ -937,3 +938,406 @@ def test_an_open_while_already_connected_rebases_rather_than_vanishing() -> None
 
     assert controller.state is ConnectionState.CONNECTED
     assert _reasons(published) == []
+
+
+# --- the reconnect that moved here from the feed (#39) ----------------------------
+#
+# Backoff, the lifetime budget and the decision to redial were inside `DeltaFeed.run`'s
+# `while` loop until #39. They are the controller's now, so their tests are here — and
+# the two that need a socket drive the real `DeltaFeed` through a scripted connection,
+# exactly as `test_feed.py` used to, because a reconnect asserted only against a double
+# that reconnects itself proves nothing about the code that dials.
+
+
+async def _drive(controller, seconds: float = 0.3) -> None:
+    """Run a controller against a live-ish adapter, then take it down."""
+    task = asyncio.create_task(controller.run())
+    await asyncio.sleep(seconds)
+    controller.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+def _delta_over(connect):
+    """A real `DeltaAdapter` over a real `DeltaFeed` over a scripted connection."""
+    adapter = DeltaAdapter(
+        feed_factory=lambda sink, **kw: DeltaFeed(sink, connect=connect, **kw)
+    )
+    instrument = instrument_from_symbol(SYMBOL)
+    assert instrument is not None
+    adapter.subscribe([instrument])
+    return adapter
+
+
+def test_frames_close_frames_reconnects_and_replays_everything() -> None:
+    """The ticket's own script, and the whole shape of a reconnect in three assertions.
+
+    The connection goes down, comes back through `connecting` rather than jumping
+    straight to `connected`, and **every subscription is replayed** — which the fake
+    records, because a controller cannot see inside a replay and an empty snapshot is
+    the healthy-connection-zero-messages failure made visible.
+    """
+    controller, published = run_script(
+        [Frames("ob_l2", [BOOK_FRAME]), Close("1006"), Frames("ob_l2", [BOOK_FRAME])]
+    )
+
+    assert moves(published) == [
+        (0.0, None, "connecting", "start"),
+        (0.0, "connecting", "connected", "open"),
+        (0.0, "connected", "reconnecting", "closed"),
+        (0.0, "reconnecting", "connecting", "backoff"),
+        (0.0, "connecting", "connected", "open"),
+        (0.0, "connected", "stopped", "stopped"),
+    ]
+    assert controller.adapter.replays == [
+        {"ticker": {SYMBOL}, "ob_l2": {SYMBOL}},
+        {"ticker": {SYMBOL}, "ob_l2": {SYMBOL}},
+    ], "a reconnect that replayed a subset is the failure with no error"
+    assert controller.reconnects == 1
+
+
+def test_a_spent_budget_stops_the_connection_out_loud(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """**The loudest thing the engine says.** A budget of two allows two reconnects; the
+    third drop ends the connection rather than leaving it retrying forever.
+
+    Checked before spending rather than after, so that "two" means two. And it is not a
+    quiet exit: one `alert` on the bus and one error-level log record, because a feed
+    that has given up produces no other symptom — the screens simply stop moving.
+    """
+    with caplog.at_level(logging.ERROR, logger="deltapayoff.controller"):
+        controller, published = run_script(
+            [Close("one"), Close("two"), Close("three")], reconnect_budget=2
+        )
+
+    assert moves(published)[-1] == (0.0, "reconnecting", "stopped", "stopped")
+    assert controller.state is ConnectionState.STOPPED
+    assert controller.budget_remaining == 0
+    assert controller.reconnects == 3
+
+    alerts = [e for _at, e in published if isinstance(e, Alert)]
+    assert [a.code for a in alerts] == ["reconnect_budget_spent"]
+    assert alerts[0].severity == "error"
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    assert "budget of 2 is spent" in errors[0].getMessage()
+
+
+def test_two_drops_inside_a_budget_of_two_do_not_stop_it() -> None:
+    """The other side of the boundary, so the off-by-one cannot pass unnoticed."""
+    controller, published = run_script([Close("one"), Close("two")], reconnect_budget=2)
+
+    assert controller.reconnects == 2
+    assert controller.budget_remaining == 0
+    # The script running out always ends in `stopped`, so the state at the end says
+    # nothing. The alert is what a spent budget produces and nothing else does.
+    assert [e for _at, e in published if isinstance(e, Alert)] == []
+    assert moves(published)[-3:-1] == [
+        (0.0, "reconnecting", "connecting", "backoff"),
+        (0.0, "connecting", "connected", "open"),
+    ], "the second drop still came back"
+
+
+def test_a_message_restores_the_whole_budget() -> None:
+    """OpenAlgo's recorded bug, inverted into a guard.
+
+    A cumulative counter that never resets kills a feed reconnecting once a day after a
+    month, with no failure anywhere to point at. Delivering data proves the endpoint
+    works, so it restores the budget **in full** — and with a budget of two, three drops
+    with a frame between them stop nothing.
+    """
+    controller, published = run_script(
+        [Close("one"), Close("two"), Frames("ob_l2", [BOOK_FRAME]), Close("three")],
+        reconnect_budget=2,
+    )
+
+    assert controller.reconnects == 3
+    assert [e for _at, e in published if isinstance(e, Alert)] == []
+    assert controller.budget_remaining == 1, "one spent since the frame, of two"
+
+
+def test_a_dropped_connection_is_redialled_and_resubscribed() -> None:
+    """**The move, end to end, over the real socket owner.**
+
+    `DeltaFeed.run` is one connection since #39, so the second socket exists only
+    because the controller dialled it — and it must be sent the complete registry, not a
+    subset and not nothing. This is the test `test_feed.py` used to own; the half that
+    stayed there is that every open replays, and the half that is here is that there is
+    a second open at all.
+    """
+    first = FakeSocket([ticker_frame(SYMBOL, 579, 584)], close_after=0)
+    second = FakeSocket([])
+    adapter = _delta_over(connector([first, second]))
+    published: list = []
+    controller = ConnectionController(
+        adapter, published.append, retry_delay=0.01, heartbeat_every=1_000.0
+    )
+
+    asyncio.run(_drive(controller))
+
+    resent = [
+        entry
+        for message in second.sent
+        if message.get("type") == "subscribe"
+        for entry in message["payload"]["channels"]
+    ]
+    assert {c["name"] for c in resent} == {"ticker", "ob_l2"}
+    for channel in resent:
+        assert channel["symbols"] == [SYMBOL]
+    assert adapter.feed.connections == 2
+    # The trailing `stopped` is this test taking the controller down, not a sixth state.
+    assert _reasons(published)[-4:-1] == ["closed", "backoff", "open"]
+
+
+def test_the_attempt_is_announced_when_it_begins_not_when_it_succeeds() -> None:
+    """#38 could only reach `connecting` at the instant a socket opened, because it did
+    not own the dial. It does now, so `reconnecting -> connecting` is emitted when the
+    redial starts — the difference between a badge showing `reconnecting` for the whole
+    of an outage and one showing a try in progress.
+
+    The second dial here never opens, so the only way `connecting` can appear is if the
+    controller announced the attempt itself.
+    """
+    first = FakeSocket([ticker_frame(SYMBOL, 579, 584)], close_after=0)
+
+    def connect(url):
+        if first.closed:
+            raise ConnectionRefusedError("the endpoint is down")
+        return first
+
+    adapter = _delta_over(connect)
+    published: list = []
+    controller = ConnectionController(
+        adapter, published.append, retry_delay=0.01, heartbeat_every=1_000.0
+    )
+
+    asyncio.run(_drive(controller, seconds=0.15))
+
+    announced = [
+        event
+        for event in published
+        if isinstance(event, FeedConnection) and event.reason == "backoff"
+    ]
+    assert announced, "the redial was never announced"
+    assert announced[0].to_state is ConnectionState.CONNECTING
+    assert adapter.feed.connections == 1, "the second dial was refused, as scripted"
+
+
+def test_a_silence_the_venue_never_closed_is_not_redialled() -> None:
+    """**`reconnecting` is not the same question as "the socket is gone".**
+
+    The staleness watchdog reaches `reconnecting` over a connection the venue never
+    closed and merely stopped speaking on. Redialling that would dial a second socket
+    over one that is still open, so the controller backs off on the **adapter's last
+    word about its socket**, not on its own state.
+
+    The backoff delay is a distinctive number here, and the injected sleep records what
+    it was asked for, so a redial is an assertion that fails rather than a hang.
+    """
+    BACKOFF = 7.0
+    clock = ScriptClock()
+    published: list = []
+
+    async def sleep(seconds: float) -> None:
+        # **It raises rather than recording.** Removing the guard does not merely add one
+        # redial: the fake walks its script again, and because a scripted silence yields
+        # to no event loop the whole thing spins without ever reaching an assertion — so
+        # a test that only checked afterwards would hang instead of failing, and a test
+        # that cannot fail is worse than no test. Raising here fails on the first redial.
+        if seconds == BACKOFF:  # the backoff, and nothing else uses this number
+            raise AssertionError("it backed off over a socket the venue never closed")
+        await asyncio.Event().wait()  # the poll timer; the script clock drives polls
+
+    adapter = ScriptedAdapter(
+        script=[Frames("ob_l2", [BOOK_FRAME]), Silence(60.0)], sleep=clock.sleep
+    )
+    instrument = instrument_from_symbol(SYMBOL)
+    assert instrument is not None
+    adapter.subscribe([instrument])
+    controller = ConnectionController(
+        adapter,
+        lambda event: published.append((clock.now, event)),
+        clock=clock.read,
+        sleep=sleep,
+        degraded_after=15.0,
+        reconnect_after=45.0,
+        retry_delay=BACKOFF,
+    )
+    clock.controller = controller
+
+    asyncio.run(controller.run())
+
+    assert adapter.connections == 1
+    assert moves(published)[-1] == (60.0, "reconnecting", "stopped", "stopped")
+
+
+def test_a_socket_that_dies_after_going_silent_still_spends_the_budget() -> None:
+    """**A drop is a drop, whatever state the machine was already in.**
+
+    The staleness watchdog can reach `reconnecting` on its own, over a socket the venue
+    has not closed yet. When that socket then really does die, the close arrives at a
+    machine already in `reconnecting` — and a budget spent only on the *transition* would
+    not be spent at all. That is an unbounded reconnect loop in exactly the case the
+    budget exists for: a connection that goes quiet and dies, over and over, spending a
+    venue's connection allowance with a full budget on the books the whole time.
+    """
+    clock = FakeClock()
+    published: list = []
+    controller = ConnectionController(
+        ScriptedAdapter(),
+        published.append,
+        clock=clock.read,
+        degraded_after=15.0,
+        reconnect_after=45.0,
+        heartbeat_every=1_000.0,
+        reconnect_budget=2,
+    )
+    controller.start()
+    controller.connection_opened()
+    controller.message_arrived()
+
+    clock.now = 60.0
+    controller.poll()
+    assert controller.state is ConnectionState.RECONNECTING, "the silence, not the close"
+
+    controller.connection_closed("1006")
+
+    assert controller.reconnects == 1
+    assert controller.budget_remaining == 1, "the drop was free"
+
+
+def test_an_announced_redial_is_not_immediately_called_silent() -> None:
+    """**The flood #39 introduced, and the reason `_opened_at` exists pointed one step
+    earlier.**
+
+    `_attempt_forever` announces `reconnecting -> connecting` when a dial *begins*, which
+    is new in #39 — under #38 `connecting` was only ever entered by `connection_opened`,
+    and that sets `_opened_at`. Nothing rebased the staleness clock on the announcement,
+    and `_check_staleness` includes `connecting` and measures from the last message or
+    the last open, both of which are from before the drop.
+
+    So in any outage longer than `reconnect_after` every single attempt was announced and
+    then, on the very next poll, demoted with reason `silent` — and an
+    `ALERT_CONNECTION_SILENT` was raised about a socket that does not exist. Once per
+    attempt, for the whole outage: roughly five or six extra alerts and a dozen extra
+    transitions in a ten-minute one, inflating `transitions` on `/health` and flipping
+    #40's badge back within a second of each try.
+
+    It is the same family as the flap #38 fixed, and it contradicts `controller.md`'s own
+    rule that alerts must not flood during the incident an operator is watching.
+
+    Scripted as one socket that delivers a frame and closes, and an endpoint that refuses
+    every dial after it — so every `connecting` here is an announcement and none of them
+    is a socket.
+    """
+    first = FakeSocket([ticker_frame(SYMBOL, 579, 584)], close_after=0)
+
+    class HangingDial:
+        """A dial that takes time and then fails, which is what an outage looks like.
+
+        `websockets.connect` carries a 20 s `open_timeout`, so an attempt against a dead
+        endpoint occupies `connecting` for many polls. A fake that refuses *instantly*
+        returns to `reconnecting` before the next poll can see it and hides this bug
+        completely — which is exactly what the first draft of this test did.
+
+        The hang is **shorter than `reconnect_after` and longer than `poll_seconds`**,
+        which is the real ratio: the production dial gives up at 20 s and the bound is
+        45 s, so a dial in flight can never legitimately outlive the bound. Scripting a
+        hang longer than the bound would test something else — a dial the machine is
+        entitled to call silent.
+        """
+
+        async def __aenter__(self):
+            await asyncio.sleep(0.025)
+            raise ConnectionRefusedError("the endpoint is down")
+
+        async def __aexit__(self, *_):
+            return False
+
+    def connect(url):
+        return HangingDial() if first.closed else first
+
+    adapter = _delta_over(connect)
+    published: list = []
+    controller = ConnectionController(
+        adapter,
+        published.append,
+        retry_delay=0.01,
+        degraded_after=0.02,
+        reconnect_after=0.05,
+        poll_seconds=0.005,
+        heartbeat_every=1_000.0,
+    )
+
+    asyncio.run(_drive(controller, seconds=0.5))
+
+    announced = [
+        event
+        for event in published
+        if isinstance(event, FeedConnection)
+        and event.to_state is ConnectionState.CONNECTING
+        and event.reason == "backoff"
+    ]
+    assert announced, "the outage produced no announced redial, so this proves nothing"
+
+    demoted = [
+        event
+        for event in published
+        if isinstance(event, FeedConnection)
+        and event.from_state is ConnectionState.CONNECTING
+        and event.reason == "silent"
+    ]
+    assert demoted == [], (
+        f"{len(demoted)} announced attempts were called silent on the next poll, for a "
+        "socket that was never open"
+    )
+
+    alerts = [
+        event
+        for event in published
+        if isinstance(event, Alert) and event.code == "connection_silent"
+    ]
+    assert alerts == [], (
+        f"{len(alerts)} silence alerts fired during one outage — an alert per redial is "
+        "the flood an alert exists to stand out from"
+    )
+
+
+def test_a_message_arriving_after_a_stop_does_not_restore_the_budget() -> None:
+    """**A stopped connection is stopped, and nothing a socket says changes that.**
+
+    `message_arrived` restored the budget, the backoff and the age before it looked at
+    the state at all, so a frame off a socket winding down — or, from #41, a frame that
+    arrives between a stop and the reader noticing — silently handed a `stopped`
+    connection its whole lifetime budget back. The transitions were guarded and the
+    counters were not, which is the more dangerous half: `/health` would report a feed
+    that had given up as having a full budget in hand, and #41's resume would start from
+    a number nobody spent.
+    """
+    clock = FakeClock()
+    published: list = []
+    controller = ConnectionController(
+        ScriptedAdapter(),
+        published.append,
+        reconnect_budget=1,
+        clock=clock.read,
+        heartbeat_every=1_000.0,
+    )
+    controller.start()
+    controller.connection_opened()
+    controller.message_arrived()
+    controller.connection_closed("1006")
+    controller.connection_closed("1006")
+
+    assert controller.state is ConnectionState.STOPPED
+    assert controller.budget_remaining == 0
+
+    clock.now = 5.0
+    controller.message_arrived()
+
+    assert controller.state is ConnectionState.STOPPED
+    assert controller.budget_remaining == 0, (
+        "a stopped connection was handed its lifetime budget back by a stray frame"
+    )

@@ -48,7 +48,10 @@ from pathlib import Path
 import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+
+from _window import run_window  # noqa: E402
 from deltapayoff.fanout import FanOut  # noqa: E402
 from deltapayoff.adapters import DeltaAdapter, DeltaFeed  # noqa: E402
 from deltapayoff.store import BarStore, BarWriter, all_stores, default_root  # noqa: E402
@@ -87,22 +90,37 @@ async def measure_raw(seconds: float) -> dict[str, float]:
     feed.subscribe("ticker", symbols)
     feed.subscribe("ob_l2", symbols)
 
-    task = asyncio.create_task(feed.run())
-    await asyncio.sleep(3.0)  # connect and subscribe before the clock starts
-    start_messages, start_bytes = feed.messages, feed.bytes_read
-    started = time.perf_counter()
-    await asyncio.sleep(seconds)
-    elapsed = time.perf_counter() - started
+    # **Redials for the whole window.** Since #39 `feed.run()` returns at the first
+    # drop; the old task-and-sleep divided however many bytes arrived before it by the
+    # full window, understating the denominator every later ratio rests on.
+    # `tools/_window.py` carries the whole story.
+    warmup = 3.0  # connect and subscribe before the clock starts
+    counters: dict[str, float] = {}
+
+    async def note_start() -> None:
+        await asyncio.sleep(warmup)
+        counters["messages"] = feed.messages
+        counters["bytes"] = feed.bytes_read
+        counters["at"] = time.perf_counter()
+
+    marker = asyncio.create_task(note_start())
+    window = await run_window(feed, warmup + seconds)
+    await asyncio.gather(marker, return_exceptions=True)
+    window.warn_if_truncated()
+
+    start_messages = int(counters.get("messages", 0))
+    start_bytes = int(counters.get("bytes", 0))
+    elapsed = time.perf_counter() - counters.get("at", time.perf_counter())
     messages = feed.messages - start_messages
     read = feed.bytes_read - start_bytes
 
-    feed.stop()
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
     return {
         "symbols": float(len(symbols)),
+        # Measured, not requested. `window_complete` is 0.0 when the run ended early and
+        # every ratio below then covers only the part of the window observed.
         "seconds": elapsed,
+        "connections": float(window.attempts),
+        "window_complete": 1.0 if window.complete else 0.0,
         "messages": float(messages),
         "bytes": float(read),
         "msg_per_second": messages / elapsed,
@@ -146,17 +164,38 @@ async def capture(root: Path, seconds: float, flush_seconds: float) -> dict[str,
     feed.subscribe("ticker", symbols)
     feed.subscribe("ob_l2", symbols)
 
+    # **The feed is not one of these tasks any more.** Since #39 `adapter.stream` is one
+    # connection that returns when the socket ends, exactly as `feed.run()` is, so a
+    # `create_task` around it dies at the first drop and this capture would keep writing
+    # an empty store for the rest of the window while reporting the whole of it. The
+    # other three are genuine forever-loops and stay as they are.
     tasks = [
-        asyncio.create_task(adapter.stream(bus.publish), name="feed"),
         asyncio.create_task(stream.run(), name="stream"),
         asyncio.create_task(recompute_forever(stream), name="recompute"),
         asyncio.create_task(writer.run(), name="writer"),
     ]
-    await asyncio.sleep(3.0)  # connect and subscribe before the clock starts
-    start_messages, start_bytes = feed.messages, feed.bytes_read
-    started = time.perf_counter()
-    await asyncio.sleep(seconds)
-    elapsed = time.perf_counter() - started
+    warmup = 3.0  # connect and subscribe before the clock starts
+    counters: dict[str, float] = {}
+
+    async def note_start() -> None:
+        await asyncio.sleep(warmup)
+        counters["messages"] = feed.messages
+        counters["bytes"] = feed.bytes_read
+        counters["at"] = time.perf_counter()
+
+    marker = asyncio.create_task(note_start())
+    window = await run_window(
+        feed,
+        warmup + seconds,
+        dial=lambda: adapter.stream(bus.publish),
+        stop=adapter.stop,
+    )
+    await asyncio.gather(marker, return_exceptions=True)
+    window.warn_if_truncated()
+
+    start_messages = int(counters.get("messages", 0))
+    start_bytes = int(counters.get("bytes", 0))
+    elapsed = time.perf_counter() - counters.get("at", time.perf_counter())
     messages = feed.messages - start_messages
     read = feed.bytes_read - start_bytes
 
@@ -168,7 +207,10 @@ async def capture(root: Path, seconds: float, flush_seconds: float) -> dict[str,
     await writer.aclose()
 
     return {
+        # Measured, not requested. `window_complete` is 0.0 when the run ended early.
         "seconds": elapsed,
+        "connections": float(window.attempts),
+        "window_complete": 1.0 if window.complete else 0.0,
         "symbols": float(len(symbols)),
         "messages": float(messages),
         "bytes": float(read),
