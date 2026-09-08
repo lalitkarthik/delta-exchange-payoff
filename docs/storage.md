@@ -842,13 +842,27 @@ pays in bytes.
 **#16 moved the flush to five minutes, and this paragraph is the measurement it lands on.**
 A flush is now about 3,440 rows rather than 41,280 — between run G's two measured points,
 1,260 and 41,280 — so the marginal cost of a file sits somewhere between the two curves
-above and compaction starts buying real bytes as well as file count. How many is **not
-measured**: run G was written against hourly files and the arithmetic above should not be
-divided by twelve and called a number. The section that needs re-running first is this one,
-against a real day at the new cadence.
+above and compaction starts buying real bytes as well as file count. Not divided by twelve
+and called a number: it is now `measured` directly, below.
 
 It also means **run F's 143.34 MB/day is within about 1.5% of a fully compacted day**, so
 the footprint above is a figure rather than a bound.
+
+**Run H, #37: the five-minute flush, BTC alone, live.** One production-interval flush of
+the running engine, both channels, every listed BTC contract: **7,535 rows, 8 files,
+877,975 bytes** across the four tables (a scheduled flush plus the trailing open-minute
+flush at capture end, 4 tables × 2 — the same file-per-partition-per-flush shape run F used).
+
+**Run I, #43: the same flush, BTC+ETH.** One production-interval (300 s) flush into a
+scratch root — never `data/` — both underlyings, both channels, 782 contracts: the
+scheduled flush alone was **11,740 rows, 8 files, 699,591 bytes**; adding the trailing
+open-minute flush (2,348 rows, 8 files, 209,646 bytes) brings the total to **14,088 rows,
+16 files, 909,237 bytes**. File count doubles cleanly — one partition per underlying per
+table per flush, exactly what #43 changed — but rows and bytes do not double against run
+H: the two runs differ in market activity and in exactly which minutes each captured, not
+only in which underlyings were subscribed, so **the honest comparison is the file count**,
+not a ratio on rows or bytes. `measured`, `tools/measure_store.py`'s `capture()` pattern
+generalised to more than one underlying, 2026-09-08.
 
 ### Read time, with and without partition pruning
 
