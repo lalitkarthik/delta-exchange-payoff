@@ -73,7 +73,7 @@ Three independent authorities — Nautilus's read task, Delta's documentation, a
 | Longest quiet gap, tagged, 610 s | **0.724 s** | `measured` | `tools/measure_quiet_gap.py`, run `20260909T125124Z`, 610.0 s, 502 BTC symbols, both channels, 657,163 messages, **1 connection**, 0 malformed, 0 empty opens |
 | Gaps spanning a connection event, same run | **0** | `measured` | Same run. `spanning_gap_seconds.count == 0`; the one connection event is the open at t=1.3 s |
 | p99 / p95 / median, same run | 0.011 / 0.002 / 0.0 s | `measured` | Same run. **Identical to all three runs of 2026-09-07** at 35 s, 550 s and 3610 s |
-| Longest quiet gap, ≥ 6 hours, tagged | **pending, run started 2026-09-09T13:03:04Z, PID 28432** | — | Detached `tools/measure_quiet_gap.py 21600`; log `0003-quiet-gap-6h.log`. See below |
+| Longest quiet gap, six hours, tagged, **unbroken connection** | **6.792 s** | `measured` | `tools/measure_quiet_gap.py`, run `20260909T130306Z`, 21,610 s, 23,713,768 messages, 13 connections. Longest spanning gap 22.83 s. `reconnect_after` 45 s is 6.6x above it. Full row in `../quiet-gap.md` |
 | Longest gap, one hour, **untagged** | 44.785 s | `measured` | Run `20260907T135951Z`. Three connections; which gaps spanned a drop is **not proven**. `../quiet-gap.md` |
 | `reconnect_after` | 45 s, **unchanged** | `assumed`, bounded | Below Delta's 60 s (bound 2). Above Delta's own 35 s heartbeat window (bound 3) |
 | Backoff to a spent budget | **303 s** of waiting across 11 dials | `derived` | 1+2+4+8+16+32+60+60+60+60, from `retry_delay` 1 s, factor 2, ceiling 60 s, budget 10 |

@@ -121,9 +121,11 @@ nothing for 45 s; there is no latency to lose.
 
 ## What would change this decision
 
-- **The six-hour tagged run.** If a gap on an unbroken connection exceeds 45 s, the bound
-  is wrong and the adopted rule would cut a healthy socket — the one way this change can
-  do harm. That is why the number is `pending` and not guessed.
+- ~~**The six-hour tagged run.**~~ **Landed 2026-09-09T19:03Z**: the longest gap on an
+  unbroken connection was `measured` **6.792 s**, 6.6x inside the bound, so the adopted rule
+  cannot cut a healthy socket on this evidence. What the run did show is thirteen
+  connections in six hours, partly this laptop's tunnel; the venue's own drop rate is still
+  to be measured from a host without one.
 - **A second feed process, or a fleet.** Jitter stops being a knob with no effect the day
   more than one client of ours redials at the same instant.
 - **A Delta outage longer than five minutes.** `derived` 303 s of backoff exhausts the

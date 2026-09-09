@@ -51,14 +51,40 @@ bounds are actually chosen against, and it is the first time that has been true 
 here. p99, p95 and the median are **identical to all three runs of 2026-09-07**: the "only
 the tail moves" finding survives a fourth window.
 
-## The fifth run: six hours, pending
+## The fifth run: six hours, tagged
 
-**Started 2026-09-09T13:03:04Z, PID 28432, due about 2026-09-09T19:03Z.** Detached, six
-hours, tagging on — the run #59's acceptance criteria ask for and the one that decides
-whether `reconnect_after` stays at 45 s. Console output goes to
-`design/research/0003-quiet-gap-6h.log` and the JSON lands in `tools/out/`, which is
-gitignored: **copy the row into this file when it finishes**, the way the four above were.
-Until then no six-hour number exists and none may be quoted.
+**Run `20260909T130306Z`, 21,610 s, 502 BTC symbols, both channels, 23,713,768 messages,
+`measured` 2026-09-09 13:03–19:03Z.** Tagging on. The run #59's acceptance criteria asked
+for, and the first window long enough to see the tail.
+
+| Number | Value |
+|---|---|
+| Longest quiet gap on an **unbroken** connection | **6.792 s** |
+| Longest gap spanning a connection event | 22.83 s (at t=6034.6, across four closes and an open) |
+| Gaps that spanned a connection event | 12 |
+| p99 / p95 / median | 0.017 / 0.002 / 0.0 s |
+| Connections that delivered data | **13** over six hours; 21 dial attempts, 8 delivered nothing |
+| Longest unbroken connection | 3,976 s (66 min); the five longest 3,976 / 3,801 / 3,020 / 2,928 / 2,004 s |
+| Connected fraction | 21,563.9 of 21,610 s = 99.79% |
+
+**`reconnect_after` = 45 s is now supported, not assumed: the worst quiet gap on a live
+socket is 6.6x inside it.** The 44.785 s gap of 2026-09-07 was, as suspected, a gap across a
+drop and not a quiet market; with tagging on, nothing on an unbroken connection came within
+an order of magnitude of the bound. `degraded_after` = 15 s was never crossed on an unbroken
+connection either.
+
+**The finding this run adds is the drop rate, and it is partly this machine's.** Thirteen
+connections in six hours is a drop roughly every half hour. The close details are mixed:
+the venue's own `no close frame received or sent` beside three that are local —
+`getaddrinfo failed` (DNS), `WinError 64` (network name no longer available) and
+`WinError 5` (access denied) — consistent with the Cloudflare WARP tunnel #68 found active on
+this laptop. So the count says the **controller** reconnects correctly and repeatedly (20
+redials, budget never spent, `empty_opens` 0, `malformed` 0), and says nothing reliable
+about how often Delta itself drops a socket. That measurement needs a host without a
+tunnel — the deployed `feed` after #65 is the place.
+
+p99, p95 and the median are identical to every previous run: five windows from 35 seconds to
+six hours, and only the maximum ever moved.
 
 ## What it says about the two defaults
 
