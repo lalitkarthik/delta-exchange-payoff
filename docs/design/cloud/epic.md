@@ -86,8 +86,14 @@ app into its own repo is deferred until it earns it.
 does not change. Every one of the nine event types crosses it at full rate, about 1,700
 messages a second for BTC and ETH. `feed` pipelines its writes; the batch interval is
 measured and recorded in the ticket that lands it. One stream per event type per venue per
-underlying with an environment prefix, subject to the naming research. Events without an
-underlying are per venue. Payload encoding is JSON unless the research says otherwise.
+underlying with an environment prefix — **fixed by #58** as `{env}:{event_type}:{VENUE}[:{UNDERLYING}]`,
+e.g. `prod:md.option_quote:DELTA:BTC`, colon between sections per Redis's own convention.
+Events without an underlying are per venue; `alert` is per environment. Encoding: the seven
+envelope fields flat, one Redis field each, and the type's own keys as one JSON `payload`
+field — chosen because a Redis field has no null. The standard is
+[nomenclature.md](nomenclature.md); the evidence is
+[../research/0001-stream-naming-and-payload-format.md](../research/0001-stream-naming-and-payload-format.md)
+and the record [../decisions/0001-stream-naming-and-payload-format.md](../decisions/0001-stream-naming-and-payload-format.md).
 
 **Retention and persistence.** Redis is a pipe. Thirty minutes, trimmed by age on every
 batch write. No AOF, no snapshots. The archive is the Parquet store.

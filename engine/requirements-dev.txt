@@ -3,3 +3,8 @@
 # Tests never reach the network; httpx (above) also backs FastAPI's TestClient.
 pytest>=8.0
 ruff>=0.6
+
+# tools/measure_payload_size.py only (#58). msgpack is the MessagePack encoding it sizes;
+# protobuf verifies the hand-written encoder byte-for-byte and the tool degrades without it.
+msgpack>=1.1
+protobuf>=5.0
