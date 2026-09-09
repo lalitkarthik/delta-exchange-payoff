@@ -147,6 +147,24 @@ function assertNumeric(chain: ChainResponse): void {
   }
 }
 
+/**
+ * #60 (I1): the contract guard for the currency field. `docs/chain-contract.md` makes
+ * `quote_currency` a required, non-nullable string on every `/chain` response, so an
+ * engine old enough to predate this ticket — or one that regresses it — answers with a
+ * payload this app must not silently render as if it were USD by default. The web app
+ * must never guess a chain's currency from the venue name; refusing the payload here is
+ * what keeps that promise rather than merely documenting it.
+ */
+function assertCurrency(chain: ChainResponse): void {
+  if (typeof chain.quote_currency !== "string" || chain.quote_currency.length === 0) {
+    throw new ContractViolationError(
+      `Engine sent a /chain response with no quote_currency, which docs/chain-contract.md ` +
+        `requires since #60 (I1). The web app will not guess a currency. Got: ` +
+        `${JSON.stringify(chain.quote_currency)}`,
+    );
+  }
+}
+
 /** The fixture only holds a chain for its own underlying, so only that one gets a hint. */
 function fixturePreferred(underlying: Underlying): string | undefined {
   return underlying === FIXTURE_CHAIN.underlying ? FIXTURE_CHAIN.expiry : undefined;
@@ -190,6 +208,7 @@ export async function loadChain(
       `/chain?underlying=${underlying}&expiry=${encodeURIComponent(expiry)}`,
     );
     assertNumeric(data);
+    assertCurrency(data);
     return { data, source: "engine" };
   } catch (err) {
     if (err instanceof EngineUnreachableError) {

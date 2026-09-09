@@ -419,6 +419,14 @@ class ChainStream:
             return None
 
         legs = []
+        # **Read off the first instrument, not a constant.** `keys` is non-empty here
+        # (checked above), and every contract on one underlying and expiry was built
+        # by the same adapter, so any one of them answers for the chain's currency.
+        # Taking it from the event rather than a hard-coded default is what keeps this
+        # cache venue-neutral the way its own module docstring promises — a second
+        # venue's instruments would carry their own `quote_currency` with nothing here
+        # to change.
+        quote_currency = self._reference[keys[0]][0].quote_currency
         for key in keys:
             instrument, reference = self._reference[key]
             leg = leg_from_events(instrument, reference, self._quote.get(key))
@@ -430,6 +438,7 @@ class ChainStream:
             legs,
             self._spot.get(underlying.upper()),
             fetched_at=datetime.now(timezone.utc),
+            quote_currency=quote_currency,
         )
 
     def chain(self, underlying: str, expiry: str) -> ChainResponse | None:

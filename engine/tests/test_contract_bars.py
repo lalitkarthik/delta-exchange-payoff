@@ -34,7 +34,7 @@ from deltapayoff.store import (
 
 MINUTE = datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
 DAY = Date(2026, 9, 4)
-INSTRUMENT = "DELTA-BTC-20260904-77600-C"
+INSTRUMENT = "DELTA-BTC-20260904-77600-C-USD"
 
 
 def quote_bar(
@@ -284,7 +284,7 @@ def test_the_underlying_in_the_instrument_string_is_normalised(
     stores.quote.add([quote_bar(underlying="BTC")])
     stores.quote.flush()
 
-    body = bars_of(make_client(), instrument="DELTA-btc-20260904-77600-C")
+    body = bars_of(make_client(), instrument="DELTA-btc-20260904-77600-C-USD")
 
     assert body["underlying"] == "BTC"
     assert body["bars"][0]["bid_close"] == 73.0
@@ -296,7 +296,7 @@ def test_a_different_strike_answers_nothing(
     stores.quote.add([quote_bar(strike=77600.0)])
     stores.quote.flush()
 
-    body = bars_of(make_client(), instrument="DELTA-BTC-20260904-80000-C")
+    body = bars_of(make_client(), instrument="DELTA-BTC-20260904-80000-C-USD")
 
     assert body["bars"] == []
 
@@ -312,8 +312,8 @@ def test_a_put_and_a_call_at_the_same_strike_are_different_contracts(
     )
     stores.quote.flush()
 
-    call = bars_of(make_client(), instrument="DELTA-BTC-20260904-77600-C")["bars"][0]
-    put = bars_of(make_client(), instrument="DELTA-BTC-20260904-77600-P")["bars"][0]
+    call = bars_of(make_client(), instrument="DELTA-BTC-20260904-77600-C-USD")["bars"][0]
+    put = bars_of(make_client(), instrument="DELTA-BTC-20260904-77600-P-USD")["bars"][0]
 
     assert call["bid_close"] == 73.0
     assert put["bid_close"] == 5.0
@@ -328,9 +328,9 @@ def test_venue_is_parsed_but_not_filtered_on(
     stores.quote.add([quote_bar()])
     stores.quote.flush()
 
-    body = bars_of(make_client(), instrument="NSE-BTC-20260904-77600-C")
+    body = bars_of(make_client(), instrument="NSE-BTC-20260904-77600-C-USD")
 
-    assert body["instrument"] == "NSE-BTC-20260904-77600-C"
+    assert body["instrument"] == "NSE-BTC-20260904-77600-C-USD"
     assert body["bars"][0]["bid_close"] == 73.0
 
 
@@ -358,6 +358,11 @@ def test_a_minute_still_in_the_buffer_reaches_the_wire_unflushed(
         "DELTA-BTC-2026-09-04-77600-C",
         "DELTA-BTC-20260904-77600-X",
         "DELTA-BTC-nonsense-77600-C",
+        # #60 (I1): the pre-I1 five-part shape, with no currency token — now
+        # rejected loudly rather than accepted with a guessed currency.
+        "DELTA-BTC-20260904-77600-C",
+        # A six-part string whose currency token is not upper-case ISO 4217 shaped.
+        "DELTA-BTC-20260904-77600-C-usd",
     ],
 )
 def test_a_malformed_instrument_is_400(make_client, instrument: str) -> None:

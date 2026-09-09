@@ -36,9 +36,15 @@ store carries as a watermark: `measured` p50 212.6 ms, p99 365.3 ms, max 510.3 m
 on `ticker`, which is why the two seal on different graces.
 
 **The instrument** is a frozen record — `venue`, `underlying`, `expiry` as a calendar date,
-`strike` as a decimal, `right` as call or put, and `venue_symbol` kept verbatim. Its canonical
-string is derived and never stored as truth: `VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P`, e.g.
-`DELTA-BTC-20260627-60000-C`.
+`strike` as a decimal, `right` as call or put, `venue_symbol` kept verbatim, and — #57/#60
+(I1) — `quote_currency` and `settlement_currency`, ISO 4217 upper-case strings, both
+optional and defaulting to `"USD"`. Its canonical string is derived and never stored as
+truth: `VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P-CCY`, e.g. `DELTA-BTC-20260627-60000-C-USD`,
+the last token the **quote** currency. `settlement_currency` does not travel in the string —
+a string naming two currencies with no marker for which is which would be a worse ambiguity
+than the one #60 closes — and `Instrument.from_canonical` rejects the pre-I1 five-part form
+loudly rather than defaulting a currency onto it, so a stale cache key or log line is a bug
+that fails fast rather than a silent guess.
 
 ---
 
@@ -173,7 +179,10 @@ vocabulary back on the bus to redraw a line the catalogue already draws with two
 when one is added with a default.** Adding an optional field is compatible; renaming one,
 changing its units, or changing when it is `null` is not. The nine fields #37 added to
 `md.option_quote` and `md.option_reference` are all optional with defaults, so every type is
-still at `1`.
+still at `1`. #60 (I1) is the same rule applied to `Instrument`: `quote_currency` and
+`settlement_currency` are optional and default to `"USD"`, so an event built exactly as
+every producer built one before I1 still parses, and the `instrument` field's own
+`schema_version` — inherited by every event that carries one — stays at `1` too.
 
 The version is per type, so bumping `md.option_reference` leaves the other eight at `1`. A
 consumer that does not know a version it receives must fail loudly rather than guess. The

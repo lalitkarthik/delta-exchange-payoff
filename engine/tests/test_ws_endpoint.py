@@ -99,6 +99,9 @@ def test_the_payload_is_the_same_shape_the_rest_endpoint_returns(live_stream) ->
     assert set(chain) == {
         "underlying",
         "expiry",
+        # #60 (I1): the currency every price in `rows` is quoted in, so the browser
+        # never has to guess it from the venue.
+        "quote_currency",
         "spot",
         "atm_strike",
         "fetched_at",

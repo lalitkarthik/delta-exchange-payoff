@@ -8,7 +8,7 @@ one contract's whole day instead. Split into its own file for the reason
 200-line bound at 222, and a third read path is a third subject, not an appendix to the
 first two.
 
-## `GET /bars?instrument=DELTA-BTC-20260904-77600-C&date=2026-09-04`
+## `GET /bars?instrument=DELTA-BTC-20260904-77600-C-USD&date=2026-09-04`
 
 One contract's minute bars for one date, addressed by the **canonical instrument
 string** `docs/design/lld/events.md` defines — not by `underlying`/`expiry`/`strike` as
@@ -18,7 +18,7 @@ one string this route needs to be asked with.
 
 ```json
 {
-  "instrument": "DELTA-BTC-20260904-77600-C",
+  "instrument": "DELTA-BTC-20260904-77600-C-USD",
   "underlying": "BTC",
   "expiry": "04-09-2026",
   "date": "2026-09-04",

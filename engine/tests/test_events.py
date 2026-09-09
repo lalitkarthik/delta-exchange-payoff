@@ -184,7 +184,7 @@ def documented_event_types() -> set[str]:
 
 
 def test_the_canonical_string_is_the_one_spelling() -> None:
-    assert INSTRUMENT.canonical() == "DELTA-BTC-20260627-60000-C"
+    assert INSTRUMENT.canonical() == "DELTA-BTC-20260627-60000-C-USD"
 
 
 def test_the_instrument_round_trips_through_its_canonical_string() -> None:
@@ -207,10 +207,46 @@ def test_a_parsed_instrument_without_a_venue_symbol_equals_one_built_without_it(
     assert Instrument.from_canonical(bare.canonical()) == bare
 
 
+def test_quote_currency_and_settlement_currency_default_to_usd() -> None:
+    """The sensible default `docs/design/events.md` §Versioning permits: adding an
+    optional field with a default is compatible, so an instrument built exactly as
+    every caller built one before I1 still gets a currency rather than `None`."""
+    bare = Instrument(
+        venue="DELTA",
+        underlying="BTC",
+        expiry=date(2026, 6, 27),
+        strike=Decimal("60000"),
+        right=Right.CALL,
+    )
+    assert bare.quote_currency == "USD"
+    assert bare.settlement_currency == "USD"
+
+
+def test_settlement_currency_does_not_travel_in_the_canonical_string() -> None:
+    """Only the quote currency is the canonical string's last token — #57 fixed the
+    six-part form as `VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P-CCY` with the **quote**
+    currency alone. A round trip through `from_canonical` therefore cannot recover a
+    `settlement_currency` that was set to something other than the class default; it
+    comes back at the default instead, which is documented rather than silently lost."""
+    instrument = Instrument(
+        venue="DELTA",
+        underlying="BTC",
+        expiry=date(2026, 6, 27),
+        strike=Decimal("60000"),
+        right=Right.CALL,
+        quote_currency="USD",
+        settlement_currency="USD",
+    )
+    assert instrument.canonical() == "DELTA-BTC-20260627-60000-C-USD"
+    parsed = Instrument.from_canonical(instrument.canonical())
+    assert parsed.quote_currency == "USD"
+    assert parsed.settlement_currency == "USD"
+
+
 def test_the_strike_parses_as_a_decimal_and_not_a_float() -> None:
     """`60000`, not `60000.0`. A float strike would print a trailing zero into cache
     keys and log lines and would not compare equal to the venue's own integer."""
-    parsed = Instrument.from_canonical("DELTA-BTC-20260627-60000-C")
+    parsed = Instrument.from_canonical("DELTA-BTC-20260627-60000-C-USD")
     assert isinstance(parsed.strike, Decimal)
     assert parsed.strike == Decimal("60000")
     assert str(parsed.strike) == "60000"
@@ -239,7 +275,7 @@ def test_the_strike_prints_without_trailing_zeros(strike: Decimal, printed: str)
         strike=strike,
         right=Right.PUT,
     )
-    assert instrument.canonical() == f"DELTA-BTC-20260627-{printed}-P"
+    assert instrument.canonical() == f"DELTA-BTC-20260627-{printed}-P-USD"
     assert Instrument.from_canonical(instrument.canonical()).strike == strike
 
 
@@ -251,7 +287,7 @@ def test_a_put_prints_p() -> None:
         strike=Decimal("60000"),
         right=Right.PUT,
     )
-    assert instrument.canonical() == "DELTA-BTC-20260627-60000-P"
+    assert instrument.canonical() == "DELTA-BTC-20260627-60000-P-USD"
 
 
 @pytest.mark.parametrize(
@@ -259,11 +295,20 @@ def test_a_put_prints_p() -> None:
     [
         "",
         "DELTA-BTC-20260627-60000",
-        "DELTA-BTC-20260627-60000-C-EXTRA",
-        "DELTA-BTC-2026627-60000-C",
-        "DELTA-BTC-20260627-sixty-C",
-        "DELTA-BTC-20260627-60000-X",
-        "DELTA-BTC-20260632-60000-C",
+        # The pre-I1 five-part form. #57 fixed the six-part shape and #60 (I1) makes
+        # it real: a string with no currency token is refused loudly rather than
+        # defaulted, so a caller cannot silently keep addressing contracts the old way.
+        "DELTA-BTC-20260627-60000-C",
+        "DELTA-BTC-20260627-60000-C-USD-EXTRA",
+        "DELTA-BTC-2026627-60000-C-USD",
+        "DELTA-BTC-20260627-sixty-C-USD",
+        "DELTA-BTC-20260627-60000-X-USD",
+        "DELTA-BTC-20260632-60000-C-USD",
+        # The six-part shape with an unreadable currency token: too short, lower
+        # case, and not alphabetic, respectively.
+        "DELTA-BTC-20260627-60000-C-US",
+        "DELTA-BTC-20260627-60000-C-usd",
+        "DELTA-BTC-20260627-60000-C-12A",
     ],
 )
 def test_an_unparseable_canonical_string_raises_rather_than_guessing(text: str) -> None:

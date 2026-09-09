@@ -81,6 +81,7 @@ def priced_chain(
     return ChainResponse(
         underlying="BTC",
         expiry=EXPIRY,
+        quote_currency="USD",
         spot=PLANTED_SPOT,
         atm_strike=80_000.0,
         fetched_at=TAKEN.strftime("%Y-%m-%dT%H:%M:%SZ"),

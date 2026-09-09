@@ -216,7 +216,7 @@ def test_instruments_for_an_expiry_are_reported_for_subscribing() -> None:
     feed(stream, ticker("C-BTC-77600-040926", 579, 584), "ticker")
     feed(stream, ticker("C-BTC-80000-110926", 200, 210), "ticker")
 
-    assert stream.instruments("BTC", EXPIRY) == ["DELTA-BTC-20260904-77600-C"]
+    assert stream.instruments("BTC", EXPIRY) == ["DELTA-BTC-20260904-77600-C-USD"]
 
 
 def test_a_real_captured_chain_rebuilds_from_the_cache(
@@ -234,6 +234,9 @@ def test_a_real_captured_chain_rebuilds_from_the_cache(
     assert len(chain.rows) == 69
     assert chain.spot is not None
     assert chain.atm_strike is not None
+    # #60 (I1): read off the instruments the frames decoded to, not a constant
+    # sitting in `stream.py` — see `raw_chain`'s own comment on why.
+    assert chain.quote_currency == "USD"
 
 
 # --- T8: dirty tracking and the coalesced recompute ---------------------------------

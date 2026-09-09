@@ -57,6 +57,7 @@ def planted_chain(
     return ChainResponse(
         underlying="BTC",
         expiry="04-10-2026",
+        quote_currency="USD",
         spot=PLANTED_SPOT,
         atm_strike=78_000.0,
         fetched_at="2026-09-04T12:00:00Z",

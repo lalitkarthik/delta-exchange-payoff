@@ -115,6 +115,7 @@ function QuoteCells({
   previous,
   underlying,
   expiry,
+  quoteCurrency,
   onSelectContract,
 }: {
   leg: Leg | null;
@@ -127,6 +128,9 @@ function QuoteCells({
   previous: PriceMemory | null;
   underlying: string;
   expiry: string;
+  /** `chain.quote_currency`, #60 (I1) — threaded down rather than re-read from a
+   * module constant, so a second venue's chain needs no change here. */
+  quoteCurrency: string;
   /** #46: opens the contract chart panel for this leg. `undefined` renders every cell
    * exactly as before — the ladder has one caller today, but nothing here should break
    * a second one that renders read-only. */
@@ -175,7 +179,7 @@ function QuoteCells({
   // that happens to be wired. Built once per leg rather than per cell so the canonical
   // string is computed a single time regardless of which of the nine columns is clicked.
   const instrument = onSelectContract
-    ? canonicalInstrument(underlying, expiry, strike, side)
+    ? canonicalInstrument(underlying, expiry, strike, side, quoteCurrency)
     : null;
   const selectLabel = instrument
     ? `Open the chart for ${side} ${formatStrike(strike)}`
@@ -325,7 +329,8 @@ export function ChainLadder({
     <div className="chain-wrap">
       <table className="chain">
         <caption className="sr-only">
-          {chain.underlying} option chain expiring {chain.expiry}. Calls on the left, strikes in
+          {chain.underlying} option chain expiring {chain.expiry}, priced in {chain.quote_currency}.
+          Calls on the left, strikes in
           the centre, puts on the right. The IV and delta columns are computed by this engine from
           the order book; the venue’s own figures are in each cell’s tooltip. A hatched cell
           means that side is not listed; an empty cell means the field could not be computed or
@@ -349,11 +354,11 @@ export function ChainLadder({
             <th title="Gamma, scaled by 10,000 so it is readable. Computed here.">Gamma&nbsp;×10⁴</th>
             <th title="Delta, with respect to the forward. Computed here.">Delta</th>
             <th title="Implied volatility, solved from the out-of-the-money leg.">IV</th>
-            <th>Bid</th>
-            <th>Ask</th>
+            <th title={`Bid, in ${chain.quote_currency}.`}>Bid&nbsp;({chain.quote_currency})</th>
+            <th title={`Ask, in ${chain.quote_currency}.`}>Ask&nbsp;({chain.quote_currency})</th>
             <th style={{ textAlign: "center" }}>Strike</th>
-            <th>Ask</th>
-            <th>Bid</th>
+            <th title={`Ask, in ${chain.quote_currency}.`}>Ask&nbsp;({chain.quote_currency})</th>
+            <th title={`Bid, in ${chain.quote_currency}.`}>Bid&nbsp;({chain.quote_currency})</th>
             <th title="Implied volatility, solved from the out-of-the-money leg.">IV</th>
             <th title="Delta, with respect to the forward. Computed here.">Delta</th>
             <th title="Gamma, scaled by 10,000 so it is readable. Computed here.">Gamma&nbsp;×10⁴</th>
@@ -377,6 +382,7 @@ export function ChainLadder({
                   previous={seen}
                   underlying={chain.underlying}
                   expiry={chain.expiry}
+                  quoteCurrency={chain.quote_currency}
                   onSelectContract={onSelectContract}
                 />
                 <td className="strike">
@@ -391,6 +397,7 @@ export function ChainLadder({
                   previous={seen}
                   underlying={chain.underlying}
                   expiry={chain.expiry}
+                  quoteCurrency={chain.quote_currency}
                   onSelectContract={onSelectContract}
                 />
               </tr>

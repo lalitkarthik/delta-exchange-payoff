@@ -18,6 +18,24 @@ from .models import ChainResponse, ChainRow, ExpiriesResponse, Leg
 
 UNDERLYINGS = ("BTC", "ETH")
 
+#: Delta's options are USD, quote and settlement both — `docs/settlement.md` §3.1's
+#: measured `quoting_asset`/`settling_asset`, both `USD`, on 1,031 options across the
+#: full listing (§3.2). Kept here rather than in `adapters/delta.py`, and re-exported
+#: to it, so `build_chain` below and `DeltaAdapter.instruments` read the same fact
+#: instead of two constants that could drift; `chain.py` already holds `UNDERLYINGS`,
+#: a Delta fact, for the same reason. **Not read off a live venue field**: Delta's
+#: `/v2/tickers` rows — the only record `instruments()` and this module ever see —
+#: carry no `quoting_asset`/`settling_asset` key at all; those live on `/v2/products`,
+#: which settlement.md's measurement called once per symbol and this engine does not
+#: call per instrument. Should Delta ever quote a second currency, or a venue with a
+#: currency on its ticker row arrive, this stops being a constant and starts being
+#: read off the record — see #60 (I1)'s ticket comment, "Rejected and why".
+QUOTE_CURRENCY = "USD"
+#: See `QUOTE_CURRENCY` above. Equal to it on Delta today; kept as a second constant
+#: because `events.instrument.Instrument` carries two fields, not one — a venue where
+#: they differ must not require this module's shape to change.
+SETTLEMENT_CURRENCY = "USD"
+
 EXPIRY_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
 EXPIRY_FORMAT = "%d-%m-%Y"
 
@@ -138,6 +156,8 @@ def chain_from_legs(
     legs: Iterable[tuple[float, str, Leg]],
     spot: float | None,
     fetched_at: datetime | None = None,
+    *,
+    quote_currency: str,
 ) -> ChainResponse:
     """`(strike, side, leg)` triples into the ladder, ascending by strike.
 
@@ -150,6 +170,13 @@ def chain_from_legs(
     `side` is `"call"` or `"put"` — this engine's own word, not a venue's. A repeated
     `(strike, side)` keeps the **last** triple offered, which is what a caller iterating a
     cache newest-last means by it.
+
+    `quote_currency` is keyword-only and carries no default, on purpose: #60 (I1) put
+    the currency on the response so the browser never guesses it from the venue, and a
+    default here would let a caller reintroduce exactly that guess. `build_chain` below
+    passes `QUOTE_CURRENCY`; `stream.py`'s live path passes the value already sitting on
+    the instrument each leg's events named, which is one canonical string agreeing with
+    the response built around it rather than two independent opinions.
     """
     sides: dict[float, dict[str, Leg]] = {}
     for strike, side, leg in legs:
@@ -167,6 +194,7 @@ def chain_from_legs(
         atm_strike=nearest_strike(list(sides), spot),
         fetched_at=stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         rows=rows,
+        quote_currency=quote_currency,
     )
 
 
@@ -197,4 +225,5 @@ def build_chain(
         triples,
         spot_from_tickers(tickers),
         fetched_at=fetched_at,
+        quote_currency=QUOTE_CURRENCY,
     )

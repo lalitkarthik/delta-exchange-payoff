@@ -44,6 +44,14 @@ def test_calls_and_puts_sharing_a_strike_land_on_one_row(chain_tickers) -> None:
     assert row.put.symbol == "P-BTC-77500-040926"
 
 
+def test_the_chain_carries_the_quote_currency() -> None:
+    """#60 (I1): the browser must never guess a chain's currency from the venue, so
+    the response carries it — at the response level, since one chain is one
+    underlying on one venue and every row on it shares one quote currency."""
+    result = chain([])
+    assert result.quote_currency == "USD"
+
+
 def test_rows_are_ascending_by_strike(chain_tickers) -> None:
     strikes = [row.strike for row in chain(chain_tickers).rows]
     assert strikes == sorted(strikes)

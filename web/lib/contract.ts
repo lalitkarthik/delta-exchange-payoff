@@ -115,6 +115,20 @@ export interface ChainResponse {
   underlying: Underlying;
   expiry: ExpiryDate;
   /**
+   * ISO 4217, upper case — `"USD"`. What every price in `rows` is quoted in.
+   * `docs/chain-contract.md`, #57/#60 (I1).
+   *
+   * **At the response level, not per leg.** One chain is one underlying on one
+   * venue, so every row shares one quote currency; repeating it on every leg would
+   * be the same fact copied dozens of times for no reason a reader could use.
+   *
+   * **The browser must never guess this from the venue name.** Delta is `"USD"`
+   * today, but this field is what stops that from being an assumption baked into
+   * the ladder — the day an NSE adapter publishes NIFTY in INR beside BTC in USD,
+   * this is the field that tells `ChainLadder` which is which.
+   */
+  quote_currency: string;
+  /**
    * Delta's top-level `spot_price`. `greeks.spot` is deliberately not exposed.
    *
    * Always present on this route — a live chain always carries a spot price. Typed

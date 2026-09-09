@@ -172,6 +172,23 @@ export function subscribeChain(
       }
 
       if (message.type === "chain") {
+        // #60 (I1): the same guard `lib/engine.ts`'s `loadChain` applies to `/chain`,
+        // reapplied here because this is the primary path — `ChainScreen` follows the
+        // socket, not the REST route, whenever it is live. A `ChainResponse` with no
+        // `quote_currency` is a contract breach the app must not render as if it were
+        // silently USD; the socket is not a promise a caller can catch a thrown error
+        // from, so this reports it exactly as a malformed frame is reported below.
+        if (
+          typeof message.data.quote_currency !== "string" ||
+          message.data.quote_currency.length === 0
+        ) {
+          handlers.onStatus(
+            "error",
+            "The engine sent a chain with no quote_currency, which docs/chain-contract.md " +
+              "requires since #60 (I1).",
+          );
+          return;
+        }
         // A message arriving proves the connection works, so the backoff resets here
         // rather than on open: a socket that opens and immediately closes would
         // otherwise reset the delay on every attempt and retry in a tight loop.

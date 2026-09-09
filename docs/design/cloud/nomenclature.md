@@ -118,7 +118,7 @@ VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P-CCY
 ```
 
 `DELTA-BTC-20260627-60000-C-USD`. The last token is the **quote** currency, ISO 4217. Decided in
-#57 and not open here.
+#57 and landed by #60 (I1) — this is the shape every wire form and cache key carries now.
 
 - Joined on `-`, and no part may contain one; `venue` and `underlying` already refuse it.
 - `STRIKE` carries no trailing zeros and never an exponent — `format_strike`.
@@ -126,8 +126,12 @@ VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P-CCY
   and a stream field agree.
 - `venue_symbol` is deliberately not in it: the string names a contract, and two venues listing the
   same contract should produce the same string.
-- `Instrument.from_canonical` splits on `-` and expects five parts today. **I1 widens it to six**
-  and defaults the currency; until I1 lands, no wire form carries the suffix.
+- `Instrument.from_canonical` splits on `-` and expects **six** parts. #60 (I1) widened it from
+  five and made the five-part pre-I1 form raise `InstrumentParseError` rather than defaulting a
+  currency onto it — a stale caller fails loudly instead of silently addressing a contract with
+  no currency. `settlement_currency`, the instrument's second currency field, does not travel in
+  this string at all; only the quote currency does, because that is the one a reader of a price
+  needs.
 
 ---
 

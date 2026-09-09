@@ -99,6 +99,14 @@ class ChainResponse(BaseModel):
     spot: float | None = None
     atm_strike: float | None = None
     fetched_at: str
+    #: ISO 4217, upper case — `"USD"`. What every price in `rows` is quoted in, #60
+    #: (I1). At the response level and not per leg: one chain is one underlying on
+    #: one venue, so every row on it shares one quote currency, and a field repeated
+    #: on every leg would be the same fact copied dozens of times for no reason. Not
+    #: nullable — unlike `spot`, a chain's currency is a fact about the contract, not
+    #: an observation that can be missing, so even a stored minute with nothing in
+    #: `spot-bars` still knows what it would have been quoted in.
+    quote_currency: str
     rows: list[ChainRow]
     #: The forward the enrichment priced against, and the discount factor fitted
     #: alongside it. `None` on a chain that has not been enriched, and on one with

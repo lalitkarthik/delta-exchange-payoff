@@ -65,10 +65,24 @@ the engine would have had to invent. `derived` ≈118 extra events a second agai
 `measured` 1,322.9 msg/s feed; the spot columns are unaffected either way. `instrument`
 stays `null`.
 
-**The instrument.** `C-BTC-77600-040926` becomes `DELTA-BTC-20260904-77600-C`, the venue's
-string kept in `venue_symbol`. A symbol that is not a contract returns `None` and is counted
-rather than raised: `underlying` is a partition directory name, and a wrong guess files
-quotes under an asset they did not happen in.
+**The instrument.** `C-BTC-77600-040926` becomes `DELTA-BTC-20260904-77600-C-USD`, the
+venue's string kept in `venue_symbol`. A symbol that is not a contract returns `None` and is
+counted rather than raised: `underlying` is a partition directory name, and a wrong guess
+files quotes under an asset they did not happen in.
+
+**`quote_currency` and `settlement_currency`, #60 (I1).** `instrument_from_symbol` sets
+both explicitly, to `chain.QUOTE_CURRENCY` and `chain.SETTLEMENT_CURRENCY` — `"USD"`,
+`"USD"` — rather than leaving them to `Instrument`'s own class default, because the
+acceptance criterion is that the **adapter** states them, not merely that the right value
+falls out of a default. Neither is read off this frame or off Delta's `/v2/tickers` row:
+the venue calls the pair `quoting_asset`/`settling_asset` on `/v2/products/{symbol}`,
+which `docs/settlement.md` §3.1 measured once per symbol; the ticker row `instruments()`
+and `_decode` actually see carries neither key. Adding a `/v2/products` call per
+instrument to read a currency that is, today, always `"USD"` was rejected as a network
+round trip this ticket does not need — see #60's ticket comment, "Rejected and why". The
+constants live in `chain.py`, re-exported to this module, so both files read one fact
+rather than two that could drift; `chain.py` already holds `UNDERLYINGS`, a Delta fact,
+for the same reason.
 
 **Both stamps travel.** `ts_venue` is Delta's `ts` — microseconds since the epoch, converted
 by integer arithmetic so the last digit survives, because the store buckets on it since #37;

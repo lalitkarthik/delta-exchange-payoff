@@ -134,7 +134,11 @@ def test_delta_s_symbol_becomes_a_canonical_instrument() -> None:
     assert instrument.strike == Decimal("77600")
     assert instrument.right is Right.CALL
     assert instrument.venue_symbol == "C-BTC-77600-040926"
-    assert instrument.canonical() == "DELTA-BTC-20260904-77600-C"
+    # #60 (I1): both currencies are the adapter's own doing, not the class default —
+    # a test per field, per the ticket's acceptance criterion.
+    assert instrument.quote_currency == "USD"
+    assert instrument.settlement_currency == "USD"
+    assert instrument.canonical() == "DELTA-BTC-20260904-77600-C-USD"
 
 
 def test_eth_s_symbol_becomes_a_canonical_instrument_too() -> None:
@@ -148,7 +152,7 @@ def test_eth_s_symbol_becomes_a_canonical_instrument_too() -> None:
     assert instrument.expiry == date(2026, 9, 8)
     assert instrument.strike == Decimal("3600")
     assert instrument.right is Right.PUT
-    assert instrument.canonical() == "DELTA-ETH-20260908-3600-P"
+    assert instrument.canonical() == "DELTA-ETH-20260908-3600-P-USD"
 
 
 @pytest.mark.parametrize(

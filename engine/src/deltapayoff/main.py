@@ -1265,7 +1265,7 @@ def chain_at(
 def bars(
     instrument: Annotated[
         str,
-        Query(description="canonical string, e.g. DELTA-BTC-20260627-60000-C"),
+        Query(description="canonical string, e.g. DELTA-BTC-20260627-60000-C-USD"),
     ],
     date: Annotated[str, Query(description="YYYY-MM-DD, the store's own spelling")],
     source: Annotated[HistoricalSource, Depends(get_historical_source)],

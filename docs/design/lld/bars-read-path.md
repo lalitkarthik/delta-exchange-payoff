@@ -15,7 +15,7 @@ reads four tables across every listed strike at one minute.
 
 ## Addressed by canonical string
 
-`/bars?instrument=DELTA-BTC-20260904-77600-C&date=2026-09-04` takes
+`/bars?instrument=DELTA-BTC-20260904-77600-C-USD&date=2026-09-04` takes
 `events.instrument.Instrument.from_canonical`, not separate
 `underlying`/`expiry`/`strike`/`option_type` parameters the way every earlier route is
 addressed. This is the first route in the engine to be addressed this way, and it is

@@ -104,6 +104,19 @@ class Instrument(BaseModel):
     #: The venue's string, verbatim. `None` on an instrument parsed back from a
     #: canonical string, which does not carry it.
     venue_symbol: str | None = None
+    #: ISO 4217, upper case — `"USD"`. What a price on this contract is **quoted**
+    #: in, and the canonical string's last token, #57/#60 (I1). Optional with this
+    #: default so an instrument built exactly as every caller built one before I1
+    #: still gets a currency rather than `None` — `docs/design/events.md` §Versioning
+    #: permits adding an optional field with a default without a schema bump, and
+    #: `"USD"` is the only currency any venue here has used so far.
+    quote_currency: str = "USD"
+    #: ISO 4217, upper case. What this contract **settles** in. Equal to
+    #: `quote_currency` on every venue this project has met — Delta is USD for both,
+    #: `docs/settlement.md` §3.1 — but kept as a second field rather than one shared
+    #: value because a venue where the two differ is a venue this type must not have
+    #: to be redesigned for.
+    settlement_currency: str = "USD"
 
     @field_validator("venue", "underlying")
     @classmethod
@@ -117,12 +130,32 @@ class Instrument(BaseModel):
             raise ValueError(f"may not contain '-'; got {value!r}")
         return value
 
+    @field_validator("quote_currency", "settlement_currency")
+    @classmethod
+    def _currency_is_iso4217_shaped(cls, value: str) -> str:
+        """Three upper-case letters — `"USD"`, `"INR"`. Not a lookup against the real
+        ISO 4217 table, which this project has no need to carry; the shape is what
+        `canonical()` needs to keep joining cleanly on `-`, and what a reader expects
+        a currency code to look like on sight."""
+        if len(value) != 3 or not value.isalpha() or value != value.upper():
+            raise ValueError(
+                "currency must be three upper-case letters, ISO 4217 style; "
+                f"got {value!r}"
+            )
+        return value
+
     @field_serializer("strike", when_used="json")
     def _serialise_strike(self, strike: Decimal) -> int | float:
         return strike_as_json_number(strike)
 
     def canonical(self) -> str:
-        """`VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P`, e.g. `DELTA-BTC-20260627-60000-C`."""
+        """`VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P-CCY`, e.g.
+        `DELTA-BTC-20260627-60000-C-USD`. The last token is `quote_currency` — a price
+        on screen next to this contract is quoted in it. `settlement_currency` does
+        not travel here; #57 fixed the six-part form with one currency in it, the one
+        a reader needs to make sense of a price, and a string naming two currencies
+        with no marker for which is which would be a worse ambiguity than the one this
+        ticket closes."""
         return "-".join(
             (
                 self.venue,
@@ -130,6 +163,7 @@ class Instrument(BaseModel):
                 self.expiry.strftime("%Y%m%d"),
                 format_strike(self.strike),
                 self.right.value,
+                self.quote_currency,
             )
         )
 
@@ -140,15 +174,24 @@ class Instrument(BaseModel):
         """Invert `canonical`. `venue_symbol` is supplied because the string omits it.
 
         Split on the separator rather than matched with one regular expression, so that
-        the failure says which of the five parts was wrong when a caller reads the
+        the failure says which of the six parts was wrong when a caller reads the
         traceback.
+
+        **A five-part string — the pre-I1 shape with no currency — is rejected loudly,
+        not defaulted.** Guessing `"USD"` for a string that predates the suffix would
+        make a caller who never updated their address book fail silently the day a
+        second, non-USD venue arrives; refusing it here instead surfaces every stale
+        cache key, log line and fixture at once, which is #60's whole point.
+        `settlement_currency` is not recoverable from this string at all — it comes
+        back at the class default, `"USD"`, exactly as an instrument built with no
+        currency arguments would.
         """
         parts = (text or "").split("-")
-        if len(parts) != 5:
+        if len(parts) != 6:
             raise InstrumentParseError(
-                f"expected VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P; got {text!r}"
+                f"expected VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P-CCY; got {text!r}"
             )
-        venue, underlying, expiry_text, strike_text, right_text = parts
+        venue, underlying, expiry_text, strike_text, right_text, currency_text = parts
         if not venue or not underlying:
             raise InstrumentParseError(f"venue and underlying may not be empty: {text!r}")
         # `strptime` is lenient about digit counts and reads `2026627` as 2026-06-27,
@@ -182,6 +225,19 @@ class Instrument(BaseModel):
             raise InstrumentParseError(
                 f"right {right_text!r} is not C or P in {text!r}"
             ) from error
+        # Checked here, with the same explicit message style as every part above it,
+        # rather than left to the field validator: a currency-shaped failure from
+        # `cls(...)` below would raise `pydantic.ValidationError`, not
+        # `InstrumentParseError`, and this parser's whole contract is that a bad
+        # string raises the one exception type a caller can catch for all of them.
+        if (
+            len(currency_text) != 3
+            or not currency_text.isalpha()
+            or currency_text != currency_text.upper()
+        ):
+            raise InstrumentParseError(
+                f"currency {currency_text!r} is not three upper-case letters in {text!r}"
+            )
         return cls(
             venue=venue,
             underlying=underlying,
@@ -189,4 +245,5 @@ class Instrument(BaseModel):
             strike=strike,
             right=right,
             venue_symbol=venue_symbol,
+            quote_currency=currency_text,
         )

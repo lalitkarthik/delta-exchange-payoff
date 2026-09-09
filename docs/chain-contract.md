@@ -49,6 +49,7 @@ no reformatting anywhere in the stack.
 {
   "underlying": "BTC",
   "expiry": "04-09-2026",
+  "quote_currency": "USD",
   "spot": 77543.0,
   "atm_strike": 77500.0,
   "fetched_at": "2026-09-01T09:21:04Z",
@@ -64,6 +65,18 @@ no reformatting anywhere in the stack.
 
 `rows` is ascending by strike. `atm_strike` is the listed strike closest to `spot` — a lookup,
 not a model. Either side of a row may be `null` when only one of the pair is listed.
+
+**`quote_currency` — ISO 4217, upper case, e.g. `"USD"` — #57/#60 (I1).** What every price
+in `rows` is quoted in. At the **response level**, not per leg or per row: one chain is one
+underlying on one venue, so every row on it shares one quote currency, and repeating it on
+every leg would be the same fact copied dozens of times. Never `null` — unlike `spot`, a
+chain's currency is a property of the contract, not an observation that can be missing, so
+even a stored minute with nothing in `spot-bars` still knows what it would have been quoted
+in. **The browser must never guess this from the venue name**: a NIFTY chain will one day sit
+beside a BTC one and only this field tells the ladder which is which. Delta is `"USD"` for
+both quote and settlement, `docs/settlement.md` §3.1; a settlement currency is not on this
+contract because nothing on the screen needs it — a price is always read as quoted, never as
+settled.
 
 **`spot` and `atm_strike` are `number | null`, not `number` — #47.** This route always
 populates both: a live chain always carries Delta's own spot price. The type is nullable

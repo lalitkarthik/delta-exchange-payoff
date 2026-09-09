@@ -9,10 +9,16 @@
  * the web app needs a strike or an expiry it does not already have from the chain
  * response that produced the string.
  *
- * `VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P`, e.g. `DELTA-BTC-20260627-60000-C` — hyphen
- * separated, ISO date, strike without a trailing zero. This app only ever talks to one
- * venue, so `VENUE` is the literal `DELTA` everywhere below; the engine's own type
- * carries the field because it is venue-independent, and this file is not.
+ * `VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P-CCY`, e.g. `DELTA-BTC-20260627-60000-C-USD` —
+ * hyphen separated, ISO date, strike without a trailing zero, the quote currency last.
+ * This app only ever talks to one venue, so `VENUE` is the literal `DELTA` everywhere
+ * below; the engine's own type carries the field because it is venue-independent, and
+ * this file is not.
+ *
+ * **The currency is required, not optional, #60 (I1).** `events.instrument.Instrument
+ * .from_canonical` rejects a five-part string — the pre-I1 shape with no currency —
+ * loudly rather than defaulting one onto it, so `canonicalInstrument` must be handed a
+ * currency to build a string `/bars` will accept at all.
  */
 
 export const VENUE = "DELTA";
@@ -44,14 +50,22 @@ function expiryToIso(expiry: string): string {
  * A JS number already prints without a trailing zero or a leading `+` — `String(60000)`
  * is `"60000"`, `String(1234.5)` is `"1234.5"` — so, unlike the engine's `Decimal`-typed
  * strike, no separate formatting step is needed here to match `format_strike`'s output.
+ *
+ * `quoteCurrency` comes from the `ChainResponse` the leg was clicked on
+ * (`chain.quote_currency`, #60/I1) — never a literal `"USD"` here, which would be
+ * exactly the guess `docs/chain-contract.md` says the browser must never make.
  */
 export function canonicalInstrument(
   underlying: string,
   expiry: string,
   strike: number,
   side: Right,
+  quoteCurrency: string,
 ): string {
-  return `${VENUE}-${underlying}-${expiryToIso(expiry)}-${strike}-${rightCode(side)}`;
+  return (
+    `${VENUE}-${underlying}-${expiryToIso(expiry)}-${strike}-` +
+    `${rightCode(side)}-${quoteCurrency}`
+  );
 }
 
 /**
@@ -62,9 +76,14 @@ export function canonicalInstrument(
  * answers 400 if not. This is not a validator the way `Instrument.from_canonical` is; it
  * exists so a mistyped or truncated link opens the chain page without a panel stuck
  * trying to load nothing, rather than so a malformed string is rejected here first.
+ *
+ * **Six parts, #60 (I1)** — the pre-I1 five-part shape no longer matches, exactly as
+ * the engine's own parser no longer accepts it. A link copied before this ticket landed
+ * opens the chain page cleanly with no panel, the same disposition every other
+ * malformed value already gets.
  */
 export function looksCanonical(text: string): boolean {
-  return /^[^-]+-[^-]+-\d{8}-[0-9.]+-[CP]$/.test(text);
+  return /^[^-]+-[^-]+-\d{8}-[0-9.]+-[CP]-[A-Z]{3}$/.test(text);
 }
 
 /** What the panel needs back out of a canonical string to find its row on the live or

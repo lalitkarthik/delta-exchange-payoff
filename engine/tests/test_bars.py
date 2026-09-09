@@ -1122,6 +1122,7 @@ def enriched_chain(
     return ChainResponse(
         underlying="BTC",
         expiry="04-09-2026",
+        quote_currency="USD",
         spot=77568.2,
         atm_strike=77600.0,
         fetched_at=stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1360,7 +1361,7 @@ def test_the_computed_bar_carries_the_partition_and_filter_columns() -> None:
 def instrument_without_a_venue_symbol():
     """A canonical instrument with no venue spelling — what `Instrument.from_canonical`
     gives back, because the canonical string does not carry one."""
-    return Instrument.from_canonical("DELTA-BTC-20260904-77600-C")
+    return Instrument.from_canonical("DELTA-BTC-20260904-77600-C-USD")
 
 
 @pytest.mark.parametrize(

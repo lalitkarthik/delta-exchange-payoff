@@ -206,7 +206,9 @@ def ladder_from_events(ticker_frames, book_frames, taken, *, poison: bool):
                 leg_from_events(instrument, reference, quotes.get(key)),
             )
         )
-    return chain_from_legs("BTC", "04-09-2026", legs, spot, fetched_at=taken)
+    return chain_from_legs(
+        "BTC", "04-09-2026", legs, spot, fetched_at=taken, quote_currency="USD"
+    )
 
 
 @pytest.fixture

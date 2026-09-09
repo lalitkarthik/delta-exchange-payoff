@@ -1867,6 +1867,7 @@ def sampled_chain(minute: int, second: int, iv: float | None = 0.43) -> ChainRes
     return ChainResponse(
         underlying="BTC",
         expiry="04-09-2026",
+        quote_currency="USD",
         spot=77568.2,
         atm_strike=77600.0,
         fetched_at=stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -2432,6 +2433,7 @@ def test_a_stored_row_reproduces_offline_from_the_quote_bar_beside_it(
     rebuilt = ChainResponse(
         underlying="BTC",
         expiry=sample["expiry"],
+        quote_currency="USD",
         spot=spot,
         atm_strike=nearest_strike(list(legs), spot),
         fetched_at=recovered.strftime("%Y-%m-%dT%H:%M:%SZ"),

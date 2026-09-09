@@ -1,6 +1,7 @@
 {
   "underlying": "BTC",
   "expiry": "04-09-2026",
+  "quote_currency": "USD",
   "spot": 77636.0,
   "atm_strike": 77600.0,
   "fetched_at": "2026-09-03T10:28:30Z",

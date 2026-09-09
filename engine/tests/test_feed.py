@@ -522,10 +522,10 @@ def test_frames_off_the_socket_become_canonical_events() -> None:
         "OptionQuote",
     ]
     reference, index, quote = published
-    assert reference.instrument.canonical() == "DELTA-BTC-20260904-77600-C"
+    assert reference.instrument.canonical() == "DELTA-BTC-20260904-77600-C-USD"
     assert reference.mark_iv == 0.30
     assert index.underlying == "BTC" and index.spot == 77651.9
-    assert quote.instrument.canonical() == "DELTA-BTC-20260904-77600-P"
+    assert quote.instrument.canonical() == "DELTA-BTC-20260904-77600-P-USD"
     assert (quote.bid, quote.ask) == (120.0, 125.0)
 
 

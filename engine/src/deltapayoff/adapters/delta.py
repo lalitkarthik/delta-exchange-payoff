@@ -47,7 +47,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ..chain import build_chain, build_expiries
+from ..chain import QUOTE_CURRENCY, SETTLEMENT_CURRENCY, build_chain, build_expiries
 from ..delta_client import DeltaClient
 from ..events import Event, IndexQuote, Instrument, OptionQuote, OptionReference, Right
 from ..models import ChainResponse, ExpiriesResponse
@@ -100,6 +100,19 @@ def instrument_from_symbol(symbol: str, venue: str = VENUE) -> Instrument | None
             strike=strike,
             right=right,
             venue_symbol=symbol,
+            # **Populated here, not left to `Instrument`'s own default.** #60 (I1)'s
+            # acceptance criterion is that the adapter states these, not that they
+            # merely come out right because the class default happens to agree.
+            # `QUOTE_CURRENCY`/`SETTLEMENT_CURRENCY` are `chain.py`'s constants,
+            # sourced from `docs/settlement.md`'s measured `quoting_asset`/
+            # `settling_asset` — both `USD` on every one of the 1,031 options
+            # measured there. Not read off this frame: neither the REST ticker row
+            # nor the websocket ticker frame carries a `quoting_asset` or
+            # `settling_asset` field — that pair lives on `/v2/products/{symbol}`,
+            # which settlement.md called once per symbol and which this adapter does
+            # not call per instrument. See #60's ticket comment, "Rejected and why".
+            quote_currency=QUOTE_CURRENCY,
+            settlement_currency=SETTLEMENT_CURRENCY,
         )
     except ValidationError:
         # An empty or hyphenated `underlying` — neither reachable from a four-part split,

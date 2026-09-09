@@ -32,7 +32,7 @@ from typing import Any
 
 import polars as pl
 
-from .chain import nearest_strike
+from .chain import QUOTE_CURRENCY, nearest_strike
 from .models import ChainRow, ComputedLeg, HistoricalChain, Leg
 from .store import BarStore, scan_and_pending
 
@@ -119,6 +119,12 @@ def read_ladder_at(
         fetched_at=stamp,
         spot=spot,
         atm_strike=nearest_strike(list(legs), spot),
+        # Every table this route reads was written by this codebase's own Delta
+        # adapter — there is no venue field on a Parquet row to read a currency off,
+        # only `symbol`, `strike`, `option_type` and the rest of the schema
+        # `docs/design/lld/store.md` fixes. `QUOTE_CURRENCY` is therefore the same
+        # constant `build_chain` uses for the same reason.
+        quote_currency=QUOTE_CURRENCY,
         rows=rows,
         **_chain_fields(computed),
     )
