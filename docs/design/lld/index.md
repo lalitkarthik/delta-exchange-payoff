@@ -24,6 +24,7 @@ file, and change the row's status to a link. Do not write one ahead of the code.
 | The historical read path — the ladder at a stored minute, and the day's minutes | [historical-read-path.md](historical-read-path.md) | #45 |
 | The bars read path — one contract's minute bars for a date | [bars-read-path.md](bars-read-path.md) | #46 |
 | Re-listing — the cadence, the live subscribe, settled contracts | [relisting.md](relisting.md) | #51 |
+| The Redis Streams bus — the two policies over a broker, batching, trimming, replay | [redis-bus.md](redis-bus.md) | #61 |
 
 ## What a low-level design should contain
 

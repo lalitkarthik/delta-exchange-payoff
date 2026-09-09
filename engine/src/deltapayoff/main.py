@@ -74,7 +74,7 @@ from .chain import (
 from .compute import enrich
 from .contract_bars import ContractBarsResponse, read_contract_bars
 from .delta_client import DeltaClient, DeltaUnavailable
-from .events import ConnectionState, ControlCommand, Event, FeedConnection
+from .events import Bus, ConnectionState, ControlCommand, Event, FeedConnection
 from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
 from .historical import list_minutes, read_ladder_at
@@ -91,6 +91,7 @@ from .models import (
     WatchedPair,
 )
 from .realised_vol import ESTIMATORS
+from .redis_bus import REDIS_BUS, BusConfig, RedisBus, selected_bus
 from .smile import read_smile
 from .store import (
     COMPUTED_DATASET,
@@ -287,7 +288,12 @@ class FeedStack:
     #: subscribe, with different queue policies (see `fanout.py`). #36 ran a second bus
     #: beside it carrying the retired quote record — that was the expand half of an
     #: expand-contract, and it is gone with the record and the shim that filled it.
-    events: FanOut
+    #:
+    #: **Typed as the interface since #61**, because there are two of them now: the
+    #: in-process fan-out and `redis_bus.RedisBus`, chosen by `build_bus` off one
+    #: environment variable. Nothing in this module knows which it has, which is the
+    #: whole of what `events/bus.py` was written for.
+    events: Bus
     stream: ChainStream
     writer: BarWriter
     #: The venue, behind `adapters.base.Adapter`. Everything venue-specific is inside it,
@@ -317,6 +323,56 @@ class FeedStack:
     def feed(self) -> Any:
         """The socket owner inside the adapter, for the counters #39's `/health` reads."""
         return self.adapter.feed
+
+
+def build_bus() -> Bus:
+    """The in-process fan-out, or Redis Streams, by configuration.
+
+    **The default is the fan-out and stays the fan-out.** `DELTA_BUS=redis` is the only
+    thing that moves this engine onto a broker; anything else, including a typo, is the
+    in-process bus it has always run, because a mistyped value must not silently pick a
+    broker. Read at start-up rather than at import, like every other switch here.
+
+    Nothing is connected yet. `start_bus` does that, and it is what fails loudly when
+    Redis is not there.
+    """
+    if selected_bus() != REDIS_BUS:
+        return FanOut()
+    config = BusConfig.from_env(underlyings=live_underlyings())
+    log_event(
+        logger,
+        logging.INFO,
+        log_events.BUS_SELECTED,
+        "the event bus is Redis Streams at %s, prefix %r, batching every %d ms, "
+        "retaining %.0f s",
+        config.url,
+        config.env,
+        config.batch_ms,
+        config.retention_seconds,
+    )
+    return RedisBus(config)
+
+
+async def start_bus(bus: Bus) -> None:
+    """Connect the bus, if it is one that connects. **Fatal when it cannot.**
+
+    #57's user story 22: a feed that starts with no Redis fails loudly rather than
+    buffering forever, so a misconfiguration is visible at once. `BusUnavailable` leaves
+    here uncaught, the lifespan raises, and uvicorn exits with the reason printed —
+    within the connect timeout, which is bounded for exactly this.
+
+    The fan-out has no start and needs none, which is why this is a function here rather
+    than a third method on the interface: `publish` and `subscribe` are the seam, and a
+    lifecycle a broker needs is not something a producer or a consumer should learn about.
+    """
+    if isinstance(bus, RedisBus):
+        await bus.start()
+
+
+async def stop_bus(bus: Bus) -> None:
+    """Write what is left and close the connection. A no-op on the fan-out."""
+    if isinstance(bus, RedisBus):
+        await bus.aclose()
 
 
 def build_feed_stack(client: DeltaClient) -> FeedStack:
@@ -350,7 +406,7 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     factory for exactly that reason: the adapter builds the socket owner around its own
     sink, and the name it builds is still this module's.
     """
-    events = FanOut()
+    events = build_bus()
     stream = ChainStream()
     stream.attach(events)
     writer = BarWriter(BarStore(), chains=stream.live_computed_chains)
@@ -571,13 +627,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     and give three inconsistent views of one market.
 
     What is wired to what is `build_feed_stack`; this function owns only the process's
-    lifetime and the decision to run live or not.
+    lifetime, the decision to run live or not, and — since #61 — connecting the bus when
+    the bus is one that connects. A Redis bus that cannot be reached ends start-up here,
+    which is #57's user story 22: a misconfiguration is visible at once rather than
+    buffering into an outbox nobody drains.
     """
     client = DeltaClient()
     await client.__aenter__()
     app.state.delta = client
 
     stack = build_feed_stack(client)
+    try:
+        # **Before anything is published and before the feed is started.** A bus that
+        # cannot be reached is fatal here — `start_bus` says why — and the client opened
+        # above has to be closed on the way out, since nothing below will run.
+        await start_bus(stack.events)
+    except Exception:
+        await client.aclose()
+        raise
     app.state.stack = stack
     app.state.events = stack.events
     app.state.adapter = stack.adapter
@@ -602,6 +669,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await stop_feed_stack(stack)
+        # After the consumers have stopped and the last bar has flushed, so the final
+        # batch on the wire is the one the writer's own shutdown produced.
+        await stop_bus(stack.events)
         await client.aclose()
         # **Undo every assignment above.** `app.state` is a plain namespace on a
         # module-level singleton and Starlette does not clear it on shutdown, so a test

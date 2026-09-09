@@ -1,0 +1,56 @@
+{
+  "consumer_cpu_percent_of_a_core": 45.43,
+  "elapsed_seconds": 2416.9,
+  "received": {
+    "store": 3330235
+  },
+  "unjoined_receipts": 20,
+  "unjoined_stamps": 0,
+  "consumers": {
+    "store": {
+      "offered": 3330235,
+      "dropped": 0,
+      "queued": 0,
+      "lossless": true,
+      "over_capacity": 0,
+      "backlog_peak": 1668,
+      "skipped": 0,
+      "resyncs": 0,
+      "undecodable": 0
+    }
+  },
+  "phases": {
+    "control": {
+      "samples": 16,
+      "p50_ms": 92.08,
+      "p90_ms": 108.73,
+      "p99_ms": 117.9,
+      "max_ms": 117.9,
+      "mean_ms": 88.93
+    },
+    "10": {
+      "samples": 55728,
+      "p50_ms": 230.09,
+      "p90_ms": 616.85,
+      "p99_ms": 842.36,
+      "max_ms": 1107.02,
+      "mean_ms": 289.4
+    },
+    "50": {
+      "samples": 54919,
+      "p50_ms": 195.19,
+      "p90_ms": 632.81,
+      "p99_ms": 847.84,
+      "max_ms": 1156.76,
+      "mean_ms": 296.26
+    },
+    "100": {
+      "samples": 55761,
+      "p50_ms": 235.32,
+      "p90_ms": 607.16,
+      "p99_ms": 830.57,
+      "max_ms": 1157.88,
+      "mean_ms": 313.34
+    }
+  }
+}

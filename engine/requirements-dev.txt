@@ -8,3 +8,9 @@ ruff>=0.6
 # protobuf verifies the hand-written encoder byte-for-byte and the tool degrades without it.
 msgpack>=1.1
 protobuf>=5.0
+
+# The bus contract suite (#61) runs three times: the fan-out, fakeredis, and a real
+# `redis:7-alpine` the suite starts on the test-only port 6399. fakeredis is what keeps
+# the Redis path covered on a machine with no Docker, where the third parametrisation
+# skips loudly.
+fakeredis>=2.23

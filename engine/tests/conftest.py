@@ -25,7 +25,11 @@ The three JSON fixtures under `tests/fixtures/`:
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
+import time
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -117,3 +121,100 @@ def ws_captured_at(ws_ticker_frames) -> datetime:
     """
     stamps = [frame["ts"] for frame in ws_ticker_frames.values() if frame.get("ts")]
     return datetime.fromtimestamp(max(stamps) / 1e6, tz=timezone.utc)
+
+
+#: The test-only Redis port. **Not 6379**: a developer's own Redis, or a `dev` stack
+#: running under Compose, is on the default port, and a suite that trimmed and deleted
+#: keys there would eat a running system's streams. 6399 is the same port
+#: `tools/measure_redis_hosting.py` uses, so one container serves both.
+REDIS_TEST_PORT = 6399
+REDIS_TEST_URL = f"redis://127.0.0.1:{REDIS_TEST_PORT}"
+REDIS_CONTAINER = "deltapayoff-tests-redis-6399"
+#: The pipe's own flags, so the suite runs against the configuration
+#: `docs/design/cloud/redis-hosting.md` §1 fixes — with `maxmemory` at 1gb rather than
+#: prod's 2gb, because this runs on a laptop.
+REDIS_ARGS = (
+    "redis-server --save '' --appendonly no --maxmemory 1gb "
+    "--maxmemory-policy noeviction"
+)
+
+
+@pytest.fixture(scope="session")
+def redis_server() -> Iterator[str]:
+    """A throwaway Redis on 6399 for the session, started and removed here.
+
+    **Skips loudly rather than passing quietly.** A Redis contract suite that silently
+    became zero tests when Docker was not running would let the bus regress with a green
+    suite over it, which is the plausible-and-wrong failure this project keeps refusing.
+    The skip reason names the exact command, so a reader of the summary can turn the
+    suite back on in one paste.
+
+    Nothing here touches the network: the container is local, the port is loopback and
+    the image is whatever Docker already has or pulls once.
+    """
+    docker = shutil.which("docker")
+    hint = (
+        f"docker run -d --rm --name {REDIS_CONTAINER} "
+        f"-p {REDIS_TEST_PORT}:6379 redis:7-alpine {REDIS_ARGS}"
+    )
+    if docker is None:
+        pytest.skip(f"SKIPPED LOUDLY: no docker on PATH. Start one by hand: {hint}")
+
+    probe = subprocess.run(  # noqa: S603 - a fixed argv, no shell
+        [docker, "version", "--format", "{{.Server.Version}}"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip(
+            "SKIPPED LOUDLY: docker is installed but its daemon is not answering "
+            f"({probe.stderr.strip() or probe.stdout.strip()}). Start it, or run: {hint}"
+        )
+
+    already = subprocess.run(  # noqa: S603
+        [docker, "ps", "-q", "--filter", f"publish={REDIS_TEST_PORT}"],
+        capture_output=True,
+        text=True,
+    )
+    if already.stdout.strip():
+        # Something is already serving the port — `tools/measure_redis_hosting.py`'s own
+        # container, most likely. Use it and leave it alone; removing another process's
+        # container would be a surprise this fixture has no business springing.
+        yield REDIS_TEST_URL
+        return
+
+    run = subprocess.run(  # noqa: S603
+        [docker, "run", "-d", "--rm", "--name", REDIS_CONTAINER,
+         "-p", f"{REDIS_TEST_PORT}:6379", "redis:7-alpine", *REDIS_ARGS.split()],
+        capture_output=True,
+        text=True,
+    )
+    if run.returncode != 0:
+        pytest.skip(
+            "SKIPPED LOUDLY: docker could not start the test Redis "
+            f"({run.stderr.strip()}). By hand: {hint}"
+        )
+    try:
+        _await_redis(REDIS_TEST_URL)
+        yield REDIS_TEST_URL
+    finally:
+        subprocess.run(  # noqa: S603
+            [docker, "rm", "-f", REDIS_CONTAINER], capture_output=True, text=True
+        )
+
+
+def _await_redis(url: str, attempts: int = 50) -> None:
+    """Wait for the container's first `PING`. Not a clock dependency — a readiness poll
+    with a bound, which fails the fixture rather than the tests underneath it."""
+    import redis
+
+    conn = redis.Redis.from_url(url, socket_connect_timeout=0.5, socket_timeout=0.5)
+    for _attempt in range(attempts):
+        try:
+            conn.ping()
+            conn.close()
+            return
+        except Exception:  # noqa: BLE001 - any failure here is "not up yet"
+            time.sleep(0.1)
+    conn.close()
+    pytest.skip(f"SKIPPED LOUDLY: the test Redis on {url} never answered PING")

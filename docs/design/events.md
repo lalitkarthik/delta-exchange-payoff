@@ -202,12 +202,18 @@ Every decimal is a JSON number or `null`, converted once at the adapter boundary
 
 ## The bus these travel on
 
-`publish(event)` and `subscribe(name, maxsize, lossless)`, implemented today by `fanout.py` and
-replaceable by a broker without touching a producer or a consumer. **One bus since #37**, where
-two ran side by side. Subscription semantics are unchanged: the bar writer subscribes with
+`publish(event)` and `subscribe(name, maxsize, lossless)`, implemented by `fanout.py` in process
+and, since #61, by `redis_bus.py` over Redis Streams — one environment variable chooses, and the
+default is the fan-out, so a producer and a consumer are opened by neither. **One bus since #37**,
+where two ran side by side. Subscription semantics are unchanged: the bar writer subscribes with
 `lossless=True`, where `maxsize` becomes a watermark and every over-capacity offer is counted;
 the chain cache subscribes bounded and drops the oldest, because a quote from four seconds ago is
-worthless to a screen. Every drop is counted, because a silent drop is a lie.
+worthless to a screen. Every drop is counted, because a silent drop is a lie — and on Redis so is
+every entry a reader skipped, because Redis trims silently and this does not.
+
+What each event is named on the wire and how it is encoded there is
+[cloud/nomenclature.md](cloud/nomenclature.md); how the two policies are kept across a broker that
+offers neither is [lld/redis-bus.md](lld/redis-bus.md).
 
 ## What is deliberately not an event
 

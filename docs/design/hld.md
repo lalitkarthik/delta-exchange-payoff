@@ -92,15 +92,28 @@ liveness alone.
 
 ### 2.4 The bus
 
-**One producer, many independent consumers, in one process.** `fanout.py` today; #37 puts it
-behind an interface of `publish(event)` and `subscribe(name, maxsize, lossless)`, so a broker can
-replace the implementation without touching a producer or a consumer. The socket handler
-publishes and returns: if it blocks, the OS receive buffer fills and the venue closes us.
+**One producer, many independent consumers.** `publish(event)` and
+`subscribe(name, maxsize, lossless)` since #37, so that a broker could replace the implementation
+without touching a producer or a consumer. The socket handler publishes and returns: if it blocks,
+the OS receive buffer fills and the venue closes us.
 
 **Queue policy is per subscription and does not change.** The bar writer subscribes losslessly,
 because drop-oldest under load systematically shaves the highs and lows bars exist to capture;
 the chain cache drops the oldest, because it holds only the newest frame per contract anyway.
-Every drop is counted. **No broker is deployed:** the interface is the seam, the fan-out fills it.
+Every drop is counted.
+
+**Two implementations behind that seam since #61, and the default is still in-process.**
+`fanout.py` is what runs unless `DELTA_BUS=redis` says otherwise; `redis_bus.py` is Redis Streams,
+publishing in pipelined batches and trimming by age on every batch write, with the same two
+policies kept honest across a broker that offers neither — lossless is a consumer group acked on
+receipt and replayed from a recorded id, drop-oldest is a reader outside every group that jumps to
+the newest entries and **counts what it skipped**. One contract suite runs against both. How it is
+built inside, and the numbers behind the batch interval, are [lld/redis-bus.md](lld/redis-bus.md);
+the names and the encoding on the wire are [cloud/nomenclature.md](cloud/nomenclature.md); the ack,
+trim and persistence rules are [cloud/redis-hosting.md](cloud/redis-hosting.md).
+
+**Still one process.** Nothing has moved out: this is the expand half of #57's split, and the
+services, the containers and the replaying store are I3 to I5.
 
 ### 2.5 The consumers
 
@@ -194,8 +207,9 @@ only, whether ETH changes it, and says nothing about event-loop contention under
 
 ## 6. Out of scope, and why
 
-- **A message broker.** Undecided. The interface exists so one can be slotted in; the in-process
-  fan-out stays. Crossing a process wall we do not have would buy nothing.
+- **A message broker other than Redis.** Kafka and the rest stay out; #57 decided Redis Streams
+  and #61 landed it behind the seam, off by default. What is still out of scope is *deploying* a
+  process wall — the services split is I3 to I5, not this document's §2.
 - **Order execution, positions, the sandbox** — the whiteboard's right half. The envelope is shaped
   so they can share it; nothing else here is designed for them.
 - **An NSE adapter** and the instrument fields it needs — currency, lot size, tick size,

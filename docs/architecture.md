@@ -182,12 +182,13 @@ itself racing one. The partial minute is a real observation and is written with 
 tick counts rather than discarded for tidiness. A failed final flush costs that minute and
 is logged, but must not take the shutdown with it and leave the HTTP client unclosed.
 
-Two switches matter:
+Three switches matter:
 
 | | |
 |---|---|
 | `DELTA_LIVE_FEED=0` | Serve REST and the websocket with no socket to Delta. The test suite sets it |
 | `LIVE_UNDERLYINGS` | `("BTC",)`. **ETH is served over REST but is not on the live feed and is not stored** |
+| `DELTA_BUS=redis` | Publish and consume over Redis Streams instead of the in-process fan-out. **Default is the fan-out**; a process with this set and no Redis exits at start-up. `docs/design/lld/redis-bus.md` has the rest of the variables |
 
 ---
 

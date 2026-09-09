@@ -109,6 +109,19 @@ lossless=True)` gives the queue `maxsize=0`, so this is unreachable under the mo
 construction; guarded anyway, because "impossible" describes the code as written today and
 not every later change to it.
 
+### `bus.selected`
+
+Which bus this process runs on, said once at start-up. Info, carrying the URL, the key
+prefix, the batch interval and the retention when it is Redis, and nothing at all when it
+is the in-process fan-out — the default says itself by being the default. The two are
+identical through the seam, so this line is the only moment anybody can tell them apart,
+and a process pointed at the wrong Redis is otherwise a silent misconfiguration.
+
+The same name carries the **resync**, at warning: a drop-oldest reader on Redis that found
+more than a queue's worth waiting, jumped to the newest entries, and is saying how many it
+skipped. Redis trims silently and this project does not — see
+`docs/design/lld/redis-bus.md`.
+
 ### `compute.recompute_set`
 
 The set the live pass solves changed: a pair joined the cache for the first time, or —

@@ -46,6 +46,12 @@ WS_CLIENT_DETACH = "ws.client_detach"
 #: the alert's own `severity` field, which is a property of the alert and not of how
 #: loudly the log should say so.
 ALERT = "alert"
+#: Which bus this process is running on, said once at start-up. Info: the fan-out and
+#: Redis Streams behave identically through the seam, so the one moment anybody can tell
+#: them apart is the line that says which was chosen — and a laptop pointed at the wrong
+#: Redis is otherwise a silent misconfiguration. Also carries the queue's own resync,
+#: which is a **warning**: a drop-oldest reader that jumped counts what it skipped here.
+BUS_SELECTED = "bus.selected"
 #: A catch-all for a defensive branch that should not run: an unexpected exception in a
 #: background task, a watchdog that died, a config value that could not be honoured.
 #: Always error or worse; never on a path this project expects to take.
@@ -64,6 +70,7 @@ ALL = frozenset(
         WS_CLIENT_ATTACH,
         WS_CLIENT_DETACH,
         ALERT,
+        BUS_SELECTED,
         ENGINE_ERROR,
     }
 )
