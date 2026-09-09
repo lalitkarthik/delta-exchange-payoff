@@ -186,12 +186,12 @@ cd engine && ./.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.mai
 
 ## Still open
 
-1. No day compacted from a full day of **real** flush files — 24 hourly ones before
-   [#16](https://github.com/lalitkarthik/delta-exchange-payoff/issues/16), 288 five-minute
-   ones after it. Bounded at ~1.5% of bytes; bounding is not doing.
-2. **The whole-day read against the five-minute layout is not measured.** `derived` in #16
-   at roughly 88 ms, up from a measured 6.8 ms. It needs a real day at the new cadence
-   before it is a number.
+1. ~~No day compacted from a full day of **real** flush files.~~ **Answered by #67**, on a
+   scratch copy of 2026-09-08 (BTC+ETH): 2,040 files → 8, 174.22 MiB → 144.81 MiB, 16.9%
+   smaller, 4.6 s. `measured`, `docs/design/research/0004-durable-store.md` §2.
+2. ~~The whole-day read against the five-minute layout is not measured.~~ **Answered by
+   #67**: 2026-09-08 BTC, four tables, 2,217,941 rows, warm cache, min of five — 206.4 ms
+   uncompacted, 82.0 ms compacted. `measured`, same file.
 3. No lock stops two compactors running at once. Documented, not defended against.
 4. The aggregator is not yet checked against a raw frame capture.
 5. `lts`'s meaning is unverified. It is stored and decides nothing.

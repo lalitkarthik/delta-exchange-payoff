@@ -135,6 +135,14 @@ a managed endpoint stays unmeasured until access. Standard: [redis-hosting.md](r
 evidence [../research/0002-redis-hosting.md](../research/0002-redis-hosting.md); record
 [../decisions/0002-redis-hosting.md](../decisions/0002-redis-hosting.md).
 
+**Durable store — fixed by #67.** Parquet in the hive layout, unchanged, on S3 Standard, one
+bucket per environment, compacted nightly — uncompacted the same reads cost 288× in requests.
+Timescale is not on RDS and Timestream for LiveAnalytics is closed to new customers; RDS
+Postgres becomes the named home for OMS state beside the bars, not instead of them. Standard:
+[durable-store.md](durable-store.md); evidence
+[../research/0004-durable-store.md](../research/0004-durable-store.md); record
+[../decisions/0004-durable-store.md](../decisions/0004-durable-store.md).
+
 **Controller.** Ours stays. A research ticket gap-analyses it against Nautilus Trader's
 live reconnect policy and re-measures `reconnect_after` over a longer window.
 
