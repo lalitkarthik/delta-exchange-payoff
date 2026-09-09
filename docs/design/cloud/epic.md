@@ -127,6 +127,14 @@ logs go to CloudWatch, alerts to Discord, one alarm on `stopped`. Environments a
 locally and `prod`, then `staging` last. Cloud tickets run after the local split and after
 access arrives.
 
+**Redis hosting — fixed by #69.** A container beside the services, one per environment, started
+with `--save "" --appendonly no --maxmemory 2gb --maxmemory-policy noeviction`. Named fallback
+ElastiCache for Valkey, one `cache.t4g.medium`, no replica, backups off. MemoryDB rejected because
+its durability cannot be turned off; serverless because it has no `maxmemory`. The network hop to
+a managed endpoint stays unmeasured until access. Standard: [redis-hosting.md](redis-hosting.md);
+evidence [../research/0002-redis-hosting.md](../research/0002-redis-hosting.md); record
+[../decisions/0002-redis-hosting.md](../decisions/0002-redis-hosting.md).
+
 **Controller.** Ours stays. A research ticket gap-analyses it against Nautilus Trader's
 live reconnect policy and re-measures `reconnect_after` over a longer window.
 
