@@ -143,6 +143,15 @@ Postgres becomes the named home for OMS state beside the bars, not instead of th
 [../research/0004-durable-store.md](../research/0004-durable-store.md); record
 [../decisions/0004-durable-store.md](../decisions/0004-durable-store.md).
 
+**Compute and region — fixed by #68.** ECS on EC2, one `m7g.large` in ap-south-1, `host` network
+mode, all six containers in one task, public subnet with no NAT gateway — inbound market data
+through a NAT would cost more than the compute. ECS on EC2 charges nothing over the instance, so
+it and Compose are one bill and ECS wins on operations. Fargate's mandatory `awsvpc` would break
+the loopback the batch interval was chosen on. Delta's endpoints are CloudFront served from
+Mumbai with the origin in Tokyo; Mumbai wins on cost and NSE. Standard: [compute.md](compute.md);
+evidence [../research/0005-compute-and-region.md](../research/0005-compute-and-region.md);
+record [../decisions/0005-compute-and-region.md](../decisions/0005-compute-and-region.md).
+
 **Controller.** Ours stays. A research ticket gap-analyses it against Nautilus Trader's
 live reconnect policy and re-measures `reconnect_after` over a longer window.
 
