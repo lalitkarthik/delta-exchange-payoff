@@ -34,6 +34,32 @@ the part of the distribution that was never in question.
 The hour says the worst gap is nearly three times the degraded bound. The ticket's
 insistence on an hour was right, and the 35-second run should not be quoted on its own.
 
+
+## The fourth run: the first with connection tagging
+
+#39 added tagging to the recorder and no run had used it. #59 took one, so the tool is
+proved before the long run it is for. **All `measured`, 2026-09-09, BTC, both channels.**
+
+| Run | Window | Symbols | Messages | Connections | **Max gap** | p99 | p95 | median |
+|---|---|---|---|---|---|---|---|---|
+| `20260909T125124Z` | 610 s | 502 | 657,163 | **1** | **0.724 s** | 0.011 | 0.002 | 0.0 |
+
+0 malformed, 0 empty opens, `last_error` null. **`spanning_gap_seconds.count` is 0** — one
+connection event in the whole window, the open at t=1.3 s, and no gap contained it. So
+every gap above is a quiet market on an unbroken socket, which is the distribution the two
+bounds are actually chosen against, and it is the first time that has been true of any run
+here. p99, p95 and the median are **identical to all three runs of 2026-09-07**: the "only
+the tail moves" finding survives a fourth window.
+
+## The fifth run: six hours, pending
+
+**Started 2026-09-09T13:03:04Z, PID 28432, due about 2026-09-09T19:03Z.** Detached, six
+hours, tagging on — the run #59's acceptance criteria ask for and the one that decides
+whether `reconnect_after` stays at 45 s. Console output goes to
+`design/research/0003-quiet-gap-6h.log` and the JSON lands in `tools/out/`, which is
+gitignored: **copy the row into this file when it finishes**, the way the four above were.
+Until then no six-hour number exists and none may be quoted.
+
 ## What it says about the two defaults
 
 - **`degraded_after` = 15 s fires, and roughly twice an hour.** Two gaps crossed it:
@@ -43,7 +69,10 @@ insistence on an hour was right, and the 35-second run should not be quoted on i
   fire on a quiet Sunday minute — did not happen in an hour of ordinary trading.
 - **`reconnect_after` = 45 s held by 0.215 s.** The largest gap in the hour sat just
   inside it. It was not crossed, but there is no margin here worth the name, and a second
-  hour should be taken before anyone treats 45 s as comfortable.
+  hour should be taken before anyone treats 45 s as comfortable. **The 610-second tagged
+  run says nothing against it and nothing for it**: 0.724 s is two orders of magnitude
+  under the bound, and a ten-minute window measures only the part of the distribution that
+  was never in question — which is this file's own oldest finding, applied to itself.
 - **The hour was not clean.** Three connections means two reconnects, and `last_error`
   records a local network abort (`WinError 1236`) — at least one interruption was this
   machine's rather than Delta's. **The tool does not tag a gap with the connection it
@@ -59,9 +88,9 @@ insistence on an hour was right, and the 35-second run should not be quoted on i
 - **A quiet market.** All three runs are an active BTC session. The case the bound is most
   likely to misfire on — a weekend, an overnight lull, a thin ETH chain — is untested.
 - **ETH.** The tool subscribes BTC only.
-- **Whether a gap spanned a reconnect.** Worth adding to the recorder before the next hour:
-  it is the difference between "the venue went quiet" and "our socket died", and the
-  controller treats those very differently.
+- **Whether a gap spanned a reconnect.** ~~Worth adding to the recorder before the next
+  hour~~ — **done**, and first used in the 610-second run above. The 44.785 s maximum of
+  2026-09-07 predates it and stays unattributable for good.
 
 ## Reproducing
 

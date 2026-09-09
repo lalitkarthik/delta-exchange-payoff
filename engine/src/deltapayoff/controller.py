@@ -762,6 +762,30 @@ class ConnectionController:
             # is a badge and a heartbeat, and an alert on every quiet minute is exactly
             # the flood an alert exists to stand out from.
             self._alert(ALERT_CONNECTION_SILENT, detail)
+            # **And the socket comes down, which is #59's one adoption from Nautilus
+            # Trader.** Until this line the watchdog marked the state, raised the alert
+            # and stopped: nothing was cut and nothing was redialled, so a socket the
+            # venue never closed and merely stopped speaking on sat in `reconnecting`
+            # with a red badge and no data until the venue finally ended it or a person
+            # sent `POST /feed/{adapter}/reconnect`. At 02:00 there is no person, and a
+            # detected silence nobody acts on is the same missing bars as an undetected
+            # one. `docs/design/lld/reconnect.md` §4 predicted this gap and #41 built the
+            # lever — `_cut` cancels the stream, which unwinds the socket's `async with`
+            # — and nothing pulled it.
+            #
+            # **The rule §4 protects is untouched.** It refuses a redial decided by
+            # `state is RECONNECTING`, because that would dial a second socket over one
+            # that is still open. This does not redial on state: it *ends* the socket
+            # first and reports the drop, exactly as an operator's `reconnect` does, so
+            # by the time the dial loop reads `_socket_closed` the old socket is really
+            # gone. The two calls are `reconnect()`'s own body, in its order.
+            #
+            # It costs one of the budget, as any drop does, and the first frame off the
+            # replacement restores it in full. A socket that reopens and stays silent
+            # therefore burns the budget over `reconnect_budget` silences and stops out
+            # loud, rather than retrying an unreachable venue forever.
+            self._cut(REASON_SILENT, detail)
+            self.connection_closed(detail)
         elif age >= self.degraded_after and self._state is State.CONNECTED:
             self.transition(State.DEGRADED, REASON_STALE, f"{age:.1f}s silent")
 

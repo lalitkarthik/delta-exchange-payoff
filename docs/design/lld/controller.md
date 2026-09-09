@@ -4,9 +4,9 @@
 [../hld.md](../hld.md); what crosses out of one is [../events.md](../events.md), the
 authority on the event names and fields. Numbers carry the run that produced them.
 
-**Landed by #38, completed by #39, commanded by #41.** This is the state machine,
-staleness and the events they emit. Three designs were split out of this one at its
-200-line bound and are part of it:
+**Landed by #38, completed by #39, commanded by #41, and its policy checked against
+Nautilus Trader by #59.** This is the state machine, staleness and the events they emit.
+Three designs were split out of this one at its 200-line bound and are part of it:
 
 - **[connection-signal.md](connection-signal.md)** — what an adapter reports about its
   socket, and the register it reports through (#38).
@@ -64,14 +64,11 @@ reconnecting, and cannot reach `connected` without passing through `connecting`.
 | `reconnecting` | `stopped` | `stopped` | **The lifetime budget is spent** — [reconnect.md](reconnect.md) §3 |
 
 **Two readings of the table this design fixed, and both are choices a later reader may
-disagree with.**
-
-- **`any` excludes `stopped`.** A stopped connection is not trying, and the table's own
-  resume row already takes it to `connecting`; a `stopped -> reconnecting` move would
-  contradict it.
-- **`any` excludes a state moving to itself.** A `feed.connection` whose `from_state`
-  equals its `to_state` describes no change, and #40 would put it on the wire as a badge
-  that did not move.
+disagree with.** **`any` excludes `stopped`** — a stopped connection is not trying, and the
+table's own resume row already takes it to `connecting`, so a `stopped -> reconnecting`
+move would contradict it. **`any` excludes a state moving to itself** — a `feed.connection`
+whose `from_state` equals its `to_state` describes no change, and #40 would put it on the
+wire as a badge that did not move.
 
 **One trigger was added, not one row.** `connecting -> connected` is in `hld.md`, reached
 by an open; the controller also reaches it on a message, because a frame is stronger
@@ -83,29 +80,30 @@ reported its opens late would otherwise sit in `connecting` while data flowed. T
 
 | Number | Value | Tag | Where from |
 |---|---|---|---|
-| Longest quiet gap, live BTC chain, both channels, **one hour** | **44.785 s** | `measured` | `tools/measure_quiet_gap.py`, run `20260907T135951Z`, 3610 s, 2026-09-07. Two shorter runs the same day: 3.355 s over 550 s, 0.321 s over 35 s. [../quiet-gap.md](../quiet-gap.md) |
+| Longest quiet gap, live BTC chain, both channels, **one hour**, untagged | **44.785 s** | `measured` | `tools/measure_quiet_gap.py`, run `20260907T135951Z`, 3610 s, 2026-09-07. Two shorter runs the same day: 3.355 s over 550 s, 0.321 s over 35 s. [../quiet-gap.md](../quiet-gap.md) |
+| Longest quiet gap, **tagged**, unbroken connection, 610 s | **0.724 s** | `measured` | Run `20260909T125124Z`, #59. One connection, no gap spanned a connection event — the first run of any length that can say so |
+| The same over **six hours** | **pending**, started 2026-09-09T13:03:04Z, PID 28432 | — | #59's detached run. `reconnect_after` stays `assumed` until it lands |
 | `degraded_after` | 15 s | `assumed`, and now supported | Three ticker refreshes at `measured` 5001 ms (`feed.py`). The hour crossed it twice, both times on an interruption rather than a quiet market — which is what the badge is for |
-| `reconnect_after` | 45 s | `assumed` | Three degraded intervals, under Delta's documented 60 s idle disconnect so we notice before the venue drops us. **The hour's worst gap missed it by 0.215 s** |
+| `reconnect_after` | 45 s | `assumed` | Three degraded intervals, under Delta's documented 60 s idle disconnect so we notice before the venue drops us, and above Delta's own 35 s heartbeat window. **The untagged hour's worst gap missed it by 0.215 s.** Confirmed unchanged by #59, on documents rather than on a measurement |
 | `heartbeat_every` | 10 s | `assumed` | 8,640 heartbeats per adapter per day — fast enough for a badge, slow enough not to be a flood |
 | `poll_seconds` | 1 s | `assumed` | The staleness timer's resolution; a 15 s bound observed to the nearest second |
 
 ### What the hour showed
 
-**One hour has been measured, not two** — this heading claimed two before either existed.
-#39 added connection tagging to `tools/measure_quiet_gap.py`, so a gap spanning a drop can
-now be told from a quiet market, but **no run has been taken with it yet**: the hour below
-predates it. #39 also found the tools stopped recording at the first drop while still
-reporting a full window, so any run before that fix is truncated and must not be quoted.
-Full record: [../quiet-gap.md](../quiet-gap.md). Two findings the bounds rest on:
+**The hour below is untagged and stays that way.** #39 added connection tagging so a gap
+spanning a drop could be told from a quiet market, and #59 was the first to run it — 610 s,
+one connection, no gap spanning anything. #39 also found the tools stopped recording at the
+first drop while reporting a full window, so any run before that fix is truncated and must
+not be quoted. Full record: [../quiet-gap.md](../quiet-gap.md). Two findings the bounds
+rest on:
 
 **Only the tail moves.** p99 (0.011 s), p95 (0.002 s) and the median (0.0 s) are identical
-across 35 seconds, 550 seconds and an hour; the maximum goes 0.321 → 3.355 → **44.785 s**.
+across 35 s, 550 s, an hour, and #59's 610 s; the maximum goes 0.321 → 3.355 → **44.785 s**.
 The quiet gap is heavy-tailed, so a short window measures only the part of the distribution
-never in question — 35 seconds would have said 15 s is 47x the worst gap, confidently wrong.
-
-**The flap this design's review fixed came 0.215 s from production.** The old code demoted a
-reopened socket once the pre-drop age passed `reconnect_after`, and that age reached
-44.785 s in the first hour.
+never in question — 35 seconds would have said 15 s is 47x the worst gap, confidently wrong,
+and 610 seconds would have said the same thing again. **The flap this design's review fixed
+came 0.215 s from production**: the old code demoted a reopened socket once the pre-drop age
+passed `reconnect_after`, and that age reached 44.785 s in the first hour.
 
 ## 5. The connection signal
 
@@ -173,6 +171,7 @@ the log line, where a person reads them.
 | The adapter's `stream` returns | One connection has ended. `run()` redials it **only if the adapter reported its socket gone** — [reconnect.md](reconnect.md) §4 — and otherwise leaves the connection `stopped`. A `pause` is the exception: the loop parks instead of returning, so a `resume` still has an adapter to dial — [commands.md](commands.md) §4. |
 | The reconnect budget is spent | `-> stopped`, one `alert` at error, one error log record, and the adapter is stopped with it. [reconnect.md](reconnect.md) §3. |
 | A message while `reconnecting` | Routed through `connecting` in two transitions, so the table is honoured and the machine cannot stick. |
+| **A socket the venue never closed and stopped speaking on** | Since #59 the watchdog **ends it itself**: crossing `reconnect_after` cuts the stream and reports the drop, which is `reconnect()`'s own body, and the ordinary loop backs off and dials. Before that it marked the state, alerted and waited for the venue or a person. It costs one of the budget, as any drop does. [reconnect.md](reconnect.md) §4, [../decisions/0003-controller-policy.md](../decisions/0003-controller-policy.md). |
 | A resume after a long pause | `start()` forgets the last-message age. Time spent stopped is our silence, not the venue's, and a resumed connection would otherwise arrive already past the reconnect bound. |
 | A reconnect after an outage | **Where the line falls, corrected by review.** "A reconnect keeps its age" is right *while* it is reconnecting — that gap was the venue's and it is what the bound exists to catch — and wrong the instant the replay completes. `connection_opened()` records `_opened_at`, and staleness is measured from the **later** of that and the last message, so the replayed socket gets the same grace a fresh start gets. Without it every outage longer than `reconnect_after` ended in a flap: the reopened socket was demoted on the very next poll for a gap belonging to the socket before it, at three spurious `feed.connection` events a second, on the badge #40 draws, during the incident an operator is watching. The heartbeat's `last_message_age_seconds` is untouched — that one is the venue's own silence and stays true across the reconnect. |
 | A staleness poll raises | Logged with its traceback and the watchdog keeps ticking; after `POLL_FAILURES_BEFORE_ALERT` consecutive failures, an `alert`. `poll()` reaches `_publish`, which is the bus and, from #39, a consumer's code; letting that out killed the timer task, and `run()`'s `gather(..., return_exceptions=True)` retrieved the exception so not even asyncio's unretrieved-exception warning fired. The connection then sat in `connected` through any silence at all — this module's own thesis, reintroduced one layer up. `run()` now reads the gather result rather than discarding it. |

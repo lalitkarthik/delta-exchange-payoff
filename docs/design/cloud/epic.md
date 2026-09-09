@@ -152,8 +152,15 @@ Mumbai with the origin in Tokyo; Mumbai wins on cost and NSE. Standard: [compute
 evidence [../research/0005-compute-and-region.md](../research/0005-compute-and-region.md);
 record [../decisions/0005-compute-and-region.md](../decisions/0005-compute-and-region.md).
 
-**Controller.** Ours stays. A research ticket gap-analyses it against Nautilus Trader's
-live reconnect policy and re-measures `reconnect_after` over a longer window.
+**Controller.** Ours stays — **confirmed by #59**, which gap-analysed it against Nautilus
+Trader's live reconnect policy and adopted exactly one rule: silence past `reconnect_after`
+now cuts the socket and redials rather than waiting for the venue or an operator. Jitter,
+a windowed budget, a budget restored on uptime and a second liveness clock were all
+rejected with reasons. The rules are [controller-policies.md](controller-policies.md); the
+evidence is
+[../research/0003-controller-against-nautilus.md](../research/0003-controller-against-nautilus.md)
+and the record [../decisions/0003-controller-policy.md](../decisions/0003-controller-policy.md).
+`reconnect_after` stays 45 s; the six-hour tagged re-measurement is running, not finished.
 
 **Documents.** This epic is the plan. The senior's two documents, the message bus and the
 data feed engine cloud architectures, are deliverables assembled from the research

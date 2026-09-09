@@ -331,13 +331,40 @@ class ScriptClock:
                 self.controller.poll(self.now)
 
 
-async def never(_seconds: float) -> None:
-    """A timer that never fires.
+#: `run_script`'s backoff, distinct from its poll cadence so `ScriptSleep` can tell the
+#: two apart. Nothing asserts on the number; only that it is not `poll_seconds`.
+SCRIPT_BACKOFF = 7.0
 
-    The script's clock is the timer in these tests; the controller's own watchdog must
-    not also advance it, or two timers would race over one fake clock.
+
+class ScriptSleep:
+    """The controller's `sleep` under a `ScriptClock`. Two waits, two answers.
+
+    **The poll timer parks.** The script's own clock is the timer in these tests, and
+    the controller's watchdog must not also advance it or two timers race over one fake
+    clock. Parking rather than returning is not a detail: a `sleep` that returns without
+    awaiting anything never yields to the loop, so the timer spins and nothing else
+    runs.
+
+    **The backoff ends the run**, and that is #59's addition. The staleness watchdog now
+    cuts the socket when it calls a connection silent, so a script with a long silence
+    reaches the dial loop's backoff — which the old parking timer would have sat in
+    forever, turning a changed rule into a hung suite rather than a failed assertion.
+    The wait is recorded and the controller stopped, so exactly one redial is
+    observable and the fake does not walk its whole script a second time.
     """
-    await asyncio.Event().wait()
+
+    def __init__(self, poll_seconds: float, backoff: float) -> None:
+        self.poll_seconds = poll_seconds
+        self.backoff = backoff
+        self.backoffs: list[float] = []
+        self.controller: ConnectionController | None = None
+
+    async def __call__(self, seconds: float) -> None:
+        if seconds != self.backoff:
+            await asyncio.Event().wait()
+        self.backoffs.append(seconds)
+        assert self.controller is not None
+        self.controller.stop()
 
 
 def run_script(script, **kwargs):
@@ -348,15 +375,18 @@ def run_script(script, **kwargs):
     instrument = instrument_from_symbol(SYMBOL)
     assert instrument is not None
     adapter.subscribe([instrument])
+    kwargs.setdefault("retry_delay", SCRIPT_BACKOFF)
+    sleep = ScriptSleep(kwargs.get("poll_seconds", 1.0), kwargs["retry_delay"])
     controller = ConnectionController(
         adapter,
         lambda event: published.append((clock.now, event)),
         clock=clock.read,
-        sleep=never,
+        sleep=sleep,
         degraded_after=15.0,
         reconnect_after=45.0,
         **kwargs,
     )
+    sleep.controller = controller
     clock.controller = controller
     asyncio.run(controller.run())
     return controller, published
@@ -417,18 +447,6 @@ def test_frames_then_close_reconnects_with_reason_closed() -> None:
         (0.0, "connected", "stopped", "stopped"),
     ]
     assert controller.transitions == 6
-
-
-def test_silence_past_the_longer_bound_reconnects() -> None:
-    _controller, published = run_script([Frames("ob_l2", [BOOK_FRAME]), Silence(60.0)])
-
-    assert moves(published) == [
-        (0.0, None, "connecting", "start"),
-        (0.0, "connecting", "connected", "open"),
-        (15.0, "connected", "degraded", "stale"),
-        (45.0, "degraded", "reconnecting", "silent"),
-        (60.0, "reconnecting", "stopped", "stopped"),
-    ]
 
 
 def test_a_reconnect_that_replays_nothing_is_visible() -> None:
@@ -779,6 +797,13 @@ def test_a_raising_consumer_does_not_kill_the_staleness_watchdog() -> None:
         reconnect_after=0.2,
         heartbeat_every=0.05,
         poll_seconds=0.02,
+        # **A budget of nought, since #59, and it is what keeps this test bounded.** The
+        # watchdog now cuts the socket when it calls a connection silent, and the fake
+        # walks its whole script again on every redial — so with a budget the run would
+        # loop through the backoff ladder rather than ending. Nought means the first
+        # drop is the one that stops, which is the same five moves as before and no
+        # wall clock spent proving a rule this test is not about.
+        reconnect_budget=0,
     )
 
     asyncio.run(controller.run())
@@ -1126,37 +1151,57 @@ def test_the_attempt_is_announced_when_it_begins_not_when_it_succeeds() -> None:
     assert adapter.feed.connections == 1, "the second dial was refused, as scripted"
 
 
-def test_a_silence_the_venue_never_closed_is_not_redialled() -> None:
-    """**`reconnecting` is not the same question as "the socket is gone".**
+def test_a_silence_the_venue_never_closed_is_cut_and_redialled() -> None:
+    """**#59's adoption from Nautilus Trader: the watchdog pulls the lever itself.**
 
-    The staleness watchdog reaches `reconnecting` over a connection the venue never
-    closed and merely stopped speaking on. Redialling that would dial a second socket
-    over one that is still open, so the controller backs off on the **adapter's last
-    word about its socket**, not on its own state.
+    Silence past `reconnect_after` used to mark the state, raise the alert and stop
+    there. Nothing came down and nothing was redialled, because a socket the venue never
+    closed is still open and dialling a second one over it is the failure
+    `reconnect.md` §4 refused. So the connection sat in `reconnecting` — badge red,
+    alert raised, no data — until the venue finally ended the socket or a person sent
+    `POST /feed/DELTA/reconnect`. At 02:00 there is no person.
 
-    The backoff delay is a distinctive number here, and the injected sleep records what
-    it was asked for, so a redial is an assertion that fails rather than a hang.
+    Nautilus's read task breaks its own connection on the idle timeout and its
+    controller redials
+    (`crates/network/src/websocket/client.rs`, `idle_timeout_exceeded`), and Delta's own
+    documentation says the client "should exit the existing connection and try to
+    reconnect". #41 already built the lever — `_cut` cancels the stream, which unwinds
+    the socket's `async with` — and nothing pulled it.
+
+    So the watchdog now does exactly what an operator's `reconnect` does: cut, report
+    the drop, back off, dial. The invariant `reconnect.md` §4 protects is untouched,
+    because the redial still turns on the adapter's own signal — the socket really is
+    gone by the time the loop reads it, and **we** are the ones who ended it, which is
+    what `adapter.closes == 0` below says.
+
+    **Supersedes two tests.** `test_silence_past_the_longer_bound_reconnects` asserted
+    the four moves below and then that the run simply ended, and
+    `test_a_silence_the_venue_never_closed_is_not_redialled` asserted that no backoff
+    ran at all — the rule this ticket reverses. Both facts are asserted here, the second
+    inverted.
     """
-    BACKOFF = 7.0
     clock = ScriptClock()
-    published: list = []
-
-    async def sleep(seconds: float) -> None:
-        # **It raises rather than recording.** Removing the guard does not merely add one
-        # redial: the fake walks its script again, and because a scripted silence yields
-        # to no event loop the whole thing spins without ever reaching an assertion — so
-        # a test that only checked afterwards would hang instead of failing, and a test
-        # that cannot fail is worse than no test. Raising here fails on the first redial.
-        if seconds == BACKOFF:  # the backoff, and nothing else uses this number
-            raise AssertionError("it backed off over a socket the venue never closed")
-        await asyncio.Event().wait()  # the poll timer; the script clock drives polls
-
+    published: list[tuple[float, Any]] = []
     adapter = ScriptedAdapter(
         script=[Frames("ob_l2", [BOOK_FRAME]), Silence(60.0)], sleep=clock.sleep
     )
     instrument = instrument_from_symbol(SYMBOL)
     assert instrument is not None
     adapter.subscribe([instrument])
+    BACKOFF = 7.0  # distinctive, so the backoff is not the poll timer
+    backoffs: list[float] = []
+    holder: list[ConnectionController] = []
+
+    async def sleep(seconds: float) -> None:
+        if seconds != BACKOFF:
+            # The poll timer. The script's own clock drives polls here, so this one must
+            # park rather than return, or it spins without yielding.
+            await asyncio.Event().wait()
+        # The backoff, recorded and then ended: the script would otherwise restart from
+        # the top and this test would measure the fake rather than the controller.
+        backoffs.append(seconds)
+        holder[0].stop()
+
     controller = ConnectionController(
         adapter,
         lambda event: published.append((clock.now, event)),
@@ -1165,13 +1210,23 @@ def test_a_silence_the_venue_never_closed_is_not_redialled() -> None:
         degraded_after=15.0,
         reconnect_after=45.0,
         retry_delay=BACKOFF,
+        heartbeat_every=1_000.0,
     )
+    holder.append(controller)
     clock.controller = controller
 
     asyncio.run(controller.run())
 
-    assert adapter.connections == 1
-    assert moves(published)[-1] == (60.0, "reconnecting", "stopped", "stopped")
+    assert backoffs == [BACKOFF], "the silence produced no redial"
+    assert adapter.closes == 0, "the venue never closed it — the watchdog did"
+    assert controller.reconnects == 1, "a cut we made is still a drop and still counts"
+    assert controller.budget_remaining == 9
+    assert moves(published)[:4] == [
+        (0.0, None, "connecting", "start"),
+        (0.0, "connecting", "connected", "open"),
+        (15.0, "connected", "degraded", "stale"),
+        (45.0, "degraded", "reconnecting", "silent"),
+    ]
 
 
 def test_a_socket_that_dies_after_going_silent_still_spends_the_budget() -> None:
@@ -1183,6 +1238,13 @@ def test_a_socket_that_dies_after_going_silent_still_spends_the_budget() -> None
     not be spent at all. That is an unbounded reconnect loop in exactly the case the
     budget exists for: a connection that goes quiet and dies, over and over, spending a
     venue's connection allowance with a full budget on the books the whole time.
+
+    **Two drops here since #59, not one, and the arithmetic is the point.** The silence
+    itself now cuts the socket and reports that drop, so the poll below spends one; the
+    venue's own close arriving afterwards at a machine already in `reconnecting` spends
+    the second. In production a cut stream reports no close and the second never comes —
+    this drives it by hand because the rule is what stops the loop being unbounded, and
+    a rule only one code path can reach is a rule one refactor from being lost.
     """
     clock = FakeClock()
     published: list = []
@@ -1202,11 +1264,12 @@ def test_a_socket_that_dies_after_going_silent_still_spends_the_budget() -> None
     clock.now = 60.0
     controller.poll()
     assert controller.state is ConnectionState.RECONNECTING, "the silence, not the close"
+    assert controller.reconnects == 1, "the watchdog's own cut is a drop"
 
     controller.connection_closed("1006")
 
-    assert controller.reconnects == 1
-    assert controller.budget_remaining == 1, "the drop was free"
+    assert controller.reconnects == 2
+    assert controller.budget_remaining == 0, "the second drop was free"
 
 
 def test_an_announced_redial_is_not_immediately_called_silent() -> None:
@@ -1417,7 +1480,10 @@ def test_every_alert_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
     run_script([Frames("ob_l2", [BOOK_FRAME]), Silence(60.0)])
 
     records = [r for r in caplog.records if r.name == "deltapayoff.controller"]
-    alerts = [r for r in records if r.event == log_events.ALERT]
+    # `getattr`, because not every record here is a structured one: `_cut` writes a
+    # plain info line, and since #59 the staleness watchdog cuts the socket, so that
+    # line is now on this path. A bare `r.event` raised `AttributeError` on it.
+    alerts = [r for r in records if getattr(r, "event", None) == log_events.ALERT]
     assert len(alerts) == 1, [r.getMessage() for r in records]
     assert alerts[0].levelno == logging.WARNING
     assert alerts[0].code == "connection_silent"

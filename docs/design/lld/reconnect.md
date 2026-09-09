@@ -29,7 +29,7 @@ whose central transition is made by code it cannot see.
 |---|---|---|---|
 | `retry_delay` | 1.0 s | `assumed` | The first wait after a drop. Was `delta_socket.RETRY_DELAY_SECONDS` |
 | ceiling on the wait | 60.0 s | `assumed` | Doubling stops here. One dial a minute through a venue outage, and back within a minute of its return. Was `delta_socket.MAX_RETRY_DELAY_SECONDS` |
-| `reconnect_budget` | 10 | `assumed` | The lifetime budget. Was `delta_socket.MAX_RETRIES` |
+| `reconnect_budget` | 10 | `assumed` | The budget. Was `delta_socket.MAX_RETRIES`. Called *lifetime* until #59: `message_arrived` sets the spend back to zero, so it has always counted **consecutive** failures |
 | Attempts before the budget existed | **21 in 0.3 s** with a budget of 3 | `measured`, 2026-09 | The bug this budget exists against, recorded in `test_feed.py` |
 | Delta's connection allowance | 150 per 5 minutes | `measured`, `tools/probe_api.py` | Why an unbounded retry is not merely untidy |
 
@@ -112,6 +112,32 @@ socket on the way out — so the protocol stays at eight members and every adapt
 behaviour rather than the ones that remembered a new method. The `reconnect` command is
 that cut plus the controller reporting the drop itself, because a cancelled stream reports
 no close. [commands.md](commands.md) §4 is the design.
+
+**And closed the rest of the way by #59: nothing had to pull the lever.** #41 gave an
+operator a cut and left the automatic case where it was — a connection the watchdog called
+`reconnecting` still sat there until the venue ended it or a person sent
+`POST /feed/{adapter}/reconnect`, and at 02:00 there is no person. Since #59 the staleness
+watchdog does it itself: crossing `reconnect_after` cuts the stream and reports the drop,
+which is `reconnect()`'s own body in its own order, and the ordinary loop below backs off
+and dials. Nautilus Trader's read task breaks its own connection on the same condition
+(`crates/network/src/websocket/client.rs`, `idle_timeout_exceeded`) and Delta's own
+documentation tells clients to "exit the existing connection and try to reconnect";
+[../research/0003-controller-against-nautilus.md](../research/0003-controller-against-nautilus.md)
+is the comparison and
+[../decisions/0003-controller-policy.md](../decisions/0003-controller-policy.md) the
+decision.
+
+**The rule in the table above is untouched, and that is the whole reason this is safe.**
+It refuses a redial decided by `state is RECONNECTING`, because the watchdog reaches that
+state over a socket the venue never closed. This does not decide on state: it **ends** the
+socket first and reports the drop, so the adapter's last word really is `CLOSED` by the
+time the loop reads it. It spends one of the budget, as any drop does, and the first frame
+off the replacement restores it in full — so a socket that reopens and stays silent burns
+the budget over `reconnect_budget` silences and stops out loud rather than dialling
+forever. Red-green as `test_a_silence_the_venue_never_closed_is_cut_and_redialled`, which
+supersedes `test_silence_past_the_longer_bound_reconnects` and
+`test_a_silence_the_venue_never_closed_is_not_redialled` — the second of those pinned the
+rule this reverses, and it is named here rather than deleted quietly.
 
 ## 5. Announcing the attempt, not its success
 
