@@ -3,7 +3,7 @@
 `docs/design/cloud/nomenclature.md` is the authority and this file implements it, so
 every rule below is a citation rather than an invention:
 
-* **§1 the grammar** — `{env}:{event_type}:{VENUE}[:{UNDERLYING}]`, fourteen keys for one
+* **§1 the grammar** — `{event_type}:{VENUE}[:{UNDERLYING}]`, fourteen keys for one
   venue and two underlyings, and **no discovery**: `stream_names` builds the list from
   configuration because `XREAD` takes an explicit key list and has no wildcard, so a
   stream discovered late is a stream that was silently not read. That is #51 restaged.
@@ -27,7 +27,7 @@ the event's `adapter`. `md.index_quote` and `computed.chain` carry neither — t
 names an underlying and the second an expiry — so the venue comes from the publisher's
 **configuration**, as the `venue` argument. `source` is deliberately not consulted: it
 names the component that built the event, so `computed.chain` would publish to
-`dev:computed.chain:CHAIN-CACHE:BTC` and a reader taking the configured list would never
+`computed.chain:CHAIN-CACHE:BTC` and a reader taking the configured list would never
 see it. A publisher configured with no venue at all is refused loudly rather than allowed
 to invent one, because a mis-keyed stream is a stream nobody reads and nothing says so.
 """
@@ -58,7 +58,7 @@ ENVELOPE_FIELDS = (
     "venue_symbol",
 )
 
-#: Event types whose stream carries an underlying, i.e. `{env}:{type}:{VENUE}:{UNDER}`.
+#: Event types whose stream carries an underlying, i.e. `{type}:{VENUE}:{UNDER}`.
 #: The hot ones plus the two that name an underlying in their payload.
 WITH_UNDERLYING = (
     "md.option_quote",
@@ -73,9 +73,10 @@ WITH_UNDERLYING = (
 #: never read an NSE command.
 WITH_VENUE_ONLY = ("feed.connection", "heartbeat", "control.command")
 
-#: The one type that is per environment. `adapter` is nullable and no reader wants a
-#: subset: the logger and the Discord consumer take all of them.
-ENVIRONMENT_ONLY = ("alert",)
+#: The one type whose stream carries neither a venue nor an underlying. `adapter` is
+#: nullable and no reader wants a subset: the logger and the Discord consumer take all
+#: of them.
+UNSCOPED = ("alert",)
 
 
 class StreamMismatch(ValueError):
@@ -95,29 +96,28 @@ class StreamMismatch(ValueError):
 
 
 def stream_type(stream: str) -> str:
-    """The `{event_type}` section of a key. The second, because `{env}` is the first."""
-    parts = stream.split(":")
-    return parts[1] if len(parts) > 1 else ""
+    """The `{event_type}` section of a key: the first colon-separated section."""
+    return stream.split(":")[0]
 
 
-def stream_name(event: Event, *, env: str, venue: str = "") -> str:
+def stream_name(event: Event, *, venue: str = "") -> str:
     """The one key `event` belongs on.
 
     `venue` is the configured venue, used by the two events that name neither an
     instrument nor an adapter; see this module's docstring for why it is a parameter and
     not a constant, and why `source` is not consulted in its place.
     """
-    if event.type in ENVIRONMENT_ONLY:
-        return f"{env}:{event.type}"
+    if event.type in UNSCOPED:
+        return event.type
 
     resolved = _venue_of(event, venue)
     if event.type in WITH_VENUE_ONLY:
-        return f"{env}:{event.type}:{resolved}"
-    return f"{env}:{event.type}:{resolved}:{_underlying_of(event)}"
+        return f"{event.type}:{resolved}"
+    return f"{event.type}:{resolved}:{_underlying_of(event)}"
 
 
 def stream_names(
-    *, env: str, venues: Iterable[str], underlyings: Iterable[str]
+    *, venues: Iterable[str], underlyings: Iterable[str]
 ) -> tuple[str, ...]:
     """Every key this configuration can produce or read. **Sorted, and never scanned.**
 
@@ -125,13 +125,13 @@ def stream_names(
     underlyings in it are the same configured set the feed is given, which is what makes
     "what does this service read" one answer rather than two.
     """
-    names: list[str] = [f"{env}:{event_type}" for event_type in ENVIRONMENT_ONLY]
+    names: list[str] = list(UNSCOPED)
     for venue in venues:
         upper = venue.upper()
-        names += [f"{env}:{t}:{upper}" for t in WITH_VENUE_ONLY]
+        names += [f"{t}:{upper}" for t in WITH_VENUE_ONLY]
         for underlying in underlyings:
             names += [
-                f"{env}:{t}:{upper}:{underlying.upper()}" for t in WITH_UNDERLYING
+                f"{t}:{upper}:{underlying.upper()}" for t in WITH_UNDERLYING
             ]
     return tuple(sorted(names))
 

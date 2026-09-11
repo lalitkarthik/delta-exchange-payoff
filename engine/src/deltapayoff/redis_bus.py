@@ -63,7 +63,6 @@ REDIS_BUS = "redis"
 FANOUT_BUS = "fanout"
 
 REDIS_URL_ENV = "DELTA_REDIS_URL"
-BUS_PREFIX_ENV = "DELTA_BUS_ENV"
 BATCH_MS_ENV = "DELTA_BUS_BATCH_MS"
 RETENTION_ENV = "DELTA_BUS_RETENTION_SECONDS"
 INSTANCE_ENV = "DELTA_BUS_INSTANCE"
@@ -114,10 +113,6 @@ class BusConfig:
     """Everything about the bus that is a deployment decision rather than a code one."""
 
     url: str = "redis://127.0.0.1:6379"
-    #: The mandatory first section of every key. `dev` on a laptop, `prod` on AWS, and
-    #: never absent — nomenclature §4. Separate instances are the real separation; the
-    #: prefix is what makes a mistaken share harmless rather than what prevents it.
-    env: str = "dev"
     #: The venue this process publishes for. Answers `{VENUE}` for the two events that
     #: name neither an instrument nor an adapter — see `events/redis_wire.py`.
     venue: str = "DELTA"
@@ -147,7 +142,6 @@ class BusConfig:
         """Read at start-up rather than at import, so the bus is a deployment decision."""
         return cls(
             url=os.environ.get(REDIS_URL_ENV, cls.url),
-            env=os.environ.get(BUS_PREFIX_ENV, cls.env),
             underlyings=tuple(underlyings) if underlyings else cls.underlyings,
             batch_ms=int(os.environ.get(BATCH_MS_ENV, cls.batch_ms)),
             retention_seconds=float(
@@ -171,7 +165,7 @@ class BusConfig:
 
     def streams(self) -> tuple[str, ...]:
         return stream_names(
-            env=self.env, venues=(self.venue,), underlyings=self.underlyings
+            venues=(self.venue,), underlyings=self.underlyings
         )
 
 
@@ -293,7 +287,7 @@ class RedisBus:
         """
         self.published += 1
         try:
-            key = stream_name(record, env=self.config.env, venue=self.config.venue)
+            key = stream_name(record, venue=self.config.venue)
             fields = encode(record)
         except Exception:
             self._unroutable += 1

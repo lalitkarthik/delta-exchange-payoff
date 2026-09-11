@@ -15,12 +15,11 @@ Landed by #58 as a standard, not as code. Nothing here is built yet.
 ## 1. Stream names
 
 ```
-{env}:{event_type}:{VENUE}[:{UNDERLYING}]
+{event_type}:{VENUE}[:{UNDERLYING}]
 ```
 
 | Part | Drawn from | Spelling |
 |---|---|---|
-| `{env}` | the deployment | lower case, one of `dev`, `prod`, later `staging`. Mandatory; there is no unprefixed key |
 | `{event_type}` | the event's own `type` field, verbatim | exactly as `docs/design/events.md` spells it, dots included |
 | `{VENUE}` | `Instrument.venue`, or the event's `adapter` | upper case — `DELTA`, later `NSE` |
 | `{UNDERLYING}` | `Instrument.underlying`, or the payload's `underlying` | upper case — `BTC`, `ETH` |
@@ -28,36 +27,35 @@ Landed by #58 as a standard, not as code. Nothing here is built yet.
 **`:` separates sections and `.` lives inside one.** That is Redis's own convention: "there is a
 convention for using the colon ':' character to split keys into sections", and "Dots or dashes are
 often used for multi-word fields"
-([Keys and values](https://redis.io/docs/latest/develop/using-commands/keyspace/)). So the
-environment is a section of its own — `prod:md.option_quote:DELTA:BTC`, not
-`prod.md.option_quote:DELTA:BTC`, which is #57's working proposal with its first separator
-corrected.
+([Keys and values](https://redis.io/docs/latest/develop/using-commands/keyspace/)). The event type
+is the first section — `md.option_quote:DELTA:BTC`, with the dots in `md.option_quote` kept
+inside that section.
 
 ### The nine
 
 | Event | Stream | Why that arity |
 |---|---|---|
-| `md.option_quote` | `{env}:md.option_quote:{VENUE}:{UNDERLYING}` | the hot one; a reader wanting BTC must not parse ETH |
-| `md.option_reference` | `{env}:md.option_reference:{VENUE}:{UNDERLYING}` | same |
-| `md.index_quote` | `{env}:md.index_quote:{VENUE}:{UNDERLYING}` | `instrument` is `null`; the underlying comes off the payload |
-| `md.option_bar` | `{env}:md.option_bar:{VENUE}:{UNDERLYING}` | the `table` discriminator stays in the payload — four names for one envelope would be four registries |
-| `computed.chain` | `{env}:computed.chain:{VENUE}:{UNDERLYING}` | `instrument` is `null`; the expiry stays in the payload, because expiries list and settle daily and a key that appears daily is a key a reader misses |
-| `feed.connection` | `{env}:feed.connection:{VENUE}` | no underlying; one socket per venue |
-| `heartbeat` | `{env}:heartbeat:{VENUE}` | same |
-| `alert` | `{env}:alert` | `adapter` is nullable and no reader wants a subset: the logger and the Discord consumer take all of them |
-| `control.command` | `{env}:control.command:{VENUE}` | **inbound.** Per venue because the reader is one `feed` per venue, and a DELTA feed must never read an NSE command |
+| `md.option_quote` | `md.option_quote:{VENUE}:{UNDERLYING}` | the hot one; a reader wanting BTC must not parse ETH |
+| `md.option_reference` | `md.option_reference:{VENUE}:{UNDERLYING}` | same |
+| `md.index_quote` | `md.index_quote:{VENUE}:{UNDERLYING}` | `instrument` is `null`; the underlying comes off the payload |
+| `md.option_bar` | `md.option_bar:{VENUE}:{UNDERLYING}` | the `table` discriminator stays in the payload — four names for one envelope would be four registries |
+| `computed.chain` | `computed.chain:{VENUE}:{UNDERLYING}` | `instrument` is `null`; the expiry stays in the payload, because expiries list and settle daily and a key that appears daily is a key a reader misses |
+| `feed.connection` | `feed.connection:{VENUE}` | no underlying; one socket per venue |
+| `heartbeat` | `heartbeat:{VENUE}` | same |
+| `alert` | `alert` | `adapter` is nullable and no reader wants a subset: the logger and the Discord consumer take all of them |
+| `control.command` | `control.command:{VENUE}` | **inbound.** Per venue because the reader is one `feed` per venue, and a DELTA feed must never read an NSE command |
 
 Examples, in full:
 
 ```
-prod:md.option_quote:DELTA:BTC          dev:md.option_quote:DELTA:BTC
-prod:md.option_reference:DELTA:ETH      prod:md.index_quote:DELTA:BTC
-prod:md.option_bar:DELTA:BTC            prod:computed.chain:DELTA:ETH
-prod:feed.connection:DELTA              prod:heartbeat:DELTA
-prod:alert                              prod:control.command:DELTA
+md.option_quote:DELTA:BTC          md.option_quote:DELTA:ETH
+md.option_reference:DELTA:ETH      md.index_quote:DELTA:BTC
+md.option_bar:DELTA:BTC            computed.chain:DELTA:ETH
+feed.connection:DELTA              heartbeat:DELTA
+alert                              control.command:DELTA
 ```
 
-Longest key today, `prod:md.option_reference:DELTA:BTC`, is 34 bytes — far inside the "very long
+Longest key today, `md.option_reference:DELTA:BTC`, is 29 bytes — far inside the "very long
 keys are not a good idea" advice on the same Redis page, and far above "very short keys are often
 not a good idea".
 
@@ -137,9 +135,7 @@ VENUE-UNDERLYING-YYYYMMDD-STRIKE-C|P-CCY
 
 ## 4. Environments
 
-**The prefix is mandatory and separate instances are the real separation.** `dev` runs a Redis
-container on a laptop, `prod` runs its own; they never share one. The prefix is what makes a
-mistaken share harmless — no key collides — rather than what prevents it.
+Stream names carry no environment: there is one Redis on a laptop and one in prod, and they never share one (I11, #74; decision record 0006).
 
 **Numbered databases are not used, and `SELECT` is never called.** Redis's own page says it:
 "Use Redis databases to separate keys within the same application when needed. Don't use them to
@@ -162,7 +158,7 @@ managed Redis, and #57 has not chosen one yet.
 | Start id, `api` | `$` — never replay; the cache refills from live frames | |
 
 **No environment and no venue in a group name.** A group lives inside one stream and the stream key
-already carries both; repeating them would be two places for one fact.
+already carries the venue; repeating it would be two places for one fact.
 
 **One group per service, never one per instance.** That is what makes the store and the screen
 independent readers of the same stream rather than competitors for one message.

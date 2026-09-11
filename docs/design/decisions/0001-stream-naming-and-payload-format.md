@@ -1,5 +1,8 @@
 # 0001 — Stream naming and payload format
 
+> **Superseded in part** by [0006](0006-stream-names-without-environment.md), 2026-09-12:
+> the `{env}` section is removed from the grammar. Everything else here stands.
+
 **Status** decided, #58, 2026-09-09. **Supersedes** nothing. **Fills**
 [../cloud/nomenclature.md](../cloud/nomenclature.md). **Evidence**
 [../research/0001-stream-naming-and-payload-format.md](../research/0001-stream-naming-and-payload-format.md).

@@ -32,7 +32,6 @@ import contextlib
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from uuid import uuid4
 
 import pytest
 
@@ -143,9 +142,8 @@ async def until(predicate, timeout: float = 10.0, what: str = "") -> None:
 async def open_bus(kind: str, url: str | None, clock=lambda: NOW):
     """A started bus of the kind under test, and its keys removed afterwards.
 
-    Every Redis run gets its own environment prefix. That is not tidiness — it is §4 of
-    the nomenclature used as intended: the prefix is what makes a shared instance
-    harmless, so two tests on one container cannot read each other's streams.
+    Every Redis run deletes its configured streams before closing, so two tests on one
+    container cannot read each other's entries.
     """
     if kind == "fanout":
         yield FanOut()
@@ -153,7 +151,6 @@ async def open_bus(kind: str, url: str | None, clock=lambda: NOW):
 
     config = BusConfig(
         url=url or "redis://127.0.0.1:6399",
-        env=f"t{uuid4().hex[:10]}",
         underlyings=("BTC", "ETH"),
         # Small, so a test that lets the flusher run does not wait on a 50 ms tick. Every
         # assertion still goes through an explicit `flush()`.
@@ -412,7 +409,7 @@ def test_a_restarted_reader_replays_from_the_id_it_last_flushed(redis_kind) -> N
         async with open_bus(kind, url) as bus:
             writer = bus.subscribe("store", maxsize=500, lossless=True)
             await live(bus)
-            key = stream_name(quote(0.0), env=bus.config.env)
+            key = stream_name(quote(0.0))
 
             for n in range(5):
                 bus.publish(quote(float(n)))
@@ -465,7 +462,7 @@ def test_every_batch_write_trims_by_age_and_nothing_younger_goes(redis_kind) -> 
 
     async def scenario():
         async with open_bus(kind, url, clock=lambda: clock["now"]) as bus:
-            key = stream_name(quote(1.0), env=bus.config.env)
+            key = stream_name(quote(1.0))
             for n in range(500):
                 bus.publish(quote(float(n)))
             await settle(bus)
@@ -631,7 +628,6 @@ def test_asking_for_redis_builds_a_redis_bus_from_the_environment(monkeypatch) -
 
     monkeypatch.setenv("DELTA_BUS", "redis")
     monkeypatch.setenv("DELTA_REDIS_URL", "redis://redis:6379")
-    monkeypatch.setenv("DELTA_BUS_ENV", "prod")
     monkeypatch.setenv("DELTA_BUS_BATCH_MS", "100")
     monkeypatch.setenv("DELTA_BUS_RETENTION_SECONDS", "900")
     monkeypatch.setenv("DELTA_LIVE_UNDERLYINGS", "BTC,ETH")
@@ -640,14 +636,22 @@ def test_asking_for_redis_builds_a_redis_bus_from_the_environment(monkeypatch) -
 
     assert isinstance(bus, RedisBus)
     assert bus.config.url == "redis://redis:6379"
-    assert bus.config.env == "prod"
     assert bus.config.batch_ms == 100
     assert bus.config.retention_seconds == 900
-    assert "prod:md.option_quote:DELTA:ETH" in bus.config.streams()
+    assert "md.option_quote:DELTA:ETH" in bus.config.streams()
     # Nothing connected. Building is separated from starting here for the same reason
     # `build_feed_stack` separates them: a process with no live feed still has the whole
     # structure present and introspectable.
     assert bus.client is None
+
+
+def test_bus_config_from_env_ignores_the_legacy_environment_slot(monkeypatch) -> None:
+    monkeypatch.setenv("DELTA_BUS_ENV", "prod")
+
+    config = BusConfig.from_env(underlyings=("BTC", "ETH"))
+
+    assert not hasattr(config, "env")
+    assert all(not key.startswith(("dev:", "prod:")) for key in config.streams())
 
 
 def test_the_app_refuses_to_start_when_the_redis_it_was_told_to_use_is_absent(

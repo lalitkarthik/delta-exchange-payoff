@@ -35,6 +35,7 @@ from deltapayoff.events.redis_wire import (
     encode,
     stream_name,
     stream_names,
+    stream_type,
 )
 
 # The nine built samples, one per catalogued type, live beside the catalogue's own tests.
@@ -118,24 +119,53 @@ def test_a_payload_whose_type_disagrees_with_its_stream_is_an_error() -> None:
     it must be able to."""
     fields = encode(SAMPLES["md.option_quote"])
     with pytest.raises(StreamMismatch):
-        decode(fields, stream="dev:md.option_reference:DELTA:BTC")
+        decode(fields, stream="md.option_reference:DELTA:BTC")
 
 
 # ------------------------------------------------------------------ the key grammar
 
 
 @pytest.mark.parametrize(
+    ("stream", "expected"),
+    [
+        ("alert", "alert"),
+        ("heartbeat:DELTA", "heartbeat"),
+        ("md.option_quote:DELTA:BTC", "md.option_quote"),
+    ],
+)
+def test_stream_type_reads_the_event_type_from_the_first_section(
+    stream: str, expected: str
+) -> None:
+    assert stream_type(stream) == expected
+
+
+def test_stream_names_do_not_include_an_environment_section() -> None:
+    keys = stream_names(venues=("DELTA",), underlyings=("BTC", "ETH"))
+
+    assert len(keys) == 14
+    assert not any(key.startswith(("dev:", "prod:")) for key in keys)
+    assert all(key.count(":") <= 2 for key in keys)
+
+
+def test_stream_mismatch_reads_the_type_from_the_first_stream_section() -> None:
+    fields = encode(SAMPLES["md.option_quote"])
+
+    with pytest.raises(StreamMismatch):
+        decode(fields, stream="heartbeat:md.option_quote")
+
+
+@pytest.mark.parametrize(
     ("type_name", "expected"),
     [
-        ("md.option_quote", "dev:md.option_quote:DELTA:BTC"),
-        ("md.option_reference", "dev:md.option_reference:DELTA:BTC"),
-        ("md.index_quote", "dev:md.index_quote:DELTA:BTC"),
-        ("md.option_bar", "dev:md.option_bar:DELTA:BTC"),
-        ("computed.chain", "dev:computed.chain:DELTA:BTC"),
-        ("feed.connection", "dev:feed.connection:DELTA"),
-        ("heartbeat", "dev:heartbeat:DELTA"),
-        ("alert", "dev:alert"),
-        ("control.command", "dev:control.command:DELTA"),
+        ("md.option_quote", "md.option_quote:DELTA:BTC"),
+        ("md.option_reference", "md.option_reference:DELTA:BTC"),
+        ("md.index_quote", "md.index_quote:DELTA:BTC"),
+        ("md.option_bar", "md.option_bar:DELTA:BTC"),
+        ("computed.chain", "computed.chain:DELTA:BTC"),
+        ("feed.connection", "feed.connection:DELTA"),
+        ("heartbeat", "heartbeat:DELTA"),
+        ("alert", "alert"),
+        ("control.command", "control.command:DELTA"),
     ],
 )
 def test_each_event_lands_on_the_key_the_nomenclature_names(
@@ -148,17 +178,17 @@ def test_each_event_lands_on_the_key_the_nomenclature_names(
     publisher's configuration, and it is what answers for `md.index_quote` and
     `computed.chain`, which name no venue of their own.
     """
-    assert stream_name(SAMPLES[type_name], env="dev", venue="DELTA") == expected
+    assert stream_name(SAMPLES[type_name], venue="DELTA") == expected
 
 
 def test_an_event_naming_no_venue_is_refused_rather_than_keyed_by_its_source() -> None:
     """`computed.chain`'s `source` is `chain-cache`, the component that built it.
 
-    Keying on it would publish to `dev:computed.chain:CHAIN-CACHE:BTC` — a stream no
+    Keying on it would publish to `computed.chain:CHAIN-CACHE:BTC` — a stream no
     configured reader lists, and therefore a stream nobody reads with nothing saying so.
     """
     with pytest.raises(ValueError, match="comes from configuration"):
-        stream_name(SAMPLES["computed.chain"], env="dev")
+        stream_name(SAMPLES["computed.chain"])
 
 
 def test_the_configured_key_list_is_the_fourteen_and_is_never_discovered() -> None:
@@ -167,21 +197,15 @@ def test_the_configured_key_list_is_the_fourteen_and_is_never_discovered() -> No
     Fourteen keys for one venue and two underlyings — five per-underlying types times
     two, three per-venue types, and `alert`.
     """
-    keys = stream_names(env="dev", venues=("DELTA",), underlyings=("BTC", "ETH"))
+    keys = stream_names(venues=("DELTA",), underlyings=("BTC", "ETH"))
 
     assert len(keys) == 14
-    assert "dev:md.option_quote:DELTA:ETH" in keys
-    assert "dev:alert" in keys
-    assert "dev:control.command:DELTA" in keys
+    assert "md.option_quote:DELTA:ETH" in keys
+    assert "alert" in keys
+    assert "control.command:DELTA" in keys
     assert list(keys) == sorted(keys), "a stable order: two services build one list"
-    assert all(key.startswith("dev:") for key in keys), "the prefix is mandatory"
-
-
-def test_the_environment_prefix_is_a_section_and_not_a_dotted_prefix() -> None:
-    """#58 corrected #57's proposal in exactly one place: `:` separates sections and `.`
-    lives inside one."""
-    key = stream_name(SAMPLES["md.option_quote"], env="prod", venue="DELTA")
-    assert key.startswith("prod:md.")
+    assert not any(key.startswith(("dev:", "prod:")) for key in keys)
+    assert all(key.count(":") <= 2 for key in keys)
 
 
 # ------------------------------------------------------------------ no drift

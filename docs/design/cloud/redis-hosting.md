@@ -24,11 +24,9 @@ redis-server --save "" --appendonly no --maxmemory 2gb --maxmemory-policy noevic
 |---|---|---|
 | Where | Compose on a laptop | the same image beside `feed`, `store` and `api` |
 | Reachable from | the Compose network only | the VPC only; never a public address |
-| Key prefix | `dev:` | `prod:` |
 | Sizing | whatever the laptop has | `maxmemory 2gb` — 2× the `derived` 1,051.5 MiB |
 
-**`dev` and `prod` never share an instance**, and the environment prefix on every key makes
-a mistaken share harmless rather than preventing it ([nomenclature.md](nomenclature.md) §4).
+Stream names carry no environment: there is one Redis on a laptop and one in prod, and they never share one (I11, #74; decision record 0006).
 
 **The named fallback is ElastiCache for Valkey**, one `cache.t4g.medium` node, no replica,
 backup retention 0 — `derived` $47.30/month in ap-south-1, 2026-09-09. Moving there is one
@@ -63,7 +61,7 @@ because the most likely cause of his is not Redis at all.
 | `maxmemory-policy` | `noeviction` | **The whole point.** At the ceiling Redis returns an error to the writer |
 
 **`noeviction` is a data-loss decision, not a tuning one.** Under `allkeys-lru` Redis evicts
-whole *keys*, and one of our keys is one stream: `prod:md.option_quote:DELTA:BTC` would stop
+whole *keys*, and one of our keys is one stream: `md.option_quote:DELTA:BTC` would stop
 existing with nothing raised. `noeviction` turns the same condition into an `OOM` error at
 `feed`, which is where the invariant wants it — loud, at the publisher.
 

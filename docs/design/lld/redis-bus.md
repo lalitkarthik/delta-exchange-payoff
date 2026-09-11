@@ -20,28 +20,30 @@ The ack, trim and persistence policy is [../cloud/redis-hosting.md](../cloud/red
 |---|---|---|
 | `DELTA_BUS` | `fanout` | `redis` and nothing else selects Redis. **A typo is the default**, because a mistyped value must not silently pick a broker |
 | `DELTA_REDIS_URL` | `redis://127.0.0.1:6379` | where |
-| `DELTA_BUS_ENV` | `dev` | the mandatory first key section — `dev`, `prod` |
 | `DELTA_BUS_BATCH_MS` | `50` | the publisher's batch period. §7 |
 | `DELTA_BUS_RETENTION_SECONDS` | `1800` | the trim floor's age |
 | `DELTA_BUS_INSTANCE` | `1` | the `{instance}` half of `{service}-{instance}` |
 
 `main.build_bus()` reads them at start-up, never at import, and logs `bus.selected` with the
-URL, the prefix, the interval and the retention. That line is the only moment anybody can
+URL, the interval and the retention. That line is the only moment anybody can
 tell the two implementations apart from outside, which is why it exists: a process pointed
 at the wrong Redis is otherwise a silent misconfiguration.
 
 **The stream list comes from configuration and is never discovered.** `BusConfig.streams()`
-is `stream_names(env, venues, underlyings)` — fourteen keys for one venue and two
+is `stream_names(venues, underlyings)` — fourteen keys for one venue and two
 underlyings, built from the same `--underlyings` set the feed is given. `XREAD` has no
 wildcard, so a stream found late is a stream that was silently not read: that is #51
 restaged, and #51 cost three days of history.
+
+Streams under the old `dev:` and `prod:` names may still exist in a local Redis; they are not
+migrated, because the pipe holds thirty minutes and they age out on their own.
 
 ## 2. Lossless — a consumer group, acked on receipt
 
 `subscribe(..., lossless=True)` creates `XGROUP CREATE <stream> <name> 0 MKSTREAM` on every
 configured stream and reads `XREADGROUP <name> <name>-<instance> ... >`. **The group name is
 the subscription's name**, which is the service name — no environment and no venue in it,
-because the key already carries both.
+because the key already carries the venue.
 
 Every batch read is **acked before the work**, in one pipelined `XACK` per stream. This is
 not the textbook pattern and the reason is `redis-hosting.md` §5: the durability boundary is

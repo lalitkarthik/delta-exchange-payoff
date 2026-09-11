@@ -45,7 +45,7 @@ split works. The senior's two documents are assembled from those research findin
 10. As the operator, I want `store` to keep its five-minute flush, so that the file count per day stays at 288 per table.
 11. As the operator, I want `api` to ack on receipt and never replay, so that its cache refills from live frames in 508 ms and never serves a backlog.
 12. As the operator, I want each consumer in its own consumer group, so that the store and the screen never compete for the same message.
-13. As the operator, I want every stream named by environment, event type, venue and underlying, so that a reader takes only what it wants and two stacks never share a Redis by accident.
+13. As the operator, I want every stream named by event type, venue and underlying, so that a reader takes only what it wants.
 14. As the operator, I want the message format on the wire decided by a research ticket against standard practice, so that JSON is a choice and not a habit.
 15. As a trader, I want every price on the dashboard to state its currency, so that a BTC option in USD and a NIFTY option in INR cannot be confused.
 16. As a developer, I want `quote_currency` and `settlement_currency` on every instrument, so that the day they differ nothing is redesigned.
@@ -86,9 +86,9 @@ app into its own repo is deferred until it earns it.
 does not change. Every one of the nine event types crosses it at full rate, about 1,700
 messages a second for BTC and ETH. `feed` pipelines its writes; the batch interval is
 measured and recorded in the ticket that lands it. One stream per event type per venue per
-underlying with an environment prefix — **fixed by #58** as `{env}:{event_type}:{VENUE}[:{UNDERLYING}]`,
-e.g. `prod:md.option_quote:DELTA:BTC`, colon between sections per Redis's own convention.
-Events without an underlying are per venue; `alert` is per environment. Encoding: the seven
+underlying — **fixed by #74** as `{event_type}:{VENUE}[:{UNDERLYING}]`,
+e.g. `md.option_quote:DELTA:BTC`, colon between sections per Redis's own convention.
+Events without an underlying are per venue; `alert` is unscoped. Encoding: the seven
 envelope fields flat, one Redis field each, and the type's own keys as one JSON `payload`
 field — chosen because a Redis field has no null. The standard is
 [nomenclature.md](nomenclature.md); the evidence is
@@ -124,8 +124,7 @@ compute platform with region, and Redis hosting, each against these criteria in 
 order: does not break our invariants; operations burden for a small team; monthly cost at
 our rate and at ten times it; path to OMS and NSE; latency to the venue. Prod is private,
 logs go to CloudWatch, alerts to Discord, one alarm on `stopped`. Environments are one local
-and one prod, nothing between: no staging, no shared containers, and stream names carry
-no environment (I11, 2026-09-12). Cloud tickets run after the local split and after access
+and one prod, nothing between: no staging, no shared containers. Stream names carry no environment: there is one Redis on a laptop and one in prod, and they never share one (I11, #74; decision record 0006). Cloud tickets run after the local split and after access
 arrives.
 
 **Redis hosting — fixed by #69.** A container beside the services, one per environment, started

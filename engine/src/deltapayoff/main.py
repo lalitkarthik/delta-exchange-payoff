@@ -343,10 +343,9 @@ def build_bus() -> Bus:
         logger,
         logging.INFO,
         log_events.BUS_SELECTED,
-        "the event bus is Redis Streams at %s, prefix %r, batching every %d ms, "
+        "the event bus is Redis Streams at %s, batching every %d ms, "
         "retaining %.0f s",
         config.url,
-        config.env,
         config.batch_ms,
         config.retention_seconds,
     )
