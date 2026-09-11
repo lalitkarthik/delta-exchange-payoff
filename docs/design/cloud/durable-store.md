@@ -26,7 +26,7 @@ already writes**, one bucket per environment, in the region R4 (#68) chooses.
 | Written by | the `store` service | the `store` service, unchanged but for the root |
 | Reachable from | the file system | the VPC, via a gateway endpoint; the bucket blocks public access |
 | Storage class | — | **Standard**; not Intelligent-Tiering, not Standard-IA — see §5 |
-| Compaction | `tools/compact_store.py`, by hand | the same tool, nightly, once a day per closed partition |
+| Compaction | `tools/compact_store.py`, by hand | the same tool, nightly, once a day per closed partition — not on the go, see §4 |
 
 **The named fallback, if criterion 4 moves, is RDS for PostgreSQL beside the bars, not
 instead of them** — `db.t4g.medium`, `derived` $61.32/month in ap-south-1, for OMS state
@@ -113,6 +113,16 @@ requests.
 and the window between them is the same *gap, never a doubling* window the local code
 already accepts. The manifest is what makes it recoverable, and it is a sidecar in the
 prefix it describes so a partition is recoverable on its own.
+
+**Nightly, not on the go** — [../decisions/0009-compaction-cadence.md](../decisions/0009-compaction-cadence.md).
+Parquet cannot append, so "on the go" means folding today's partition while `store` flushes
+into it. `measured` 2026-09-11 on a real day cut at 15:00Z, 193 files a table: `/chain/at`
+93.5 ms median, 115.1 ms p95; folded into hour files, 34.1 / 45.5 ms. `/smile`, ~410 ms, is
+row-bound and does not move. A `derived` ~60 ms does not pay for an hourly job, a fold
+and a compactor beside the live writer. **It flips when a route reads today from S3**: a
+`PUT` is atomic there, and `derived` at `assumed` 1,000 today-reads a day the bill is $14.69
+a month nightly against $2.73 two-tier. Re-measure `/chain/at` against a ~180-object S3
+partition first; past 250 ms p95, build the two-tier fold the record describes.
 
 ## 5. The storage class, and the 128 KB cliff
 
