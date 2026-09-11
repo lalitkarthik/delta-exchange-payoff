@@ -123,9 +123,10 @@ reverse proxy in front of `api` and `web`. Prod runs the same images.
 compute platform with region, and Redis hosting, each against these criteria in this
 order: does not break our invariants; operations burden for a small team; monthly cost at
 our rate and at ten times it; path to OMS and NSE; latency to the venue. Prod is private,
-logs go to CloudWatch, alerts to Discord, one alarm on `stopped`. Environments are `dev`
-locally and `prod`, then `staging` last. Cloud tickets run after the local split and after
-access arrives.
+logs go to CloudWatch, alerts to Discord, one alarm on `stopped`. Environments are one local
+and one prod, nothing between: no staging, no shared containers, and stream names carry
+no environment (I11, 2026-09-12). Cloud tickets run after the local split and after access
+arrives.
 
 **Redis hosting — fixed by #69.** A container beside the services, one per environment, started
 with `--save "" --appendonly no --maxmemory 2gb --maxmemory-policy noeviction`. Named fallback
@@ -165,6 +166,14 @@ and the record [../decisions/0003-controller-policy.md](../decisions/0003-contro
 **Documents.** This epic is the plan. The senior's two documents, the message bus and the
 data feed engine cloud architectures, are deliverables assembled from the research
 findings, with shared sections (AWS services, nomenclature) written once and linked.
+
+**Amended 2026-09-12 — six decisions, detail in #57.** Environments: one local, one prod,
+no environment slot in stream names (I11 #74). Store layout: `underlying/date`, no venue,
+one migration (I12 #77). Load profile per service (R6 #75; `measured` by I13 #79 after I6).
+Topology, one box or several, against R4's baseline (R7 #78, record 0008; #68 stays
+closed; hop `measured` by I14 #80 after prod). Compaction on the go or at the close,
+measured then decided (R8 #76). D1 is the single source of truth, action-first, Simplified
+Technical English, with a `CONTEXT.md` (#72 amended).
 
 ## Testing Decisions
 
@@ -219,15 +228,22 @@ blockers are closed.
 | #59 | R2 | Controller against Nautilus reconnect policy | — | Opus |
 | #60 | I1 | Currency on instrument, symbol, screen | — | Sonnet |
 | #61 | I2 | Redis Streams bus behind the seam, one process | #58 | Opus |
-| #62 | I3 | Feed as its own process | #61 | Opus |
-| #63 | I4 | Store as its own process, replaying from last flush | #61 | Opus |
+| #62 | I3 | Feed as its own process | #61 #74 | Opus |
+| #63 | I4 | Store as its own process, replaying from last flush | #61 #77 | Opus |
 | #64 | I5 | Api learns feed state and commands over the bus | #62 | Opus |
 | #65 | I6 | Images, Compose, proxy, smoke test | #62 #63 #64 | Sonnet |
 | #66 | I7 | Discord consumer for alerts | #65 | Sonnet |
 | #67 | R3 | Where the durable store lives | #65 | Opus |
 | #68 | R4 | Compute platform and region | #65 | Opus |
 | #69 | R5 | Where Redis lives, disk-bloat diagnosis | #65 | Opus |
-| #70 | I8 | Store writes to its chosen home | #67 | Sonnet |
+| #70 | I8 | Store writes to its chosen home | #67 #77 | Sonnet |
 | #71 | I9 | Deploy prod | #68 #69 #70 | Opus |
-| #72 | D1 | Assemble the two architecture documents | #58 #59 #67 #68 #69 #71 | Opus |
+| #72 | D1 | Assemble the two architecture documents | #58 #59 #67 #68 #69 #71 #74 #76 #78 | Opus |
 | #73 | I10 | Staging | #71 | Sonnet |
+| #74 | I11 | Stream names lose the environment slot | — | Sonnet |
+| #75 | R6 | Which process is compute-heavy, which data-heavy | — | Opus |
+| #76 | R8 | Compact on the go, or at the close | — | Opus |
+| #77 | I12 | Store partitions by underlying, then date | #62 | Opus |
+| #78 | R7 | One instance, or several | #75 | Opus |
+| #79 | I13 | Measure each service on its own container | #65 #75 | Sonnet |
+| #80 | I14 | Measure the hop between instances | #71 #78 | Sonnet |
