@@ -45,7 +45,7 @@ numbers.
 not.
 
 - *The ceiling must exist and must be `noeviction`.* Under `allkeys-lru` Redis evicts whole
-  keys, and one of our keys is one stream: `prod:md.option_quote:DELTA:BTC` would simply
+  keys, and one of our keys is one stream: `md.option_quote:DELTA:BTC` (written with a `prod:` prefix before 0006) would simply
   stop existing, with nothing raised. `noeviction` turns the same condition into an error at
   the publisher, which is where our first invariant wants it — loud, at the writer, not
   silent, at the reader. The container ships `noeviction`; ElastiCache defaults to

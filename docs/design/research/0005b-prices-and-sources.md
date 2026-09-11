@@ -75,7 +75,7 @@ Instances, if ever used, is a per-instance surcharge on top of EC2: `m7g.large` 
 | NAT gateway, per hour | 0.056 | 0.059 | 0.062 | 0.045 |
 | NAT gateway, **per GB processed** | **0.056** | 0.059 | 0.062 | 0.045 |
 | In-use public IPv4, per hour | 0.005 | 0.005 | 0.005 | 0.005 |
-| Regional data transfer, in/out/between AZs | 0.01 /GB | 0.01 | 0.01 | 0.01 |
+| Regional data transfer, in/out/between AZs, **charged in each direction** | 0.01 /GB | 0.01 | 0.01 | 0.01 |
 
 ## 3. The arithmetic, cell by cell
 

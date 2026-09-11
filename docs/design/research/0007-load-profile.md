@@ -88,7 +88,7 @@ and **decoded once per consumer**. Both costs are from I2 ([0061-batch-interval.
 | D2, D3 | 82.0 ms for a compacted whole-day read, `measured` locally ([../decisions/0004-durable-store.md](../decisions/0004-durable-store.md) §5), at 0004's `assumed` 1,000 reads a day. Redis has no persistence, as decided (0002) |
 | N1 | 843.4 KB/s `measured` (hld §5) + the re-list's 987 KB a minute (`main.py`, `RELIST_INTERVAL_SECONDS`) = 859.9 KB/s = **6.9 Mbit/s**; out 598.2 KB/s, encoding B (0001; 0002 writes KiB/s for the same figure) |
 | N2–N4 | each consumer reads the whole 598.2 KB/s; Redis writes it once and serves it twice. N3 is m3; a 101-row ladder at ~2.8× is `assumed` ~109 KB/s |
-| Hop | across two instances, 1,196.4 KB/s × 2,628,000 s = **3,144 GB/month**: $31.44 cross-AZ at 0005b §2's $0.01/GB, $314.40 at 10×. Same-AZ is `assumed` $0; R7 confirms |
+| Hop | across two instances, 1,196.4 KB/s × 2,628,000 s = **3,144 GB/month**: $62.88 cross-AZ at 0005b §2's $0.01/GB, charged in each direction, $628.80 at 10× (corrected by R7, #78; first printed as half). Same-AZ is `assumed` $0; R7 confirms |
 
 ## 5. The profile at 10×
 
@@ -151,7 +151,7 @@ most 70% of the vCPUs; reservations + 0.5 GiB OS within 90% of RAM; burstable on
 | `api` alone | 0.31–0.63 | `c7g.large` **$35.84**; viewers spike | 2.6–5.0 | `m7g.xlarge` → `m7g.2xlarge` |
 | `web` alone | ~0 | `t4g.medium` **$16.35** | ~0 | `t4g.medium` $16.35 |
 | Redis alone | 0.05 | `t4g.medium` **$16.35**, 3.5 of 4 GiB | 0.5 | `m7g.xlarge` **$85.12**, 13.5 of 16 GiB |
-| **All six, one box** (R4) | 1.21–1.94 | `m7g.large` $42.56 lower; **`m7g.xlarge` $85.12** upper | 11.1–17.7 | **none priced**: the largest is 8 vCPU |
+| **All six, one box** (R4) | 1.21–1.95 | `m7g.large` $42.56 lower; **`m7g.xlarge` $85.12** upper | 11.1–17.7 | **none priced**: the largest is 8 vCPU |
 | `feed`+Redis ∣ the rest | 0.76 ∣ 1.19 | `c7g.large` ×2 **$71.68** (Redis at the memory limit) | 5.7–7.6 ∣ 5.4–10.2 | none ∣ `m7g.2xlarge` lower |
 | `feed`+`store`+Redis ∣ `api`+`web`+proxy | 1.27 ∣ 0.68 | `m7g.large` + `c7g.large` **$78.40** | 8.5–12.7 ∣ 2.6–5.1 | none ∣ `m7g.xlarge` → `m7g.2xlarge` |
 | One per service | | **$137.08** | | ≥ **$442.02**, `feed` unpriced at the upper |
