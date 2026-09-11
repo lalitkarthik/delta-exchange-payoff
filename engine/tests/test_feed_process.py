@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +12,11 @@ from fastapi.testclient import TestClient
 
 from deltapayoff import feed_main, feed_runtime, main
 from deltapayoff.delta_client import DeltaUnavailable
-from deltapayoff.events import ConnectionState
+from deltapayoff.events import ConnectionState, ControlCommand
 from deltapayoff.models import HealthReport
 from deltapayoff.redis_bus import BusUnavailable
+
+TS = datetime(2026, 9, 12, tzinfo=timezone.utc)
 
 
 def test_feed_process_entrypoint_and_shared_relisting_module_are_importable() -> None:
@@ -32,6 +35,7 @@ class _Bus:
     def __init__(self, config) -> None:
         self.config = config
         self.events: list[str] = []
+        self.subscriptions: list[_Subscription] = []
         self.instances.append(self)
         self.events.append("bus.construct")
 
@@ -41,8 +45,26 @@ class _Bus:
     async def aclose(self) -> None:
         self.events.append("bus.close")
 
-    def publish(self, _event) -> None:
+    def subscribe(
+        self, name: str, maxsize: int, lossless: bool = False, *, event_types=None
+    ):
+        subscription = _Subscription(name, maxsize, lossless, event_types)
+        self.subscriptions.append(subscription)
+        return subscription
+
+    def publish(self, event) -> None:
         self.events.append("bus.publish")
+        for subscription in self.subscriptions:
+            subscription.queue.put_nowait(event)
+
+
+class _Subscription:
+    def __init__(self, name, capacity, lossless, event_types) -> None:
+        self.name = name
+        self.capacity = capacity
+        self.lossless = lossless
+        self.event_types = tuple(event_types) if event_types is not None else None
+        self.queue: asyncio.Queue = asyncio.Queue()
 
 
 class _Client:
@@ -90,6 +112,7 @@ class _Supervisor:
         self.events.append("supervisor.construct")
         self.adapters = adapters
         self.started = False
+        self.dispatched: list[object] = []
         self.instances.append(self)
 
     def start(self) -> None:
@@ -98,6 +121,10 @@ class _Supervisor:
 
     async def aclose(self) -> None:
         self.events.append("supervisor.close")
+
+    def dispatch_command(self, event) -> bool:
+        self.dispatched.append(event)
+        return True
 
     def report(self) -> HealthReport:
         state = ConnectionState.CONNECTED if self.started else ConnectionState.STOPPED
@@ -181,6 +208,43 @@ def test_feed_entrypoint_keeps_health_alive_when_initial_listing_is_unavailable(
         body = client.get("/health").json()
         assert body["feed"] == "stopped"
         assert _Supervisor.instances[-1].started is False
+
+        command = ControlCommand(
+            source="operator",
+            ts_received=TS,
+            adapter="SCRIPT",
+            command="pause",
+        )
+        client.portal.call(_Bus.instances[-1].publish, command)
+        client.portal.call(asyncio.sleep, 0)
+        assert _Supervisor.instances[-1].dispatched == [command]
+
+
+def test_feed_entrypoint_registers_one_command_consumer_and_dispatches_once(
+    monkeypatch,
+) -> None:
+    _patch_feed_components(monkeypatch)
+
+    with TestClient(feed_main.app) as client:
+        bus = _Bus.instances[-1]
+        assert [
+            (sub.name, sub.capacity, sub.lossless, sub.event_types)
+            for sub in bus.subscriptions
+        ] == [
+            ("feed-control", 100, False, ("control.command",))
+        ]
+        assert client.app.state.control_task.get_name() == "feed-control"
+
+        command = ControlCommand(
+            source="operator",
+            ts_received=TS,
+            adapter="SCRIPT",
+            command="pause",
+        )
+        bus.publish(object())
+        bus.publish(command)
+        client.portal.call(asyncio.sleep, 0)
+        assert _Supervisor.instances[-1].dispatched == [command]
 
 
 def test_feed_entrypoint_shutdown_cancels_relisting_before_supervisor_redis_and_delta(

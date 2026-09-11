@@ -20,6 +20,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from deltapayoff import main
 from deltapayoff.adapters import DeltaAdapter, DeltaFeed
@@ -39,11 +40,22 @@ class _StubRedisBus:
     def __init__(self, config) -> None:
         self.config = config
         self._fanout = FanOut()
+        self.subscription_types: dict[str, tuple[str, ...] | None] = {}
         self.started = False
         self.closed = False
         self.__class__.instances.append(self)
 
-    def subscribe(self, name: str, maxsize: int, lossless: bool = False):
+    def subscribe(
+        self,
+        name: str,
+        maxsize: int,
+        lossless: bool = False,
+        *,
+        event_types=None,
+    ):
+        self.subscription_types[name] = (
+            None if event_types is None else tuple(event_types)
+        )
         return self._fanout.subscribe(name, maxsize=maxsize, lossless=lossless)
 
     def publish(self, event) -> None:
@@ -88,7 +100,26 @@ def test_redis_bus_is_a_consumer_only_composition(monkeypatch, tmp_path) -> None
         assert client.get("/health").json() == {
             "status": "ok",
             "feed": "stopped",
-            "adapters": [],
+            "adapters": [
+                {
+                    "adapter": "DELTA",
+                    "state": "stopped",
+                    "reason": None,
+                    "last_message_at": None,
+                    "last_message_age_seconds": None,
+                    "reconnects": None,
+                    "budget_remaining": None,
+                    "transitions": None,
+                    "empty_opens": None,
+                    "undecodable": None,
+                    "state_learned_at": None,
+                    "state_age_seconds": None,
+                    "last_connection_at": None,
+                    "last_connection_age_seconds": None,
+                    "last_heartbeat_at": None,
+                    "last_heartbeat_age_seconds": None,
+                }
+            ],
             "watched": [],
         }
         assert main.app.state.adapter is None
@@ -108,6 +139,61 @@ def test_redis_bus_is_a_consumer_only_composition(monkeypatch, tmp_path) -> None
         assert _StubRedisBus.instances[-1].started is True
 
     assert _StubRedisBus.instances[-1].closed is True
+
+
+def test_split_health_has_the_configured_remote_adapter_before_any_event(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("DELTA_BUS", "redis")
+    monkeypatch.setenv("DELTA_STORE_ROOT", str(tmp_path))
+    monkeypatch.setattr(main, "RedisBus", _StubRedisBus)
+
+    with TestClient(main.app) as client:
+        body = client.get("/health").json()
+
+    assert body["feed"] == "stopped"
+    assert [row["adapter"] for row in body["adapters"]] == ["DELTA"]
+    assert body["adapters"][0]["reason"] is None
+    assert body["adapters"][0]["state_learned_at"] is None
+    assert body["adapters"][0]["last_heartbeat_at"] is None
+    assert body["adapters"][0]["reconnects"] is None
+    assert _StubRedisBus.instances[-1].subscription_types["feed-state"] == (
+        "feed.connection",
+        "heartbeat",
+    )
+
+
+def test_split_health_reads_fresh_state_from_the_cache_and_leaves_counters_null(
+    monkeypatch,
+) -> None:
+    from datetime import datetime, timezone
+
+    from deltapayoff.events import ConnectionState, Heartbeat
+
+    cache = main.FeedConnectionCache(venue="DELTA")
+    cache.apply(
+        Heartbeat(
+            source="controller",
+            ts_received=datetime(2026, 9, 12, tzinfo=timezone.utc),
+            adapter="DELTA",
+            state=ConnectionState.CONNECTED,
+        )
+    )
+    main.app.dependency_overrides[main.get_supervisor] = lambda: None
+    main.app.dependency_overrides[main.get_feed_cache] = lambda: cache
+    main.app.dependency_overrides[main.get_watched_stream] = lambda: None
+    try:
+        response = TestClient(main.app).get("/health")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    row = response.json()["adapters"][0]
+    assert response.status_code == 200
+    assert response.json()["feed"] == "connected"
+    assert row["adapter"] == "DELTA"
+    assert row["reconnects"] is None
+    assert row["budget_remaining"] is None
+    assert row["transitions"] is None
 
 
 def ticker_frame(symbol: str, bid: float, ask: float) -> dict:

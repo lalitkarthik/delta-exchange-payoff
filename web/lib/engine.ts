@@ -394,3 +394,42 @@ export async function setRecording(recording: boolean): Promise<RecordingState> 
   }
   return body as RecordingState;
 }
+
+export type FeedCommand = "pause" | "resume" | "reconnect";
+
+/** Send one command to the venue feed. The websocket remains the sole source of feed state. */
+export async function commandFeed(
+  adapter: string,
+  command: FeedCommand,
+): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(
+      `${ENGINE_URL}/feed/${encodeURIComponent(adapter)}/${command}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({}),
+        cache: "no-store",
+      },
+    );
+  } catch (cause) {
+    throw new EngineUnreachableError(cause);
+  }
+
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new EngineResponseError(
+      res.status,
+      `${res.status} ${res.statusText}: body was not JSON`,
+    );
+  }
+  if (!res.ok) {
+    throw new EngineResponseError(
+      res.status,
+      isEngineError(body) ? body.detail : `${res.status} ${res.statusText}`,
+    );
+  }
+}

@@ -358,6 +358,32 @@ html, body {
   letter-spacing: 0.03em;
 }
 
+.feed-controls {
+  display: flex;
+  gap: 3px;
+}
+
+.feed-control {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 2px 5px;
+  background: transparent;
+  color: var(--ink-soft);
+  font: 10px var(--mono);
+  cursor: pointer;
+}
+
+.feed-control:hover:not(:disabled),
+.feed-control:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.feed-control:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 /* ------------------------------------------------------------- pickers */
 
 /* The Underlying and Expiry dropdowns. Shaped as a `.stat` deliberately: they sit in the

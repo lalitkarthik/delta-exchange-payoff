@@ -24,7 +24,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -138,6 +138,188 @@ def test_feed_connection_cache_drains_only_feed_state_events_and_propagates_canc
     asyncio.run(scenario())
 
 
+def test_feed_connection_cache_reports_observation_ages_and_initial_remote_row() -> None:
+    wall = {"now": datetime(2026, 9, 12, tzinfo=timezone.utc)}
+    mono = {"now": 100.0}
+    cache = FeedConnectionCache(
+        venue="DELTA",
+        wall_clock=lambda: wall["now"],
+        monotonic_clock=lambda: mono["now"],
+    )
+
+    initial = cache.report()
+    assert initial.feed is ConnectionState.STOPPED
+    assert len(initial.adapters) == 1
+    assert initial.adapters[0].model_dump() == {
+        "adapter": "DELTA",
+        "state": ConnectionState.STOPPED,
+        "reason": None,
+        "last_message_at": None,
+        "last_message_age_seconds": None,
+        "reconnects": None,
+        "budget_remaining": None,
+        "transitions": None,
+        "empty_opens": None,
+        "undecodable": None,
+        "state_learned_at": None,
+        "state_age_seconds": None,
+        "last_connection_at": None,
+        "last_connection_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_heartbeat_age_seconds": None,
+    }
+
+    connection = FeedConnection(
+        source="controller",
+        ts_received=wall["now"],
+        adapter="DELTA",
+        to_state=ConnectionState.CONNECTED,
+        reason="open",
+    )
+    cache.apply(connection)
+    mono["now"] = 102.0
+    wall["now"] += timedelta(seconds=2)
+    cache.apply(
+        Heartbeat(
+            source="controller",
+            ts_received=connection.ts_received + timedelta(seconds=1),
+            adapter="DELTA",
+            state=ConnectionState.CONNECTED,
+            last_message_age_seconds=3.5,
+        )
+    )
+    mono["now"] = 104.0
+    wall["now"] += timedelta(seconds=2)
+
+    row = cache.report().adapters[0]
+    assert row.state is ConnectionState.CONNECTED
+    assert row.reason == "open"
+    assert row.state_learned_at == datetime(2026, 9, 12, 0, 0, 2, tzinfo=timezone.utc)
+    assert row.state_age_seconds == 2.0
+    assert row.last_connection_at == datetime(2026, 9, 12, tzinfo=timezone.utc)
+    assert row.last_connection_age_seconds == 4.0
+    assert row.last_heartbeat_at == datetime(2026, 9, 12, 0, 0, 2, tzinfo=timezone.utc)
+    assert row.last_heartbeat_age_seconds == 2.0
+    assert row.last_message_age_seconds == 5.5
+    assert row.last_message_at == datetime(
+        2026, 9, 11, 23, 59, 58, 500000, tzinfo=timezone.utc
+    )
+
+
+def test_feed_connection_cache_uses_heartbeat_staleness_and_recovers() -> None:
+    wall = {"now": datetime(2026, 9, 12, tzinfo=timezone.utc)}
+    mono = {"now": 10.0}
+    cache = FeedConnectionCache(
+        venue="DELTA",
+        wall_clock=lambda: wall["now"],
+        monotonic_clock=lambda: mono["now"],
+    )
+    connection = FeedConnection(
+        source="controller",
+        ts_received=wall["now"],
+        adapter="DELTA",
+        to_state=ConnectionState.CONNECTED,
+        reason="open",
+    )
+    cache.apply(connection)
+    mono["now"] = 11.0
+    wall["now"] += timedelta(seconds=1)
+    heartbeat = Heartbeat(
+        source="controller",
+        ts_received=connection.ts_received + timedelta(seconds=1),
+        adapter="DELTA",
+        state=ConnectionState.CONNECTED,
+        last_message_age_seconds=2.25,
+    )
+    cache.apply(heartbeat)
+
+    mono["now"] = 11.0 + main.FEED_HEARTBEAT_STALE_SECONDS
+    exact = cache.effective("DELTA")
+    assert exact is not None
+    assert exact.state is ConnectionState.CONNECTED
+    assert exact.state_age_seconds == main.FEED_HEARTBEAT_STALE_SECONDS
+
+    mono["now"] += 0.001
+    stale = cache.effective("DELTA")
+    assert stale is not None
+    assert stale.state is ConnectionState.STOPPED
+    assert stale.reason == "silent"
+    assert stale.state_learned_at == (
+        datetime(2026, 9, 12, 0, 0, 1, tzinfo=timezone.utc)
+        + timedelta(seconds=main.FEED_HEARTBEAT_STALE_SECONDS)
+    )
+
+    mono["now"] += 1.0
+    wall["now"] += timedelta(seconds=1)
+    recovery = Heartbeat(
+        source="controller",
+        ts_received=heartbeat.ts_received + timedelta(seconds=1),
+        adapter="DELTA",
+        state=ConnectionState.CONNECTED,
+        last_message_age_seconds=0.0,
+    )
+    cache.apply(recovery)
+    recovered = cache.effective("DELTA")
+    assert recovered is not None
+    assert recovered.state is ConnectionState.CONNECTED
+    assert recovered.reason == "open"
+
+
+def test_feed_connection_cache_orders_each_event_type_and_connection_wins_ties() -> None:
+    wall = {"now": datetime(2026, 9, 12, tzinfo=timezone.utc)}
+    mono = {"now": 0.0}
+    cache = FeedConnectionCache(
+        venue="DELTA",
+        wall_clock=lambda: wall["now"],
+        monotonic_clock=lambda: mono["now"],
+    )
+    base = wall["now"]
+    first_connection = FeedConnection(
+        source="controller",
+        ts_received=base + timedelta(seconds=10),
+        adapter="DELTA",
+        to_state=ConnectionState.CONNECTED,
+        reason="open",
+    )
+    cache.apply(first_connection)
+    mono["now"] = 1.0
+    wall["now"] += timedelta(seconds=1)
+    heartbeat = Heartbeat(
+        source="controller",
+        ts_received=base + timedelta(seconds=20),
+        adapter="DELTA",
+        state=ConnectionState.DEGRADED,
+    )
+    cache.apply(heartbeat)
+    mono["now"] = 2.0
+    wall["now"] += timedelta(seconds=1)
+    cache.apply(
+        FeedConnection(
+            source="controller",
+            ts_received=base + timedelta(seconds=5),
+            adapter="DELTA",
+            to_state=ConnectionState.STOPPED,
+            reason="old",
+        )
+    )
+    assert cache.latest["DELTA"] is first_connection
+    assert cache.effective("DELTA").state is ConnectionState.DEGRADED
+    assert cache.effective("DELTA").reason is None
+
+    mono["now"] = 3.0
+    wall["now"] += timedelta(seconds=1)
+    tied = FeedConnection(
+        source="controller",
+        ts_received=base + timedelta(seconds=20),
+        adapter="DELTA",
+        to_state=ConnectionState.CONNECTED,
+        reason="tie",
+    )
+    cache.apply(tied)
+    assert cache.effective("DELTA").state is ConnectionState.CONNECTED
+    assert cache.effective("DELTA").reason == "tie"
+
+
 def test_split_websocket_uses_a_received_feed_connection_without_a_supervisor() -> None:
     cache = FeedConnectionCache()
     event = FeedConnection(
@@ -164,6 +346,108 @@ def test_split_websocket_uses_a_received_feed_connection_without_a_supervisor() 
     assert first["data"]["adapter"] == "DELTA"
     assert first["data"]["state"] == "connected"
     assert first["data"]["reason"] == "open"
+
+
+def test_split_websocket_hydrates_feed_from_a_late_heartbeat() -> None:
+    fixed = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    cache = FeedConnectionCache(
+        venue="DELTA",
+        wall_clock=lambda: fixed,
+        monotonic_clock=lambda: 10.0,
+    )
+    cache.apply(
+        Heartbeat(
+            source="controller",
+            ts_received=fixed,
+            adapter="DELTA",
+            state=ConnectionState.CONNECTED,
+            last_message_age_seconds=0.0,
+        )
+    )
+    app.dependency_overrides[get_supervisor] = lambda: None
+    app.dependency_overrides[get_feed_cache] = lambda: cache
+    app.dependency_overrides[get_chain_stream] = lambda: ChainStream()
+    try:
+        client = TestClient(app)
+        with client.websocket_connect(
+            f"/ws/chain?underlying=BTC&expiry={EXPIRY}"
+        ) as socket:
+            first = json.loads(socket.receive_text())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first == {
+        "type": "feed",
+        "data": {
+            "adapter": "DELTA",
+            "state": "connected",
+            "since": "2026-09-12T00:00:00Z",
+            "reason": "",
+        },
+    }
+
+
+def test_split_websocket_reports_stale_feed_and_heartbeat_recovery() -> None:
+    wall = {"now": datetime(2026, 9, 12, tzinfo=timezone.utc)}
+    mono = {"now": 10.0}
+    cache = FeedConnectionCache(
+        venue="DELTA",
+        wall_clock=lambda: wall["now"],
+        monotonic_clock=lambda: mono["now"],
+    )
+    first_heartbeat = Heartbeat(
+        source="controller",
+        ts_received=wall["now"],
+        adapter="DELTA",
+        state=ConnectionState.CONNECTED,
+        last_message_age_seconds=0.0,
+    )
+    cache.apply(first_heartbeat)
+    app.dependency_overrides[get_supervisor] = lambda: None
+    app.dependency_overrides[get_feed_cache] = lambda: cache
+    app.dependency_overrides[get_chain_stream] = lambda: ChainStream()
+    try:
+        client = TestClient(app)
+        with client.websocket_connect(
+            f"/ws/chain?underlying=BTC&expiry={EXPIRY}&interval=0.02"
+        ) as socket:
+            first = json.loads(socket.receive_text())
+            assert first["type"] == "feed"
+            assert first["data"]["state"] == "connected"
+
+            mono["now"] += main.FEED_HEARTBEAT_STALE_SECONDS + 0.001
+            stale = None
+            for _ in range(10):
+                message = json.loads(socket.receive_text())
+                if message["type"] == "feed":
+                    stale = message
+                    break
+            assert stale is not None
+            assert stale["data"]["state"] == "stopped"
+            assert stale["data"]["reason"] == "silent"
+
+            wall["now"] += timedelta(seconds=1)
+            mono["now"] += 1.0
+            cache.apply(
+                Heartbeat(
+                    source="controller",
+                    ts_received=first_heartbeat.ts_received + timedelta(seconds=1),
+                    adapter="DELTA",
+                    state=ConnectionState.CONNECTED,
+                    last_message_age_seconds=0.0,
+                )
+            )
+            recovered = None
+            for _ in range(10):
+                message = json.loads(socket.receive_text())
+                if message["type"] == "feed":
+                    recovered = message
+                    break
+            assert recovered is not None
+            assert recovered["data"]["state"] == "connected"
+            assert recovered["data"]["reason"] == ""
+    finally:
+        app.dependency_overrides.clear()
 
 
 class _YieldingClock:

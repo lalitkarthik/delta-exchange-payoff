@@ -8,11 +8,17 @@ from collections import Counter
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from deltapayoff import main, redis_bus
 from deltapayoff.adapters import instrument_from_symbol
-from deltapayoff.events import OptionQuote, OptionReference
+from deltapayoff.events import (
+    ConnectionState,
+    ControlCommand,
+    OptionQuote,
+    OptionReference,
+)
 from deltapayoff.events.redis_wire import decode, stream_name, stream_names
 from deltapayoff.redis_bus import BusConfig, RedisBus
 from deltapayoff.supervisor import FeedSupervisor
@@ -304,5 +310,138 @@ def test_feed_restart_delivers_captured_events_to_the_live_consumer(
                 await first_feed.bus.aclose()
             await main.stop_consumer_stack(consumer)
             await _cleanup_redis(kind, url, server, expected_streams)
+
+
+def test_split_pause_resume_reconnect_round_trip_over_redis(monkeypatch) -> None:
+    """API and feed processes command one adapter through Redis."""
+    import fakeredis.aioredis
+    monkeypatch.setenv("DELTA_BUS", "redis")
+
+    async def scenario() -> None:
+        server = fakeredis.aioredis.FakeServer()
+
+        def client_factory(_config: BusConfig):
+            return fakeredis.aioredis.FakeRedis(
+                server=server, decode_responses=False
+            )
+
+        config = BusConfig(
+            venue="SCRIPT",
+            underlyings=(UNDERLYING,),
+            batch_ms=1,
+            read_block_ms=0,
+            idle_sleep_seconds=0.001,
+        )
+        api_bus = RedisBus(config, client_factory=client_factory)
+        feed_bus = RedisBus(config, client_factory=client_factory)
+        cache = main.FeedConnectionCache(venue="SCRIPT")
+        cache.attach(api_bus)
+        control = feed_bus.subscribe(
+            "feed-control",
+            maxsize=100,
+            event_types=("control.command",),
+        )
+        script = ScriptedAdapter(
+            script=[Silence(3600.0)],
+            venue="SCRIPT",
+            underlyings=(UNDERLYING,),
+        )
+        other = ScriptedAdapter(
+            script=[Silence(3600.0)],
+            venue="OTHER",
+            underlyings=(UNDERLYING,),
+        )
+        supervisor = FeedSupervisor(
+            [script, other],
+            feed_bus.publish,
+            poll_seconds=1_000.0,
+            heartbeat_every=1_000.0,
+            retry_delay=0.0,
+        )
+        received: list[ControlCommand] = []
+
+        async def consume_commands() -> None:
+            while True:
+                event = await control.queue.get()
+                if isinstance(event, ControlCommand):
+                    received.append(event)
+                    supervisor.dispatch_command(event)
+
+        command_task = asyncio.create_task(consume_commands(), name="feed-control")
+        cache_task: asyncio.Task | None = None
+        monkeypatch_state = main.app.state
+        main.app.dependency_overrides[main.get_supervisor] = lambda: None
+        main.app.dependency_overrides[main.get_feed_cache] = lambda: cache
+        monkeypatch_state.events = api_bus
+        try:
+            await feed_bus.start()
+            await api_bus.start()
+            cache_task = asyncio.create_task(cache.run(), name="feed-state")
+            supervisor.start()
+            await _wait_until(
+                lambda: all(
+                    controller.state is ConnectionState.CONNECTED
+                    for controller in supervisor.controllers
+                )
+            )
+            await _wait_until(
+                lambda: cache.effective("SCRIPT") is not None
+                and cache.effective("SCRIPT").state is ConnectionState.CONNECTED
+            )
+            other_before = supervisor.controllers[1].state
+
+            transport = httpx.ASGITransport(app=main.app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://engine.test"
+            ) as client:
+                paused = await client.post("/feed/script/pause")
+                assert paused.status_code == 200
+                assert paused.json()["state"] == "stopped"
+                assert paused.json()["reason"] == "paused"
+                assert supervisor.controllers[1].state is other_before
+                assert cache.effective("SCRIPT").state is ConnectionState.STOPPED
+                assert cache.effective("SCRIPT").reason == "paused"
+
+                resume_generation = cache.generation("SCRIPT")
+                resumed = await client.post("/feed/SCRIPT/resume")
+                assert resumed.status_code == 200
+                assert resumed.json()["state"] == "connecting"
+                assert resumed.json()["reason"] == "resume"
+                assert supervisor.controllers[1].state is other_before
+                assert cache.generation("SCRIPT") > resume_generation
+
+                await _wait_until(
+                    lambda: cache.effective("SCRIPT") is not None
+                    and cache.effective("SCRIPT").state
+                    is ConnectionState.CONNECTED
+                )
+                reconnected = await client.post("/feed/script/reconnect")
+                assert reconnected.status_code == 200
+                assert reconnected.json()["state"] == "reconnecting"
+                assert reconnected.json()["reason"] == "closed"
+                assert supervisor.controllers[1].state is other_before
+                assert cache.generation("SCRIPT") > resume_generation
+
+            assert [event.adapter for event in received] == [
+                "SCRIPT",
+                "SCRIPT",
+                "SCRIPT",
+            ]
+            assert [event.command for event in received] == [
+                "pause",
+                "resume",
+                "reconnect",
+            ]
+        finally:
+            main.app.dependency_overrides.clear()
+            main.app.state.events = None
+            command_task.cancel()
+            await asyncio.gather(command_task, return_exceptions=True)
+            if cache_task is not None:
+                cache_task.cancel()
+                await asyncio.gather(cache_task, return_exceptions=True)
+            await supervisor.aclose()
+            await feed_bus.aclose()
+            await api_bus.aclose()
 
     asyncio.run(scenario())

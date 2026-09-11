@@ -14,7 +14,14 @@ import {
   UNDERLYINGS,
   type Underlying,
 } from "@/lib/contract";
-import { ENGINE_URL, loadChainAt, loadChainMinutes, loadExpiries } from "@/lib/engine";
+import {
+  ENGINE_URL,
+  commandFeed,
+  loadChainAt,
+  loadChainMinutes,
+  loadExpiries,
+  type FeedCommand,
+} from "@/lib/engine";
 import { looksCanonical } from "@/lib/instrument";
 import {
   feedBadge,
@@ -126,6 +133,7 @@ export default function ChainScreen({
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [feedCommandPending, setFeedCommandPending] = useState(false);
 
   /** #46: the contract chart panel. `null` means closed. Seeded from the URL so a link
    * carrying a contract opens straight onto its chart, as `docs/bars-contract.md`'s own
@@ -136,6 +144,7 @@ export default function ChainScreen({
   const expiryRequest = useRef(0);
   const minutesRequest = useRef(0);
   const ladderRequest = useRef(0);
+  const feedCommandInFlight = useRef(false);
 
   const loadExpiryList = useCallback(async (next: Underlying, wanted: string | null) => {
     const id = ++expiryRequest.current;
@@ -304,6 +313,21 @@ export default function ChainScreen({
     setWanted(timeline.stamps[at] ?? null);
   };
 
+  const runFeedCommand = async (command: FeedCommand) => {
+    if (feedStatus === null || feedCommandInFlight.current) return;
+    feedCommandInFlight.current = true;
+    setFeedCommandPending(true);
+    setError(null);
+    try {
+      await commandFeed(feedStatus.adapter, command);
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      feedCommandInFlight.current = false;
+      setFeedCommandPending(false);
+    }
+  };
+
   /**
    * Which of the two ladders is on screen — and, below, the one predicate every label
    * about it is read from.
@@ -404,6 +428,39 @@ export default function ChainScreen({
           <span className="feed-badge" data-state={badge.state} title={badge.reason || undefined}>
             {badge.label}
           </span>
+        ) : null}
+
+        {following && feedStatus ? (
+          <div className="feed-controls" role="group" aria-label="Feed controls">
+            <button
+              type="button"
+              className="feed-control"
+              onClick={() => void runFeedCommand("pause")}
+              disabled={feedCommandPending || feedStatus.state === "stopped"}
+            >
+              Pause
+            </button>
+            <button
+              type="button"
+              className="feed-control"
+              onClick={() => void runFeedCommand("resume")}
+              disabled={
+                feedCommandPending ||
+                feedStatus.state !== "stopped" ||
+                feedStatus.reason !== "paused"
+              }
+            >
+              Resume
+            </button>
+            <button
+              type="button"
+              className="feed-control"
+              onClick={() => void runFeedCommand("reconnect")}
+              disabled={feedCommandPending || feedStatus.state === "stopped"}
+            >
+              Reconnect
+            </button>
+          </div>
         ) : null}
 
         <RecordingToggle />

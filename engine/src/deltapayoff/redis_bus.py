@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import log_events
-from .events.redis_wire import decode, encode, stream_name, stream_names
+from .events.redis_wire import decode, encode, stream_name, stream_names, stream_type
 from .fanout import Subscription
 from .logging_setup import log_event
 
@@ -393,6 +393,7 @@ class RedisBus:
         lossless: bool = False,
         *,
         start_id: str | None = None,
+        event_types: Iterable[str] | None = None,
     ) -> RedisSubscription:
         """Register a consumer, exactly as the fan-out does, plus one keyword.
 
@@ -408,11 +409,25 @@ class RedisBus:
             raise ValueError(f"maxsize must be at least 1; got {maxsize}")
         if name in self._subscriptions:
             raise ValueError(f"a subscriber named {name!r} already exists")
+        streams = self.config.streams()
+        if event_types is not None:
+            selected_types = tuple(event_types)
+            if not selected_types:
+                raise ValueError("event_types must not be empty")
+            configured_types = {stream_type(stream) for stream in streams}
+            missing = set(selected_types) - configured_types
+            if missing:
+                raise ValueError(
+                    f"event type(s) not configured: {', '.join(sorted(missing))}"
+                )
+            streams = tuple(
+                stream for stream in streams if stream_type(stream) in selected_types
+            )
         subscription = RedisSubscription(
             name,
             maxsize,
             lossless,
-            streams=self.config.streams(),
+            streams=streams,
             consumer=f"{name}-{self.config.instance}",
             start_id=start_id,
         )

@@ -9,6 +9,7 @@ error table below assert about the boundary the browser actually talks to.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from typing import Any
@@ -17,11 +18,24 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from deltapayoff import main
 from deltapayoff.adapters import DeltaAdapter
 from deltapayoff.adapters.delta import instrument_from_symbol
 from deltapayoff.delta_client import DeltaUnavailable, parse_envelope
-from deltapayoff.events import OptionReference
-from deltapayoff.main import app, get_adapter, get_supervisor, get_watched_stream
+from deltapayoff.events import (
+    ConnectionState,
+    ControlCommand,
+    FeedConnection,
+    OptionReference,
+)
+from deltapayoff.main import (
+    FeedConnectionCache,
+    app,
+    get_adapter,
+    get_feed_cache,
+    get_supervisor,
+    get_watched_stream,
+)
 from deltapayoff.stream import ChainStream
 
 
@@ -192,20 +206,192 @@ def test_no_contracts_for_that_underlying_is_404(make_client) -> None:
     assert response.status_code == 404
 
 
-def test_split_feed_command_is_unavailable_over_http_until_the_bus_command_route_lands(
+def test_split_feed_command_round_trips_over_the_bus(
     monkeypatch,
 ) -> None:
+    fixed = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    cache = FeedConnectionCache(
+        venue="SCRIPT",
+        wall_clock=lambda: fixed,
+        monotonic_clock=lambda: 0.0,
+    )
+    cache.apply(
+        FeedConnection(
+            source="controller",
+            ts_received=fixed,
+            adapter="SCRIPT",
+            to_state=ConnectionState.CONNECTED,
+            reason="open",
+        )
+    )
+
+    class Bus:
+        def __init__(self) -> None:
+            self.published: list[ControlCommand] = []
+
+        def publish(self, event) -> None:
+            assert isinstance(event, ControlCommand)
+            self.published.append(event)
+            asyncio.get_running_loop().call_soon(
+                cache.apply,
+                FeedConnection(
+                    source="controller",
+                    ts_received=fixed.replace(second=1),
+                    adapter="SCRIPT",
+                    to_state=ConnectionState.STOPPED,
+                    reason="paused",
+                ),
+            )
+
+    events = Bus()
     monkeypatch.setenv("DELTA_BUS", "redis")
+    monkeypatch.setattr(app.state, "events", events, raising=False)
     app.dependency_overrides[get_supervisor] = lambda: None
+    app.dependency_overrides[get_feed_cache] = lambda: cache
     try:
-        response = TestClient(app).post("/feed/DELTA/pause")
+        response = TestClient(app).post("/feed/script/pause")
     finally:
         app.dependency_overrides.clear()
 
-    assert response.status_code == 503
-    assert response.json()["detail"] == (
-        "feed commands travel over the bus from I5 (#64); unavailable in split mode"
+    assert response.status_code == 200
+    assert response.json()["adapter"] == "SCRIPT"
+    assert response.json()["state"] == "stopped"
+    assert response.json()["reason"] == "paused"
+    assert len(events.published) == 1
+    assert events.published[0].adapter == "SCRIPT"
+
+
+def test_split_feed_command_rejects_unknown_adapter_without_publishing(
+    monkeypatch,
+) -> None:
+    cache = FeedConnectionCache(venue="SCRIPT")
+    events = type("Bus", (), {"published": []})()
+
+    def publish(event) -> None:
+        events.published.append(event)
+
+    events.publish = publish
+    monkeypatch.setenv("DELTA_BUS", "redis")
+    monkeypatch.setattr(app.state, "events", events, raising=False)
+    app.dependency_overrides[get_supervisor] = lambda: None
+    app.dependency_overrides[get_feed_cache] = lambda: cache
+    try:
+        response = TestClient(app).post("/feed/other/pause")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert events.published == []
+
+
+def test_split_feed_command_rejects_unknown_command_without_publishing(
+    monkeypatch,
+) -> None:
+    cache = FeedConnectionCache(venue="SCRIPT")
+    events = type("Bus", (), {"published": []})()
+
+    def publish(event) -> None:
+        events.published.append(event)
+
+    events.publish = publish
+    monkeypatch.setenv("DELTA_BUS", "redis")
+    monkeypatch.setattr(app.state, "events", events, raising=False)
+    app.dependency_overrides[get_supervisor] = lambda: None
+    app.dependency_overrides[get_feed_cache] = lambda: cache
+    try:
+        response = TestClient(app).post("/feed/script/unknown")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422
+    assert events.published == []
+
+
+def test_split_feed_command_times_out_without_a_qualifying_later_event(
+    monkeypatch,
+) -> None:
+    fixed = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    cache = FeedConnectionCache(
+        venue="SCRIPT",
+        wall_clock=lambda: fixed,
+        monotonic_clock=lambda: 0.0,
     )
+    cache.apply(
+        FeedConnection(
+            source="controller",
+            ts_received=fixed,
+            adapter="SCRIPT",
+            to_state=ConnectionState.CONNECTED,
+            reason="open",
+        )
+    )
+
+    class Bus:
+        def __init__(self) -> None:
+            self.published: list[ControlCommand] = []
+
+        def publish(self, event) -> None:
+            self.published.append(event)
+
+    events = Bus()
+    monkeypatch.setenv("DELTA_BUS", "redis")
+    monkeypatch.setattr(main, "COMMAND_ACK_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(app.state, "events", events, raising=False)
+    app.dependency_overrides[get_supervisor] = lambda: None
+    app.dependency_overrides[get_feed_cache] = lambda: cache
+    try:
+        response = TestClient(app).post("/feed/script/pause")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == (
+        "feed command was published but SCRIPT did not acknowledge it"
+    )
+    assert len(events.published) == 1
+
+
+def test_split_feed_command_publishes_idempotent_pause_and_returns_cached_line(
+    monkeypatch,
+) -> None:
+    fixed = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    cache = FeedConnectionCache(
+        venue="SCRIPT",
+        wall_clock=lambda: fixed,
+        monotonic_clock=lambda: 0.0,
+    )
+    cache.apply(
+        FeedConnection(
+            source="controller",
+            ts_received=fixed,
+            adapter="SCRIPT",
+            to_state=ConnectionState.STOPPED,
+            reason="paused",
+        )
+    )
+
+    class Bus:
+        def __init__(self) -> None:
+            self.published: list[ControlCommand] = []
+
+        def publish(self, event) -> None:
+            self.published.append(event)
+
+    events = Bus()
+    monkeypatch.setenv("DELTA_BUS", "redis")
+    monkeypatch.setattr(main, "COMMAND_ACK_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(app.state, "events", events, raising=False)
+    app.dependency_overrides[get_supervisor] = lambda: None
+    app.dependency_overrides[get_feed_cache] = lambda: cache
+    try:
+        response = TestClient(app).post("/feed/script/pause")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "stopped"
+    assert response.json()["reason"] == "paused"
+    assert len(events.published) == 1
 
 
 def _reference(symbol: str) -> OptionReference:

@@ -147,7 +147,14 @@ class FeedSupervisor:
         second caller — a replay, a future broker — is not left guessing.
         """
         self._publish(event)
-        return any(controller.command(event) for controller in self._controllers)
+        return self.dispatch_command(event)
+
+    def dispatch_command(self, event: ControlCommand) -> bool:
+        """Apply a command that has already been published to every controller."""
+        accepted = False
+        for controller in self._controllers:
+            accepted = controller.command(event) or accepted
+        return accepted
 
     def start(self) -> None:
         """One task per controller. Idempotent; a second call starts nothing new."""

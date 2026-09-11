@@ -35,7 +35,15 @@ from decimal import Decimal
 
 import pytest
 
-from deltapayoff.events import Instrument, OptionQuote, Right
+from deltapayoff.events import (
+    ConnectionState,
+    ControlCommand,
+    FeedConnection,
+    Heartbeat,
+    Instrument,
+    OptionQuote,
+    Right,
+)
 from deltapayoff.events.redis_wire import stream_name
 from deltapayoff.fanout import FanOut
 from deltapayoff.redis_bus import BusConfig, BusUnavailable, RedisBus
@@ -355,6 +363,63 @@ def test_a_subscriber_needs_a_bounded_queue(bus_kind) -> None:
             return True
 
     assert run(scenario()) is True
+
+
+def test_redis_subscriptions_can_receive_only_selected_event_types() -> None:
+    """A state reader must not drain market data or inbound commands."""
+
+    async def scenario():
+        async with open_bus("redis-fake", None) as bus:
+            with pytest.raises(ValueError):
+                bus.subscribe("empty", maxsize=10, event_types=[])
+            with pytest.raises(ValueError):
+                bus.subscribe("unknown", maxsize=10, event_types=["not-an-event"])
+            assert "empty" not in bus._subscriptions
+            assert "unknown" not in bus._subscriptions
+
+            feed_state = bus.subscribe(
+                "feed-state",
+                maxsize=10,
+                event_types=["feed.connection", "heartbeat"],
+            )
+            commands = bus.subscribe(
+                "feed-control", maxsize=10, event_types=["control.command"]
+            )
+            await live(bus)
+            bus.publish(
+                FeedConnection(
+                    source="controller",
+                    ts_received=TS,
+                    adapter="DELTA",
+                    to_state=ConnectionState.CONNECTED,
+                    reason="open",
+                )
+            )
+            bus.publish(
+                Heartbeat(
+                    source="controller",
+                    ts_received=TS,
+                    adapter="DELTA",
+                    state=ConnectionState.CONNECTED,
+                )
+            )
+            bus.publish(_command_event())
+            bus.publish(quote(1.0))
+            await settle(bus)
+            return await take(feed_state, 2), await take(commands, 1)
+
+    feed_events, command_events = run(scenario())
+    assert [event.type for event in feed_events] == ["feed.connection", "heartbeat"]
+    assert [event.type for event in command_events] == ["control.command"]
+
+
+def _command_event() -> ControlCommand:
+    return ControlCommand(
+        source="operator",
+        ts_received=TS,
+        adapter="DELTA",
+        command="pause",
+    )
 
 
 # ------------------------------------------------------------------- Redis only

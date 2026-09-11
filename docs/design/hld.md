@@ -119,10 +119,15 @@ reference columns, never inputs.
 
 ### 2.6 The public surface and the screens
 
-In split mode, feed has only `GET /health`, which is `FeedSupervisor.report`. The engine serves
-`/expiries`, `/chain`, `/smile`, `/iv-vs-rv`, `/recording`, `/health` and `/ws/chain`; its health
-route is process liveness plus watched pairs. The websocket sends the chain ladder and feed badge
-from the engine's cache. The default no-`DELTA_BUS` engine keeps the existing combined surface.
+In split mode, feed has `GET /health`, which is its local `FeedSupervisor.report`. The engine
+serves `/expiries`, `/chain`, `/smile`, `/iv-vs-rv`, `/recording`, `/health` and `/ws/chain`.
+Its `/health` is authoritative about remote feed state from the `feed.connection` and
+`heartbeat` observations in `FeedConnectionCache`, while retaining process liveness and
+watched pairs. The websocket badge is derived from that same projection, including its
+heartbeat-silence rule. Screen commands enter through the existing
+`POST /feed/{adapter}/{command}` route: the API publishes `control.command` and the feed
+returns state through the bus. No service-to-service HTTP is added. The default
+no-`DELTA_BUS` engine keeps the existing combined surface and synchronous command path.
 
 `web/` renders and computes nothing. It will wear a badge on the ladder header whenever the feed
 is not `connected`, clearing on recovery (#40); gain a chart panel of a contract's minute candles
@@ -162,7 +167,7 @@ Every transition emits one `feed.connection` event and one log record; nothing e
 |---|---|---|
 | Feed adapter | Redis publisher | `md.option_quote`, `md.option_reference`, `md.index_quote` |
 | Redis | ChainStream, BarWriter | the three canonical market events |
-| Redis | FeedConnectionCache | `feed.connection`, `heartbeat`, `alert` |
+| Redis | FeedConnectionCache | `feed.connection`, `heartbeat` |
 | ChainStream | REST and websocket handlers | ladders from the live cache |
 | BarWriter | Parquet store | sealed `md.option_bar` data |
 | Store | the REST routes | Parquet reads, carrying no event |

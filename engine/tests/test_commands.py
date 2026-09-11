@@ -640,3 +640,58 @@ def test_the_supervisor_offers_a_command_to_the_controller_that_owns_the_adapter
     ], "the command reached the adapter it named and only that one"
     assert published[0].type == "control.command"
     assert supervisor.names() == ["ONE", "TWO"]
+
+
+def test_dispatch_command_routes_a_published_event_without_republishing_it() -> None:
+    published: list[Event] = []
+    first = ScriptedAdapter(venue="ONE")
+    second = ScriptedAdapter(venue="TWO")
+    supervisor = FeedSupervisor([first, second], published.append)
+    for controller in supervisor.controllers:
+        controller.start()
+    published.clear()
+
+    taken = supervisor.dispatch_command(_command("TWO", "pause"))
+
+    assert taken is True
+    assert [controller.state for controller in supervisor.controllers] == [
+        ConnectionState.CONNECTING,
+        ConnectionState.STOPPED,
+    ]
+    assert [event.type for event in published] == ["feed.connection"]
+    assert not any(isinstance(event, ControlCommand) for event in published)
+
+
+def test_dispatch_command_offers_to_every_controller_after_one_accepts() -> None:
+    offered: list[str] = []
+
+    class Controller:
+        def __init__(self, adapter, _publish) -> None:
+            self.adapter_name = adapter.venue
+
+        def command(self, _event: ControlCommand) -> bool:
+            offered.append(self.adapter_name)
+            return self.adapter_name == "ONE"
+
+    supervisor = FeedSupervisor(
+        [ScriptedAdapter(venue="ONE"), ScriptedAdapter(venue="TWO")],
+        lambda _event: None,
+        controller_factory=Controller,
+    )
+
+    assert supervisor.dispatch_command(_command("ONE", "pause")) is True
+    assert offered == ["ONE", "TWO"]
+
+
+def test_command_publishes_before_dispatching_the_event() -> None:
+    published: list[Event] = []
+    supervisor = FeedSupervisor([ScriptedAdapter(venue="TWO")], published.append)
+    supervisor.controllers[0].start()
+    published.clear()
+
+    assert supervisor.command(_command("TWO", "pause")) is True
+
+    assert [event.type for event in published] == [
+        "control.command",
+        "feed.connection",
+    ]

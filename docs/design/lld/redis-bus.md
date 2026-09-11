@@ -63,9 +63,10 @@ A consumer records it at the moment it flushes, having drained the queue, and ha
 as `start_id` after a restart. I3 is what will do that in `store.py`; this ticket provides
 it and pins it.
 
-**The feed-state cold-start gap is deliberate until #64.** An engine started after `feed` is
-already connected cannot learn the current connection state until the next `feed.connection`
-transition; #64 will make it report the last `feed.connection` and `heartbeat` it saw, with age.
+**The feed-state subscription closes the cold-start gap.** An engine started after `feed` is
+already connected observes `feed.connection` and `heartbeat` on its filtered subscription and
+reports the last observation and its age. The first heartbeat after API start carries the
+controller's state and hydrates the cache; no feed-side startup change is needed.
 
 ## 3. Drop-oldest — a reader outside every group, and it jumps
 
@@ -187,7 +188,7 @@ because prod is Linux beside the Redis; `DEFAULT_READ_BLOCK_MS` carries the same
 **The default remains in-process.** With `DELTA_BUS` unset, FanOut keeps the engine and feed
 composition unchanged. With `DELTA_BUS=redis`, this bus is the process boundary: `feed` publishes
 and the engine owns the three subscriptions. Store replay from its recorded id is I4 (#63); engine
-health learning the feed's state from the bus is I5 (#64).
+I5 (#64) adds the engine's feed-state health projection to that consumer composition.
 
 **No `XAUTOCLAIM`, no pending-list recovery, no dead-letter.** §2 says why: the flush is the
 durability boundary and the recorded id is the recovery. A consumer that needed per-message

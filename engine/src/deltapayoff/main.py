@@ -46,6 +46,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -74,7 +76,7 @@ from .chain import (
 from .compute import enrich
 from .contract_bars import ContractBarsResponse, read_contract_bars
 from .delta_client import DeltaClient, DeltaUnavailable
-from .events import Bus, ConnectionState, ControlCommand, Event, FeedConnection
+from .events import Bus, ConnectionState, ControlCommand, Event, FeedConnection, Heartbeat
 from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
 from .feed_runtime import relist_forever, relist_instruments
@@ -107,7 +109,7 @@ from .store import (
     read_spot_bars,
 )
 from .stream import ChainStream, recompute_every_minute, recompute_forever
-from .supervisor import FeedSupervisor
+from .supervisor import FeedSupervisor, worst
 from .volatility import (
     ALIGNMENTS,
     INTERVALS,
@@ -190,6 +192,11 @@ MAX_POINTS = 2000
 #: it — the suite sets it in `conftest.py`, because nothing in it may touch the network.
 LIVE_FEED_ENV = "DELTA_LIVE_FEED"
 
+#: `derived`: heartbeats come every `controller.HEARTBEAT_SECONDS` (10 s), so 25 s
+#: tolerates two missed heartbeats plus 5 s of batching and scheduling slack while a dead
+#: `feed` turns the badge in under half a minute.
+FEED_HEARTBEAT_STALE_SECONDS = 25.0
+
 
 def live_feed_enabled() -> bool:
     return os.environ.get(LIVE_FEED_ENV, "1") != "0"
@@ -226,6 +233,30 @@ def live_underlyings() -> tuple[str, ...]:
 
 
 @dataclass
+class _FeedObservation:
+    connection: FeedConnection | None = None
+    connection_at: datetime | None = None
+    connection_mono: float | None = None
+    heartbeat: Heartbeat | None = None
+    heartbeat_at: datetime | None = None
+    heartbeat_mono: float | None = None
+    first_connection_at: datetime | None = None
+    first_connection_mono: float | None = None
+    state_source: tuple[str, str] | None = None
+    state_learned_at: datetime | None = None
+    state_learned_mono: float | None = None
+    generation: int = 0
+    update_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    history: deque[tuple[int, AdapterHealth]] = field(
+        default_factory=lambda: deque(maxlen=32), repr=False
+    )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@dataclass
 class FeedConnectionCache:
     """The latest `feed.connection` transition per adapter. #40's badge reads this.
 
@@ -246,20 +277,127 @@ class FeedConnectionCache:
     to catch a `feed.connection` event that arrives a few times an hour.
     """
 
+    venue: str = "DELTA"
+    wall_clock: Callable[[], datetime] = field(default=_utc_now, repr=False)
+    monotonic_clock: Callable[[], float] = field(
+        default=time.monotonic, repr=False
+    )
     latest: dict[str, FeedConnection] = field(default_factory=dict)
+    heartbeats: dict[str, Heartbeat] = field(default_factory=dict)
+    _observations: dict[str, _FeedObservation] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _subscription: Any = field(default=None, init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        self._observations[self.venue] = _FeedObservation()
+
+    @property
+    def latest_heartbeats(self) -> dict[str, Heartbeat]:
+        return self.heartbeats
+
+    def names(self) -> list[str]:
+        return list(self._observations)
+
     def apply(self, event: Event) -> None:
-        """Note `event` if it is a transition. Anything else passes unremembered."""
+        """Record the newest event of each feed-state type."""
+        if not isinstance(event, (FeedConnection, Heartbeat)):
+            return
+        adapter = self._adapter_name(event.adapter)
+        observation = self._observations.setdefault(adapter, _FeedObservation())
+        observed_at = self.wall_clock()
+        observed_mono = self.monotonic_clock()
+
         if isinstance(event, FeedConnection):
-            self.latest[event.adapter] = event
+            if (
+                observation.connection is not None
+                and event.ts_received <= observation.connection.ts_received
+            ):
+                return
+            observation.connection = event
+            observation.connection_at = observed_at
+            observation.connection_mono = observed_mono
+            if observation.first_connection_mono is None:
+                observation.first_connection_at = observed_at
+                observation.first_connection_mono = observed_mono
+            self.latest[adapter] = event
+        else:
+            if (
+                observation.heartbeat is not None
+                and event.ts_received <= observation.heartbeat.ts_received
+            ):
+                return
+            observation.heartbeat = event
+            observation.heartbeat_at = observed_at
+            observation.heartbeat_mono = observed_mono
+            self.heartbeats[adapter] = event
+
+        self._learn_effective_state(observation, observed_at, observed_mono)
+        observation.generation += 1
+        observation.history.append(
+            (
+                observation.generation,
+                self._health(adapter, observed_at, observed_mono),
+            )
+        )
+        observation.update_event.set()
 
     def get(self, adapter: str) -> FeedConnection | None:
-        return self.latest.get(adapter)
+        """Return the newest transition, retaining the cache's original API."""
+        return self.latest.get(self._adapter_name(adapter))
+
+    def effective(self, adapter: str) -> AdapterHealth | None:
+        """Return the effective state projection for one adapter."""
+        name = self._adapter_name(adapter)
+        if name not in self._observations:
+            return None
+        return self._health(name, self.wall_clock(), self.monotonic_clock())
+
+    def generation(self, adapter: str) -> int:
+        """Return the projection generation for one configured adapter."""
+        name = self._adapter_name(adapter)
+        observation = self._observations.get(name)
+        return 0 if observation is None else observation.generation
+
+    async def wait_for_generation(self, adapter: str, after: int) -> int:
+        """Wait until a later feed-state event has been applied for an adapter."""
+        generation, _health = await self.wait_for_update(adapter, after)
+        return generation
+
+    async def wait_for_update(
+        self, adapter: str, after: int
+    ) -> tuple[int, AdapterHealth]:
+        """Wait for and return the first cached projection after a generation."""
+        name = self._adapter_name(adapter)
+        observation = self._observations.get(name)
+        if observation is None:
+            raise KeyError(name)
+        while True:
+            for generation, health in observation.history:
+                if generation > after:
+                    return generation, health
+            await observation.update_event.wait()
+            if not any(generation > after for generation, _ in observation.history):
+                observation.update_event.clear()
+
+    def report(self) -> HealthReport:
+        wall = self.wall_clock()
+        monotonic = self.monotonic_clock()
+        adapters = [self._health(name, wall, monotonic) for name in self.names()]
+        return HealthReport(
+            feed=worst(adapter.state for adapter in adapters), adapters=adapters
+        )
 
     def attach(self, bus, maxsize: int = 100, name: str = "feed-state"):
-        """Attach one drop-oldest subscription for connection transitions."""
-        self._subscription = bus.subscribe(name, maxsize=maxsize)
+        """Attach one drop-oldest subscription for feed state events."""
+        if isinstance(bus, RedisBus):
+            self._subscription = bus.subscribe(
+                name,
+                maxsize=maxsize,
+                event_types=("feed.connection", "heartbeat"),
+            )
+        else:
+            self._subscription = bus.subscribe(name, maxsize=maxsize)
         return self._subscription
 
     async def run(self) -> None:
@@ -268,6 +406,143 @@ class FeedConnectionCache:
             raise RuntimeError("attach() the feed connection cache before running it")
         while True:
             self.apply(await self._subscription.queue.get())
+
+    def _adapter_name(self, adapter: str) -> str:
+        if adapter.upper() == self.venue.upper():
+            return self.venue
+        return adapter
+
+    def _learn_effective_state(
+        self, observation: _FeedObservation, observed_at: datetime, observed_mono: float
+    ) -> None:
+        source = self._effective_source(observation)
+        if source is None:
+            return
+        kind, event = source
+        token = (kind, event.event_id)
+        if token != observation.state_source:
+            observation.state_source = token
+            observation.state_learned_at = observed_at
+            observation.state_learned_mono = observed_mono
+
+    @staticmethod
+    def _effective_source(
+        observation: _FeedObservation,
+    ) -> tuple[str, FeedConnection | Heartbeat] | None:
+        connection = observation.connection
+        heartbeat = observation.heartbeat
+        if connection is None and heartbeat is None:
+            return None
+        if heartbeat is None or (
+            connection is not None and connection.ts_received >= heartbeat.ts_received
+        ):
+            return "connection", connection
+        return "heartbeat", heartbeat
+
+    def _health(self, name: str, wall: datetime, monotonic: float) -> AdapterHealth:
+        observation = self._observations[name]
+        source = self._effective_source(observation)
+        if source is None:
+            state = ConnectionState.STOPPED
+            reason = None
+            learned_at = None
+            learned_mono = None
+        else:
+            _kind, event = source
+            state = (
+                event.to_state
+                if isinstance(event, FeedConnection)
+                else event.state
+            )
+            if isinstance(event, FeedConnection):
+                reason = event.reason
+            elif (
+                observation.connection is not None
+                and observation.connection.to_state is event.state
+            ):
+                reason = observation.connection.reason
+            else:
+                reason = None
+            learned_at = observation.state_learned_at
+            learned_mono = observation.state_learned_mono
+
+        stale_origin_at = (
+            observation.heartbeat_at
+            if observation.heartbeat is not None
+            else observation.first_connection_at
+        )
+        stale_origin_mono = (
+            observation.heartbeat_mono
+            if observation.heartbeat is not None
+            else observation.first_connection_mono
+        )
+        stale_age = (
+            None
+            if stale_origin_mono is None
+            else max(0.0, monotonic - stale_origin_mono)
+        )
+        if stale_age is not None and stale_age > FEED_HEARTBEAT_STALE_SECONDS:
+            state = ConnectionState.STOPPED
+            reason = "silent"
+            learned_mono = stale_origin_mono + FEED_HEARTBEAT_STALE_SECONDS
+            learned_at = stale_origin_at + timedelta(
+                seconds=FEED_HEARTBEAT_STALE_SECONDS
+            )
+
+        connection_age = (
+            None
+            if observation.connection_mono is None
+            else _age(monotonic, observation.connection_mono)
+        )
+        heartbeat_age = (
+            None
+            if observation.heartbeat_mono is None
+            else _age(monotonic, observation.heartbeat_mono)
+        )
+        payload_age = (
+            None
+            if observation.heartbeat is None
+            or observation.heartbeat.last_message_age_seconds is None
+            else max(0.0, observation.heartbeat.last_message_age_seconds)
+        )
+        last_message_at = (
+            None
+            if payload_age is None or observation.heartbeat_at is None
+            else observation.heartbeat_at - timedelta(seconds=payload_age)
+        )
+        last_message_age = (
+            None
+            if payload_age is None or heartbeat_age is None
+            else _rounded_age(payload_age + heartbeat_age)
+        )
+        return AdapterHealth(
+            adapter=name,
+            state=state,
+            reason=reason,
+            last_message_at=last_message_at,
+            last_message_age_seconds=last_message_age,
+            reconnects=None,
+            budget_remaining=None,
+            transitions=None,
+            empty_opens=None,
+            undecodable=None,
+            state_learned_at=learned_at,
+            state_age_seconds=None
+            if learned_mono is None
+            else _rounded_age(monotonic - learned_mono),
+            last_connection_at=observation.connection_at,
+            last_connection_age_seconds=connection_age,
+            last_heartbeat_at=observation.heartbeat_at,
+            last_heartbeat_age_seconds=heartbeat_age,
+        )
+
+
+def _age(now: float, then: float) -> float:
+    return _rounded_age(max(0.0, now - then))
+
+
+def _rounded_age(value: float) -> float:
+    return round(max(0.0, value), 3)
 
 
 @dataclass
@@ -418,7 +693,7 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     # `FeedConnectionCache`. So the cache is updated **synchronously, in front of the
     # real bus**, rather than through a subscription of its own: the same `publish`
     # `FeedSupervisor` was already being handed, with one line added before it.
-    feed_cache = FeedConnectionCache()
+    feed_cache = FeedConnectionCache(venue=adapter.venue)
 
     def publish(event: Event) -> None:
         feed_cache.apply(event)
@@ -439,12 +714,13 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
 
 def build_consumer_stack() -> FeedStack:
     """Wire the Redis-only engine process, without any venue components."""
-    events = RedisBus(BusConfig.from_env(live_underlyings()))
+    config = BusConfig.from_env(live_underlyings())
+    events = RedisBus(config)
     stream = ChainStream()
     stream.attach(events)
     writer = BarWriter(BarStore(), chains=stream.live_computed_chains)
     writer.attach(events)
-    feed_cache = FeedConnectionCache()
+    feed_cache = FeedConnectionCache(venue=config.venue)
     feed_cache.attach(events)
     return FeedStack(
         events=events,
@@ -888,6 +1164,7 @@ def get_feed_cache() -> FeedConnectionCache | None:
 @app.get("/health", response_model=HealthReport)
 async def health(
     supervisor: Annotated[FeedSupervisor | None, Depends(get_supervisor)],
+    feed_cache: Annotated[FeedConnectionCache | None, Depends(get_feed_cache)],
     stream: Annotated[ChainStream | None, Depends(get_watched_stream)],
 ) -> HealthReport:
     """Liveness **and** readiness, and the difference between them.
@@ -899,11 +1176,12 @@ async def health(
     `models.HealthReport`, and it is the seam #40's badge, #41's commands and #44's
     watched set all read through.
     """
-    report = (
-        HealthReport(feed=ConnectionState.STOPPED)
-        if supervisor is None
-        else supervisor.report()
-    )
+    if supervisor is not None:
+        report = supervisor.report()
+    elif feed_cache is not None:
+        report = feed_cache.report()
+    else:
+        report = HealthReport(feed=ConnectionState.STOPPED)
     if stream is not None:
         # #44's watched set. Built here rather than in `supervisor.report()` because the
         # supervisor owns connections and knows nothing about a chain cache — and what
@@ -925,6 +1203,27 @@ async def health(
 #: name the one it refused rather than handing back pydantic's own message about a
 #: literal, which is about a type and not about a feed.
 FEED_COMMANDS = ("pause", "resume", "reconnect")
+COMMAND_ACK_TIMEOUT_SECONDS = 2.0
+
+
+def _command_is_acknowledged(health: AdapterHealth, command: str) -> bool:
+    if command == "pause":
+        return health.state is ConnectionState.STOPPED and health.reason == "paused"
+    if command == "resume":
+        return health.state is ConnectionState.CONNECTING and health.reason == "resume"
+    return health.state is ConnectionState.RECONNECTING and health.reason == "closed"
+
+
+async def _wait_for_command_ack(
+    cache: FeedConnectionCache,
+    adapter: str,
+    generation: int,
+    command: str,
+) -> AdapterHealth:
+    while True:
+        generation, health = await cache.wait_for_update(adapter, generation)
+        if _command_is_acknowledged(health, command):
+            return health
 
 
 @app.post("/feed/{adapter}/{command}", response_model=AdapterHealth)
@@ -932,6 +1231,7 @@ async def feed_command(
     adapter: str,
     command: str,
     supervisor: Annotated[FeedSupervisor | None, Depends(get_supervisor)],
+    feed_cache: Annotated[FeedConnectionCache | None, Depends(get_feed_cache)],
 ) -> AdapterHealth:
     """Pause, resume or reconnect one adapter. **The engine's second mutating route.**
 
@@ -957,17 +1257,13 @@ async def feed_command(
     is not. Both are checked before anything is published: a command nobody can carry out
     must not reach the bus, where a later reader would find it and assume it happened.
     """
-    if selected_bus() == REDIS_BUS and supervisor is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "feed commands travel over the bus from I5 (#64); "
-                "unavailable in split mode"
-            ),
-        )
-    names = supervisor.names() if supervisor is not None else []
+    names = supervisor.names() if supervisor is not None else (
+        feed_cache.names()
+        if selected_bus() == REDIS_BUS and feed_cache is not None
+        else []
+    )
     matched = next((name for name in names if name.upper() == adapter.upper()), None)
-    if supervisor is None or matched is None:
+    if matched is None:
         raise HTTPException(
             status_code=404,
             detail=(
@@ -983,16 +1279,46 @@ async def feed_command(
                 f"{', '.join(FEED_COMMANDS[:-1])} or {FEED_COMMANDS[-1]}"
             ),
         )
-    supervisor.command(
-        ControlCommand(
-            source="operator",
-            ts_received=datetime.now(timezone.utc),
-            adapter=matched,
-            command=command,  # type: ignore[arg-type]  # checked against FEED_COMMANDS
-        )
+    event = ControlCommand(
+        source="operator",
+        ts_received=datetime.now(timezone.utc),
+        adapter=matched,
+        command=command,  # type: ignore[arg-type]  # checked against FEED_COMMANDS
     )
-    report = supervisor.report()
-    return next(line for line in report.adapters if line.adapter == matched)
+    if supervisor is not None:
+        supervisor.command(event)
+        report = supervisor.report()
+        return next(line for line in report.adapters if line.adapter == matched)
+
+    if selected_bus() != REDIS_BUS or feed_cache is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no adapter named {adapter!r}; this engine runs "
+                f"{', '.join(names) if names else 'none'}"
+            ),
+        )
+    events = getattr(app.state, "events", None)
+    if events is None:
+        raise HTTPException(status_code=503, detail="the feed command bus is unavailable")
+
+    generation = feed_cache.generation(matched)
+    cached = feed_cache.effective(matched)
+    events.publish(event)
+    if cached is not None and _command_is_acknowledged(cached, command):
+        return cached
+    try:
+        return await asyncio.wait_for(
+            _wait_for_command_ack(feed_cache, matched, generation, command),
+            timeout=COMMAND_ACK_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"feed command was published but {matched} did not acknowledge it"
+            ),
+        ) from exc
 
 
 @app.get("/expiries", response_model=ExpiriesResponse)
@@ -1450,15 +1776,16 @@ async def set_recording(
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-def _feed_message(event: FeedConnection) -> dict[str, Any]:
+def _feed_message(health: AdapterHealth) -> dict[str, Any]:
     """A `FeedConnection` event, in the shape `docs/live-chain-contract.md` fixes."""
+    assert health.state_learned_at is not None
     return {
         "type": "feed",
         "data": {
-            "adapter": event.adapter,
-            "state": event.to_state.value,
-            "since": event.ts_received.strftime(_TIMESTAMP_FORMAT),
-            "reason": event.reason,
+            "adapter": health.adapter,
+            "state": health.state.value,
+            "since": health.state_learned_at.strftime(_TIMESTAMP_FORMAT),
+            "reason": health.reason or "",
         },
     }
 
@@ -1535,10 +1862,10 @@ async def live_chain(
         adapter_name: str | None = None
         if supervisor is not None and supervisor.controllers:
             adapter_name = supervisor.controllers[0].adapter_name
-        elif feed_cache is not None and feed_cache.latest:
-            # Split mode has no local supervisor. The consumer has one feed adapter today,
-            # so the first adapter that published a transition is the badge's source.
-            adapter_name = next(iter(feed_cache.latest))
+        elif feed_cache is not None and feed_cache.names():
+            # Split mode has no local supervisor. The cache knows the configured adapter
+            # before its first event, so a late-start heartbeat can hydrate the badge.
+            adapter_name = feed_cache.names()[0]
 
         #: The state last actually sent to *this* connection, so a `feed` message goes
         #: out only when it says something new — see `docs/live-chain-contract.md`'s
@@ -1550,11 +1877,15 @@ async def live_chain(
             nonlocal last_sent_state
             if adapter_name is None or feed_cache is None:
                 return
-            event = feed_cache.get(adapter_name)
-            if event is None or event.to_state.value == last_sent_state:
+            health = feed_cache.effective(adapter_name)
+            if (
+                health is None
+                or health.state_learned_at is None
+                or health.state.value == last_sent_state
+            ):
                 return
-            last_sent_state = event.to_state.value
-            await websocket.send_json(_feed_message(event))
+            last_sent_state = health.state.value
+            await websocket.send_json(_feed_message(health))
 
         # **Interest, registered on accept and released on close.** This is what puts
         # the pair in the 100 ms live pass and on `/health`'s watched set; an expiry no

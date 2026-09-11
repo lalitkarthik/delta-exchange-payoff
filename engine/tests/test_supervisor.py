@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from deltapayoff import main
 from deltapayoff.events import Alert, ConnectionState
+from deltapayoff.models import AdapterHealth
 from deltapayoff.supervisor import SEVERITY, FeedSupervisor, worst
 from fakes.scripted_adapter import Close, Frames, ScriptedAdapter, Silence
 
@@ -284,6 +285,14 @@ def test_an_adapter_that_has_never_delivered_reports_an_unknown_age() -> None:
 
     assert row.last_message_age_seconds is None
     assert row.last_message_at is None
+
+
+def test_remote_adapter_health_does_not_invent_controller_counters() -> None:
+    row = AdapterHealth(adapter="DELTA", state=ConnectionState.STOPPED)
+
+    assert row.reconnects is None
+    assert row.budget_remaining is None
+    assert row.transitions is None
 
 
 def test_a_silent_connection_shows_as_reconnecting_in_the_report() -> None:

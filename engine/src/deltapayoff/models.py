@@ -295,14 +295,14 @@ class AdapterHealth(BaseModel):
     #: Times this connection has **dropped** since the process started — the count the
     #: controller spends its budget against, not the number of entries into
     #: `reconnecting`, which the staleness watchdog can reach without a drop.
-    reconnects: int
+    reconnects: int | None = None
     #: Reconnects left before the connection gives up for good. Restored in full by any
     #: message arriving, so a healthy feed sits at the configured budget.
-    budget_remaining: int
+    budget_remaining: int | None = None
     #: Every state change since the process started, including the ones that came back.
     #: A connection flapping between `connected` and `degraded` shows up here and in no
     #: other field of this report.
-    transitions: int
+    transitions: int | None = None
     #: Sockets that opened with **nothing subscribed** — a connection guaranteed to
     #: deliver nothing, which is the failure with no error. `null` when the adapter has
     #: no socket owner to ask, because an absent count is not a count of zero.
@@ -313,6 +313,19 @@ class AdapterHealth(BaseModel):
     #: climbing, which is a silent failure with a counter nobody reads. `null` when the
     #: adapter does not decode anything of its own.
     undecodable: int | None = None
+    #: When the API observed the event that currently supplies `state`, or `null` before
+    #: the first state event reaches a remote consumer.
+    state_learned_at: datetime | None = None
+    #: Seconds since `state_learned_at`, measured on a monotonic clock.
+    state_age_seconds: float | None = None
+    #: When the API observed the newest `feed.connection`, or `null` if none arrived.
+    last_connection_at: datetime | None = None
+    #: Seconds since `last_connection_at`, measured on a monotonic clock.
+    last_connection_age_seconds: float | None = None
+    #: When the API observed the newest `heartbeat`, or `null` if none arrived.
+    last_heartbeat_at: datetime | None = None
+    #: Seconds since `last_heartbeat_at`, measured on a monotonic clock.
+    last_heartbeat_age_seconds: float | None = None
 
 
 class WatchedPair(BaseModel):

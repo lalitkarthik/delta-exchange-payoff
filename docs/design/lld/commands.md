@@ -7,7 +7,7 @@ there, and this is the three things an operator can tell one. The event is
 `engine/src/deltapayoff/main.py`; the verbs live on
 `engine/src/deltapayoff/controller.py`.
 
-**Landed by #41.** It closes the gap [reconnect.md](reconnect.md) §4 recorded — a
+**Landed by #41; split delivery extended by #64.** It closes the gap [reconnect.md](reconnect.md) §4 recorded — a
 connection the staleness watchdog has called `reconnecting` could not be forced down —
 and it gave #40's badge the lever its last acceptance line needed.
 
@@ -38,26 +38,44 @@ and a spent reconnect budget — the loudest failure this engine has. So `reason
 `models.AdapterHealth` gains a `reason` field so `/health` carries it too. Adding an
 optional field with a default is compatible, so no `schema_version` moves.
 
-## 3. The route answers *after* the command, not before
+## 3. Delivery depends on the bus mode
 
-The ticket asks which of the two this is, because both are defensible and a reader has to
-know which they are looking at. **It answers after.**
+The route answers only after the command has an acknowledged state. The path that gets to
+that acknowledgement differs between the unchanged monolith and split mode.
 
-The worry the question comes from is real: a command delivered through a queue is acted on
-after the route has answered, so `POST .../pause` would reply `connected` — technically
-true, and reading as a failure. Delivery here is **synchronous**, in the same call, and
-that is not a shortcut around the bus but the same decision #40's `FeedConnectionCache`
-already made in the other direction: a consumer task on the market-data bus would be
-draining roughly 1,300 messages a second to catch an event that arrives a few times a day.
-So `FeedSupervisor.command` publishes the event — the bus first, so a log read in order
-shows the cause before the transitions it produced — and then offers it to each controller,
-which takes it if it is addressed to its own adapter. Nothing blocks: each verb is a flag,
-a transition and a cancellation.
+### Monolith: synchronous `FeedSupervisor.command`
 
-**What is *not* finished when the route answers is what happens next.** `resume` answers
-`connecting`, truthfully, and the dial that follows takes as long as it takes; `reconnect`
-answers `reconnecting` and the backoff runs after. The route reports the state the command
-put the connection in, never the state it will settle into.
+With `DELTA_BUS` unset, the route calls `FeedSupervisor.command` in the same process. It
+publishes one `control.command` to FanOut first, then offers it to the local controllers.
+The addressed controller performs the transition and publishes the resulting
+`feed.connection`; the route returns `200` with the resulting `AdapterHealth`. This is the
+existing synchronous delivery path, and the bus-first order keeps the cause before the
+transition in the event stream.
+
+### Split mode: publish, consume, transition, return
+
+With `DELTA_BUS=redis`, the API has no local controller. The exact path is:
+
+1. The API matches the adapter and command, builds one `control.command`, and publishes it
+   to Redis.
+2. The feed's control consumer receives it and calls
+   `FeedSupervisor.dispatch_command`.
+3. `dispatch_command` finds the addressed local controller and asks it to perform the
+   controller transition. The controller publishes `feed.connection`.
+4. Redis carries that event back to the API's filtered `feed-state` subscription. The API
+   cache observes the matching transition and completes the pending request with `200` and
+   the resulting `AdapterHealth`.
+
+The API waits up to **`COMMAND_ACK_TIMEOUT_SECONDS = 2.0` (`assumed`, code constant)** for
+that acknowledgement. If the command was published but no matching acknowledgement
+returns, it answers HTTP `504` with exactly:
+
+    "feed command was published but DELTA did not acknowledge it"
+
+An already acknowledged command has an idempotent cached outcome. A repeated delivery that
+matches that completed outcome returns the cached `200` state and does not apply a second
+transition. The route reports the state the command put the connection in, never the state
+the later dial or backoff will eventually reach.
 
 ## 4. Cutting the socket, and the protocol member that was not needed
 
@@ -112,19 +130,24 @@ done.
 
 | Case | Answer |
 |---|---|
-| Both names good | `200` with that adapter's `AdapterHealth` line, after the command |
+| `pause` acknowledged | `200` with `stopped` / `paused` in that adapter's `AdapterHealth` line |
+| `resume` acknowledged | `200` with `connecting` / `resume` in that adapter's `AdapterHealth` line |
+| `reconnect` acknowledged | `200` with `reconnecting` / `closed` in that adapter's `AdapterHealth` line |
 | Unknown adapter | `404` naming it, and naming the adapters that do exist |
 | Unknown verb | `422` naming it, and naming the three |
-| No feed at all (no lifespan has run) | `404`, because an engine with no adapters has no `DELTA` to command |
+| Published without an acknowledgement | `504` with the exact detail in §3 |
 
 **Both names are checked before anything is published.** A command nobody can carry out
 must not reach the bus, where a later reader would find it and assume it happened. The
 adapter name is matched case-insensitively and the event carries the adapter's **own**
-spelling, so `/feed/delta/pause` publishes `DELTA`.
+spelling, so `/feed/delta/pause` publishes `DELTA`; the feed-side
+`dispatch_command` applies the same case-insensitive match.
 
 `ALLOWED_METHODS` already carried `POST` for `/recording`; this route needed no CORS
-change. Who may call it is `docs/recording-contract.md`'s answer for the other mutating
-route and is the same here: anything that can reach the port, and the port is loopback.
+change. The feed process exposes **no command HTTP route**: command HTTP ends at the API,
+and only the `control.command` event crosses to feed. Who may call it is
+`docs/recording-contract.md`'s answer for the other mutating route and is the same here:
+anything that can reach the port, and the port is loopback.
 
 ## 7. What was observed live
 
