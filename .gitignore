@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
+# the Codex sandbox's own temp and cache tree (AGENTS.md); it deletes it, this is the backstop
+.sandbox-tmp/
 
 # node
 node_modules/

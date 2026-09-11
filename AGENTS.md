@@ -22,11 +22,14 @@ Engine, from `engine/`:
 .venv/Scripts/python.exe -m ruff check .
 ```
 
-**Inside the Codex sandbox, add `--basetemp=.pytest_cache/basetemp` to the pytest command.**
-The sandbox runs as a different Windows user, which cannot write the real user's
-`%TEMP%\pytest-of-Acer`. Without the flag every test that uses `tmp_path` errors at setup
-with `PermissionError: [WinError 5]` — 205 of them, `measured` 2026-09-12. `.pytest_cache/`
-is already git-ignored, so the temp tree never reaches a diff.
+**Inside the Codex sandbox, add `--basetemp=.sandbox-tmp/basetemp -o cache_dir=.sandbox-tmp/cache`
+to the pytest command, and delete `.sandbox-tmp/` as your last command.** The sandbox runs
+as a different Windows user, which cannot write the real user's `%TEMP%\pytest-of-Acer`:
+without the flag every test that uses `tmp_path` errors at setup with `PermissionError:
+[WinError 5]` — 205 of them, `measured` 2026-09-12. Nor can it create anything inside
+`engine/.pytest_cache/`, which the real user owns (`measured` 2026-09-12, #62: 209 errors).
+A directory the sandbox creates itself works; `.sandbox-tmp/` is git-ignored. The real
+user runs pytest without either flag.
 
 Web, from `web/`:
 
@@ -38,7 +41,7 @@ node node_modules/next/dist/bin/next build
 `next build` rewrites `web/next-env.d.ts`. Leave it dirty and say so in your report; the
 orchestrator restores it. Do not run git yourself.
 
-The suite is 1,084 tests with Docker available, 1,071 plus 13 skipped without. A run that
+The suite is 1,101 tests with Docker available, 1,087 plus 14 skipped without. A run that
 collects far fewer than that has failed to collect, whatever it printed.
 
 ## Hard rules
