@@ -8,26 +8,25 @@ decision is [../decisions/0005-compute-and-region.md](../decisions/0005-compute-
 Redis's own rules are [redis-hosting.md](redis-hosting.md) and the names on the wire
 [nomenclature.md](nomenclature.md).
 
-Landed by #68 as a standard, not as code. Nothing here is built yet, and #65 has not yet
-produced the images this sizes.
+Landed by #68 and #78 as standards, not as code; nothing here is built, and #65 has not yet produced the images.
 
 ---
 
 ## 1. The platform, in one line
 
-**ECS on EC2: one `m7g.large` instance in a public subnet of `ap-south-1` (Mumbai), one task
-definition holding all six containers, `host` network mode.** `derived` **$48.94 a month**,
-on-demand, 2026-09-09.
+**ECS on EC2: one `c7g.xlarge` instance in a public subnet of `ap-south-1` (Mumbai), one task
+definition holding all six containers, `host` network mode.** `derived` **$78.07 a month**,
+on-demand, 2026-09-12. The class is [0008](../decisions/0008-topology.md)'s; 0005 chose `m7g.large` ($48.94).
 
 | | `dev` | `prod` |
 |---|---|---|
 | Runs on | Docker Compose on a laptop | ECS on one EC2 instance |
 | Region | — | `ap-south-1` |
-| Instance | — | `m7g.large`, Graviton3, 2 vCPU, 8 GiB, 30 GB gp3 root |
+| Instance | — | `c7g.xlarge`, Graviton3, 4 vCPU, 8 GiB, 30 GB gp3 root; `feed` reserves 1,024 CPU units |
 | Containers | the same six | the same six |
 | Networking | the Compose network | `host` mode — every container on the instance's stack |
 | Reachable from | the laptop | a tunnel or Tailscale only; **never a public listener** (#57) |
-| Redis key prefix | `dev:` | `prod:` |
+| Stream names | no environment in the name: `md.option_quote:DELTA:BTC` ([0006](../decisions/0006-stream-names-without-environment.md)) | the same names; one Redis each, never shared |
 
 **The images are identical.** One `Dockerfile` per service, built `linux/arm64`, and the same
 tag runs in both places. Graviton is not a preference — `m7i.large` is the x86 twin of
@@ -81,15 +80,15 @@ IPv6-only egress through an egress-only internet gateway is free of both charges
 | Container | vCPU | Memory | Basis |
 |---|---|---|---|
 | `feed` | 0.5 | 1 GB | `measured` 30.89% of a core for the whole monolith, plus the publisher's `measured` 5.88% |
-| `store` | 0.5 | 1 GB | `derived` 143 MB/day, five-minute flush buffer |
+| `store` | 0.5 | 1 GB | `derived` 201.5 MB/day for BTC+ETH ([0007](../research/0007-load-profile.md) D1; 143 was BTC alone), five-minute flush buffer |
 | `api` | 1.0 | 2 GB | `measured` 175.227 ms full solve pass; the pre-#44 all-expiry loop was `derived` ~64% of a core |
 | `web` | 0.25 | 0.5 GB | `measured` 203.1 MiB private, 0.00% of a core with no viewer |
 | proxy | 0.25 | 0.5 GB | `assumed` |
 | **`redis`** | 0.5 | **3 GB** | the `maxmemory 2gb` ceiling ([redis-hosting.md](redis-hosting.md)) plus overhead |
-| **Total** | **3.0** | **8.0 GB** | → `m7g.large` (2 vCPU, 8 GiB); the host overcommits vCPU, which is why Fargate — where reservations are the bill — costs more |
+| **Total** | **3.0** | **8.0 GB** | → 0005's `m7g.large` (2 vCPU, 8 GiB); the host overcommits vCPU, which is why Fargate — where reservations are the bill — costs more |
 
-**At ten times the rate**: 9.5 vCPU and 29 GB, Redis at `derived` 10.269 GiB behind a 12 GiB
-ceiling, and the instance becomes `m7g.2xlarge` (8 vCPU, 32 GiB), `derived` $179.43.
+**These reservations under-count CPU** (0007): 1× needs 4 vCPU and 10× 16–32, so the instance is
+`c7g.xlarge`, and `c7g.4xlarge`–`c7g.8xlarge` at 10×, `derived` $295.72–582.39 (§9).
 
 **Why not `t4g.medium` at $22.74.** Burstable instances have a CPU baseline — 20% per vCPU on
 `t4g.medium`, so **0.4 of a core** against a `measured` 0.31 today plus the publisher's 5.88%.
@@ -137,7 +136,7 @@ month:**
    strings. ~10 minutes.
 3. **Check disk on the root volume** — images, logs and anything the store leaves locally
    before R3's answer lands. ~5 minutes.
-4. **Check the bill** against the `derived` $48.94, because an unexpected line is usually a
+4. **Check the bill** against the `derived` $78.07, because an unexpected line is usually a
    NAT gateway or a forgotten public IP. ~5 minutes.
 5. **Confirm the private path still works** — the tunnel or Tailscale that fronts `web`.
 6. **Deploy, when there is one**: build, push to ECR, register a task definition revision,
@@ -168,16 +167,14 @@ cost, becomes the constraint.
 | Full solve pass 175.227 ms; pre-#44 loop ~64% of a core | `measured` / `derived` | `../lld/chain-cache.md` §9 |
 | Redis publisher 5.88% of a core at 100 ms batches; 1,051.5 MiB at thirty minutes | `measured` / `derived` | #58, #69 |
 | Inbound 2,216.5 GB/month; NAT gateway $165.00/month | `derived` | 843.4 KB/s × 730 h × $0.056/GB |
-| `m7g.large` $48.94/mo; `m7g.2xlarge` $179.43/mo, ap-south-1 | `derived` | AWS Price List Bulk API, read 2026-09-09 |
+| `m7g.large` $48.94/mo; `m7g.2xlarge` $179.43/mo, ap-south-1 (0005's classes; 0008's are in §9) | `derived` | AWS Price List Bulk API, read 2026-09-09 |
 | EKS control plane $73.00/month; ECS on EC2 $0 | `measured` | AWS Price List Bulk API; [ECS pricing](https://aws.amazon.com/ecs/pricing/) |
 | Delta endpoints are CloudFront; POP `BOM78-P11`; edge↔origin `derived` ~167 ms | `measured` / `derived` | `tools/measure_venue_latency.py`, 2026-09-09 (**through a Cloudflare WARP tunnel**) |
 | Latency from ap-south-1 and ap-northeast-1 | **unmeasured** | no AWS access; commands in `../research/0005a-venue-latency-run.md` §3 |
 | Image sizes and per-container footprint | **unmeasured** | #65 has not landed; **re-cost this section when it does** |
 
-**Nothing here is fixed against #65.** The instance size, the reservations in §4 and every
-dollar in §2 are `derived` from a monolith's footprint. When #65 produces the images, re-run
-this against the `measured` image sizes and per-container CPU and memory, and note any change
-in the decision record — that is #68's own acceptance criterion.
+**Nothing here is fixed against #65.** When it produces the images, re-run §2, §4 and §9 against the
+`measured` image sizes and per-container CPU and memory, and note any change in the decision records.
 
 ## 8. The load profile, per service
 
@@ -191,5 +188,12 @@ belief in [../decisions/0007-load-profile.md](../decisions/0007-load-profile.md)
 | `api` | CPU, set by viewers | 0.25–0.49, + 0.05–0.14 a watched expiry | 2.5–4.9, + viewers |
 | `web` / Redis | memory | 240.8 MiB / 1,056.4 MiB `measured` | unchanged / 10.3 GiB |
 
-**The split costs 1.10–1.75 cores against the monolith's 0.31**, so §4 under-counts CPU and
-over-counts memory. It meets 0005's re-cost trigger. `feed` and `api` contend first; R7 (#78) costs it.
+**The split costs 1.10–1.75 cores against the monolith's 0.31**: §4 under-counts CPU and over-counts memory.
+
+## 9. One instance or several
+
+`derived` by R7 (#78): the table is [compute-topology.md](compute-topology.md), the decision [0008](../decisions/0008-topology.md). It answers 0005's re-cost trigger.
+- **One `c7g.xlarge`, $78.07 at 1×**: on 4 vCPU three one-core Python services cannot starve `feed`, which reserves 1,024 CPU units.
+- Two boxes cost $73.22–84.46 and one per service $128.07 at the 1× upper bound. One box stays cheapest until `strategy` arrives.
+- **Split into `feed`+`store`+Redis ∣ `api`+`web`+proxy** when the box passes 2.8 cores or `oms` places its first order.
+- The same-AZ hop is `derived` ≤ 1 ms, invisible to every real consumer. Same-AZ transfer is free on private addresses only.

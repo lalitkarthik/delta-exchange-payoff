@@ -1,3 +1,4 @@
+> **Superseded in part** by [0008](0008-topology.md), 2026-09-12: the instance class — one `c7g.xlarge` at 1× and one `c7g.4xlarge`–`c7g.8xlarge` at 10× replace `m7g.large` and `m7g.2xlarge`; platform, network mode, subnet and region stand.
 # 0005 — The compute platform, and the region
 
 **Status** decided, #68, 2026-09-09. **Supersedes** nothing. **Fills**
