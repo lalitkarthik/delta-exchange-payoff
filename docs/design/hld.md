@@ -1,57 +1,57 @@
 # High-level design: the feed, end to end
 
-**What the platform is: one engine that owns every venue connection, turns venue frames into
-canonical events, and publishes them to consumers that never block each other.** A quote arrives
-on a broker's socket; an adapter decodes it into an event carrying a canonical instrument; a
-controller says whether that socket is healthy; a bus copies the event to whoever subscribed. It
-becomes three things — the newest state of a ladder, our own implied volatility and Greeks, and a
-sealed one-minute bar in Parquet. `docs/chain-contract.md` stays the authority on the page.
+**What the platform is:** in split mode, `feed` owns the venue connection, turns venue frames
+into canonical events, and publishes them to Redis; the engine consumes those events into the
+newest ladder, our implied volatility and Greeks, and sealed one-minute Parquet bars.
+`docs/chain-contract.md` stays the authority on the page.
 
 This document says **what the parts are and how they talk**, never how one is built inside —
 that is a low-level design, written when the part lands ([lld/index.md](lld/index.md)). What
 crosses between parts is [events.md](events.md); where the two disagree the catalogue wins.
 
-**Status marks.** Present tense describes code that exists today; **will** describes work
-specified in #33 and names the ticket that lands it. Where the two differ for one box, both are
-written, because this is a map of a system in motion. It supersedes `docs/architecture.md`, whose
-per-module detail is still accurate where this document is silent.
+**Modes.** `DELTA_BUS=redis` selects the two-process composition: `deltapayoff.feed_main:app`
+is the feed and `deltapayoff.main:app` is the engine. With `DELTA_BUS` unset — the default —
+the engine remains the existing in-process FanOut monolith, exactly as before. No service calls
+the other over HTTP. This supersedes `docs/architecture.md`, whose per-module detail is still
+accurate where this document is silent.
 
 ---
 
 ## 1. The shape of the system
 
 ```
-       VENUES                 ENGINE FEED MANAGEMENT
-  +----------------+     +------------------------------+
-  | Delta Exchange |     |  +------------------------+  |
-  | India ws + REST|====>|  | Delta adapter     #36  |  |
-  +----------------+     |  +-----------+------------+  |
-  +----------------+     |  | connection controller  |  |
-  | NSE  ~~ = not  |~~~~>|  | #38  state machine     |  |
-  | built yet      |     |  +-----------+------------+  |
-  +----------------+     |  | supervisor        #39  |  |
-  control.command  ----->|  +-----------+------------+  |
-  pause/resume  (#41)    +--------------|---------------+
-                                        | canonical events
-                                 +------+-------+
-                                 |   the bus    |  fanout.py
-                                 +--+--------+--+
-                      drop-oldest |        | lossless
-                       +----------+-+   +--+-----------+
-                       | chain cache|   |  bar writer  |
-                       | stream.py  |   |  store.py    |
-                       | + pricing  |   | -> Parquet x4|
-                       +-----+------+   +-------+------+
-                       +-----+------------------+-------+
-                       |  main.py    FastAPI :8000      |
-                       |  /expiries /chain /health      |
-                       |  /ws/chain  + #45 #46 routes   |
-                       +---------------+----------------+
-                                       | ChainResponse + feed badge
-                               +-------+--------+
-                               |  web/  :3000   |
-                               +----------------+
+                         DELTA EXCHANGE
+                        websocket + REST
+                               |
+                 +-------------v--------------+
+                 | feed: deltapayoff.feed_main|
+                 | DeltaClient + DeltaAdapter  |
+                 | controller + FeedSupervisor |
+                 | relisting + Redis publisher |
+                 +-------------+--------------+
+                               | canonical events
+                        +--+--------+--+
+                        | Redis Streams |
+                        +--+--------+--+
+                  canonical |        | canonical
+              +--------------v+      +-v--------------+
+              | ChainStream    |      | BarWriter       |
+              | chain-stream   |      | bar-writer      |
+              | drop-oldest    |      | lossless        |
+              +-------+--------+      +--------+--------+
+                      +----------+-----------+
+                                 |
+              +------------------v------------------+
+              | engine: deltapayoff.main:app        |
+              | feed-state -> FeedConnectionCache   |
+              | (feed-state is drop-oldest)          |
+              | REST /expiries /chain /health       |
+              | /ws/chain                            |
+              +-------------------------------------+
 ```
+
+Canonical stream names are `{event_type}:{VENUE}[:{UNDERLYING}]`; issue #74 removed the
+environment section. Only `feed` contacts Delta, and neither service calls the other over HTTP.
 
 ## 2. The boxes
 
@@ -62,33 +62,30 @@ Delta Exchange India, public market data, no API key: one websocket carrying `ob
 interface exists to admit it — a different spelling, currency, lot size and calendar — and it is
 out of scope.
 
-### 2.2 Broker adapters
+### 2.2 The feed process
 
-**An adapter owns everything venue-specific and nothing else:** the socket, the REST reads the
-screens need, the symbol spelling, the channel names, the wire layout. It answers four
-questions — describe yourself, list an underlying's instruments, subscribe to a set of them,
-stream events until stopped — and emits canonical events carrying a canonical `Instrument`, so
-nothing downstream sees venue JSON. **One boundary rule lives here and nowhere else:** the
-venue's absent-quote spellings become `null`, and a real zero stays `0`.
+`deltapayoff.feed_main:app` owns the Delta REST client and websocket adapter, the connection
+controller, `FeedSupervisor`, instrument relisting through shared `feed_runtime.py`, and the
+Redis publisher — and nothing else. **An adapter owns everything venue-specific and nothing
+else:** the socket, REST reads, symbol spelling, channel names and wire layout. It emits
+canonical events carrying a canonical `Instrument`, so nothing downstream sees venue JSON.
+**Only feed contacts Delta.**
 
 #35 landed the instrument and the envelope; #36 moved the venue's three modules behind the
 protocol and added a **scripted fake adapter**, the one new test seam; #37 retired the quote
 record that used to carry a raw frame past the adapter, moved the socket owner into the
 adapter package with it, and moved the two consumers onto the events. The `connect` factory
-stays injectable, because that is the seam the feed tests already drive.
+stays injectable, because that is the seam the feed tests already drive. Redis is mandatory in
+split mode: an unreachable Redis fails startup with the existing `BusUnavailable` error before
+the feed opens the venue.
 
-### 2.3 The controller and the supervisor
+### 2.3 The engine process
 
-**One controller per adapter, and it is the only thing that may change a connection's state.** It
-owns backoff, the lifetime reconnect budget, subscription replay and staleness detection, will
-emit a `feed.connection` event and a log record on every transition (#38), and will accept
-`control.command` (#41). **One supervisor holds every controller**, starts and stops them with the
-application lifespan, and reports the **worst** state among them as the feed's state. `/health`
-will grow from `{"status": "ok"}` into a report — that field preserved, plus per adapter its
-state, last message time and age, reconnect count, budget remaining, and the pairs being solved
-(#39, #44). Neither exists today: all of it lives inside the feed loop, where reconnect,
-resubscribe and budget are correct but unreadable from outside, and `/health` reports process
-liveness alone.
+`deltapayoff.main:app` owns `ChainStream`, `BarWriter`, Parquet access, the REST routes and
+`/ws/chain`. In split mode it opens no Delta socket: `ChainStream` consumes `chain-stream`,
+`BarWriter` consumes `bar-writer` losslessly, and `FeedConnectionCache` consumes `feed-state`
+with drop-oldest semantics. `/chain` and `/expiries` answer from `ChainStream` in that mode.
+The two engine consumers receive the canonical events that feed published to Redis.
 
 ### 2.4 The bus
 
@@ -102,40 +99,30 @@ because drop-oldest under load systematically shaves the highs and lows bars exi
 the chain cache drops the oldest, because it holds only the newest frame per contract anyway.
 Every drop is counted.
 
-**Two implementations behind that seam since #61, and the default is still in-process.**
-`fanout.py` is what runs unless `DELTA_BUS=redis` says otherwise; `redis_bus.py` is Redis Streams,
-publishing in pipelined batches and trimming by age on every batch write, with the same two
-policies kept honest across a broker that offers neither — lossless is a consumer group acked on
-receipt and replayed from a recorded id, drop-oldest is a reader outside every group that jumps to
-the newest entries and **counts what it skipped**. One contract suite runs against both. How it is
-built inside, and the numbers behind the batch interval, are [lld/redis-bus.md](lld/redis-bus.md);
-the names and the encoding on the wire are [cloud/nomenclature.md](cloud/nomenclature.md); the ack,
-trim and persistence rules are [cloud/redis-hosting.md](cloud/redis-hosting.md).
-
-**Still one process.** Nothing has moved out: this is the expand half of #57's split, and the
-services, the containers and the replaying store are I3 to I5.
+**Two implementations behind that seam since #61.** `fanout.py` remains the default when
+`DELTA_BUS` is unset: the unchanged in-process monolith. `redis_bus.py` is selected by
+`DELTA_BUS=redis`; feed publishes in pipelined batches and trims by age, while the engine owns
+the `chain-stream`, `bar-writer` and `feed-state` subscriptions. Lossless remains acked and
+replayed from a recorded id; drop-oldest still jumps to the newest entries and **counts what it
+skipped**. Details are [lld/redis-bus.md](lld/redis-bus.md); names and encoding are
+[cloud/nomenclature.md](cloud/nomenclature.md); ack, trim and persistence are
+[cloud/redis-hosting.md](cloud/redis-hosting.md).
 
 ### 2.5 The consumers
 
-- **Chain cache** — `stream.py`. Newest frame per contract, rebuilt into a ladder on demand, the
-  recompute loop solving our IV and Greeks. Invalidation is by arrival, not by time, so the cache
-  cannot serve a stale answer. Will consume events and publish `computed.chain` (#37), and solve
-  only the `(underlying, expiry)` pairs a browser watches, plus a grace window (#44).
-- **Bar writer and store** — `bars.py`, `store.py`. Ticks folded into sealed one-minute bars,
-  written as hive-partitioned Parquet in four tables. **A minute with no arrivals produces no
-  row** — not nulls, never the previous close — and that survives the refactor. Will consume
-  events (#37). Records ETH beside BTC since #43, each under its own `underlying=` partition.
-- **Pricing core** — `forward.py`, `solvers.py`, `black76.py`, `black_scholes.py`, `greeks.py`,
-  `compute.py`. Pure. The venue's IV and Greeks travel beside ours as reference columns, never
-  as inputs.
+**ChainStream** (`stream.py`) is the live chain cache: newest event per contract, rebuilt into a
+ladder on demand, with the recompute loop solving our IV and Greeks. In split mode it receives
+canonical market events only from Redis and drives `/chain`, `/expiries` and `/ws/chain`.
+**BarWriter** (`bars.py`, `store.py`) folds the lossless stream into four Parquet tables; a minute
+with no arrivals produces no row. The pricing core remains pure, and venue IV and Greeks remain
+reference columns, never inputs.
 
 ### 2.6 The public surface and the screens
 
-`main.py` serves `/expiries`, `/chain`, `/smile`, `/iv-vs-rv`, `/recording`, `/health` and
-`/ws/chain`. The websocket sends three message types today — `chain`, `waiting`, `error` — and
-will gain a fourth, `feed`, carrying the adapter's state on every transition and once on connect
-(#40). Two REST routes will be added: a contract's minute bars for a date (#46), and the ladder at
-one stored minute with the day's stored minutes beside it (#45).
+In split mode, feed has only `GET /health`, which is `FeedSupervisor.report`. The engine serves
+`/expiries`, `/chain`, `/smile`, `/iv-vs-rv`, `/recording`, `/health` and `/ws/chain`; its health
+route is process liveness plus watched pairs. The websocket sends the chain ladder and feed badge
+from the engine's cache. The default no-`DELTA_BUS` engine keeps the existing combined surface.
 
 `web/` renders and computes nothing. It will wear a badge on the ladder header whenever the feed
 is not `connected`, clearing on recovery (#40); gain a chart panel of a contract's minute candles
@@ -173,47 +160,16 @@ Every transition emits one `feed.connection` event and one log record; nothing e
 
 | From | To | Event |
 |---|---|---|
-| Adapter | bus | `md.option_quote`, `md.option_reference`, `md.index_quote` |
-| Bus | chain cache, bar writer | the three above |
-| Chain cache | bus | `computed.chain` |
-| Bar writer | bus | `md.option_bar`, on seal |
-| Controller | bus | `feed.connection`, `heartbeat`, `alert` |
-| Bus | websocket handler | `feed.connection`, sent to the browser as the `feed` message |
-| Operator, over a route | controller | `control.command` — pause, resume, reconnect |
-| Store | the two new REST routes | Parquet reads, carrying no event (#45, #46) |
+| Feed adapter | Redis publisher | `md.option_quote`, `md.option_reference`, `md.index_quote` |
+| Redis | ChainStream, BarWriter | the three canonical market events |
+| Redis | FeedConnectionCache | `feed.connection`, `heartbeat`, `alert` |
+| ChainStream | REST and websocket handlers | ladders from the live cache |
+| BarWriter | Parquet store | sealed `md.option_bar` data |
+| Store | the REST routes | Parquet reads, carrying no event |
 
 Fields, emitters, consumers and timing are in [events.md](events.md).
 
-## 5. Numbers, and where each came from
+## 5. Evidence and boundaries
 
-| Number | Tag | Run |
-|---|---|---|
-| `ob_l2` refreshes every 508 ms per contract, `ticker` every 5,001 ms; both channels on BTC alone carry 1,322.9 msg/s at 636.5 KB/s | `measured` | `tools/measure_feed.py`, 2026-09-03 |
-| Both channels, every listed contract, **BTC alone**: 504 contracts, 1,095.1 msg/s, 547.3 KB/s. **BTC+ETH**: 782 contracts (BTC 504, ETH 278), 1,693.6 msg/s, 843.4 KB/s | `measured` | `tools/measure_feed.py --underlyings ... --seconds 60`, 60 s each, back to back, 2026-09-08 04:09–04:11 UTC (~09:39 IST) |
-| BTC ladder unchanged within noise: push interval (nominal 1.0 s) median 1,011.7→1,015.0 ms, p95 1,027.7→1,063.1 ms with ETH also live; one-expiry solve pass (`enrich()`) median 0.966→0.983 ms | `measured` | live `/ws/chain` client (24 pushes each) + 200-run `time_it` on real data, 2026-09-08 |
-| Staleness before `degraded` 15 s (three ticker refreshes); grace after the last viewer leaves an expiry 30 s | `assumed` | #33. The staleness half is now measured against a live hour and stands — longest quiet gap 44.785 s, `design/quiet-gap.md`. The grace half is still untested |
-| Store gap 2026-09-04 09:38Z to 2026-09-07 09:45Z, unnoticed | `measured` | store file timestamps |
-
-**The contested number is settled: never a subscription mismatch, only measured vs. not.** #33's
-spec quoted `main.py`'s own comment, ~600 msg/s and ~300 KB/s for BTC alone — never actually run,
-no probe output behind it anywhere in this repository's history. 1,322.9 msg/s at 636.5 KB/s
-(2026-09-03) names the identical subscription, not a different one; #43's run above is a third
-point on it, differing by the day's contract count and activity, exactly as §8 of
-`docs/architecture.md` predicts. `main.py`'s comment now points here rather than repeat a number.
-
-**One number stays absent on purpose:** #33 wants one expiry's solve cost measured against the
-*running engine*, not a direct call — the solve-pass row above answers #43's narrower question
-only, whether ETH changes it, and says nothing about event-loop contention under load.
-
-## 6. Out of scope, and why
-
-- **A message broker other than Redis.** Kafka and the rest stay out; #57 decided Redis Streams
-  and #61 landed it behind the seam, off by default. What is still out of scope is *deploying* a
-  process wall — the services split is I3 to I5, not this document's §2.
-- **Order execution, positions, the sandbox** — the whiteboard's right half. The envelope is shaped
-  so they can share it; nothing else here is designed for them.
-- **An NSE adapter** and the instrument fields it needs — currency, lot size, tick size,
-  settlement style, calendar — added with the adapter, against a real need.
-- **The computed-bars rebuild tool**, specified as a batch job from quote bars; **backfilling the
-  store's three-day hole**, not recoverable; **a web test runner**, where `typecheck` and `build`
-  remain the gate; and **changing the four bar tables' schemas** beyond what the new routes read.
+[HLD evidence](hld-evidence.md) contains every measured, assumed, and derived number, the run
+and caveat behind each, and the explicit out-of-scope decisions.

@@ -1,12 +1,12 @@
 # The Redis Streams bus — how the two policies survive a broker
 
 **The seam does not move.** `events/bus.py` names `publish(event)` and
-`subscribe(name, maxsize, lossless)`; `fanout.py` has filled it since #37 and still does by
-default. `redis_bus.py` is a second implementation behind the same two methods, selected by
-one environment variable, landed by #61 (I2). No producer and no consumer was opened to add
-it: `ChainStream.attach` and `BarWriter.attach` call the same methods and read the same
-`Subscription`, which is why the Redis subscription **subclasses** that class rather than
-imitating it.
+`subscribe(name, maxsize, lossless)`; `fanout.py` still fills it by default. `redis_bus.py` is
+the second implementation behind the same methods, selected by `DELTA_BUS=redis`, landed by
+#61 (I2). In split mode, `feed` is publisher-only; the engine owns `chain-stream`, `bar-writer`
+and `feed-state` subscriptions, and `ChainStream.attach` and `BarWriter.attach` still read the
+same `Subscription`. With `DELTA_BUS` unset — the default — FanOut is the unchanged in-process
+monolith. The Redis subscription **subclasses** that class rather than imitating it.
 
 Names and encoding are [../cloud/nomenclature.md](../cloud/nomenclature.md), decided in #58.
 The ack, trim and persistence policy is [../cloud/redis-hosting.md](../cloud/redis-hosting.md)
@@ -35,7 +35,8 @@ underlyings, built from the same `--underlyings` set the feed is given. `XREAD` 
 wildcard, so a stream found late is a stream that was silently not read: that is #51
 restaged, and #51 cost three days of history.
 
-Streams under the old `dev:` and `prod:` names may still exist in a local Redis; they are not
+Stream keys are `{event_type}:{VENUE}[:{UNDERLYING}]`; issue #74 removed the environment
+section. Streams under old `dev:` and `prod:` names may still exist locally; they are not
 migrated, because the pipe holds thirty minutes and they age out on their own.
 
 ## 2. Lossless — a consumer group, acked on receipt
@@ -61,6 +62,10 @@ would carry only what was never acked, and everything is acked on receipt.
 A consumer records it at the moment it flushes, having drained the queue, and hands it back
 as `start_id` after a restart. I3 is what will do that in `store.py`; this ticket provides
 it and pins it.
+
+**The feed-state cold-start gap is deliberate until #64.** An engine started after `feed` is
+already connected cannot learn the current connection state until the next `feed.connection`
+transition; #64 will make it report the last `feed.connection` and `heartbeat` it saw, with age.
 
 ## 3. Drop-oldest — a reader outside every group, and it jumps
 
@@ -88,7 +93,8 @@ warning, naming the stream and the count.
 
 ## 4. The publisher — an outbox, a batch, and the trim riding with it
 
-`publish` encodes the event, resolves its key and appends to an in-memory outbox. **It never
+In split mode, `feed` is the publisher-only caller: `publish` encodes the event, resolves its
+key and appends to an in-memory outbox. **It never
 awaits.** It is called between two reads of the venue's socket, so an `await` in it would
 put a network round trip inside the receive path, fill the OS receive buffer and get the
 connection closed — the failure `fanout.py` exists to prevent. Nothing raises out of it
@@ -122,7 +128,8 @@ not a failure, it is a process that never reports one.
 When Redis does not answer, `start()` raises `BusUnavailable` naming the URL, the reason and
 the variable to unset. `main.lifespan` does not catch it — unlike `DeltaUnavailable`, which
 is deliberately survivable — so uvicorn prints it and the process exits within the connect
-timeout. That is #57's user story 22: a misconfiguration is visible at once rather than
+timeout. In split mode, `feed_main` fails before opening the venue. That is #57's user story 22:
+a misconfiguration is visible at once rather than
 buffering into an outbox nobody is draining.
 
 ## 6. What it counts
@@ -177,9 +184,10 @@ because prod is Linux beside the Redis; `DEFAULT_READ_BLOCK_MS` carries the same
 
 ## 8. What is not here
 
-**Nothing has moved out of the process.** This is the expand half of #57's split: the same
-engine, the same consumers, one flag. `store` replaying from its recorded id is I3, `api`
-learning the feed's state from the bus is I4, and the containers are I5.
+**The default remains in-process.** With `DELTA_BUS` unset, FanOut keeps the engine and feed
+composition unchanged. With `DELTA_BUS=redis`, this bus is the process boundary: `feed` publishes
+and the engine owns the three subscriptions. Store replay from its recorded id is I4 (#63); engine
+health learning the feed's state from the bus is I5 (#64).
 
 **No `XAUTOCLAIM`, no pending-list recovery, no dead-letter.** §2 says why: the flush is the
 durability boundary and the recorded id is the recovery. A consumer that needed per-message

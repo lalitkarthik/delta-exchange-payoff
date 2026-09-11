@@ -24,11 +24,14 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 
 from deltapayoff import main
 from deltapayoff.controller import ConnectionController
+from deltapayoff.events import ConnectionState, FeedConnection, Heartbeat
 from deltapayoff.main import (
     FeedConnectionCache,
     app,
@@ -92,6 +95,75 @@ def test_the_first_message_is_feed_with_the_current_state_before_any_chain() -> 
     assert first["data"]["state"] == "connecting"
     assert first["data"]["reason"] == "start"
     assert first["data"]["since"]  # a non-empty stamp; the exact format is main.py's own
+
+
+def test_feed_connection_cache_drains_only_feed_state_events_and_propagates_cancel(
+) -> None:
+    bus = main.FanOut()
+    cache = FeedConnectionCache()
+    subscription = cache.attach(bus)
+
+    event = FeedConnection(
+        source="DELTA",
+        ts_received=datetime(2026, 9, 12, tzinfo=timezone.utc),
+        adapter="DELTA",
+        to_state=ConnectionState.CONNECTED,
+        reason="open",
+    )
+    heartbeat = Heartbeat(
+        source="DELTA",
+        ts_received=datetime(2026, 9, 12, tzinfo=timezone.utc),
+        adapter="DELTA",
+        state=ConnectionState.CONNECTED,
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(cache.run())
+        bus.publish(heartbeat)
+        await asyncio.sleep(0)
+        assert cache.latest == {}
+        bus.publish(event)
+        for _ in range(10):
+            if cache.get("DELTA") is event:
+                break
+            await asyncio.sleep(0)
+        assert cache.get("DELTA") is event
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert subscription.name == "feed-state"
+    assert subscription.capacity == 100
+    assert subscription.lossless is False
+    asyncio.run(scenario())
+
+
+def test_split_websocket_uses_a_received_feed_connection_without_a_supervisor() -> None:
+    cache = FeedConnectionCache()
+    event = FeedConnection(
+        source="DELTA",
+        ts_received=datetime(2026, 9, 12, tzinfo=timezone.utc),
+        adapter="DELTA",
+        to_state=ConnectionState.CONNECTED,
+        reason="open",
+    )
+    cache.apply(event)
+    app.dependency_overrides[get_supervisor] = lambda: None
+    app.dependency_overrides[get_feed_cache] = lambda: cache
+    app.dependency_overrides[get_chain_stream] = lambda: ChainStream()
+    try:
+        client = TestClient(app)
+        with client.websocket_connect(
+            f"/ws/chain?underlying=BTC&expiry={EXPIRY}"
+        ) as socket:
+            first = json.loads(socket.receive_text())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first["type"] == "feed"
+    assert first["data"]["adapter"] == "DELTA"
+    assert first["data"]["state"] == "connected"
+    assert first["data"]["reason"] == "open"
 
 
 class _YieldingClock:

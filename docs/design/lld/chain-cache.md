@@ -1,9 +1,11 @@
 # The chain cache — low-level design
 
 **One module, `engine/src/deltapayoff/stream.py`, and it computes nothing.** It holds the
-newest of each market-data event per instrument and folds them into a ladder when someone
-asks. Everything expensive — the implied volatility, the Greeks, the forward — is
-`compute.enrich`, called from here and owned elsewhere.
+newest market-data event per instrument and folds events into a ladder when someone asks.
+Everything expensive — the implied volatility, the Greeks, the forward — is `compute.enrich`.
+In split mode (`DELTA_BUS=redis`), it receives canonical market events only through Redis on
+`chain-stream` and drives REST `/chain` and `/expiries` plus `/ws/chain`. With `DELTA_BUS` unset
+— the default — its FanOut subscription is the unchanged in-process monolith.
 
 Landed by #37, which moved it off the venue's frames and onto the canonical events. #44
 added watched-pair reference counting and the second, minute-cadence pass.
@@ -194,5 +196,4 @@ receives the minute pass's ladders **directly** through `sample_chains` — putt
 bus instead would add a second lossless subscription carrying `measured` ~1,323 market-data
 messages a second to catch sixteen chain events a minute, which is the cost #40's
 `FeedConnectionCache` was built to avoid and the same argument again. It becomes worth doing
-the day a consumer exists outside this process; the seam is `recompute_every_minute`'s `sink`,
-which is a callable precisely so it can become a publish.
+the day a consumer exists outside this process; the seam is `recompute_every_minute`'s `sink`, which is a callable precisely so it can become a publish.

@@ -1,7 +1,11 @@
 # Low-level design: the broker adapter
 
 **What is built inside `engine/src/deltapayoff/adapters/`.** The parts are [../hld.md](../hld.md);
-what crosses out is [../events.md](../events.md). Numbers carry the run that produced them.
+what crosses out is [../events.md](../events.md). Measurements are in [HLD evidence](../hld-evidence.md#7-adapter-evidence).
+
+**Process boundary.** In split mode, `deltapayoff.feed_main:app` exclusively owns `DeltaAdapter`,
+`DeltaFeed` and the Delta REST client; the engine has no venue socket. With `DELTA_BUS` unset —
+the default — the adapter and socket remain in the unchanged in-process FanOut monolith.
 
 **Landed by #36, completed by #37.** #36 was the expand half of an expand–contract: the
 adapter emitted canonical events while a shim rebuilt the old quote record for two
@@ -17,8 +21,8 @@ the four fields it existed to carry. #38 and #39 lifted reconnect into a control
 | `delta_socket.py` | `DeltaFeed`, `VenueMessage`, and **the two channel names** |
 | `tests/fakes/scripted_adapter.py` | The scripted double. **The one new test seam** |
 
-Two modules outside the package are owned by it and reached through nothing else:
-`wire.py` (the offsets) and `delta_client.py` (the REST reads).
+Two modules outside the package are owned by the feed-side adapter and reached through nothing
+else: `wire.py` (the offsets) and `delta_client.py` (the REST reads).
 
 **`delta_socket.py` moved in here in #37**, from `deltapayoff/feed.py`, because it
 subscribes by channel name and #37's acceptance test is that those two strings appear
@@ -109,22 +113,10 @@ converts to `None` first and increments `non_finite`. An absent price drops its 
 size would describe an order at no price. Reachable, not defensive: `json.loads` accepts the
 bare tokens `NaN` and `Infinity`; standard JSON does not.
 
-## 5. What the adapter learned about the venue
+## 5. Venue findings and measurements
 
-All `measured` from the 2026-09-03 captures; tags in §10.
-
-- **The ticker frame carries no tick size.** `md.option_reference.tick_size` is `None` on
-  all 136; REST carries one and the websocket does not. Absent rather than invented.
-- **Every book frame carries `lts`, and every level is exactly `[price, size]`** — no empty
-  book either side. Sizes and `lts` had never been decoded; the offsets went into
-  `wire.decode_ob_l2_top`.
-- **16 of 136 contracts have never traded** — `ohlc` all-null — so `last_price` is `None`,
-  and 11 carry an open interest of exactly zero, so both halves of §4's rule are live.
-- **Two ticker body fields reach no event**: `pb`, the price band, and `m24hc` — seen and
-  skipped. **The decode is not the hot path**: `derived` 1.3% of a core.
-- **ETH's `ob_l2` refreshes at BTC's own 502–508 ms** — `measured` 2026-09-08, no per-underlying
-  branch needed. `ticker` reads 4,999 ms for BTC and 5,330 ms for ETH over a 60 s window, a gap a
-  ~5 s period's noise at 12 samples cannot rule out; a longer run is what would tell the two apart.
+The venue findings and their complete measured/derived table moved to [HLD evidence](../hld-evidence.md#7-adapter-evidence)
+to keep this low-level note below the repository's 200-line limit. Nothing was deleted.
 
 ## 6. The shim, and the four fields it existed for
 
@@ -173,7 +165,7 @@ then the events again — the ticket's sentence, run in `tests/test_scripted_ada
 it.
 
 **`Silence` does not wait.** The clock is injected, so twenty seconds are free and still
-assertable — which lets #38 test a 15 s staleness bound (`assumed`, `hld.md` §5) cheaply.
+assertable — which lets #38 test a 15 s staleness bound (`assumed`, [HLD evidence](../hld-evidence.md#5-numbers-and-where-each-came-from)) cheaply.
 **It emits no `feed.connection` events**: connection state is the controller's to decide and
 #38 owns it, and a double that pre-empted the machine would make #38's tests assert against
 the double. `Close` is observable through `closes`, `connections` and `replays`, where an
@@ -203,16 +195,5 @@ asserted against 136 real contracts on both channels. `tests/test_feed.py` drive
 loop, a scripted connection at one end and `md.option_quote` at the other, and
 `tests/test_composition.py` is the tracer bullet from a scripted socket to a rendered
 ladder and the bar writer's counters. Every consumer test decodes through this same
-function via `tests/fakes/decoder.py`, so none drifts from it.
-
-## 10. Numbers
-
-| Number | Tag | Run |
-|---|---|---|
-| 136 book frames → 136 quotes; 136 ticker frames → 136 references + 136 index quotes | `measured` | `tests/fixtures/ws-*.json`, decoded 2026-09-07 |
-| One distinct `sp` across all 136 ticker frames; `tick_size` absent on 136/136; `lts` present on 136/136 book frames | `measured` | same capture |
-| 11 of 136 contracts at exactly zero open interest; 16 of 136 never traded | `measured` | same capture |
-| Decode 30.6 µs per book frame, 43.6 µs per ticker frame | `measured` | 20 passes over the captures, this session |
-| ≈1.3% of one core to decode the live BTC feed — 4.9% against the contested higher rate in `hld.md` §5. The wire decode inside it already ran in the socket reader before #36; only the event construction is new | `derived` | the two above against `docs/ingestion.md`'s 267.7 and 117.6 msg/s |
-| Live: `/health` ok, `/ws/chain` a 21-row ladder after 5 `waiting` messages (spot 79634.8, forward 79642.12, 42 legs with our IV), 4 Parquet files at 412,100 bytes, 7,385 rows written | `measured` | engine run 2026-09-07T13:24:41Z, 410 s, BTC only |
-| BTC alone 504 contracts, 1,095.1 msg/s, 547.3 KB/s; BTC+ETH 782 contracts, 1,693.6 msg/s, 843.4 KB/s, both channels, 60 s each | `measured` | `tools/measure_feed.py --underlyings`, 2026-09-08, full detail in `../hld.md` §5 |
+function via `tests/fakes/decoder.py`, so none drifts from it. The numbers formerly in this
+document are in the same [HLD evidence table](../hld-evidence.md#7-adapter-evidence), including the capture, timing and live-run details.

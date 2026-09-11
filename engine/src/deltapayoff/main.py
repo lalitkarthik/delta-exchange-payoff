@@ -77,6 +77,7 @@ from .delta_client import DeltaClient, DeltaUnavailable
 from .events import Bus, ConnectionState, ControlCommand, Event, FeedConnection
 from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
+from .feed_runtime import relist_forever, relist_instruments
 from .historical import list_minutes, read_ladder_at
 from .logging_setup import configure_logging, log_event
 from .models import (
@@ -174,23 +175,6 @@ LIVE_UNDERLYINGS = ("BTC", "ETH")
 #: assets are recorded is a deployment decision and not a code change.
 LIVE_UNDERLYINGS_ENV = "DELTA_LIVE_UNDERLYINGS"
 
-#: How often the venue is asked what it lists, so contracts it lists **after** start-up
-#: are subscribed rather than missed for the life of the process. `assumed`; the full
-#: reasoning is `docs/design/lld/relisting.md` §3.
-#:
-#: One minute, because the store's resolution is one minute: a cadence of 60 s bounds the
-#: hole in a newly listed contract's history at roughly one bar, which is the smallest
-#: gap this store can even express. Five minutes would lose five bars of every new strike
-#: for nothing but a saved REST call.
-#:
-#: Not faster, either. This is `/v2/tickers` with no expiry filter, the heaviest read this
-#: engine makes: `measured` 2026-09-08 by `tools/probe_relist.py`, BTC is 520 contracts,
-#: 644.8 KB and 735 ms, ETH 278 contracts, 342.2 KB and 737 ms. At this cadence that is
-#: `derived` 987 KB a minute against the feed's own `measured` 843.4 KB/s — about 2% more
-#: traffic — for a listing that changes a few times a day. Below a minute it re-reads the
-#: same answer several times per bar it could not have improved.
-RELIST_INTERVAL_SECONDS = 60.0
-
 #: The most points `/volatility` will put in one response unless asked for fewer.
 #:
 #: A year at one-minute resolution is 525,600 points per series, and six series of that is
@@ -257,11 +241,13 @@ class FeedConnectionCache:
     `publish` callable handed to `FeedSupervisor` so this is written *before* the event
     reaches the bus, in the same call — no queue, no task, no lag, and critically no new
     consumer on the market-data bus: a raw `FanOut` subscription would receive every
-    `md.option_quote` and `md.option_reference` too, at roughly 600 messages a second,
+    `md.option_quote` and `md.option_reference` too, at measured 1,693.6 messages a
+    second,
     to catch a `feed.connection` event that arrives a few times an hour.
     """
 
     latest: dict[str, FeedConnection] = field(default_factory=dict)
+    _subscription: Any = field(default=None, init=False, repr=False)
 
     def apply(self, event: Event) -> None:
         """Note `event` if it is a transition. Anything else passes unremembered."""
@@ -270,6 +256,18 @@ class FeedConnectionCache:
 
     def get(self, adapter: str) -> FeedConnection | None:
         return self.latest.get(adapter)
+
+    def attach(self, bus, maxsize: int = 100, name: str = "feed-state"):
+        """Attach one drop-oldest subscription for connection transitions."""
+        self._subscription = bus.subscribe(name, maxsize=maxsize)
+        return self._subscription
+
+    async def run(self) -> None:
+        """Drain the feed-state subscription until cancelled."""
+        if self._subscription is None:
+            raise RuntimeError("attach() the feed connection cache before running it")
+        while True:
+            self.apply(await self._subscription.queue.get())
 
 
 @dataclass
@@ -303,7 +301,7 @@ class FeedStack:
     #: started and stopped with the application, and the thing `/health` asks. Built
     #: unconditionally, like the writer, so a process with no live feed still has a
     #: report to give rather than a route that raises.
-    supervisor: FeedSupervisor
+    supervisor: FeedSupervisor | None
     #: **#40's badge reads this.** The latest `feed.connection` per adapter, kept in step
     #: with the supervisor's own `publish` — see `FeedConnectionCache`.
     feed_cache: FeedConnectionCache
@@ -322,7 +320,7 @@ class FeedStack:
     @property
     def feed(self) -> Any:
         """The socket owner inside the adapter, for the counters #39's `/health` reads."""
-        return self.adapter.feed
+        return None if self.adapter is None else self.adapter.feed
 
 
 def build_bus() -> Bus:
@@ -439,105 +437,60 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     )
 
 
-async def relist_instruments(stack: FeedStack) -> int:
-    """Ask the venue what it lists and subscribe whatever is not subscribed yet.
+def build_consumer_stack() -> FeedStack:
+    """Wire the Redis-only engine process, without any venue components."""
+    events = RedisBus(BusConfig.from_env(live_underlyings()))
+    stream = ChainStream()
+    stream.attach(events)
+    writer = BarWriter(BarStore(), chains=stream.live_computed_chains)
+    writer.attach(events)
+    feed_cache = FeedConnectionCache()
+    feed_cache.attach(events)
+    return FeedStack(
+        events=events,
+        stream=stream,
+        writer=writer,
+        adapter=None,
+        supervisor=None,
+        feed_cache=feed_cache,
+    )
 
-    **The whole of issue #51's first half.** This used to happen once, inline in
-    `start_feed_stack`, and nothing ever asked again — so every contract Delta listed
-    after the process started was never subscribed, never stored, and absent from every
-    historical screen, while the live path went on answering `/chain` from a fresh REST
-    read and looked perfectly healthy. Measured on the night of 2026-09-07: four strikes
-    of one expiry first appear in the store at 06:32, when a *second* engine started, and
-    one of them sits between two strikes recorded from midnight.
 
-    **Additive, and additive is the whole safety argument.** `subscribe` registers rather
-    than replaces and the registry is never cleared, so this can only ever make the
-    reconnect replay larger. There is no moment at which the registry is empty, which
-    matters because an empty registry is deliberately not announced as `OPENED` (#38,
-    #39) — a re-list that briefly emptied it would put the connection badge through a
-    false reconnect for as long as it took to fill again.
+async def start_consumer_stack(stack: FeedStack) -> None:
+    """Start Redis before the five consumer tasks."""
+    await start_bus(stack.events)
+    stack.tasks = [
+        asyncio.create_task(stack.stream.run(), name="chain-stream"),
+        asyncio.create_task(recompute_forever(stack.stream), name="chain-recompute"),
+        asyncio.create_task(
+            recompute_every_minute(stack.stream, stack.writer.sample_chains),
+            name="chain-minute-pass",
+        ),
+        asyncio.create_task(stack.writer.run(), name="bar-writer"),
+        asyncio.create_task(stack.feed_cache.run(), name="feed-state"),
+    ]
+    for task in stack.tasks:
+        task.add_done_callback(_report_finished_task)
 
-    **Settled contracts are kept, deliberately.** A contract that has expired drops out
-    of the venue's listing but stays in `stack.listed` and in the socket registry, and is
-    replayed on every reconnect for the life of the process. Dropping it would mean
-    unsubscribing on a cadence, and the cadence is the problem: a contract leaves the
-    listing at settlement, while its last book updates are still the most valuable and
-    least repeatable rows in the record, and a re-list that fired in that window would
-    take the subscription away mid-settlement to save a few hundred bytes of subscribe
-    frame. The cost of keeping is a replay that grows by one day's expired contracts per
-    day the process runs — `assumed` to be tolerable for a process restarted more often
-    than weekly, and made visible rather than merely assumed: the `subscribed` count on
-    every record below is how many contracts this engine holds for that underlying — not
-    the socket registry, which is their union per channel — so the growth is in the log,
-    beside the venue's own listing size it can be compared against.
-    `docs/design/lld/relisting.md` §5 records the threshold at which this is revisited.
 
-    Returns how many contracts were newly subscribed. Raises whatever the venue read
-    raises — the caller decides whether that is fatal, and the two callers differ.
-    """
-    added = 0
-    for underlying in stack.adapter.underlyings:
-        listed = await stack.adapter.instruments(underlying)
-        known = stack.listed.setdefault(underlying, set())
-        fresh = [
-            instrument
-            for instrument in listed
-            if instrument.venue_symbol and instrument.venue_symbol not in known
-        ]
-        if not fresh:
-            continue
-        stack.adapter.subscribe(fresh)
-        known.update(instrument.venue_symbol for instrument in fresh)
-        added += len(fresh)
+async def stop_consumer_stack(stack: FeedStack) -> None:
+    """Cancel consumers, flush bars, then close Redis."""
+    for task in stack.tasks:
+        task.cancel()
+    if stack.tasks:
+        await asyncio.gather(*stack.tasks, return_exceptions=True)
+    stack.tasks = []
+    try:
+        await stack.writer.aclose()
+    except Exception:
         log_event(
             logger,
-            logging.INFO,
-            log_events.FEED_INSTRUMENTS,
-            "subscribed %d newly listed %s contracts; %d subscribed in total",
-            len(fresh),
-            underlying,
-            len(known),
-            venue=stack.adapter.venue,
-            underlying=underlying,
-            listed=len(fresh),
-            subscribed=len(known),
+            logging.ERROR,
+            log_events.ENGINE_ERROR,
+            "the final bar flush failed",
+            exc_info=True,
         )
-    return added
-
-
-async def relist_forever(
-    stack: FeedStack,
-    interval: float = RELIST_INTERVAL_SECONDS,
-    sleep: Callable[[float], Any] = asyncio.sleep,
-) -> None:
-    """Re-list on the cadence until cancelled. **A failed listing is not an outage.**
-
-    The venue's REST endpoint is a different service from its websocket and fails
-    separately: it times out, it rate-limits, it is redeployed. None of that is a reason
-    to end a feed that is delivering, so a failure here is a warning and a retry on the
-    next tick — the cost of one missed cycle is that a contract listed in the last minute
-    waits another minute, which is the same bounded cost the cadence already carries.
-
-    An unbounded `except` for the same reason `recompute_forever` has one: a loop that
-    dies leaves the engine recording the set it started with and saying nothing, which is
-    the exact failure this task was written to end.
-    """
-    while True:
-        await sleep(interval)
-        try:
-            await relist_instruments(stack)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log_event(
-                logger,
-                logging.WARNING,
-                log_events.FEED_INSTRUMENTS,
-                "could not re-list instruments; retrying in %gs",
-                interval,
-                venue=stack.adapter.venue,
-                exc_info=True,
-            )
+    await stop_bus(stack.events)
 
 
 async def start_feed_stack(stack: FeedStack) -> None:
@@ -631,6 +584,43 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     which is #57's user story 22: a misconfiguration is visible at once rather than
     buffering into an outbox nobody drains.
     """
+    if selected_bus() == REDIS_BUS:
+        stack = build_consumer_stack()
+        try:
+            await start_consumer_stack(stack)
+        except Exception:
+            await stop_consumer_stack(stack)
+            raise
+
+        app.state.delta = None
+        app.state.stack = stack
+        app.state.events = stack.events
+        app.state.adapter = None
+        app.state.stream = stack.stream
+        app.state.writer = stack.writer
+        app.state.feed = None
+        app.state.supervisor = None
+        app.state.feed_cache = stack.feed_cache
+        app.state.tasks = stack.tasks
+        try:
+            yield
+        finally:
+            await stop_consumer_stack(stack)
+            for name in (
+                "delta",
+                "stack",
+                "events",
+                "adapter",
+                "stream",
+                "writer",
+                "feed",
+                "supervisor",
+                "feed_cache",
+                "tasks",
+            ):
+                setattr(app.state, name, None)
+        return
+
     client = DeltaClient()
     await client.__aenter__()
     app.state.delta = client
@@ -967,6 +957,14 @@ async def feed_command(
     is not. Both are checked before anything is published: a command nobody can carry out
     must not reach the bus, where a later reader would find it and assume it happened.
     """
+    if selected_bus() == REDIS_BUS and supervisor is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "feed commands travel over the bus from I5 (#64); "
+                "unavailable in split mode"
+            ),
+        )
     names = supervisor.names() if supervisor is not None else []
     matched = next((name for name in names if name.upper() == adapter.upper()), None)
     if supervisor is None or matched is None:
@@ -1000,10 +998,23 @@ async def feed_command(
 @app.get("/expiries", response_model=ExpiriesResponse)
 async def expiries(
     underlying: Annotated[str, Query(description="BTC or ETH")],
-    adapter: Annotated[Adapter, Depends(get_adapter)],
+    adapter: Annotated[Adapter | None, Depends(get_adapter)],
+    stream: Annotated[ChainStream | None, Depends(get_watched_stream)],
 ) -> ExpiriesResponse:
     """Every listed expiry for one underlying, ascending. Source of the dropdown."""
     symbol = _validated(normalise_underlying, underlying)
+    if adapter is None:
+        if stream is None:
+            raise HTTPException(
+                status_code=503, detail="the engine has no chain stream"
+            )
+        listed = ExpiriesResponse(underlying=symbol, expiries=stream.expiries(symbol))
+        if not listed.expiries:
+            raise HTTPException(
+                status_code=404,
+                detail=f"the venue lists no option contracts for {symbol}",
+            )
+        return listed
     listed = await _venue(adapter.expiries(symbol))
     if not listed.expiries:
         raise HTTPException(
@@ -1016,11 +1027,26 @@ async def expiries(
 async def chain(
     underlying: Annotated[str, Query(description="BTC or ETH")],
     expiry: Annotated[str, Query(description="DD-MM-YYYY, as the venue spells it")],
-    adapter: Annotated[Adapter, Depends(get_adapter)],
+    adapter: Annotated[Adapter | None, Depends(get_adapter)],
+    stream: Annotated[ChainStream | None, Depends(get_watched_stream)],
 ) -> ChainResponse:
     """The pivoted ladder for one underlying and one expiry."""
     symbol = _validated(normalise_underlying, underlying)
     date = _validated(validate_expiry, expiry)
+    if adapter is None:
+        if stream is None:
+            raise HTTPException(
+                status_code=503, detail="the engine has no chain stream"
+            )
+        snapshot = stream.chain(symbol, date)
+        if snapshot is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"the venue lists no option contracts for {symbol} expiring {date}"
+                ),
+            )
+        return snapshot
     snapshot = await _venue(adapter.chain_snapshot(symbol, date))
     if not snapshot.rows:
         raise HTTPException(
@@ -1509,6 +1535,10 @@ async def live_chain(
         adapter_name: str | None = None
         if supervisor is not None and supervisor.controllers:
             adapter_name = supervisor.controllers[0].adapter_name
+        elif feed_cache is not None and feed_cache.latest:
+            # Split mode has no local supervisor. The consumer has one feed adapter today,
+            # so the first adapter that published a transition is the badge's source.
+            adapter_name = next(iter(feed_cache.latest))
 
         #: The state last actually sent to *this* connection, so a `feed` message goes
         #: out only when it says something new — see `docs/live-chain-contract.md`'s

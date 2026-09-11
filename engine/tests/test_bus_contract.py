@@ -662,7 +662,9 @@ def test_the_app_refuses_to_start_when_the_redis_it_was_told_to_use_is_absent(
     Driven with a client that refuses rather than a closed port, because no test here
     opens a socket. What is proven is the wiring — that `BusUnavailable` reaches out of
     the lifespan instead of being swallowed the way `DeltaUnavailable` deliberately is,
-    and that the HTTP client opened before it is closed on the way out.
+    and that the venue's HTTP client is never opened at all: with `DELTA_BUS=redis` the
+    engine is a consumer only (#62), so the Redis branch fails before `DeltaClient`
+    exists.
     """
     import redis.exceptions
     from fastapi.testclient import TestClient
@@ -704,4 +706,4 @@ def test_the_app_refuses_to_start_when_the_redis_it_was_told_to_use_is_absent(
 
     assert "redis://127.0.0.1:6399" in str(raised.value)
     assert "DELTA_BUS" in str(raised.value), "the message must say how to turn it off"
-    assert "delta" in closed, "the HTTP client must not be left open by a failed start"
+    assert "delta" not in closed, "Redis must fail before the Delta client is entered"

@@ -405,6 +405,16 @@ class ChainStream:
             if _pair(instrument) == pair
         )
 
+    def expiries(self, underlying: str) -> list[str]:
+        """The distinct expiries represented by reference events, date-sorted."""
+        symbol = underlying.upper()
+        dates = {
+            instrument.expiry
+            for instrument, _event in self._reference.values()
+            if instrument.underlying.upper() == symbol
+        }
+        return [expiry.strftime(EXPIRY_FORMAT) for expiry in sorted(dates)]
+
     def raw_chain(self, underlying: str, expiry: str) -> ChainResponse | None:
         """The ladder as the venue sent it, before enrichment. `None` if nothing arrived.
 

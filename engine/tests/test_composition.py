@@ -33,6 +33,83 @@ PUT = "P-BTC-77600-040926"
 EXPIRY = "04-09-2026"
 
 
+class _StubRedisBus:
+    instances: list[_StubRedisBus] = []
+
+    def __init__(self, config) -> None:
+        self.config = config
+        self._fanout = FanOut()
+        self.started = False
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def subscribe(self, name: str, maxsize: int, lossless: bool = False):
+        return self._fanout.subscribe(name, maxsize=maxsize, lossless=lossless)
+
+    def publish(self, event) -> None:
+        self._fanout.publish(event)
+
+    def stats(self):
+        return self._fanout.stats()
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_redis_bus_is_a_consumer_only_composition(monkeypatch, tmp_path) -> None:
+    """Split mode has only the Redis consumers and never constructs venue components."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DELTA_BUS", "redis")
+    monkeypatch.setenv("DELTA_STORE_ROOT", str(tmp_path))
+    monkeypatch.setattr(main, "RedisBus", _StubRedisBus)
+
+    class Forbidden:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("split mode constructed a venue component")
+
+    monkeypatch.setattr(main, "DeltaClient", Forbidden)
+    monkeypatch.setattr(main, "DeltaAdapter", Forbidden)
+    monkeypatch.setattr(main, "FeedSupervisor", Forbidden)
+    # `main` never names the controller, so patching it there would guard nothing. Guard
+    # the class itself: a construction from any module trips it.
+    from deltapayoff.controller import ConnectionController
+
+    def forbidden_init(self, *args, **kwargs) -> None:
+        raise AssertionError("split mode constructed a ConnectionController")
+
+    monkeypatch.setattr(ConnectionController, "__init__", forbidden_init)
+    _StubRedisBus.instances.clear()
+
+    with TestClient(main.app) as client:
+        assert client.get("/health").json() == {
+            "status": "ok",
+            "feed": "stopped",
+            "adapters": [],
+            "watched": [],
+        }
+        assert main.app.state.adapter is None
+        assert main.app.state.feed is None
+        assert main.app.state.supervisor is None
+        assert {task.get_name() for task in main.app.state.tasks} == {
+            "chain-stream",
+            "chain-recompute",
+            "chain-minute-pass",
+            "bar-writer",
+            "feed-state",
+        }
+        stats = main.app.state.events.stats()
+        assert set(stats) == {"chain-stream", "bar-writer", "feed-state"}
+        assert stats["bar-writer"]["lossless"] is True
+        assert stats["feed-state"]["lossless"] is False
+        assert _StubRedisBus.instances[-1].started is True
+
+    assert _StubRedisBus.instances[-1].closed is True
+
+
 def ticker_frame(symbol: str, bid: float, ask: float) -> dict:
     return {
         "type": "ticker",

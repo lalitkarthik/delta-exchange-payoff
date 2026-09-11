@@ -10,6 +10,7 @@ error table below assert about the boundary the browser actually talks to.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -17,8 +18,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from deltapayoff.adapters import DeltaAdapter
+from deltapayoff.adapters.delta import instrument_from_symbol
 from deltapayoff.delta_client import DeltaUnavailable, parse_envelope
-from deltapayoff.main import app, get_adapter
+from deltapayoff.events import OptionReference
+from deltapayoff.main import app, get_adapter, get_supervisor, get_watched_stream
+from deltapayoff.stream import ChainStream
 
 
 class StubDelta:
@@ -186,6 +190,71 @@ def test_no_contracts_for_that_pair_is_404(make_client) -> None:
 def test_no_contracts_for_that_underlying_is_404(make_client) -> None:
     response = make_client(StubDelta([])).get("/expiries", params={"underlying": "ETH"})
     assert response.status_code == 404
+
+
+def test_split_feed_command_is_unavailable_over_http_until_the_bus_command_route_lands(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("DELTA_BUS", "redis")
+    app.dependency_overrides[get_supervisor] = lambda: None
+    try:
+        response = TestClient(app).post("/feed/DELTA/pause")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "feed commands travel over the bus from I5 (#64); unavailable in split mode"
+    )
+
+
+def _reference(symbol: str) -> OptionReference:
+    instrument = instrument_from_symbol(symbol)
+    assert instrument is not None
+    return OptionReference(
+        source="DELTA",
+        ts_received=datetime(2026, 9, 12, tzinfo=timezone.utc),
+        instrument=instrument,
+        bid=100.0,
+        ask=110.0,
+        mark=105.0,
+    )
+
+
+def test_chain_stream_expiry_query_is_distinct_case_insensitive_and_date_sorted() -> None:
+    stream = ChainStream()
+    for symbol in (
+        "C-BTC-60000-301026",
+        "P-BTC-61000-041126",
+        "C-BTC-62000-301026",
+        "C-ETH-60000-041126",
+    ):
+        stream.apply(_reference(symbol))
+
+    assert stream.expiries("btc") == ["30-10-2026", "04-11-2026"]
+
+
+def test_redis_consumer_routes_read_chain_stream_state_when_adapter_is_absent() -> None:
+    stream = ChainStream()
+    stream.apply(_reference("C-BTC-60000-301026"))
+    app.dependency_overrides[get_adapter] = lambda: None
+    app.dependency_overrides[get_watched_stream] = lambda: stream
+    try:
+        client = TestClient(app)
+        expiries_response = client.get("/expiries", params={"underlying": "BTC"})
+        chain_response = client.get(
+            "/chain", params={"underlying": "BTC", "expiry": "30-10-2026"}
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert expiries_response.status_code == 200
+    assert expiries_response.json() == {
+        "underlying": "BTC",
+        "expiries": ["30-10-2026"],
+    }
+    assert chain_response.status_code == 200
+    assert chain_response.json()["rows"]
 
 
 @pytest.mark.parametrize(

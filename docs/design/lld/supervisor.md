@@ -4,13 +4,17 @@
 are [controller.md](controller.md); what they do about a dropped socket is
 [reconnect.md](reconnect.md). Landed by #39.
 
+**Process boundary.** In split mode, only `deltapayoff.feed_main:app` constructs
+`FeedSupervisor`; it owns the Delta adapters and their connection lifecycle. The feed exposes
+only `GET /health`, which returns `FeedSupervisor.report`. With `DELTA_BUS` unset — the default —
+the supervisor, adapter and consumers remain the unchanged in-process FanOut monolith.
+
 ## 1. What it is for
 
-The whiteboard has many adapters behind one feed-management box, and **one health call
-has to answer for the box.** Without something that owns them all, "is the feed up?"
-becomes "is *an* adapter up?", and the answer depends on which one the caller happened to
-ask — so a process with Delta connected and a second venue stopped for an hour reports
-green, truthfully, about the half of itself that works.
+The whiteboard has many adapters behind one feed-management box, and **one feed health call
+has to answer for the box.** Without something that owns them all, "is the feed up?" becomes
+"is *an* adapter up?", and the answer depends on which adapter the caller happened to ask.
+`FeedSupervisor.report` makes the aggregate state explicit.
 
 ## 2. What a supervisor is here
 
@@ -25,14 +29,11 @@ this one adds is ownership, aggregation and a shutdown that actually detaches.
 
 ## 3. Liveness and readiness
 
-`/health` answered `{"status": "ok"}` and meant **liveness**: the process is up and served
-you. It was read as **readiness**: market data is flowing. Those come apart for hours — a
-process whose socket died at 02:00 answers `ok` all night — and the gap is exactly where a
-silent failure lives.
-
-So the report carries both. `status` is unchanged, still liveness, still always `"ok"`;
-`feed` beside it is readiness. **Nothing that reads the old field breaks, and nothing that
-reads the new one is lied to.**
+The feed's `/health` is `FeedSupervisor.report`: `status` is process liveness and `feed` is
+readiness, the worst controller state. The engine's `/health` is a separate liveness report
+with watched pairs. In split mode it currently reports `status: "ok"`, `feed: "stopped"` and
+`adapters: []`; it is not authoritative about feed state until #64 supplies the last
+`feed.connection` and `heartbeat` seen and their age.
 
 ## 4. The order, from best to worst
 
@@ -80,20 +81,6 @@ answer.
       "empty_opens": 0,
       "undecodable": 0
     }
-  ],
-  "watched": [
-    {
-      "underlying": "BTC",
-      "expiry": "11-09-2026",
-      "viewers": 2,
-      "grace_remaining_seconds": null
-    },
-    {
-      "underlying": "ETH",
-      "expiry": "11-09-2026",
-      "viewers": 0,
-      "grace_remaining_seconds": 21.418
-    }
   ]
 }
 ```
@@ -102,14 +89,14 @@ answer.
 |---|---|
 | `status` | Liveness. Always `"ok"`. The shape this route used to be, kept whole. |
 | `feed` | Readiness. The worst state among the adapters, by §4. |
-| `adapters` | **A list, not a map keyed by name.** #44 adds the watched set: extending a record is not changing what a key means, and the order is the configured one rather than a dictionary's. |
+| `adapters` | **A list, not a map keyed by name.** The order is the configured one rather than a dictionary's. |
 | `last_message_at` | **Derived from the age at request time**, not stamped per message. The controller measures on a monotonic clock, the only kind a staleness bound can be measured on; taking a `datetime` on a `measured` 1,322.9 messages/second hot path to avoid one subtraction per request is the wrong trade. |
 | `last_message_age_seconds` | `null` when nothing has ever arrived — an unknown age, not an age of zero. `last_message_at` is `null` with it. |
 | `reconnects` | Times this connection has **dropped** — incremented in `connection_closed` beside the budget it spends, not on entry to `reconnecting`, which the watchdog can reach without a drop. A count, not a rate: a reader comparing two polls gets the rate, and a rate computed here needs a window nobody agreed on. |
 | `budget_remaining` | Reconnects left. A feed two drops from `stopped` and one that has never dropped are otherwise the same green badge. |
 | `transitions` | Every state change since start. A connection flapping between `connected` and `degraded` appears here and in no other field. |
 | `empty_opens` | Sockets opened with **nothing subscribed** — guaranteed to deliver nothing, the failure with no error. |
-| `watched` | **#44's addition, and not the supervisor's.** What the 100 ms live solve is running for — a pair per open `/ws/chain` connection, plus any inside its grace. Built in the route from `ChainStream.watching()`, because the supervisor owns connections and what is being solved is not a property of any adapter. Empty is the ordinary state of an engine recording with no browser open and is **not** a fault: every listed expiry is still solved once a minute by the pass that fills the store. `grace_remaining_seconds` is `null` while anyone is watching — no countdown is running, and `0` would read as one that had just finished. `docs/design/lld/chain-cache.md` §5. |
+| `watched` | **Engine health only, not the supervisor's report.** What the 100 ms live solve is running for — a pair per open `/ws/chain` connection, plus any inside its grace. Built in the route from `ChainStream.watching()`; empty is ordinary and **not** a fault. `grace_remaining_seconds` is `null` while anyone is watching. See `docs/design/lld/chain-cache.md` §5. |
 | `undecodable` | Frames that parsed as JSON and then made no sense. `delta.py` logs the first and counts the rest, and its own comment asked for this field: a systematic decode bug zeroes the event stream while the message counter climbs. |
 
 Both counters are **`null`, never `0`, when the adapter keeps none.** Each is a counter
@@ -120,23 +107,27 @@ tell "still nought" from "nobody is counting".
 badge, an alert rule, an operator — and one boolean here would fix one of those readings
 for all three.
 
-## 6. A process with no feed still answers
+## 6. The two routes and temporary split behavior
 
-`get_supervisor()` returns `None` rather than raising when the lifespan never ran, and the
-route answers `{"status": "ok", "feed": "stopped", "adapters": []}`. **This is the
-opposite call to `/recording`'s 503, and deliberately.** `/health` is what a monitor hits
-to find out whether anything is wrong; a health check that fails because there is no feed
-to describe tells the monitor the engine is down when it is up and merely not recording.
+In split mode the feed route is only `GET /health`, and it returns `FeedSupervisor.report`.
+The engine route answers `{"status": "ok", "feed": "stopped", "adapters": []}` plus its
+watched pairs while #64 is pending; that is process liveness, not feed authority. An engine
+started after an already-connected feed learns no current connection state until the next
+`feed.connection` transition. #64 will add the last `feed.connection` and `heartbeat` seen and
+their age. The engine's `POST /feed/{adapter}/{command}` returns 503 for now; commands travel
+over the bus in #64.
 
 ## 7. Lifecycle
 
 | Phase | What happens |
 |---|---|
-| Build | `main.build_feed_stack` constructs the supervisor over the configured adapters. **Nothing connects.** Constructing a controller registers it on its adapter, so they are listening from here. |
-| Start | `main.start_feed_stack`, after every contract is subscribed. One task per controller, named `feed-<venue>`, each with a done-callback that logs at error if it ends on its own. |
+| Split feed / Build | `feed_main` constructs `FeedSupervisor` over the configured adapters. Redis must be ready first; `BusUnavailable` stops startup before the venue opens. |
+| Split feed / Start | After every contract is subscribed, one task per controller runs under the feed supervisor, named `feed-<venue>`. |
+| Split engine | `main` constructs `ChainStream`, `BarWriter` and `FeedConnectionCache`; it constructs no `FeedSupervisor` and opens no Delta socket. |
+| Default | With `DELTA_BUS` unset, `main` keeps the existing supervisor and consumers together in the in-process FanOut monolith. |
 | Stop | `stop_feed_stack` awaits `aclose()` **before** cancelling the other tasks. |
 
-`aclose()` stops every controller, cancels its task, and then **detaches every one of
+In the feed process, `aclose()` stops every controller, cancels its task, and then **detaches every one of
 them**. The detach is not tidiness: a controller left registered goes on being told about
 a socket it no longer owns, and answers a signal it should never have seen by raising
 `IllegalTransition` inside a socket reader that does not belong to it. `run()` detaches on
@@ -144,9 +135,8 @@ its own way out, but a supervisor closed before it ever started, or one cancelle
 `run` reaches its `finally`, has controllers `run()` never spoke for. `detach()` is
 idempotent precisely so this can be unconditional.
 
-**The feed is no longer a task of `main`'s own.** It runs through the supervisor, which
-means a live controller's `feed.connection`, `heartbeat` and `alert` events reach the same
-bus the market data does — the wiring #38 built and did not connect.
+In split mode, a live controller's `feed.connection`, `heartbeat` and `alert` events reach the
+Redis publisher with the market data. In default mode the same events remain on FanOut.
 
 ## 8. Failure modes
 

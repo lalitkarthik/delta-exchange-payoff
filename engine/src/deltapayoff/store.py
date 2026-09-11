@@ -328,8 +328,14 @@ COMPUTED_SCHEMA: dict[str, Any] = {
 HIVE_SCHEMA: dict[str, Any] = {"date": pl.Date, "underlying": pl.Categorical}
 
 
+STORE_ROOT_ENV = "DELTA_STORE_ROOT"
+
+
 def default_root() -> Path:
-    """`<repo>/data`. Git-ignored: market data is never committed."""
+    """The configured store root, or `<repo>/data` by default."""
+    configured = os.environ.get(STORE_ROOT_ENV, "")
+    if configured:
+        return Path(configured)
     return Path(__file__).resolve().parents[3] / "data"
 
 

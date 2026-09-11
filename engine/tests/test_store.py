@@ -24,6 +24,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from deltapayoff import store as store_module
 from deltapayoff.bars import (
     BarAggregator,
     ComputedAggregator,
@@ -59,6 +60,24 @@ from fakes.decoder import events_from_frame
 
 MINUTE_US = int(datetime(2026, 9, 4, 9, 0, 0, tzinfo=timezone.utc).timestamp() * 1e6)
 MINUTE = 60_000_000
+
+
+def test_default_root_uses_the_repository_data_directory_when_unset(monkeypatch) -> None:
+    monkeypatch.delenv("DELTA_STORE_ROOT", raising=False)
+
+    assert store_module.default_root() == Path(__file__).resolve().parents[2] / "data"
+
+
+def test_default_root_uses_the_configured_store_directory(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DELTA_STORE_ROOT", str(tmp_path))
+
+    assert store_module.default_root() == tmp_path
+
+
+def test_default_root_ignores_an_empty_configured_store_directory(monkeypatch) -> None:
+    monkeypatch.setenv("DELTA_STORE_ROOT", "")
+
+    assert store_module.default_root() == Path(__file__).resolve().parents[2] / "data"
 
 
 def bar(

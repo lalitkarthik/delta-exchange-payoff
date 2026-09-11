@@ -11,6 +11,12 @@ underlying is a second value in a column that already existed, not a new code pa
 tables mean and why they are shaped this way is `docs/storage.md`; this document is the part
 a reader would otherwise reconstruct from code.
 
+**Process boundary.** In split mode (`DELTA_BUS=redis`), the engine owns `BarWriter` and its
+lossless `bar-writer` subscription; the store receives that lossless market-data stream only
+through Redis. Once an entry is written to Redis, a feed outage creates no additional store loss
+for that entry, but an event still in a dead publisher's memory is not durable. With
+`DELTA_BUS` unset — the default — FanOut keeps the existing in-process monolith unchanged.
+
 ---
 
 ## 1. Four tables, and where each comes from
@@ -77,6 +83,9 @@ This is why table A seals on the **larger** of the two watermarks. A bar sealed 
 counted late, the fallback would be dead code and the flag would be a constant `True`.
 
 ## 4. Bucketing, and the one clock that decides
+
+`DELTA_STORE_ROOT` configures the store root and defaults to `<repo>/data`. Two engine processes
+must never share a store root: both would flush into the same directories.
 
 `ts_venue` alone decides which minute a tick belongs to, converted to microseconds by
 integer arithmetic in `bars._micros` — never through `timestamp()`, which returns a float
