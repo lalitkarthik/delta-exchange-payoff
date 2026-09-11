@@ -95,7 +95,7 @@ def report_partitions(root: Path, day: str | None) -> None:
         for date, underlying in store.partitions():
             if day is not None and date != day:
                 continue
-            directory = store.path / f"date={date}" / f"underlying={underlying}"
+            directory = store.path / f"underlying={underlying}" / f"date={date}"
             files = list(directory.glob("*.parquet"))
             if not files:
                 continue
@@ -125,7 +125,7 @@ def report_compaction_cost(root: Path, day: str) -> None:
         for date, underlying in store.partitions():
             if date != day:
                 continue
-            directory = store.path / f"date={date}" / f"underlying={underlying}"
+            directory = store.path / f"underlying={underlying}" / f"date={date}"
             files = sorted(directory.glob("*.parquet"))
             if len(files) <= 1:
                 continue

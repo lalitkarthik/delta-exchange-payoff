@@ -27,11 +27,13 @@ values compresses far better than a row of dissimilar ones — which is what mak
 dictionary encoding below the single largest win available, at 588 distinct symbols
 repeated millions of times a day.
 
-**Why `date/underlying` and nothing else.** Hive partitioning puts the filter in the
-directory *name*, so a query for BTC on 4 September skips every other directory without
-opening a single file. The key choice is therefore the whole design, and it is a
-trade-off in both directions: too coarse and pruning buys nothing, too fine and the tree
-fills with tiny files. **Expiry stays a column.** As a partition level it explodes into
+**Why `underlying/date` and nothing else.** Every query filters the underlying, while
+`/smile` intentionally spans all dates, so putting underlying first prunes unrelated
+assets even without a date predicate. Hive partitioning puts the filter in the directory
+*name*, so a query for BTC on 4 September skips every other directory without opening a
+single file. The key choice is therefore the whole design, and it is a trade-off in both
+directions: too coarse and pruning buys nothing, too fine and the tree fills with tiny
+files. **Expiry stays a column.** As a partition level it explodes into
 thousands of directories holding a handful of rows each, and Parquet performs badly with
 many small files — every one carries header and footer overhead and a reader has to open
 all of them. Strike and option type are columns for the same reason, more so.
@@ -325,7 +327,7 @@ COMPUTED_SCHEMA: dict[str, Any] = {
 #: The partition columns. They live in the directory names, not in the files, which is
 #: the whole point — the filter is answered by the path. All three tables share them, so
 #: a reader joins spot to quotes on `date` and `underlying` without a schema translation.
-HIVE_SCHEMA: dict[str, Any] = {"date": pl.Date, "underlying": pl.Categorical}
+HIVE_SCHEMA: dict[str, Any] = {"underlying": pl.Categorical, "date": pl.Date}
 
 
 STORE_ROOT_ENV = "DELTA_STORE_ROOT"
@@ -529,7 +531,7 @@ class BarStore:
 
         written = 0
         for (day, underlying), bars in sorted(groups.items()):
-            directory = self.path / f"date={day}" / f"underlying={underlying}"
+            directory = self.path / f"underlying={underlying}" / f"date={day}"
             directory.mkdir(parents=True, exist_ok=True)
             earliest = min(bar.minute for bar in bars)
             name = f"{earliest.strftime('%Y%m%dT%H%M%SZ')}-{self.flushes:06d}.parquet"
@@ -620,12 +622,12 @@ class BarStore:
             self._frame(buffered)
             .with_columns(
                 pl.Series(
-                    "date", [bar.minute.date() for bar in buffered], dtype=pl.Date
-                ),
-                pl.Series(
                     "underlying",
                     [bar.underlying for bar in buffered],
                     dtype=pl.Categorical,
+                ),
+                pl.Series(
+                    "date", [bar.minute.date() for bar in buffered], dtype=pl.Date
                 ),
             )
             .lazy()
@@ -643,15 +645,15 @@ class BarStore:
         if not self.path.is_dir():
             return []
         found: list[tuple[str, str]] = []
-        for day in sorted(self.path.glob("date=*")):
-            if not day.is_dir():
+        for underlying in sorted(self.path.glob("underlying=*")):
+            if not underlying.is_dir():
                 continue
-            for underlying in sorted(day.glob("underlying=*")):
-                if underlying.is_dir():
+            for day in sorted(underlying.glob("date=*")):
+                if day.is_dir():
                     found.append(
                         (day.name.split("=", 1)[1], underlying.name.split("=", 1)[1])
                     )
-        return found
+        return sorted(found)
 
     def compact(
         self,
@@ -700,7 +702,7 @@ class BarStore:
             if stage == interrupt_at:
                 raise CompactionInterrupted(stage)
 
-        directory = self.path / f"date={day}" / f"underlying={underlying}"
+        directory = self.path / f"underlying={underlying}" / f"date={day}"
         if not directory.is_dir():
             return Compaction(
                 dataset=self.dataset,

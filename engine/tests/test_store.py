@@ -257,10 +257,10 @@ def test_a_filtered_scan_returns_only_the_matching_partition(tmp_path: Path) -> 
         for path in store.path.rglob("*.parquet")
     }
     assert {part.rsplit("/", 1)[0] for part in written} == {
-        "date=2026-09-04/underlying=BTC",
-        "date=2026-09-04/underlying=ETH",
-        "date=2026-09-05/underlying=BTC",
-        "date=2026-09-05/underlying=ETH",
+        "underlying=BTC/date=2026-09-04",
+        "underlying=ETH/date=2026-09-04",
+        "underlying=BTC/date=2026-09-05",
+        "underlying=ETH/date=2026-09-05",
     }
 
 
@@ -310,7 +310,7 @@ def test_a_partition_filter_is_answered_by_the_paths_before_a_file_is_opened(
 
     assert sources(everything) == 4, everything
     assert sources(pruned) == 1, pruned
-    assert "date=2026-09-04/underlying=BTC" in pruned.replace("\\", "/")
+    assert "underlying=BTC/date=2026-09-04" in pruned.replace("\\", "/")
 
 
 def test_a_scan_ignores_a_file_in_the_tree_that_is_not_part_of_the_dataset(
@@ -325,7 +325,7 @@ def test_a_scan_ignores_a_file_in_the_tree_that_is_not_part_of_the_dataset(
     store = BarStore(tmp_path)
     store.add([bar()])
     assert store.flush() == 1
-    directory = store.path / "date=2026-09-04" / "underlying=BTC"
+    directory = store.path / "underlying=BTC" / "date=2026-09-04"
     (directory / "_compaction.json").write_text("{}", encoding="utf-8")
     (directory / "compact-000001.parquet.tmp").write_bytes(b"not a parquet file")
     (directory / "notes.txt").write_text("hello", encoding="utf-8")
@@ -338,7 +338,7 @@ def test_expiry_strike_and_option_type_are_columns_not_partition_levels(
 ) -> None:
     """Expiry as a partition level explodes into thousands of tiny directories and makes
     Parquet slower than CSV — each small file carries header and footer overhead and a
-    reader has to open all of them. So the directory tree is `date/underlying` and
+    reader has to open all of them. So the directory tree is `underlying/date` and
     nothing else, and three expiries share one file."""
     store = BarStore(tmp_path)
     store.add(
@@ -354,7 +354,7 @@ def test_expiry_strike_and_option_type_are_columns_not_partition_levels(
         path.relative_to(store.path).parent.as_posix()
         for path in store.path.rglob("*.parquet")
     }
-    assert directories == {"date=2026-09-04/underlying=BTC"}
+    assert directories == {"underlying=BTC/date=2026-09-04"}
     assert len(list(store.path.rglob("*.parquet"))) == 1
 
     frame = store.scan().collect()
@@ -1002,10 +1002,10 @@ def test_the_reference_row_count_equals_the_minutes_that_actually_had_frames(
     assert frame["mark_ticks"].to_list() == [3] * 6
 
 
-def test_the_reference_table_partitions_on_date_and_underlying_and_nothing_else(
+def test_the_reference_table_partitions_on_underlying_and_date_and_nothing_else(
     tmp_path: Path,
 ) -> None:
-    """Table B follows table A's layout exactly: `date/underlying` in the directory
+    """Table B follows table A's layout exactly: `underlying/date` in the directory
     names, expiry and strike and option type as **columns**.
 
     Pruning asserted as behaviour — two dates, two underlyings, a filter on one of each
@@ -1035,9 +1035,9 @@ def test_the_reference_table_partitions_on_date_and_underlying_and_nothing_else(
         for path in store.path.rglob("*.parquet")
     }
     assert directories == {
-        "date=2026-09-04/underlying=BTC",
-        "date=2026-09-04/underlying=ETH",
-        "date=2026-09-05/underlying=BTC",
+        "underlying=BTC/date=2026-09-04",
+        "underlying=ETH/date=2026-09-04",
+        "underlying=BTC/date=2026-09-05",
     }
 
     one = (
@@ -1167,10 +1167,10 @@ def test_a_filtered_scan_returns_only_the_matching_spot_partition(tmp_path: Path
         for path in store.path.rglob("*.parquet")
     }
     assert directories == {
-        "date=2026-09-04/underlying=BTC",
-        "date=2026-09-04/underlying=ETH",
-        "date=2026-09-05/underlying=BTC",
-        "date=2026-09-05/underlying=ETH",
+        "underlying=BTC/date=2026-09-04",
+        "underlying=ETH/date=2026-09-04",
+        "underlying=BTC/date=2026-09-05",
+        "underlying=ETH/date=2026-09-05",
     }
 
 
@@ -2482,3 +2482,168 @@ def test_a_stored_row_reproduces_offline_from_the_quote_bar_beside_it(
             checked += 1
 
     assert checked == len(stored) == quotes.height
+
+
+def test_all_four_tables_flush_underlying_before_date(tmp_path: Path) -> None:
+    """Every table uses the same underlying-first tree for two assets and two dates."""
+    tables = (
+        (
+            BarStore(tmp_path),
+            [
+                bar(
+                    underlying="BTC",
+                    minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+                ),
+                bar(
+                    symbol="C-ETH-3000-040926",
+                    underlying="ETH",
+                    strike=3000.0,
+                    minute=datetime(2026, 9, 4, 9, 1, tzinfo=timezone.utc),
+                ),
+                bar(
+                    underlying="BTC",
+                    minute=datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc),
+                ),
+                bar(
+                    symbol="C-ETH-3000-050926",
+                    underlying="ETH",
+                    strike=3000.0,
+                    expiry="05-09-2026",
+                    minute=datetime(2026, 9, 5, 9, 1, tzinfo=timezone.utc),
+                ),
+            ],
+        ),
+        (
+            reference_store(tmp_path),
+            [
+                reference(underlying="BTC"),
+                reference(
+                    symbol="C-ETH-3000-040926",
+                    underlying="ETH",
+                    strike=3000.0,
+                ),
+                reference(
+                    underlying="BTC",
+                    minute=datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc),
+                ),
+                reference(
+                    symbol="C-ETH-3000-050926",
+                    underlying="ETH",
+                    strike=3000.0,
+                    minute=datetime(2026, 9, 5, 9, 1, tzinfo=timezone.utc),
+                ),
+            ],
+        ),
+        (
+            spot_store(tmp_path),
+            [
+                spot(underlying="BTC"),
+                spot(underlying="ETH"),
+                spot(
+                    underlying="BTC",
+                    minute=datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc),
+                ),
+                spot(
+                    underlying="ETH",
+                    minute=datetime(2026, 9, 5, 9, 1, tzinfo=timezone.utc),
+                ),
+            ],
+        ),
+        (
+            BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA),
+            [
+                computed_bar(underlying="BTC"),
+                computed_bar(
+                    symbol="C-ETH-4000-040926",
+                    underlying="ETH",
+                    strike=4000.0,
+                ),
+                computed_bar(
+                    underlying="BTC",
+                    minute=datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc),
+                ),
+                computed_bar(
+                    symbol="C-ETH-4000-050926",
+                    underlying="ETH",
+                    strike=4000.0,
+                    minute=datetime(2026, 9, 5, 9, 1, tzinfo=timezone.utc),
+                ),
+            ],
+        ),
+    )
+    expected = {
+        "underlying=BTC/date=2026-09-04",
+        "underlying=ETH/date=2026-09-04",
+        "underlying=BTC/date=2026-09-05",
+        "underlying=ETH/date=2026-09-05",
+    }
+
+    for store, bars in tables:
+        store.add(bars)
+        assert store.flush() == 4
+        directories = {
+            path.relative_to(store.path).parent.as_posix()
+            for path in store.path.rglob("*.parquet")
+        }
+        assert directories == expected, store.dataset
+        assert not any(
+            child.is_dir() and child.name.startswith("date=")
+            for child in store.path.iterdir()
+        )
+
+
+def test_all_four_tables_round_trip_every_column_in_the_underlying_first_tree(
+    tmp_path: Path,
+) -> None:
+    """A fixed post-move minute preserves every table column and both path keys."""
+    minute = datetime(2026, 9, 5, 12, 34, 56, 789, tzinfo=timezone.utc)
+    tables = (
+        (BarStore(tmp_path), bar(minute=minute)),
+        (reference_store(tmp_path), reference(minute=minute)),
+        (spot_store(tmp_path), spot(minute=minute)),
+        (
+            BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA),
+            computed_bar(minute=minute),
+        ),
+    )
+
+    for store, expected in tables:
+        store.add([expected])
+        assert store.flush() == 1
+        row = store.scan().collect().row(0, named=True)
+
+        for column in store.schema:
+            assert row[column] == getattr(expected, column), f"{store.dataset}:{column}"
+        assert row["underlying"] == expected.underlying
+        assert row["date"] == minute.date()
+
+
+def test_partitions_skip_non_directories_and_return_sorted_public_tuples(
+    tmp_path: Path,
+) -> None:
+    store = BarStore(tmp_path)
+    store.add(
+        [
+            bar(
+                minute=datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc),
+                underlying="BTC",
+            ),
+            bar(
+                minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+                underlying="ETH",
+                symbol="C-ETH-3000-040926",
+                strike=3000.0,
+            ),
+        ]
+    )
+    store.flush()
+    (store.path / "underlying=ignored-file").write_text("not a directory")
+    (store.path / "date=ignored-root").mkdir()
+    (store.path / "underlying=BTC" / "date=ignored-file").write_text(
+        "not a directory"
+    )
+
+    assert store.partitions() == [
+        ("2026-09-04", "ETH"),
+        ("2026-09-05", "BTC"),
+    ]

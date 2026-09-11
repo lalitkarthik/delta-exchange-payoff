@@ -5,11 +5,17 @@ writes bars to hive-partitioned Parquet and is the only module in the engine tha
 file. Neither knows a venue.
 
 Landed by #37, which moved the writer off the retired quote record and onto the canonical
-events. #43 adds ETH — no change here: `HIVE_SCHEMA`'s `date/underlying` partitioning already
+events. #43 adds ETH — no change here: `HIVE_SCHEMA`'s `underlying/date` partitioning already
 took the underlying's name off the event, not off a BTC-shaped assumption, so a second
 underlying is a second value in a column that already existed, not a new code path. What the
 tables mean and why they are shaped this way is `docs/storage.md`; this document is the part
 a reader would otherwise reconstruct from code.
+
+**The layout is `<table>/underlying=<asset>/date=<YYYY-MM-DD>/*.parquet` for all four tables.**
+There is one venue, so no venue level exists. Expiry, strike and option type remain columns.
+Underlying comes first because all readers select one underlying while `/smile` reads every date
+without a date predicate; the first directory therefore prunes the other asset before dates are
+scanned.
 
 **Process boundary.** In split mode (`DELTA_BUS=redis`), the engine owns `BarWriter` and its
 lossless `bar-writer` subscription; the store receives that lossless market-data stream only

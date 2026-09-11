@@ -133,6 +133,31 @@ def test_one_request_returns_every_stored_minute_for_that_expiry(
     ]
 
 
+def test_smile_reads_all_dates_for_the_requested_underlying_only(
+    make_client, store
+) -> None:
+    store.add(
+        [
+            computed_bar(minute=MINUTE),
+            computed_bar(minute=datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc)),
+            computed_bar(underlying="ETH", strike=3000.0),
+        ]
+    )
+    store.flush()
+
+    body = smile(make_client(store))
+
+    assert [entry["minute"] for entry in body["minutes"]] == [
+        "2026-09-04T09:00:00Z",
+        "2026-09-05T09:00:00Z",
+    ]
+    assert all(
+        point["strike"] != 3000.0
+        for entry in body["minutes"]
+        for point in entry["points"]
+    )
+
+
 # --- the guard that matters most: parquet AND the buffer ------------------------
 
 

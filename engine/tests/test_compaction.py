@@ -109,7 +109,7 @@ def write_hours(
 
 
 def partition(store: BarStore, day: str = DAY, underlying: str = "BTC") -> Path:
-    return store.path / f"date={day}" / f"underlying={underlying}"
+    return store.path / f"underlying={underlying}" / f"date={day}"
 
 
 def parquet_files(directory: Path) -> list[Path]:
@@ -657,7 +657,9 @@ def test_all_four_tables_are_compacted_together_and_none_is_forgotten(
     assert all(store.root == tmp_path for store in all_stores(tmp_path))
 
 
-def test_partitions_are_read_off_the_directory_names(tmp_path: Path) -> None:
+def test_partitions_are_read_off_the_underlying_then_date_directories(
+    tmp_path: Path,
+) -> None:
     store = BarStore(tmp_path)
     write_hours(store, hours=1)
     write_hours(store, hours=1, underlying="ETH")

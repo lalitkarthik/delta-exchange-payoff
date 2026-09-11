@@ -190,14 +190,14 @@ exactly why it is pinned by a test now rather than found in six months of data.
 
 ---
 
-## 3. The layout, and why `date/underlying`
+## 3. The layout, and why `underlying/date`
 
 ```
-data/quote-bars/date=2026-09-04/underlying=BTC/20260904T090000Z-000001.parquet
+data/quote-bars/underlying=BTC/date=2026-09-04/20260904T090000Z-000001.parquet
 ```
 
-Hive partitioning puts the filter in the **directory name**, so a query for BTC on
-4 September skips every other directory without opening a file. **Expiry, strike and
+Hive partitioning puts the filter in the **directory name**, underlying first: even `/smile`,
+which has no date filter, skips the other asset's files unopened (#77). **Expiry, strike and
 option type are columns.** Expiry as a partition level explodes into thousands of
 directories holding a handful of rows each, and Parquet performs badly with many small
 files — each carries header and footer overhead and a reader has to open all of them.

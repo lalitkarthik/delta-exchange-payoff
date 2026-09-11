@@ -291,13 +291,13 @@ def synthesise_day(source: Path, work: Path, *, hours: int = 24) -> Path:
         files = sorted(store.path.rglob("*.parquet"))
         if not files:
             continue
-        for day_dir in sorted(store.path.glob("date=*")):
-            for underlying_dir in sorted(day_dir.glob("underlying=*")):
-                sources = sorted(underlying_dir.glob("*.parquet"))
+        for underlying_dir in sorted(store.path.glob("underlying=*")):
+            for day_dir in sorted(underlying_dir.glob("date=*")):
+                sources = sorted(day_dir.glob("*.parquet"))
                 if not sources:
                     continue
                 frame = pl.read_parquet(sources)
-                out = target / day_dir.name / underlying_dir.name
+                out = target / underlying_dir.name / day_dir.name
                 out.mkdir(parents=True, exist_ok=True)
                 for hour in range(hours):
                     shifted = frame.with_columns(
@@ -359,17 +359,17 @@ def fan_out_dates(
         if not existing:
             continue
         day, underlying = existing[0]
-        source = store.path / f"date={day}" / f"underlying={underlying}"
+        source = store.path / f"underlying={underlying}" / f"date={day}"
         anchor = date_type(*(int(part) for part in day.split("-")))
         for offset in range(1, dates):
             new_day = (anchor - timedelta(days=offset)).isoformat()
             for name in (underlying, *underlyings):
-                target = store.path / f"date={new_day}" / f"underlying={name}"
+                target = store.path / f"underlying={name}" / f"date={new_day}"
                 target.mkdir(parents=True, exist_ok=True)
                 for path in source.glob("*.parquet"):
                     shutil.copy2(path, target / path.name)
         for name in underlyings:
-            target = store.path / f"date={day}" / f"underlying={name}"
+            target = store.path / f"underlying={name}" / f"date={day}"
             target.mkdir(parents=True, exist_ok=True)
             for path in source.glob("*.parquet"):
                 shutil.copy2(path, target / path.name)

@@ -93,7 +93,7 @@ F1–F4 for the forward. They exist to be compared (`agreement.py`, `docs/implie
 
 **The store: four tables, four dataset roots**, under a gitignored `<repo>/data/`.
 `quote-bars` (what the book did), `reference-bars` (what the venue said), `spot-bars`, and
-`computed-bars` (what we made of it). Hive-partitioned `date=/underlying=` — expiry, strike and
+`computed-bars` (what we made of it). Hive-partitioned `underlying=/date=` — expiry, strike and
 option type are **columns**, because expiry as a partition level explodes into thousands of
 directories of a handful of rows. **Polars is not allowed to lay out the tree**:
 `write_parquet(partition_by=...)` names its output `00000000.parquet` every call, so the 10:00

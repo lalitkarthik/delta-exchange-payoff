@@ -87,7 +87,7 @@ def census(root: Path) -> dict[tuple[str, str], dict[str, int]]:
     compacted: set[tuple[str, str]] = set()
     for store in all_stores(root):
         for day, und in store.partitions():
-            directory = store.path / f"date={day}" / f"underlying={und}"
+            directory = store.path / f"underlying={und}" / f"date={day}"
             files = list(directory.glob("*.parquet"))
             found[(day, und)][store.dataset] = len(files)
             if any(f.name.startswith(COMPACT_PREFIX) for f in files):
@@ -105,7 +105,7 @@ def census(root: Path) -> dict[tuple[str, str], dict[str, int]]:
 def flush_files(
     root: Path, dataset: str, day: str, und: str
 ) -> list[tuple[datetime, Path]]:
-    directory = root / dataset / f"date={day}" / f"underlying={und}"
+    directory = root / dataset / f"underlying={und}" / f"date={day}"
     out = []
     for path in sorted(directory.glob("*.parquet")):
         stamp = datetime.strptime(path.name[:STAMP_LEN], STAMP_FORMAT).replace(
@@ -170,7 +170,7 @@ def materialise(
 ) -> Path:
     root = work / name
     for dataset, groups in groups_by_table.items():
-        directory = root / dataset / f"date={day}" / f"underlying={und}"
+        directory = root / dataset / f"underlying={und}" / f"date={day}"
         directory.mkdir(parents=True)
         single = name.endswith("-single")
         for index, group in enumerate(groups):
@@ -262,7 +262,7 @@ def reads(
 def file_counts(root: Path, day: str, und: str) -> str:
     counts = []
     for store in all_stores(root):
-        directory = store.path / f"date={day}" / f"underlying={und}"
+        directory = store.path / f"underlying={und}" / f"date={day}"
         counts.append(len(list(directory.glob("*.parquet"))))
     return "/".join(str(c) for c in counts)
 
@@ -489,7 +489,7 @@ def main() -> int:
             )
             counts[name] = file_counts(roots[name], day, und)
         for store in all_stores(roots["day-single"]):
-            directory = store.path / f"date={day}" / f"underlying={und}"
+            directory = store.path / f"underlying={und}" / f"date={day}"
             day_bytes[store.dataset] = sum(
                 p.stat().st_size for p in directory.glob("*.parquet")
             )

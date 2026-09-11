@@ -63,7 +63,7 @@ def main() -> int:
             if not day < cutoff:
                 continue
             if args.dry_run:
-                directory = store.path / f"date={day}" / f"underlying={underlying}"
+                directory = store.path / f"underlying={underlying}" / f"date={day}"
                 count = len(list(directory.glob("*.parquet")))
                 verb = "would compact" if count > 1 else "already one file"
                 print(

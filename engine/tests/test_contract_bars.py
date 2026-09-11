@@ -278,6 +278,17 @@ def test_the_instrument_and_expiry_echo_back_what_was_asked(
     assert body["date"] == "2026-09-04"
 
 
+def test_bars_route_reads_flushed_rows_from_an_underlying_first_path(
+    make_client, stores: HistoricalSource
+) -> None:
+    stores.quote.add([quote_bar()])
+    stores.quote.flush()
+
+    partition = stores.quote.path / "underlying=BTC" / "date=2026-09-04"
+    assert list(partition.glob("*.parquet"))
+    assert bars_of(make_client())["bars"][0]["bid_close"] == 73.0
+
+
 def test_the_underlying_in_the_instrument_string_is_normalised(
     make_client, stores: HistoricalSource
 ) -> None:

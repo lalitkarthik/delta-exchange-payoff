@@ -66,7 +66,7 @@ show against the mid series, which moves every minute the book was quoted regard
 whether anyone traded.
 
 **Measured, not asserted:** reading `data/reference-bars` and `data/quote-bars` for
-`date=2026-09-04/underlying=BTC` (the machine's own recorded day, outside any test
+`underlying=BTC/date=2026-09-04` (the machine's own recorded day, outside any test
 fixture), for the four furthest-listed 04-09-2026 calls against an ~80,414 spot
 (`spot-bars`' own mean that day) — 85000, 86000, 87000 and 88000, all 0DTE:
 

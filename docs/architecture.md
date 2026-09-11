@@ -61,7 +61,7 @@ without a fake anything.
               │            │                             │
               │      ┌─────┴──────┐                       │
               │      │ Parquet    │  <repo>/data/         │
-              │      │ 4 datasets │  hive date=/underlying=
+              │      │ 4 datasets │  hive underlying=/date=
               │      └────────────┘                       │
               │                                           │
         ┌─────┴──────────────────────────────┐            │
@@ -138,7 +138,7 @@ Worth reading once end to end; every section after this is a detail of one hop.
    it arrived.
 9. **Eight seconds after the minute closes**, the bar for that minute is sealed and
    queued; an hour later it is written to
-   `data/quote-bars/date=2026-09-04/underlying=BTC/<name>.parquet`. A minute with no
+   `data/quote-bars/underlying=BTC/date=2026-09-04/<name>.parquet`. A minute with no
    arrivals produces **no row at all**.
 
 ---
@@ -430,7 +430,7 @@ dataset for Parquet's metadata to reconcile on every read.
 **The layout puts the filter in the directory name:**
 
 ```
-data/quote-bars/date=2026-09-04/underlying=BTC/20260904T090000Z-000001.parquet
+data/quote-bars/underlying=BTC/date=2026-09-04/20260904T090000Z-000001.parquet
 ```
 
 **Expiry, strike and option type are columns, not partition levels.** Expiry as a level

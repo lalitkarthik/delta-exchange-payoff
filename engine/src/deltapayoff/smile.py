@@ -108,7 +108,7 @@ def _filtered(source: pl.LazyFrame, underlying: str, expiry: str) -> pl.LazyFram
     """One source, narrowed to one expiry and to the columns the screen reads.
 
     Pushed into the lazy frame rather than applied after collecting, so on the disk side
-    `date=…/underlying=…` is answered by the directory names before a file is opened and
+    `underlying=…/date=…` is answered by the directory names before a file is opened and
     the Greeks' bytes are never read. The categorical columns are widened to strings here,
     before the concatenation: dictionary encoding is a storage decision, JSON has no
     opinion about it, and two frames carrying two different dictionaries for one column

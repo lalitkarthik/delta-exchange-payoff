@@ -23,10 +23,10 @@ D:\Convex Hedge\delta-exchange-payoff\data\
 
 ```
 data/
-├── quote-bars/       date=2026-09-04/underlying=BTC/*.parquet
-├── reference-bars/   date=2026-09-04/underlying=BTC/*.parquet
-├── computed-bars/    date=2026-09-04/underlying=BTC/*.parquet
-└── spot-bars/        date=2026-09-04/underlying=BTC/*.parquet
+├── quote-bars/       underlying=BTC/date=2026-09-04/*.parquet
+├── reference-bars/   underlying=BTC/date=2026-09-04/*.parquet
+├── computed-bars/    underlying=BTC/date=2026-09-04/*.parquet
+└── spot-bars/        underlying=BTC/date=2026-09-04/*.parquet
 ```
 
 The folder names carry the date and the asset. A reader skips a day without opening a file.
@@ -90,21 +90,6 @@ Aggregation is compression. Forward-filling is fabrication.
 
 **How we know the rule holds.** We put the fault into the code on purpose. Six tests failed. We took it out. Six tests passed. A guard that has never been seen to fail is not a guard.
 
----
-
-## What we built — 4 tickets
-
-| # | Commit | What it added |
-|---|---|---|
-| [#10](https://github.com/lalitkarthik/delta-exchange-payoff/issues/10) | `ba22314` | quote-bars, end to end |
-| [#11](https://github.com/lalitkarthik/delta-exchange-payoff/issues/11) | `a002ee1` | reference-bars + spot-bars |
-| [#12](https://github.com/lalitkarthik/delta-exchange-payoff/issues/12) | `e338aaa` | computed-bars + model stamp |
-| [#13](https://github.com/lalitkarthik/delta-exchange-payoff/issues/13) | `d164ba2` | compaction + measurements |
-
-**466 tests passing. ruff clean. `tsc --noEmit` clean.**
-
----
-
 ## How a price becomes a line — 5 steps
 
 1. **A tick arrives.** One price message from Delta, on one of two channels.
@@ -127,7 +112,7 @@ Sampling once a minute lost a quarter of them; see below.
 | **tick** | one price message from Delta |
 | **bar** | one minute summarised: open, high, low, close |
 | **Parquet** | the file format. Stores columns apart, so it compresses well |
-| **partition** | a folder whose name is the filter — `date=…/underlying=…` |
+| **partition** | a folder whose name is the filter — `underlying=…/date=…` |
 | **pruning** | skipping folders by name, without opening files |
 | **flush** | write buffered bars to disk. Every five minutes |
 | **watermark** | how long we wait before sealing a minute. 8 seconds |

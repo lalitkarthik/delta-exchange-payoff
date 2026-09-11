@@ -586,6 +586,20 @@ def test_the_underlying_is_normalised_before_the_store_is_asked(
     assert body["data"]["underlying"] == "BTC"
 
 
+def test_historical_routes_read_flushed_rows_from_underlying_first_paths(
+    make_client, stores: HistoricalSource
+) -> None:
+    stores.quote.add([quote_bar()])
+    stores.quote.flush()
+
+    partition = stores.quote.path / "underlying=BTC" / "date=2026-09-04"
+    assert list(partition.glob("*.parquet"))
+    assert minutes_of(make_client())["minutes"] == ["2026-09-04T09:00:00Z"]
+    assert ladder_at(make_client(), "2026-09-04T09:00:00Z")["data"]["rows"][0][
+        "call"
+    ]["bid"] == 73.0
+
+
 # --- the wiring, with nothing overridden ------------------------------------------
 
 
