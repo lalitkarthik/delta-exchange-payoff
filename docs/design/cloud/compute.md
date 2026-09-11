@@ -178,3 +178,18 @@ cost, becomes the constraint.
 dollar in §2 are `derived` from a monolith's footprint. When #65 produces the images, re-run
 this against the `measured` image sizes and per-container CPU and memory, and note any change
 in the decision record — that is #68's own acceptance criterion.
+
+## 8. The load profile, per service
+
+`derived` by R6 (#75): arithmetic in [../research/0007-load-profile.md](../research/0007-load-profile.md),
+belief in [../decisions/0007-load-profile.md](../decisions/0007-load-profile.md). I13 (#79) measures it.
+
+| Service | Bound by | 1× | 10× |
+|---|---|---|---|
+| `feed` | CPU, one core | 0.52–0.71 core | 5.2–7.1 cores: 8–11 processes, one Python process is one core |
+| `store` | CPU (decode), not disk | 0.28–0.51 core; 2.33 KB/s to disk | 2.8–5.1 cores |
+| `api` | CPU, set by viewers | 0.25–0.49, + 0.05–0.14 a watched expiry | 2.5–4.9, + viewers |
+| `web` / Redis | memory | 240.8 MiB / 1,056.4 MiB `measured` | unchanged / 10.3 GiB |
+
+**The split costs 1.10–1.75 cores against the monolith's 0.31**, so §4 under-counts CPU and
+over-counts memory. It meets 0005's re-cost trigger. `feed` and `api` contend first; R7 (#78) costs it.
