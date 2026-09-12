@@ -160,7 +160,11 @@ computed in this repository, and it is not a tag either.
 
 1. **"Save", "write" or "persist"** for a store flush. A flush is a flush, and it is qualified.
 2. **"Healthy"** for a connection. `/health` reports a state; whether it is acceptable is a judgement.
-3. **"Lifetime budget"**. The budget counts consecutive failures and always has.
+3. **"Lifetime budget"**. The budget counts consecutive failures and always has —
+   `message_arrived` sets the spend back to zero, which
+   `test_controller.py::test_a_message_restores_the_whole_budget` holds: three drops
+   against a budget of two, with one frame between, stop nothing. What is spent is a
+   **drop**, not an outage; #108 asks whether that is the right unit. #114.
 4. **"Forward-fill"** anywhere near a bar. A bar summarises events that happened.
 5. **`0` for absent.** `null` is not `0`, and an unknown age is not an age of zero.
 6. **"Supported" as a tag**, in every phrasing it has taken — *supported, no longer `assumed`*;
@@ -168,3 +172,10 @@ computed in this repository, and it is not a tag either.
    not an origin, and a number carrying it has lost the fact that a person chose the value.
    Write the tag, then name the run that bounds it. #106; `engine/tests/test_nomenclature.py`
    pins this, and §6 above is the argument.
+
+**Three of the six are held by a test; three are held by you.** `test_nomenclature.py`
+scans the normative documents and the engine source for **2** (no engine value *is* the
+word `healthy`), **3** and **6**. **1**, **4** and **5** are not scannable and the module
+says why against each — a scan that claims to hold a rule it cannot is worse than none.
+**5 is the one to notice: it is the refusal #103 was about, and no text scan can reach a
+value.** #114.

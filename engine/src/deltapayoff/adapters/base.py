@@ -29,10 +29,11 @@ stop raising `AttributeError` and start delivering silence. Conformance is check
 **Reconnect is not in this interface, and since #39 it is not below it either.** #38 put
 the **state machine** over this protocol — `controller.ConnectionController` — and took
 staleness with it, which is why `on_connection` exists: a machine needs to observe the
-connection it describes. #39 lifted backoff, the lifetime budget and the decision to
-redial up beside it, and put `supervisor.FeedSupervisor` over the result. So `stream` is
-now one connection and nothing here retries: an adapter dials, replays and reads, and the
-layer that can say *we have given up* out loud is the layer that decides it.
+connection it describes. #39 lifted backoff, the consecutive-failure budget and the
+decision to redial up beside it, and put `supervisor.FeedSupervisor` over the result. So
+`stream` is now one connection and nothing here retries: an adapter dials, replays and
+reads, and the layer that can say *we have given up* out loud is the layer that decides
+it.
 """
 
 from __future__ import annotations

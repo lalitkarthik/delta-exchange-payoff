@@ -30,10 +30,11 @@ standard JSON does not, so this is reachable from a venue and not merely defensi
 `convert.to_number` already maps the *string* spellings — `"nan"`, `"null"`, `"-"` — to
 `None`; this closes the float-shaped hole beside it.
 
-**Reconnect stays here for this ticket.** Backoff, the lifetime budget, subscription
-replay and the reason a connection ended all live in `delta_socket.DeltaFeed`, which this
-class owns and drives. #38 lifts them into a connection controller wrapped around the
-protocol. Moving them early would mean writing the state machine twice.
+**Reconnect stays here for this ticket.** Backoff, the consecutive-failure budget,
+subscription replay and the reason a connection ended all live in
+`delta_socket.DeltaFeed`, which this class owns and drives. #38 lifts them into a
+connection controller wrapped around the protocol. Moving them early would mean writing
+the state machine twice.
 """
 
 from __future__ import annotations
@@ -277,8 +278,9 @@ class DeltaAdapter:
         """**One connection**, publishing canonical events until it ends.
 
         Since #39 this returns when the socket closes rather than reconnecting behind the
-        caller's back: backoff, the lifetime budget and the decision to redial belong to
-        `controller.ConnectionController`. The values did not change, only who runs them.
+        caller's back: backoff, the consecutive-failure budget and the decision to redial
+        belong to `controller.ConnectionController`. The values did not change, only who
+        runs them.
 
         `publish` is held for the duration and cleared on the way out, so an adapter that
         has returned cannot publish into a bus the caller has finished with.

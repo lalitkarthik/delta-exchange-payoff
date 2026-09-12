@@ -32,10 +32,11 @@ A test drives `poll` itself, and a twenty-second silence costs it nothing.
 
 ## What is here since #39, and what it displaced
 
-**Backoff, the lifetime reconnect budget and the decision to redial are here**, lifted out
-of `adapters/delta_socket.py` where they lived inside a `while` loop. They moved because
-the most important thing that loop decided — *we have given up* — was a loop condition one
-layer below the state machine that exists to describe the connection: nothing could
+**Backoff, the consecutive-failure reconnect budget and the decision to redial are
+here**, lifted out of `adapters/delta_socket.py` where they lived inside a `while` loop.
+They moved because the most important thing that loop decided — *we have given up* — was
+a loop condition one layer below the state machine that exists to describe the
+connection: nothing could
 observe it, nothing could publish it, and `/health` said `ok` on either side of it. Now it
 is a transition to `stopped` with an alert and an error record attached. Every value moved
 unchanged; `docs/design/lld/reconnect.md` is the design and carries the numbers.
@@ -191,10 +192,18 @@ RETRY_DELAY_SECONDS = 1.0
 #: one dial a minute rather than a flood, and short enough that a feed is back within a
 #: minute of the venue returning.
 MAX_RETRY_DELAY_SECONDS = 60.0
-#: **The lifetime reconnect budget**, spent one per drop and **restored in full the
-#: moment a message arrives**. Delivering data, not connecting, is what proves the
-#: endpoint works: Delta can accept a handshake and close immediately, and a budget
-#: restored on merely connecting never exhausts at all. It is a budget rather than an
+#: **Ten consecutive failed reconnects**, spent one per drop and **restored in full the
+#: moment a message arrives**. The restoration is what makes the count consecutive, and
+#: #114 corrected this comment for asserting the opposite in the same sentence.
+#:
+#: **What is spent is a drop, not an outage.** #108's 348 s of name resolution failing
+#: inside the container produced eleven drops and spent eleven, one a minute once the
+#: backoff reached its ceiling, against a condition that cleared on its own. Whether
+#: that is the intended unit is #108's third criterion and is not settled here.
+#:
+#: Delivering data, not connecting, is what proves the endpoint works: Delta can accept
+#: a handshake and close immediately, and a budget restored on merely connecting never
+#: exhausts at all. It is a budget rather than an
 #: infinite retry because a feed that has failed eleven times running without ever
 #: delivering a frame is not going to succeed on the twelfth, and Delta's connection
 #: allowance is 150 per five minutes.
@@ -583,7 +592,7 @@ class ConnectionController:
 
         **A stopped connection ignores this entirely.** The transitions below were
         guarded by state and the counters above them were not, so a frame off a socket
-        winding down handed a `stopped` connection its whole lifetime budget back — and
+        winding down handed a `stopped` connection its whole budget back — and
         `/health` then reported a feed that had given up as having a full budget in hand.
         Harmless while nothing restarts a controller; #41's resume is what makes it a
         hazard, so it is refused here rather than left for that ticket to discover.
@@ -642,9 +651,10 @@ class ConnectionController:
         They do not go in `reason`, which stays the short stable `closed` so that #40 can
         badge on it and #42 can grep it without matching a thousand distinct sentences.
 
-        **This is where the lifetime budget is spent**, since #39: a drop is what a
-        reconnect budget counts, and this is the one place a drop is known. When there is
-        nothing left to spend the connection does not go on to `reconnecting` and sit
+        **This is where the consecutive-failure budget is spent**, since #39: a drop is
+        what a reconnect budget counts, and this is the one place a drop is known. When
+        there is nothing left to spend the connection does not go on to `reconnecting`
+        and sit
         there — it is taken to `stopped` through it, which is the move #38 left in the
         table for exactly this, with one `alert` and one error-level log beside it.
         """
@@ -1056,9 +1066,9 @@ class ConnectionController:
         """The only place the state changes, and the only place the event is built.
 
         Public because the machine **is** the interface: #39 drives
-        `reconnecting -> stopped` when the lifetime budget is spent, and #41 drives the
-        pause, resume and reconnect commands. Both are moves this ticket has no cause
-        method for, and neither should reach around the table to make them.
+        `reconnecting -> stopped` when the consecutive-failure budget is spent, and #41
+        drives the pause, resume and reconnect commands. Both are moves this ticket has
+        no cause method for, and neither should reach around the table to make them.
 
         **#42's level and event, decided here and nowhere else, so every caller gets it
         for free.** Entering `degraded` is `feed.stale` at warning — the staleness

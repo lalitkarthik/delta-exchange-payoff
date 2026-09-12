@@ -448,9 +448,10 @@ def test_the_registry_survives_the_drop_that_caused_the_reconnect() -> None:
     assert feed.registry["ticker"] == set(CHAIN)
 
 
-# The lifetime reconnect budget, the backoff and the giving up moved to the controller
-# in #39, and their tests moved with them: `test_controller.py`, section "the reconnect
-# that moved here from the feed". What is left in this file is one connection's worth of
+# The consecutive-failure reconnect budget, the backoff and the giving up moved to the
+# controller in #39, and their tests moved with them: `test_controller.py`, section "the
+# reconnect that moved here from the feed". What is left in this file is one
+# connection's worth of
 # behaviour, which is all this module does now.
 
 
@@ -662,7 +663,7 @@ def test_a_connection_that_delivered_clears_the_error_that_would_spend_the_budge
     None
 ):
     """The other half. `last_error` back to `None` is how the controller is told this
-    endpoint works, and it is what restores the lifetime budget."""
+    endpoint works, and it is what restores the consecutive-failure budget."""
     socket = FakeSocket([ticker_frame(CHAIN[0], 579, 584)], close_after=0)
     feed = DeltaFeed(FanOut(), connect=connector([socket]))
     feed.subscribe("ticker", CHAIN)

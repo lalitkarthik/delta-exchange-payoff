@@ -10,8 +10,8 @@ Three designs were split out of this one at its 200-line bound and are part of i
 
 - **[connection-signal.md](connection-signal.md)** — what an adapter reports about its
   socket, and the register it reports through (#38).
-- **[reconnect.md](reconnect.md)** — backoff, the lifetime budget, the dial loop and what
-  giving up sounds like (#39).
+- **[reconnect.md](reconnect.md)** — backoff, the consecutive-failure budget, the dial
+  loop and what giving up sounds like (#39).
 - **[commands.md](commands.md)** — `pause`, `resume` and `reconnect`: the route, the
   budget rule, and cutting a socket without a new protocol member (#41).
 
@@ -61,7 +61,7 @@ reconnecting, and cannot reach `connected` without passing through `connecting`.
 | `connected` | `reconnecting` | `closed` / `silent` | `connection_closed()`, or silence past `reconnect_after` before `degraded` was reached |
 | `reconnecting` | `connecting` | `backoff` | **The backoff elapsed and a redial begins** (#39); or `connection_opened()`; or `message_arrived()`, a frame off a socket believed gone |
 | any of the four running states | `stopped` | `stopped` | `stop()` — a pause, or the adapter's stream returning |
-| `reconnecting` | `stopped` | `stopped` | **The lifetime budget is spent** — [reconnect.md](reconnect.md) §3 |
+| `reconnecting` | `stopped` | `stopped` | **The consecutive-failure budget is spent** — [reconnect.md](reconnect.md) §3 |
 
 **Two readings of the table this design fixed, and both are choices a later reader may
 disagree with.** **`any` excludes `stopped`** — a stopped connection is not trying, and the
