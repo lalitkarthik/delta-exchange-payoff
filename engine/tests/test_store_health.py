@@ -530,40 +530,31 @@ def test_a_dead_reader_hands_the_seal_clock_the_position_it_stopped_at(
     assert sealed < wall, "the seal clock did not pin behind the wall clock"
 
 
-def test_store_stream_id_seconds_raises_on_every_well_formed_id(
+def test_store_stream_id_seconds_parses_well_formed_ids(
     tmp_path: Path,
 ) -> None:
-    """**A separate defect, in `store.py`, which this ticket is not allowed to edit.**
+    """**A direct unit pin of `_stream_id_seconds`, the input R4's clock is built on.**
 
-    `store.py:2236` is::
+    `store.py`'s `_stream_id_seconds` is::
 
-        milliseconds, _, _sequence = value.split("-", 1)
+        milliseconds, _, _sequence = value.partition("-")
 
-    `str.split("-", 1)` yields **two** parts and three names are being unpacked from
-    them, so it raises `ValueError: not enough values to unpack (expected 3, got 2)` for
-    every stream id there is -- `0-0` included. `seal_clock` wraps the call in
-    `except (TypeError, ValueError): continue`, so the list of times is always empty and
-    the clock always falls through to `return wall`.
+    From #63 (`83120d6`) until #103 (`720036d`) this line read `value.split("-", 1)`
+    instead, which yields **two** parts against three names unpacked, so it raised
+    `ValueError: not enough values to unpack (expected 3, got 2)` for every stream id
+    there is -- `0-0` included. `seal_clock` wraps the call in
+    `except (TypeError, ValueError): continue`, so the list of times was always empty
+    and the clock always fell through to `return wall`: record 0010 R4 never ran.
+    #103's commit changed `split` to `partition`, matching `redis_bus._id_parts`, which
+    this test now pins directly against the function itself.
 
-    **Record 0010 R4 has therefore never run in this codebase**, since #63 (83120d6)
-    introduced it. The #103 diagnosis reads "the rule is implemented correctly; `behind`
-    is the lie", and that is half the story: even with `behind` correct -- which the test
-    above proves it now is -- the seal clock cannot pin, because the one call that turns
-    a stream id into a time raises and is swallowed. It is the same shape as #103 itself:
-    an exception caught by a defensive handler, and a signal that silently became a
-    default.
-
-    The fix is one character-level change, `partition` for `split`, exactly as
-    `redis_bus._id_parts` already does it. It belongs to whoever owns `store.py`.
-
-    **Delete this test with that fix.** It fails the moment the defect is repaired, which
-    is the point: nothing here is allowed to quietly come right.
+    `test_a_dead_reader_hands_the_seal_clock_the_position_it_stopped_at` above pins the
+    same fix through `seal_clock()`, end to end; this test isolates the one call that
+    turns a stream id into a time, so a future regression here fails at the narrowest
+    possible point.
     """
     from deltapayoff.store import _stream_id_seconds
 
-    # The defect, stated as the arithmetic that proves it is gone. Before the fix each of
-    # these raised `ValueError: not enough values to unpack (expected 3, got 2)`, which
-    # `seal_clock` swallowed, so R4 never pinned anything.
     assert _stream_id_seconds("1789210956984-9") == 1789210956.984
     assert _stream_id_seconds("1789221274132-0") == 1789221274.132
     assert _stream_id_seconds("0-0") == 0.0
