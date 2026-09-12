@@ -22,6 +22,16 @@ Engine, from `engine/`:
 .venv/Scripts/python.exe -m ruff check .
 ```
 
+**If you pass `--basetemp`, create its parent directory first.** pytest makes the basetemp
+directory with `parents=False`, so `--basetemp=X/basetemp` fails outright when `X` does not
+exist — every test that uses `tmp_path` errors at setup with
+`FileNotFoundError: [WinError 3] The system cannot find the path specified`, **315 of them**
+(`measured` 2026-09-12). They are reported as errors, not failures, the run finishes faster
+because those tests never ran, and an immediate re-run is clean because `-o cache_dir=X/cache`
+creates `X` on the way past. Four separate workers read that as a transient glitch on a loaded
+machine before it was diagnosed. `mkdir -p .sandbox-tmp` first, and a run that reports ~315
+errors at setup is this, not your change.
+
 **Inside the Codex sandbox, add `--basetemp=.sandbox-tmp/basetemp -o cache_dir=.sandbox-tmp/cache`
 to the pytest command, and delete `.sandbox-tmp/` as your last command, with exactly
 `rm -rf .sandbox-tmp`.** Use that literal command and not an equivalent: this machine's Codex
@@ -45,10 +55,11 @@ node node_modules/next/dist/bin/next build
 `next build` rewrites `web/next-env.d.ts`. Leave it dirty and say so in your report; the
 orchestrator restores it. Do not run git yourself.
 
-The suite is **1,347** tests with Docker available (`measured` 2026-09-12, after #81).
-Without Docker the Redis-backed parametrisations skip rather than run: the collected count
-is the same, the passed count is lower. A run that collects far fewer than 1,347 has failed
-to collect, whatever it printed.
+The suite is **1,401** tests with Docker available (`measured` 2026-09-12, after the audit
+fixes #82 to #91). Without Docker the Redis-backed parametrisations skip rather than run: the
+collected count is the same, the passed count is lower. A run that collects far fewer than
+1,401 has failed to collect, whatever it printed — and see the `--basetemp` note above before
+you conclude your change broke something.
 
 ## Hard rules
 
