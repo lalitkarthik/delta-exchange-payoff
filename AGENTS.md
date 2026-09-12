@@ -55,8 +55,12 @@ collects far fewer than that has failed to collect, whatever it printed.
   replaces the async client factory with one that raises. Do not work around it.
 - **No wall clock in tests.** Expiry dates and windows are fixtures, never `now()`. Tests
   that pass today and fail in November have been written here before.
-- **Documentation notes stay under 200 lines.** Split rather than overflow. `docs/design/hld.md`
-  is currently 219 lines and over the bound — if your ticket touches it, split it.
+- **Documentation notes stay under 200 lines.** Split rather than overflow. Two files are over
+  the bound today (`measured` 2026-09-12): `docs/design/lld/logging.md` at 213 and
+  `docs/design/events.md` at 222. Split `logging.md` if your ticket touches it. Do **not**
+  split `events.md`: `tests/test_events.py` parses it, and the parser does not survive a
+  split — say so in your report instead. `docs/design/hld.md` is **180** lines and fits;
+  it was 219 before #62 moved its evidence into `hld-evidence.md`. Do not split it.
 - **Stay inside the ticket's allowed scope.** Note anything else you spot in
   `out_of_scope_noticed`; do not fix it.
 - Numbers are tagged `measured`, `assumed` or `derived`, with the run that produced them.
