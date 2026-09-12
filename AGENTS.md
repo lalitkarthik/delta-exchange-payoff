@@ -72,6 +72,11 @@ you conclude your change broke something.
   replaces the async client factory with one that raises. Do not work around it.
 - **No wall clock in tests.** Expiry dates and windows are fixtures, never `now()`. Tests
   that pass today and fail in November have been written here before.
+- **A test waits on a condition, never on a duration.** `time.sleep(0.6)` betting that two
+  passes of a background loop fit inside it is a bet the OS scheduler settles, not the
+  test. Use `tests/wait_helpers.py` — `wait_until` where you can `await`, `wait_until_sync`
+  where you cannot — and wait on the thing you actually care about, with a message naming
+  it. A sleep that *drives* a fake cadence is fine and is not this. #83, #93.
 - **Documentation notes stay under 200 lines.** Split rather than overflow, unless named
   exempt below with a reason. Scope: every file under `docs/`, plus this file and
   `CLAUDE.md`. Package `README.md` files (root, `engine/`, `web/`) are outside this rule —

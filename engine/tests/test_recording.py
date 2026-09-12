@@ -7,9 +7,18 @@ no test may open, and the writer's **clock**, which every test here assigns to d
 
 **Nothing in this file derives a time from the wall clock.** Two tests in this suite have
 already detonated on a calendar date with nobody touching the code, by reading
-`datetime.now()` against a hardcoded expiry. The minutes below are literals; `time.sleep`
-appears only to let the writer's task turn its loop, never as a quantity anything is
-asserted against.
+`datetime.now()` against a hardcoded expiry. The minutes below are literals.
+
+**#93 triage.** `time.sleep(LET_THE_LOOP_TURN)` reads, everywhere it appears, as "give the
+writer's task a chance to turn its loop" — but in several places that turn is exactly what
+the assertion right after the sleep depends on (a buffered row count, a written row count,
+a sampled tick), and the writer's task runs on `TestClient`'s own event loop in another
+thread, so how much of it lands inside a fixed sleep is the OS's call, not this file's.
+Those sites are converted to `wait_until_sync`, polling the condition each one actually
+cares about. The rest stay sleeps because nothing after them depends on how much of the
+sleep elapsed — a negative assertion that holds regardless of loop timing, or a window
+with nothing new published for the loop to act on. Each site below says which, in a
+comment.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ from fastapi.testclient import TestClient
 
 from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
 from deltapayoff.store import COMPUTED_DATASET, COMPUTED_SCHEMA, BarStore
+from wait_helpers import wait_until_sync
 
 MINUTE_US = int(datetime(2026, 9, 4, 9, 0, 0, tzinfo=timezone.utc).timestamp() * 1e6)
 MINUTE = 60_000_000
@@ -36,8 +46,8 @@ SYMBOL = "C-BTC-77600-040926"
 PAUSED_SYMBOL = "P-BTC-77600-040926"
 
 #: Long enough for the writer's task — waking every 10 ms — to take several passes, and
-#: short enough that the file stays fast. It is a *yield*, not a measurement: nothing
-#: below asserts anything about how much of it elapsed.
+#: short enough that the file stays fast. Still used at the sites #93 triaged as a fake
+#: cadence rather than a bet — see the module docstring.
 LET_THE_LOOP_TURN = 0.08
 
 
@@ -245,7 +255,12 @@ def test_switching_off_writes_the_buffered_minutes_before_it_stops(
         )
     # 09:03:20 by the writer's clock: both minutes are past their eight-second grace.
     clock.set((MINUTE_US + 3 * MINUTE) / 1e6 + 20.0)
-    time.sleep(LET_THE_LOOP_TURN)
+    # #93 triage: bet -- "before" below needs both minutes already sealed into the
+    # buffer, which needs the writer's task to have taken a pass since the clock moved.
+    wait_until_sync(
+        lambda: main.app.state.writer.buffered_rows == 2,
+        message="two sealed minutes never reached the buffer",
+    )
 
     before = client.get("/recording").json()
     assert before["buffered_rows"] == 2, "two sealed minutes should be waiting in memory"
@@ -283,7 +298,12 @@ def test_switching_off_stops_rows_being_written_for_subsequent_minutes(
     bus = main.app.state.events
     bus.publish(quote(SYMBOL, MINUTE_US + 1_000, bid=70.0))
     clock.set((MINUTE_US + 2 * MINUTE) / 1e6 + 20.0)
-    time.sleep(LET_THE_LOOP_TURN)
+    # #93 triage: bet -- the flip to off below flushes what is already sealed, so the
+    # `rows_written == 1` assertion needs the minute sealed into the buffer first.
+    wait_until_sync(
+        lambda: main.app.state.writer.buffered_rows == 1,
+        message="the minute was never sealed into the buffer",
+    )
 
     stopped = client.post("/recording", json={"recording": False}).json()
     assert stopped["rows_written"] == 1, "the recorded minute should be on disk"
@@ -292,6 +312,10 @@ def test_switching_off_stops_rows_being_written_for_subsequent_minutes(
     for offset in (5, 6, 7, 8):
         bus.publish(quote(PAUSED_SYMBOL, MINUTE_US + offset * MINUTE + 1_000))
     clock.set((MINUTE_US + 10 * MINUTE) / 1e6 + 20.0)
+    # #93 triage: fake cadence, not a bet -- both assertions below are negative (a
+    # paused writer must not aggregate or write), so they hold whether the loop has
+    # taken zero passes or many; this only gives a wrongly-behaving writer room to
+    # fail. It cannot go red because the loop ran too slowly.
     time.sleep(LET_THE_LOOP_TURN)
 
     while_off = client.get("/recording").json()
@@ -301,6 +325,9 @@ def test_switching_off_stops_rows_being_written_for_subsequent_minutes(
     # Back on, then off again so anything the resume produced is flushed and visible.
     client.post("/recording", json={"recording": True})
     clock.set((MINUTE_US + 12 * MINUTE) / 1e6 + 20.0)
+    # #93 triage: fake cadence, not a bet -- nothing new was published in this window,
+    # so the final assertion (no PAUSED_SYMBOL row) depends only on state that was
+    # already settled before this sleep, not on anything it needs to finish.
     time.sleep(LET_THE_LOOP_TURN)
     client.post("/recording", json={"recording": False})
 
@@ -329,17 +356,25 @@ def test_a_paused_writer_still_drains_its_subscription(client, clock: _Clock) ->
     from deltapayoff import main
 
     client.post("/recording", json={"recording": False})
-    # Let the loop reach its paused steady state *before* anything is published. Without
-    # this the writer may still be parked in the `queue.get()` of a pass that began
-    # while recording was on, and that one pass would drain the whole burst however the
-    # pause is implemented — which makes the assertion below pass for the wrong reason.
+    # #93 triage: fake cadence, not a bet -- `set_recording` flips `writer.recording`
+    # synchronously before its POST handler returns, and `ingest` re-reads that flag
+    # fresh for every item it drains (see `store.py`); nothing was queued before this
+    # pause, so there is no in-flight pass carrying a stale value for the burst below
+    # to land in. Kept as a defensive settle, not because a schedule is being bet on.
     time.sleep(LET_THE_LOOP_TURN)
 
     for offset in range(200):
         main.app.state.events.publish(
             quote(PAUSED_SYMBOL, MINUTE_US + 5 * MINUTE + offset * 1_000)
         )
-    time.sleep(LET_THE_LOOP_TURN)
+    # #93 triage: bet -- the three assertions below need all 200 published records
+    # actually drained off the (cross-thread) queue, which is exactly the writer's own
+    # background thread being scheduled promptly -- the thing under test does not
+    # control that, the OS does.
+    wait_until_sync(
+        lambda: main.app.state.writer.stats()["queued"] == 0,
+        message="a paused writer never finished draining the burst",
+    )
 
     stats = main.app.state.writer.stats()
     assert stats["queued"] == 0, "a paused writer stopped draining its subscription"
@@ -363,19 +398,38 @@ def test_switching_recording_back_on_resumes_writing(
 
     bus = main.app.state.events
     client.post("/recording", json={"recording": False})
+    # #93 triage: fake cadence, not a bet -- same reasoning as the paused-drain test
+    # above: the flag is already False by the time `client.post` returns, and nothing
+    # is queued yet for a stale in-flight pass to matter to.
     time.sleep(LET_THE_LOOP_TURN)
 
     bus.publish(quote(PAUSED_SYMBOL, MINUTE_US + 5 * MINUTE + 1_000))
     clock.set((MINUTE_US + 7 * MINUTE) / 1e6 + 20.0)
-    time.sleep(LET_THE_LOOP_TURN)
+    # #93 triage: bet -- this quote must actually be drained (and discarded, since the
+    # writer is paused) *before* recording flips back on below. If it is still queued
+    # when that happens, `ingest` would read `recording=True` and wrongly aggregate a
+    # quote that arrived while paused -- the fault this whole test exists to catch.
+    wait_until_sync(
+        lambda: main.app.state.writer.stats()["queued"] == 0,
+        message="the paused quote was never drained before the resume",
+    )
 
     resumed = client.post("/recording", json={"recording": True}).json()
     assert resumed["recording"] is True
+    # #93 triage: fake cadence, not a bet -- `set_recording(True)` returns having
+    # already set the flag, with no await beforehand, so nothing here waits out a
+    # schedule; the publish below is read against whatever `main.app.state.writer
+    # .recording` already is.
     time.sleep(LET_THE_LOOP_TURN)
 
     bus.publish(quote(SYMBOL, MINUTE_US + 10 * MINUTE + 1_000, bid=91.0))
     clock.set((MINUTE_US + 12 * MINUTE) / 1e6 + 20.0)
-    time.sleep(LET_THE_LOOP_TURN)
+    # #93 triage: bet -- the final assertions need this quote folded into the
+    # aggregator and sealed into the buffer before the flush below.
+    wait_until_sync(
+        lambda: main.app.state.writer.buffered_rows == 1,
+        message="the resumed minute was never sealed into the buffer",
+    )
 
     # Off again purely to get the resumed minute onto the disk this test reads.
     client.post("/recording", json={"recording": False})
@@ -503,16 +557,26 @@ def test_the_chain_cache_is_not_sampled_while_recording_is_off(
 
     clock.chains[:] = [sampled_chain(0, 20)]
     clock.set(MINUTE_US / 1e6 + 25.0)
-    time.sleep(LET_THE_LOOP_TURN)
+    # #93 triage: bet -- the assertion right below needs the writer's task to have
+    # actually taken a sampling pass since the clock moved.
+    wait_until_sync(
+        lambda: main.app.state.writer.stats()["computed"]["ticks"] > 0,
+        message="the cache was not being sampled even while recording",
+    )
 
     while_on = main.app.state.writer.stats()["computed"]["ticks"]
     assert while_on > 0, "the cache was not being sampled even while recording"
 
     client.post("/recording", json={"recording": False})
+    # #93 triage: fake cadence, not a bet -- sampling is skipped entirely while paused
+    # (see `store.py`'s `run`, "the three lines below stop"), by construction rather
+    # than by timing, so setting up the next chain has nothing to wait for here.
     time.sleep(LET_THE_LOOP_TURN)
 
     clock.chains[:] = [sampled_chain(1, 20)]
     clock.set((MINUTE_US + MINUTE) / 1e6 + 25.0)
+    # #93 triage: fake cadence, not a bet -- the assertion below is negative (a paused
+    # writer must not sample), so it holds regardless of how many loop passes ran.
     time.sleep(LET_THE_LOOP_TURN)
 
     assert main.app.state.writer.stats()["computed"]["ticks"] == while_on, (
@@ -539,10 +603,23 @@ def test_the_shutdown_sample_of_the_chain_cache_obeys_the_switch(
     with TestClient(main.app) as client:
         if not recording:
             client.post("/recording", json={"recording": False})
+            # #93 triage: fake cadence, not a bet -- sampling is skipped by construction
+            # while paused, not by timing; nothing to wait for before setting up chains.
             time.sleep(LET_THE_LOOP_TURN)
         clock.chains[:] = [sampled_chain(0, 20)]
         clock.set(MINUTE_US / 1e6 + 25.0)
-        time.sleep(LET_THE_LOOP_TURN)
+        if recording:
+            # #93 triage: bet -- the `recording=True` arm needs one *natural* sample
+            # to have happened before shutdown's forced sample, or `rows == 2` below
+            # can never be true no matter how long shutdown takes.
+            wait_until_sync(
+                lambda: main.app.state.writer.stats()["computed"]["ticks"] > 0,
+                message="the chain cache was never sampled before shutdown",
+            )
+        else:
+            # #93 triage: fake cadence, not a bet -- paused, so nothing should sample;
+            # this only gives a wrongly-behaving writer room to do it anyway.
+            time.sleep(LET_THE_LOOP_TURN)
 
     rows = (
         BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
@@ -573,13 +650,22 @@ def test_the_open_minute_is_held_through_the_pause_rather_than_split_across_it(
     # Half a minute in: minute 09:00 is still open, eight seconds of grace away from
     # sealing even once it closes.
     clock.set(MINUTE_US / 1e6 + 30.0)
-    time.sleep(LET_THE_LOOP_TURN)
+    # #93 triage: bet -- the final assertions depend on this quote already being
+    # folded into the aggregator's *open* bar before the pause. If it is still queued
+    # when the pause takes effect, `ingest` discards it instead of folding it in, and
+    # the minute this whole test is about never existed in the first place.
+    wait_until_sync(
+        lambda: main.app.state.writer.stats()["ticks"] >= 1,
+        message="the quote was never folded into the open bar before the pause",
+    )
 
     paused = client.post("/recording", json={"recording": False}).json()
     assert paused["buffered_rows"] == 0 and paused["rows_written"] == 0
 
     # Two minutes pass with recording off. The bar is now long past its grace.
     clock.set((MINUTE_US + 2 * MINUTE) / 1e6 + 20.0)
+    # #93 triage: fake cadence, not a bet -- both assertions below are negative (a
+    # paused writer must not seal or write), so they hold regardless of loop timing.
     time.sleep(LET_THE_LOOP_TURN)
 
     while_off = client.get("/recording").json()
@@ -587,7 +673,12 @@ def test_the_open_minute_is_held_through_the_pause_rather_than_split_across_it(
     assert while_off["rows_written"] == 0, "a paused writer wrote the open minute"
 
     client.post("/recording", json={"recording": True})
-    time.sleep(LET_THE_LOOP_TURN)
+    # #93 triage: bet -- the assertion right below needs the held bar actually sealed
+    # into the buffer, which needs a loop pass after the resume.
+    wait_until_sync(
+        lambda: main.app.state.writer.buffered_rows == 1,
+        message="the held minute was not sealed once recording resumed",
+    )
     assert client.get("/recording").json()["buffered_rows"] == 1, (
         "the held minute was not sealed once recording resumed"
     )

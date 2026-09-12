@@ -46,6 +46,7 @@ from deltapayoff.store import (
     SPOT_SCHEMA,
     BarStore,
 )
+from wait_helpers import wait_until, wait_until_sync
 
 #: Listed when the engine starts.
 EARLY = "C-BTC-77600-040926"
@@ -117,6 +118,9 @@ class SubscribedOnlySocket:
                     del self.frames[index]
                     self.delivered.append(frame["sy"])
                     return json.dumps(frame)
+            # #93 triage: fake cadence, not a bet -- already a condition poll (the
+            # `while True` above), not a fixed-duration wait; 0.005s is only the
+            # backoff between checks of `self.subscribed`.
             await asyncio.sleep(0.005)
 
     async def ping(self):
@@ -268,7 +272,32 @@ def test_a_contract_listed_after_start_up_reaches_all_four_tables(
         assert LATE not in socket.subscribed
         assert client.get("/health").status_code == 200
 
-        time.sleep(2.0)  # several re-list ticks and a shortened minute pass or two
+        # #93 triage: bet -- this used to be a fixed time.sleep(2.0) guessing at
+        # "several re-list ticks and a shortened minute pass or two". Wait on the
+        # three things the assertions below and the table check after the `with`
+        # block actually need: the late contract subscribed, a frame delivered for
+        # it, and the recompute pass having folded it into a solved ladder (which is
+        # what the shutdown-forced sample sees at the very end of this block).
+        def late_contract_is_ready() -> bool:
+            if LATE not in socket.subscribed or not socket.delivered:
+                return False
+            # `computed_chains()`, not `live_computed_chains()`: nothing here opens a
+            # `/ws/chain` connection, so this expiry is never in the *watched* set the
+            # narrower method filters to -- it is only ever solved by the whole-board
+            # minute pass, which is what `computed_chains()` reads back.
+            chains = main.app.state.stream.computed_chains()
+            return any(
+                leg is not None and leg.symbol == LATE
+                for chain in chains
+                for row in chain.rows
+                for leg in (row.call, row.put)
+            )
+
+        wait_until_sync(
+            late_contract_is_ready,
+            timeout=10.0,
+            message="the late listing was never subscribed, delivered, and computed",
+        )
 
         assert LATE in socket.subscribed, "the late listing never reached the open socket"
         assert socket.delivered, "the venue delivered nothing for it"
@@ -302,7 +331,14 @@ def test_the_late_contract_is_registered_and_survives_a_reconnect(
 
     with TestClient(main.app) as client:
         assert client.get("/health").status_code == 200
-        time.sleep(0.5)
+        # #93 triage: bet -- this used to be a fixed time.sleep(0.5) guessing how many
+        # of the default 0.05s re-list ticks would land inside it. Wait on the
+        # registry itself, which is what every assertion below reads.
+        wait_until_sync(
+            lambda: main.app.state.stack.listed.get("BTC") == {EARLY, LATE},
+            timeout=5.0,
+            message="the late listing was never added to the registry",
+        )
         registry = main.app.state.feed.registry
 
         assert registry["ticker"] == {EARLY, LATE}
@@ -340,12 +376,29 @@ def test_a_relisted_contract_is_replayed_on_the_redial() -> None:
             adapter, lambda _event: None, retry_delay=0.01, heartbeat_every=1_000.0
         )
         task = asyncio.create_task(controller.run())
-        await asyncio.sleep(0.1)
+        # #93 triage: three bets -- each used to be a fixed sleep guessing how much of
+        # the controller's connect/subscribe/redial state machine would run inside it.
+        # Everything here is mocked and `retry_delay` is 0.01s, but the controller
+        # still runs as a real asyncio task the event loop has to get around to
+        # scheduling, so wait on what each next step actually depends on instead.
+        await wait_until(
+            lambda: EARLY in sockets[0].subscribed,
+            timeout=2.0,
+            poll=0.005,
+        )
         adapter.subscribe([late])
-        await asyncio.sleep(0.1)
+        await wait_until(
+            lambda: LATE in sockets[0].subscribed,
+            timeout=2.0,
+            poll=0.005,
+        )
         # The connection drops. The controller redials and the fresh socket is replayed.
         sockets[0].drop()
-        await asyncio.sleep(0.3)
+        await wait_until(
+            lambda: len(handed) == 2 and sockets[1].subscribed == {EARLY, LATE},
+            timeout=2.0,
+            poll=0.005,
+        )
         controller.stop()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -376,16 +429,26 @@ def test_a_new_listing_is_logged_with_its_count_and_underlying(
     socket = SubscribedOnlySocket([])
     wire_the_app(monkeypatch, tmp_path, socket)
 
+    def listing_records() -> list[logging.LogRecord]:
+        return [
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == log_events.FEED_INSTRUMENTS
+        ]
+
     with caplog.at_level(logging.INFO, logger="deltapayoff.main"):
         with TestClient(main.app) as client:
             assert client.get("/health").status_code == 200
-            time.sleep(0.4)
+            # #93 triage: bet -- this used to be a fixed time.sleep(0.4) guessing how
+            # many of the default 0.05s re-list ticks it covered. Wait on the second
+            # log record itself, which is what every assertion below reads.
+            wait_until_sync(
+                lambda: len(listing_records()) >= 2,
+                timeout=5.0,
+                message="the late listing was never logged",
+            )
 
-    records = [
-        record
-        for record in caplog.records
-        if getattr(record, "event", None) == log_events.FEED_INSTRUMENTS
-    ]
+    records = listing_records()
     assert len(records) == 2, "start-up and the late listing are two separate records"
     assert [record.listed for record in records] == [1, 1]
     assert [record.subscribed for record in records] == [1, 2]
@@ -424,7 +487,10 @@ def test_a_listing_that_cannot_be_read_warns_and_leaves_the_feed_alone(
 
     async def scenario() -> None:
         task = asyncio.create_task(main.relist_forever(stack, interval=0.01))
-        await asyncio.sleep(0.1)
+        # #93 triage: bet -- this used to be a fixed time.sleep(0.1) guessing how many
+        # of the 0.01s retry ticks it covered. Wait on the retry count itself, which is
+        # what the assertion below reads.
+        await wait_until(lambda: adapter.asks >= 3, timeout=6.0, poll=0.005)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
