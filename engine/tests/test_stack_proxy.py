@@ -78,8 +78,24 @@ def test_the_proxy_answers_its_own_liveness_without_reaching_a_service() -> None
 
 
 def test_the_smoke_probe_polls_the_api_through_the_prefix() -> None:
-    """The health the smoke test waits on is the api's, reached through the proxy."""
-    text = (ROOT / "tools" / "smoke_stack.py").read_text(encoding="utf-8")
+    """The health the smoke test waits on is the api's, reached through the proxy.
 
-    assert 'PROXY_HEALTH = "http://127.0.0.1:8080/api/health"' in text
-    assert 'PROXY_SELF_HEALTH = "http://127.0.0.1:8080/healthz"' in text
+    Asserted against the imported values rather than against the source text. The
+    text form pinned one spelling of one line, so parameterising the port for a
+    second stack broke a test that has no opinion about the port -- its subject is
+    the `/api/` prefix and the proxy's own `/healthz`, both of which survive.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    try:
+        import smoke_stack
+    finally:
+        sys.path.pop(0)
+
+    assert smoke_stack.PROXY_HEALTH == "http://127.0.0.1:8080/api/health"
+    assert smoke_stack.PROXY_SELF_HEALTH == "http://127.0.0.1:8080/healthz"
+    # The prefix and the liveness path are the contract; the port is configuration.
+    api_health, proxy_self_health = smoke_stack._health_urls(9999)
+    assert api_health.endswith("/api/health")
+    assert proxy_self_health.endswith("/healthz")
