@@ -58,20 +58,24 @@ web page at `web/app/volatility/page.tsx` is not reachable through the proxy tod
 The stack uses `./.stack-data/`, a git-ignored host directory bind-mounted at `/data`.
 It is never the live `data/`: [AGENTS.md](../../../AGENTS.md) makes `data/` read-only, and a
 second writer there would corrupt the live store. The `/data` mount is read-write in `store`
-and read-only in `api`. `main.build_consumer_stack()` still builds a `BarWriter` in the API
-process, so the read-only API mount enforces the one-writer rule at the filesystem boundary.
+and read-only in `api`. `main.build_consumer_stack()` returns `writer=None` in split mode
+since I4 (#63), so `store` is the only writer; the read-only API mount keeps that true at the
+filesystem boundary rather than on trust.
 
 ## 6. Redis
 
 Redis publishes no host port and has no persistence. Its command-line policy is:
 
 ```text
---save "" --appendonly no --maxmemory 1gb --maxmemory-policy noeviction
+--save "" --appendonly no --maxmemory 2gb --maxmemory-policy noeviction
 ```
 
 Parquet is the archive, so snapshots and AOF would add disk state without buying recovery.
-The 1gb ceiling bounds the in-memory pipe; `noeviction` makes a full bus fail loudly at the
-publisher instead of silently evicting market data. See [redis-hosting.md](redis-hosting.md)
+The 2gb ceiling bounds the in-memory pipe; `noeviction` makes a full bus fail loudly at the
+publisher instead of silently evicting market data. The ceiling must stay above the retention
+window's own demand, or `noeviction` stalls the publisher rather than protecting it: thirty
+minutes costs a `derived` 1,051.5 MiB for two underlyings, so the 1gb this file carried until
+2026-09-12 was below it. See [redis-hosting.md](redis-hosting.md)
 §1 and [0002-redis-hosting.md](../decisions/0002-redis-hosting.md).
 
 ## 7. Configuration

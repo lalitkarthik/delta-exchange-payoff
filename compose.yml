@@ -6,13 +6,21 @@ services:
   redis:
     image: redis:7-alpine
     container_name: dxp-redis
-    # 1gb is the laptop-scaled figure the test conftest already starts; prod uses 2gb,
-    # twice the derived 1,051.5 MiB for thirty minutes of retention.
+    # 2gb, matching prod, because 1gb contradicts a measurement this repo already
+    # published. #61 ran thirty continuous minutes of BTC+ETH and recorded 1,056.4 MiB
+    # (`measured`) against #58's 1,051.5 MiB (`derived`) -- and had to raise its own
+    # container from 1gb to 1.5gb at minute 18 when the curve projected past 1 GiB. Its
+    # finding is quoted: "1 GiB is not enough for thirty minutes of BTC+ETH and #69's 2gb
+    # is." Under `noeviction` a Redis at its ceiling refuses writes rather than evicting,
+    # so 1gb here configured the stack to stall itself at steady state.
+    # `measured` 2026-09-12 on this stack, which lists BTC alone: 258.75 MB at 10.3
+    # minutes, growing 26.6 MB/min, projecting to ~800 MB over the full window -- it fits
+    # under 1gb only because one underlying is listed, not because 1gb was right.
     # noeviction is the hosting decision: the writer gets an error instead of silently
     # losing the oldest stream entries underneath a consumer.
     # save "" disables redis:7-alpine's default minute-scale snapshots; this stack chose
     # no snapshot persistence.
-    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "1gb", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "2gb", "--maxmemory-policy", "noeviction"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
