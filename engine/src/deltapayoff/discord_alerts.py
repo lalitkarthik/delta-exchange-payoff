@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from . import log_events
@@ -21,6 +22,52 @@ ALERT_COLLAPSE_WINDOW_SECONDS: float = 300.0
 
 DISCORD_RETRY_AFTER_FALLBACK_SECONDS: float = 1.0
 """The safe delay used when Discord's 429 body has no usable retry_after."""
+
+
+class PostOutcome(Enum):
+    """What became of one attempted Discord post.
+
+    `post_alert` used to return one boolean answering "was the HTTP seam called", and
+    `alert_consumer` read it as "did Discord get this". On 2026-09-12 at 16:13:45.415Z
+    those two questions diverged for the first time in production: a `ConnectTimeout`
+    was *attempted*, so the consumer committed the occurrence, and
+    `reconnect_budget_spent` -- the alert saying the venue connection would not come
+    back without a resume -- was both undelivered and suppressed for the following
+    300 seconds. The feed then sat dead for 10.9 minutes (#108, #115).
+
+    Three facts have to be separable, so they are three members plus `DELIVERED`:
+
+    - `NOT_ATTEMPTED` -- no webhook configured, or the local `429` backoff skipped the
+      call. Discord's endpoint was never touched, so nothing at all was spent.
+    - `DELIVERED` -- a `2xx`. A person can see the message.
+    - `RATE_LIMITED` -- a `429`. Discord *received* this request and answered it; the
+      message is dropped, and this is the one response that sets `_blocked_until`.
+    - `FAILED` -- a transport exception, a `5xx`, or any other non-`2xx`. The request
+      was made and the message did not arrive.
+    """
+
+    NOT_ATTEMPTED = "not_attempted"
+    DELIVERED = "delivered"
+    RATE_LIMITED = "rate_limited"
+    FAILED = "failed"
+
+    @property
+    def reached_discord(self) -> bool:
+        """Whether Discord's endpoint was actually called for this occurrence."""
+        return self is not PostOutcome.NOT_ATTEMPTED
+
+    @property
+    def spends_collapse_window(self) -> bool:
+        """Whether this occurrence may keep the signature's collapse window.
+
+        Only an outcome Discord itself produced may spend it. A `2xx` is the message
+        landing; a `429` is Discord seeing the request and refusing it, and holding
+        the window open there would let the next repeat re-attempt into the very
+        backoff the `429` installed. A `FAILED` post is neither: nothing arrived and
+        nothing on Discord's side knows the alert exists, so the next occurrence of
+        that signature must still be allowed through.
+        """
+        return self in (PostOutcome.DELIVERED, PostOutcome.RATE_LIMITED)
 
 
 @dataclass(frozen=True)
@@ -109,6 +156,38 @@ class AlertGate:
         """Forget the rollback point after the poster attempted this occurrence."""
         self._pending_post = None
 
+    def rollback_collapse_window(self) -> None:
+        """Un-spend the signature's collapse window after a post that did not deliver.
+
+        This is deliberately *not* `rollback_post`. The HTTP request was made, so two
+        of the three things `decide()` spent must stay spent:
+
+        - `last_post_at`, the global `ALERT_MIN_POST_INTERVAL_SECONDS` floor, is kept.
+          Refunding it would remove the only rate floor on this consumer at exactly
+          the moment Discord is unreachable, and a burst of same-signature alerts
+          during an outage would hammer the webhook as fast as the bus delivered them.
+        - the folded `collapsed_count` already popped by `decide()` stays gone. It was
+          rendered into a message that never arrived and `DiscordPoster._lost` logged
+          it as lost; restoring it here would make that record false. This is §3a
+          consequence 2 and #115 does not change it.
+
+        What is restored is the signature's own post timestamp, so the *next*
+        occurrence of `(code, adapter, severity)` is not folded into a post that never
+        happened. That is the whole of #115's first criterion.
+        """
+        snapshot = self._pending_post
+        if snapshot is None:
+            return
+
+        if snapshot.had_signature_post:
+            signature_post_at = snapshot.signature_post_at
+            if signature_post_at is None:  # pragma: no cover - impossible snapshot
+                raise RuntimeError("a gate post snapshot lost its timestamp")
+            self._last_post_at_by_signature[snapshot.signature] = signature_post_at
+        else:
+            self._last_post_at_by_signature.pop(snapshot.signature, None)
+        self._pending_post = None
+
     def rollback_post(self) -> None:
         """Restore the last decision when the poster refused to attempt it."""
         snapshot = self._pending_post
@@ -142,10 +221,30 @@ class DiscordPoster:
         self.post_fn = post_fn
         self._blocked_until = 0.0
         self.blocked_count = 0
+        #: Posts Discord answered with a `2xx`, and posts that reached Discord's
+        #: endpoint and did not arrive. A service whose only job is delivery has to be
+        #: able to say how much it has delivered and how much it has not; before #115
+        #: `blocked_count` was the only number here and it counts neither.
+        self.delivered_count = 0
+        self.failed_count = 0
+        #: The most recent attempt's outcome, or `None` before the first one. `/health`
+        #: reads this rather than `failed_count`: a cumulative failure count can never
+        #: go back down, so it cannot answer "is this consumer getting alerts out
+        #: *now*", which is the question #103 taught this repository to ask.
+        self.last_outcome: PostOutcome | None = None
 
     def ready(self, now: float) -> bool:
         """Return whether the local backoff permits another Discord call."""
         return now >= self._blocked_until
+
+    def _record(self, outcome: PostOutcome) -> PostOutcome:
+        """Count one attempt and remember it as the latest."""
+        if outcome is PostOutcome.DELIVERED:
+            self.delivered_count += 1
+        elif outcome is PostOutcome.RATE_LIMITED or outcome is PostOutcome.FAILED:
+            self.failed_count += 1
+        self.last_outcome = outcome
+        return outcome
 
     async def post_alert(
         self,
@@ -154,13 +253,17 @@ class DiscordPoster:
         collapsed_count: int,
         *,
         now: float,
-    ) -> bool:
-        """Attempt one rendered alert and report whether the HTTP seam was called."""
+    ) -> PostOutcome:
+        """Attempt one rendered alert and report what became of it.
+
+        The return value is the *delivery* outcome, not "was the seam called". See
+        `PostOutcome` for why those had to stop being one boolean (#115).
+        """
         if not webhook_url:
-            return False
+            return PostOutcome.NOT_ATTEMPTED
         if not self.ready(now):
             self.blocked_count += 1
-            return False
+            return PostOutcome.NOT_ATTEMPTED
 
         adapter = "engine" if alert.adapter is None else alert.adapter
         text = f"[{alert.severity}] {alert.code} -- {adapter}: {alert.detail}"
@@ -181,7 +284,7 @@ class DiscordPoster:
                 type(exc).__name__,
                 lost,
             )
-            return True
+            return self._record(PostOutcome.FAILED)
 
         if 200 <= response.status < 300:
             # Delivery is logged, not silent. A consumer that records only its failures
@@ -200,7 +303,7 @@ class DiscordPoster:
                 alert.code,
                 adapter,
             )
-            return True
+            return self._record(PostOutcome.DELIVERED)
         if response.status == 429:
             retry_after = self._retry_after(response)
             self._blocked_until = now + retry_after
@@ -212,7 +315,7 @@ class DiscordPoster:
                 retry_after,
                 lost,
             )
-            return True
+            return self._record(PostOutcome.RATE_LIMITED)
         if response.status >= 500:
             log_event(
                 logger,
@@ -222,7 +325,7 @@ class DiscordPoster:
                 response.status,
                 lost,
             )
-            return True
+            return self._record(PostOutcome.FAILED)
         log_event(
             logger,
             logging.ERROR,
@@ -231,7 +334,7 @@ class DiscordPoster:
             response.status,
             lost,
         )
-        return True
+        return self._record(PostOutcome.FAILED)
 
     @staticmethod
     def _lost(alert: Any, collapsed_count: int) -> str:

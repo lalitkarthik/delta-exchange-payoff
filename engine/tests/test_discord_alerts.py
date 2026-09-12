@@ -13,6 +13,7 @@ from deltapayoff.discord_alerts import (
     AlertGate,
     DiscordPoster,
     GateDecision,
+    PostOutcome,
 )
 
 
@@ -324,10 +325,12 @@ def test_a_lost_post_records_the_collapsed_count_that_died_with_it(
 ) -> None:
     """The folded repeats go with it, so the line must say how many.
 
-    The gate hands the accumulated count to the post that reveals it, and
-    `post_alert` reports the exception path as *attempted*, so the consumer commits
-    the occurrence and that count is cleared. Four repeats can die in one failed post
-    and the log is the only place that can say so.
+    The gate hands the accumulated count to the post that reveals it, and `decide()`
+    has already popped it by then. #115 rolls the signature's *collapse window* back
+    after a failed post so the next occurrence can still be posted, and deliberately
+    does **not** restore that popped count -- it was rendered into a message that
+    never arrived, and restoring it would make this very log line false. Four repeats
+    can die in one failed post and the log is still the only place that says so.
     """
     _calls, post = _fake_post(error=ConnectionError("offline"))
     poster = DiscordPoster(post)
@@ -381,3 +384,220 @@ def test_a_successful_post_is_logged_with_its_status(
     assert "connection_silent" in caplog.text
     assert any(record.levelno == logging.INFO for record in caplog.records)
     assert "https://discord.test/webhook" not in caplog.text
+
+
+# --- One boolean for two questions, and the collapse window it spent (#115) ---------
+#
+# `post_alert` returned `True` for "the HTTP seam was called" and `alert_consumer`
+# read it as "Discord has this". Those agreed until 2026-09-12T16:13:45.415Z, when a
+# `ConnectTimeout` was attempted, committed, and suppressed `reconnect_budget_spent`
+# for the next 300 seconds. The return value is now a `PostOutcome` and the gate has
+# a rollback that un-spends the signature's window without refunding the global floor.
+
+
+def test_a_transport_exception_reports_a_failed_delivery() -> None:
+    """The seam was called; the message did not arrive. Those are now two answers."""
+    _calls, post = _fake_post(error=ConnectionError("offline"))
+
+    outcome = asyncio.run(
+        DiscordPoster(post).post_alert(
+            "https://discord.test/webhook", _alert(), 0, now=10.0
+        )
+    )
+
+    assert outcome is PostOutcome.FAILED
+    assert outcome.reached_discord is True
+    assert outcome.spends_collapse_window is False
+
+
+def test_every_post_outcome_says_whether_it_may_spend_the_collapse_window() -> None:
+    """The whole policy of #115, in one table, so a new member cannot slip through.
+
+    A `2xx` landed and a `429` was answered by Discord itself -- both spend the
+    window. A transport exception, a `5xx` and an unexpected status did not arrive,
+    and an unconfigured or locally blocked call never left this process.
+    """
+    spends = {
+        outcome: outcome.spends_collapse_window for outcome in PostOutcome
+    }
+
+    assert spends == {
+        PostOutcome.DELIVERED: True,
+        PostOutcome.RATE_LIMITED: True,
+        PostOutcome.FAILED: False,
+        PostOutcome.NOT_ATTEMPTED: False,
+    }
+    assert PostOutcome.NOT_ATTEMPTED.reached_discord is False
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (204, PostOutcome.DELIVERED),
+        (200, PostOutcome.DELIVERED),
+        (429, PostOutcome.RATE_LIMITED),
+        (503, PostOutcome.FAILED),
+        (400, PostOutcome.FAILED),
+    ],
+)
+def test_each_discord_status_maps_to_one_delivery_outcome(
+    status: int, expected: PostOutcome
+) -> None:
+    _calls, post = _fake_post(SimpleNamespace(status=status, json_body=None))
+
+    outcome = asyncio.run(
+        DiscordPoster(post).post_alert(
+            "https://discord.test/webhook", _alert(), 0, now=10.0
+        )
+    )
+
+    assert outcome is expected
+
+
+def test_an_unconfigured_or_blocked_post_never_reached_discord() -> None:
+    _calls, post = _fake_post(SimpleNamespace(status=429, json_body={"retry_after": 5.0}))
+    poster = DiscordPoster(post)
+
+    async def scenario() -> tuple[PostOutcome, PostOutcome, PostOutcome]:
+        unconfigured = await poster.post_alert(None, _alert(), 0, now=10.0)
+        limited = await poster.post_alert(
+            "https://discord.test/webhook", _alert(), 0, now=10.0
+        )
+        blocked = await poster.post_alert(
+            "https://discord.test/webhook", _alert(), 0, now=11.0
+        )
+        return unconfigured, limited, blocked
+
+    unconfigured, limited, blocked = asyncio.run(scenario())
+
+    assert unconfigured is PostOutcome.NOT_ATTEMPTED
+    assert limited is PostOutcome.RATE_LIMITED
+    assert blocked is PostOutcome.NOT_ATTEMPTED
+    assert poster.blocked_count == 1
+
+
+def test_deliveries_and_failures_are_counted_separately() -> None:
+    """`/health` has nothing to report if nothing counts.
+
+    Before #115 the poster carried exactly one number, `blocked_count`, which counts
+    calls the *local* backoff skipped. A post that was attempted and failed -- the one
+    thing that happened on 2026-09-12 -- incremented nothing at all.
+    """
+    responses = iter(
+        (
+            SimpleNamespace(status=204),
+            SimpleNamespace(status=503),
+            SimpleNamespace(status=204),
+        )
+    )
+
+    async def post(_url: str, _payload: dict[str, Any]) -> Any:
+        response = next(responses)
+        if response.status == 503:
+            return response
+        return response
+
+    poster = DiscordPoster(post)
+
+    async def scenario() -> None:
+        for offset in (0.0, 1.0, 2.0):
+            await poster.post_alert(
+                "https://discord.test/webhook", _alert(), 0, now=10.0 + offset
+            )
+
+    asyncio.run(scenario())
+
+    assert poster.delivered_count == 2
+    assert poster.failed_count == 1
+    # The judgement `/health` reads is the latest attempt, not the running total.
+    assert poster.last_outcome is PostOutcome.DELIVERED
+
+
+def test_a_failed_post_leaves_the_last_outcome_failed() -> None:
+    _calls, post = _fake_post(error=ConnectionError("offline"))
+    poster = DiscordPoster(post)
+
+    assert poster.last_outcome is None
+
+    asyncio.run(
+        poster.post_alert("https://discord.test/webhook", _alert(), 0, now=10.0)
+    )
+
+    assert poster.last_outcome is PostOutcome.FAILED
+    assert poster.failed_count == 1
+    assert poster.delivered_count == 0
+
+
+def test_rolling_back_a_failed_post_frees_the_signature_for_the_next_occurrence(
+) -> None:
+    """The gate half of #115, at the unit seam.
+
+    A repeat one second after a *failed* post is still inside the 300 s window that
+    post opened, and before this rollback it was folded into a post nobody saw.
+    """
+    gate = AlertGate()
+
+    first = gate.decide(
+        now=10.0, code="reconnect_budget_spent", adapter="DELTA", severity="error"
+    )
+    gate.rollback_collapse_window()
+    second = gate.decide(
+        now=10.0 + ALERT_MIN_POST_INTERVAL_SECONDS,
+        code="reconnect_budget_spent",
+        adapter="DELTA",
+        severity="error",
+    )
+
+    assert first.post is True
+    assert second.post is True
+
+
+def test_rolling_back_a_failed_post_keeps_the_global_post_floor_spent() -> None:
+    """The request really was made, so the 2 s floor must not be refunded.
+
+    Otherwise the rollback would remove this consumer's only rate limit at exactly
+    the moment Discord is unreachable, and a burst of alerts during an outage would
+    be re-attempted as fast as the bus delivered them. `rollback_post` -- for the
+    paths where no call happened at all -- does refund it, and that is the difference
+    between the two methods.
+    """
+    gate = AlertGate()
+    gate.decide(
+        now=10.0, code="reconnect_budget_spent", adapter="DELTA", severity="error"
+    )
+    gate.rollback_collapse_window()
+
+    too_soon = gate.decide(
+        now=10.0 + ALERT_MIN_POST_INTERVAL_SECONDS - 0.1,
+        code="a_different_code",
+        adapter="DELTA",
+        severity="error",
+    )
+
+    assert too_soon == GateDecision(post=False, collapsed_count=0, rate_limited=True)
+    assert gate.last_post_at == 10.0
+
+
+def test_rolling_back_a_failed_post_does_not_resurrect_the_folded_count() -> None:
+    """Section 3a consequence 2 is unchanged by #115, and this pins that.
+
+    The folded repeats were rendered into the message that failed, and
+    `DiscordPoster._lost` logged them as lost. Restoring them here would make that
+    log record false, so the rollback restores the signature's timestamp and nothing
+    else.
+    """
+    gate = AlertGate()
+    signature = ("reconnect_budget_spent", "DELTA", "error")
+
+    gate.decide(now=10.0, code=signature[0], adapter=signature[1], severity=signature[2])
+    gate.decide(now=20.0, code=signature[0], adapter=signature[1], severity=signature[2])
+    revealing = gate.decide(
+        now=10.0 + ALERT_COLLAPSE_WINDOW_SECONDS,
+        code=signature[0],
+        adapter=signature[1],
+        severity=signature[2],
+    )
+    gate.rollback_collapse_window()
+
+    assert revealing.collapsed_count == 1
+    assert signature not in gate._suppressed_count_by_signature

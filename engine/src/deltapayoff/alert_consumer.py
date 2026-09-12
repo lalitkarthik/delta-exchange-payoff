@@ -114,7 +114,7 @@ class AlertConsumer:
             if decision.post:
                 if self.poster is None:
                     raise RuntimeError("the alert consumer has no Discord poster")
-                attempted = await self.poster.post_alert(
+                outcome = await self.poster.post_alert(
                     self.webhook_url,
                     event,
                     decision.collapsed_count,
@@ -126,9 +126,24 @@ class AlertConsumer:
                 # silent fallback it would instead revert to the exact defect the review
                 # caught -- the occurrence spent although Discord never saw the alert --
                 # and the guarantee this pair exists to install would quietly not hold.
-                if attempted:
+                #
+                # #115: it did not hold. Until that ticket `post_alert` returned one
+                # boolean meaning "the HTTP seam was called", and this branch read it as
+                # "Discord has it", so a `ConnectTimeout` committed the occurrence and
+                # suppressed its signature for 300 s -- the exact defect the paragraph
+                # above names. The seam now returns a `PostOutcome` and the three cases
+                # below are three different states of the world, not two.
+                if outcome.spends_collapse_window:
+                    # A 2xx, or a 429 Discord itself answered. Discord knows about this
+                    # occurrence either way, and the 429 is what installed the backoff.
                     self.gate.commit_post()
+                elif outcome.reached_discord:
+                    # Attempted and undelivered. The next occurrence of this signature
+                    # must not be folded into a post that never happened; the global
+                    # post floor stays spent because the request really was made.
+                    self.gate.rollback_collapse_window()
                 else:
+                    # No webhook, or the local backoff skipped the call outright.
                     self.gate.rollback_post()
         except Exception as exc:
             if decision is not None and decision.post:

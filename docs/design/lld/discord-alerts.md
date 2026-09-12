@@ -62,8 +62,15 @@ first, while the local floor is global and never resets a signature's post times
 | Unconfigured | The webhook is empty; alerts are consumed and acknowledged but no HTTP call is made. |
 | Ready | A configured consumer may ask `AlertGate` and call the poster. |
 | Locally blocked | The poster skips calls until its fake-clock `now` reaches `_blocked_until`. |
-| Discord blocked | A `429` sets the local block for the returned delay; the message is dropped, never retried. |
-| Failed post | A transport exception or `5xx` is logged and dropped; a `5xx` does not extend a `429` block. |
+| Discord blocked | A `429` sets the local block for the returned delay; the message is dropped, never retried, and the signature's collapse window stays spent. |
+| Failed post | A transport exception, a `5xx` or any other non-`2xx` is logged and dropped; a `5xx` does not extend a `429` block, and the signature's collapse window is rolled back. |
+
+`post_alert` returns a `PostOutcome`, not a boolean. Until #115 it returned `True` for "the
+HTTP seam was called" and `AlertConsumer` read it as "Discord has this" — the same answer for
+every outcome but a failed post, the one that matters. `DELIVERED` (`2xx`) and `RATE_LIMITED`
+(`429`, which Discord answered) have `spends_collapse_window`; `FAILED` (a transport exception,
+a `5xx`, any other status) and `NOT_ATTEMPTED` (no webhook, or a locally blocked call) do not,
+and only the last has `reached_discord` false.
 
 The webhook URL is never included in a log message. The one-time unconfigured startup line
 names `DISCORD_WEBHOOK_URL` and says that alerts will be consumed and acknowledged but not
@@ -75,24 +82,24 @@ posted.
 |---|---|
 | Repeat inside the collapse window | Drop and increment that signature's suppressed count; do not queue a later flush. |
 | Different signature inside the local floor | Drop and increment `rate_limited_count`; do not mark it as a post. |
-| `derived` (ticket R5) Discord status `429` | Read `retry_after` or use the `assumed` `1.0`-second fallback, then block and drop. |
-| `derived` (ticket R5) Discord status `5xx` | Log at error and drop without changing `_blocked_until`. |
-| HTTP exception | Log its safe exception type plus the alert it dropped (severity, code, adapter, folded count) at error, never the URL, then continue. See §3a. |
+| `derived` (ticket R5) Discord status `429` | Read `retry_after` or use the `assumed` `1.0`-second fallback, then block and drop. `commit_post()`: Discord saw this request and named the backoff, so the window stays spent. |
+| `derived` (ticket R5) Discord status `5xx` | Log at error and drop without changing `_blocked_until`. `rollback_collapse_window()`. |
+| HTTP exception | Log its safe exception type plus the alert it dropped (severity, code, adapter, folded count) at error, never the URL, then continue. `rollback_collapse_window()`, so the *next* occurrence of that signature is posted rather than folded into a post that never happened (#115). See §3a and §3b. |
 | An alert timestamped before this consumer instance started | Dropped in `_run_once` before the gate sees it, so it cannot spend a real alert's collapse or rate-limit slot; logged at warning under `ALERT`. |
 | Feed pause or any non-`Alert` queue item | Consume it **silently** and do not call Discord; a pause is not an alert ([events.md](../events.md), "`degraded` does not alert, and nor does a `pause`"). The silence is the observable: with `_run_once`'s `isinstance` guard removed the pause still produces no post, because the dispatch body raises `AttributeError` and the handler swallows it. Both pause tests passed that way until 2026-09-12, so they now assert that nothing was logged. |
 
 ## 3a. An acked alert whose post fails is gone, and that is the trade
 
 This consumer acknowledges on receipt and never replays. Every row of §3 therefore ends in
-`drop`: there is no pending entry to come back to, no retry behind the HTTP call, and no
-second chance. **An alert that is acked and then fails to deliver is lost.**
+`drop`: no pending entry to come back to, no retry behind the HTTP call, no second chance.
+**An alert that is acked and then fails to deliver is lost.**
 
-That is deliberate and it is the right trade here. The alternative -- holding the entry
-unacked until Discord confirms -- makes a Discord outage into a stalled consumer with a
-growing pending list, which is precisely the failure #103 spent two hours on in a different
-service. An alert is a notification, not a durable record; the durable record is the log and
-the Parquet store, and neither depends on this consumer. A notification that arrives late
-enough is worth nothing anyway, so trading delivery for liveness is the correct direction.
+That is deliberate and it is the right trade here. The alternative -- holding the entry unacked
+until Discord confirms -- makes a Discord outage into a stalled consumer with a growing pending
+list, precisely the failure #103 spent two hours on in a different service. An alert is a
+notification, not a durable record; the durable record is the log and the Parquet store, and
+neither depends on this consumer. A notification that arrives late enough is worth nothing
+anyway, so trading delivery for liveness is the correct direction.
 
 **The trade is only defensible if the loss leaves a record, and for one live failure it did
 not.** `measured` on the live `dxp` stack, 2026-09-12: seven alerts were published, and
@@ -114,27 +121,61 @@ have known which alert died, because it named the exception type and nothing els
 
 So every drop path now names what it dropped: severity, code, adapter, and the folded
 `collapsed_count` that dies with it, through `DiscordPoster._lost`. Only engine-generated
-fields go in -- never `detail`, and never the URL, which is the rule the exception branch
-already existed to honour. Pinned by five tests in `test_discord_alerts.py`
-(`test_a_failed_post_names_the_alert_it_lost` and its siblings) and, end to end over the
-live sequence, by `test_the_live_connect_timeout_loses_its_alert_and_says_which_one`.
+fields go in -- never `detail`, never the URL, which is the rule the exception branch already
+existed to honour. Pinned by five tests in `test_discord_alerts.py`
+(`test_a_failed_post_names_the_alert_it_lost` and siblings) and end to end by
+`test_the_live_connect_timeout_loses_its_alert_and_says_which_one`.
 
-**Two consequences are accepted rather than fixed**, and are named here so they are not
-re-discovered as bugs:
+**Two consequences were accepted rather than fixed** by #66. One has since been fixed and
+one still stands:
 
-1. **A failed post still spends the occurrence.** `post_alert` reports the exception path as
-   *attempted*, so the consumer calls `commit_post()` and the signature's collapse window
-   restarts. A retry would have to block the loop, which is what this design refuses.
+1. **A failed post spent the occurrence too — fixed by #115.** `post_alert` reported the
+   exception path as *attempted*, so the consumer called `commit_post()`, the collapse window
+   restarted from a post nobody saw, and the message eventually carrying it rendered
+   `(collapsed N times since last post)` about that post. Losing the message is the trade;
+   losing the next five minutes of that signature was not. `rollback_collapse_window()`
+   un-spends the signature's timestamp and **nothing else**: the global
+   `ALERT_MIN_POST_INTERVAL_SECONDS` floor stays spent, because the request was made and
+   refunding it would leave this consumer with no rate limit during exactly the outage that
+   produces alert storms; the folded count `decide()` popped stays gone, because it was
+   rendered into the failed message and `_lost` logged it as lost. A retry is still refused.
 2. **Folded repeats are revealed only on the next occurrence of their signature.** After the
    live run above the gate still held three folded `store.replay_gap` repeats and one
-   `bus.reader_stopped` repeat. If neither signature recurs, nothing ever says they happened.
-   Pinned by `test_the_four_folded_live_alerts_are_still_unreported_after_the_run`.
+   `bus.reader_stopped` repeat; if neither signature recurs, nothing ever says they happened.
+   Pinned by `test_the_four_folded_live_alerts_are_still_unreported_after_the_run`, and
+   unchanged by #115, which `test_rolling_back_a_failed_post_does_not_resurrect_the_folded_count` pins.
+
+## 3b. The alert channel failed for the same reason as the thing it reported
+
+**Not fixed here, and recorded so it is not mistaken for an oversight.** That `ConnectTimeout`
+landed five seconds after the budget was spent at 16:13:40Z, inside the name-resolution outage
+#108 records from 16:07:52Z: the network event that produced the alert is the one that stopped
+it being delivered, and a channel failing in the conditions that generate its traffic is not a
+channel. No bookkeeping inside this process changes that — a bounded retry would have dialled
+the same dead resolver, and a second channel over the same egress would have failed with it.
+The answers that could work, independent egress or a watchdog on this consumer's *silence*,
+are outside this service; #108 criterion 7 owns them, and §3c is what #115 owns.
+
+## 3c. `/health` answers a question about delivery
+
+`configured` and `alive` stay, true and useful -- and both were true at 16:44Z on 2026-09-12,
+thirty-one minutes after the only log record in the container was a failed post: `CONTEXT.md`
+§7 item 2's shape, a configuration fact where a judgement belongs. The route now carries
+`delivered`, `failed` and `blocked` counters and a `last_post` outcome, and answers **503**
+when `problems` is non-empty -- the consumer task is not running, or the latest attempt was
+`FAILED`. The judgement is that latest attempt, not `failed`, which only goes up and would read
+as broken forever after one timeout; a `429` is not a problem, because Discord received it and
+named its own backoff. The status code is the contract (#103): Compose's check is `urlopen`,
+which fails on a status and never reads a body. Nothing restarts an unhealthy
+`discord-alerts`, so the 503 is a signal, not a restart loop.
 
 ## 4. Test seam and numbers
 
 `engine/tests/test_discord_alerts.py` drives the gate and poster with explicit float
-timestamps and a fake `post_fn`; no socket is opened. `engine/tests/test_alert_consumer.py`
-drives the bus seam with FanOut and, for the Redis group cases, with fakeredis and a real
+timestamps and a fake `post_fn`; no socket is opened. #115's outcome and rollback tests live
+there, and its end-to-end pair (`test_a_failed_post_leaves_the_next_occurrence_free_to_post`,
+`test_a_discord_429_still_spends_the_collapse_window`) in `engine/tests/test_alert_consumer.py`,
+which drives the bus seam with FanOut and, for the Redis group cases, with fakeredis and a real
 Redis container in parallel parametrisations, all with an injected fake clock. The entrypoint
 test starts `uvicorn` as a subprocess on loopback and checks `/health` in the unconfigured
 case; this is the only process-launch test. `engine/tests/test_alert_main.py` also checks
