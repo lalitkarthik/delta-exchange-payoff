@@ -140,8 +140,27 @@ async def _wait_until(
 
 
 async def _start_writer(
-    process: store_main.StoreProcess, *, flush_seconds: float = 0.0
+    process: store_main.StoreProcess, *, flush_seconds: float = 0.05
 ) -> None:
+    """Start the writer's drain loop at this suite's 0.01s tick.
+
+    `flush_seconds` used to default to `0.0`. `BarWriter`'s flush guard is
+    `now - last_flush < flush_seconds`, and at `0.0` that guard never holds against the
+    `Clock` fixture used throughout this file (it does not advance on its own, so
+    `now - last_flush` is `0` on every pass) — every 10ms tick ran a full `_commit`:
+    an `Intent`, four tables flushed, a checkpoint rewritten. Idle that is cheap; under
+    load it competed with its own I/O and slowed one test up to 12x (#96). Production's
+    `FLUSH_SECONDS` (300) is not the answer either — a test's own `_wait_until` bounds
+    are 5-10s, nowhere close.
+
+    `0.05` — five ticks — is the smallest interval that survives one tick's scheduler
+    jitter without immediately reopening, so a slow tick under load cannot turn back
+    into an every-tick storm by accident. Because the `Clock` fixture never advances on
+    its own, this default (like any positive one) still commits nothing at all unless a
+    test deliberately moves `clock.value` forward past it — see
+    `test_store_restart_replays_only_after_the_saved_positions`, the one test in this
+    file that takes this default rather than overriding it.
+    """
     process.writer.tick_seconds = 0.01
     process.writer.flush_seconds = flush_seconds
     process.tasks = [
@@ -286,6 +305,15 @@ def test_store_process_first_start_positions_readers_and_writes_generation_zero(
 
 
 def test_store_restart_replays_only_after_the_saved_positions(tmp_path: Path) -> None:
+    """The one test in this file that takes `_start_writer`'s default `flush_seconds`
+    and waits on the periodic timer for its first commit, rather than driving `_seal`
+    and `_commit` by hand the way every other test below does — this test is about the
+    store *process* restarting, not about one replay edge case, so it exercises the
+    same timer production runs on. The fixed `Clock` does not advance on its own, so the
+    guard needs a nudge forward before the wait can ever resolve; the earlier minutes
+    are already sealed by the clock's starting position and are unaffected by it.
+    """
+
     async def scenario() -> None:
         import fakeredis.aioredis
 
@@ -298,6 +326,12 @@ def test_store_restart_replays_only_after_the_saved_positions(tmp_path: Path) ->
                 first.bus.publish(_quote_event(minute, bid=100.0 + minute))
             await first.bus.flush()
             await _wait_until(lambda: first.writer.aggregator.ticks == 2)
+            # The guard is `now - last_flush < flush_seconds`; `now` is this fixed
+            # clock, which does not move by itself. Advance it a moment so the next
+            # tick's periodic flush actually opens instead of waiting forever on a gap
+            # that never appears — one commit, not the storm `flush_seconds=0.0` used
+            # to produce every 10ms (#96).
+            clock.value += 1.0
             await _wait_until(lambda: first.writer.generation >= 1)
             checkpoint = read_checkpoint(tmp_path)
             assert checkpoint is not None
@@ -344,6 +378,9 @@ def test_kill_and_restart_replays_an_uncommitted_minute_once(tmp_path: Path) -> 
         clock = Clock((BASE + timedelta(minutes=3, seconds=10)).timestamp())
         first = await _make_process(tmp_path, server, clock)
         try:
+            # Cadence: this test drives `_seal`/`_commit` by hand for an exact count
+            # (3, then 2 after restart) — the periodic timer, at any interval, would
+            # commit an uncounted, load-dependent number of times instead.
             await _start_writer(first, flush_seconds=10_000.0)
             for minute in (0, 1, 2):
                 first.bus.publish(_quote_event(minute, bid=100.0 + minute))
@@ -444,6 +481,9 @@ def test_a_trimmed_replay_folds_the_first_retained_entry(tmp_path: Path) -> None
         clock = Clock((BASE + timedelta(minutes=2, seconds=10)).timestamp())
         first = await _make_process(tmp_path, server, clock)
         try:
+            # Cadence: the point of this test is "acked and folded but never
+            # committed" below — a periodic commit landing in between would flush
+            # exactly the minutes this test needs left uncommitted at the kill.
             await _start_writer(first, flush_seconds=10_000.0)
             for minute in (0, 1):
                 first.bus.publish(_quote_event(minute, bid=100.0 + minute))
@@ -526,6 +566,10 @@ def test_store_pause_resume_commits_a_span_and_leaves_paused_minutes_empty(
         clock = Clock((BASE + timedelta(minutes=2, seconds=10)).timestamp())
         process = await _make_process(tmp_path, server, clock)
         try:
+            # Cadence: `generation` here is meant to advance only from pause/resume's
+            # own commit (`_apply_pending_commands`), not the periodic timer — an
+            # incidental timer commit would still pass `generation >= 1` but for the
+            # wrong reason and would hide a broken pause/resume commit path.
             await _start_writer(process, flush_seconds=10_000.0)
             process.bus.publish(_quote_event(0, bid=100.0))
             await process.bus.flush()
@@ -575,6 +619,9 @@ def test_store_restart_drops_events_inside_an_open_pause_span(tmp_path: Path) ->
         clock = Clock((BASE + timedelta(minutes=2, seconds=10)).timestamp())
         first = await _make_process(tmp_path, server, clock)
         try:
+            # Cadence: same reasoning as the pause/resume test above — the checkpoint
+            # this test restarts from must come from pause's own commit, not a timer
+            # that happened to also fire.
             await _start_writer(first, flush_seconds=10_000.0)
             first.bus.publish(_command("pause"))
             await first.bus.flush()
@@ -614,6 +661,9 @@ def test_store_ignores_feed_targeted_commands_and_counts_them(tmp_path: Path) ->
         clock = Clock((BASE + timedelta(minutes=2)).timestamp())
         process = await _make_process(tmp_path, server, clock)
         try:
+            # Cadence: not about commits at all — nothing here is meant to commit, and
+            # a timer firing on its own would not change what this test asserts either
+            # way, but disabling it keeps the scenario to the one thing under test.
             await _start_writer(process, flush_seconds=10_000.0)
             process.bus.publish(_command("pause", target="feed"))
             await process.bus.flush()
@@ -636,6 +686,8 @@ def test_store_folds_computed_chain_events_from_its_lossless_queue(
         clock = Clock((BASE + timedelta(minutes=2, seconds=10)).timestamp())
         process = await _make_process(tmp_path, server, clock)
         try:
+            # Cadence: drives `_seal`/`_commit` by hand for an exact count (1) —
+            # same reasoning as the two replay tests above.
             await _start_writer(process, flush_seconds=10_000.0)
             process.bus.publish(_computed_event())
             await process.bus.flush()
