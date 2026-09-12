@@ -60,8 +60,10 @@ A store-mode flush runs from the writer's loop at a **drained point** — the qu
 
 A failure anywhere in 2–4 is all-or-nothing: delete this generation's files and the intent,
 leave every bar in its buffer for the next interval, `flush_errors += 1`, log at error and
-publish an `alert` (`code="store.flush_failed"`). Nothing is lost to a failed flush, which is
-a change from the monolith, where the buffer was already empty by then.
+publish an `alert` (`code="store.flush_failed"`). Nothing is lost to a failed flush, which was
+a change from the monolith, where the buffer was already empty by then. **#101 closed that
+difference** rather than leaving it standing: both paths share one implementation and the
+monolith rolls back the same way, so the clause about the monolith is history, not behaviour.
 
 **The failure points, walked**
 

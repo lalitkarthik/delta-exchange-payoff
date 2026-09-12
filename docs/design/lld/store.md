@@ -163,7 +163,7 @@ than that `derived` retention loses the minutes trimmed from Redis, and the gap 
 | A symbol that will not parse into underlying/expiry/strike/type | `unparseable` grows; never filed under a guess |
 | A reference event quoting neither side | No fallback tick; a pair of absent prices is not a quote |
 | Recording switched off | The subscription is still **drained** and `discarded` grows; a lossless queue nobody empties backs up the socket reader |
-| A flush raises | `flush_errors` grows; the loop continues and retries next interval |
+| A flush raises | All or nothing (#101): the files that flush published are removed, the buffer and the flush ordinal are left as they were, `flush_errors` grows, and the next interval flushes the same bars. Both compositions answer this way — one `BarStore._flush_buffer` implements it and `_flush_legacy` and `_flush_generation` differ only in how they name a file |
 
 ## 6. What still speaks the venue's shape
 

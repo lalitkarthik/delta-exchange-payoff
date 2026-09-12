@@ -180,21 +180,22 @@ def test_a_store_configured_for_s3_refuses_to_flush_rather_than_writing_the_host
 
     assert "s3://convex-hedge-bars/prod" in str(excinfo.value)
     assert list(tmp_path.iterdir()) == []
-    # NOT `store.buffered == 1`: `_flush_legacy` empties the buffer before writing
-    # anything and has no rollback on any exception, `StoreHomeUnavailable` included --
-    # a pre-existing gap this ticket found and did not touch. See the report's
-    # "separate defect" note; `_flush_generation`'s `BarWriter._commit` path does
-    # restore the buffer on failure, which is why this store is otherwise safe.
-    assert store.buffered == 0
+    # This read `store.buffered == 0` when #70 wrote it, documenting the gap it had found
+    # by accident: `_flush_legacy` emptied its buffer before it flushed anything and
+    # caught nothing, `StoreHomeUnavailable` included. #101 closed that gap -- both flush
+    # paths now share one implementation that keeps the buffer until the files land -- so
+    # a refusal leaves the bar exactly where a refusal should.
+    assert store.buffered == 1
 
 
 def test_a_generation_flush_on_s3_refuses_before_touching_the_buffer(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The split-mode commit path (`flush(generation=...)`) does not share
-    `_flush_legacy`'s gap: it only clears the buffer after every planned file has been
-    written, so a refusal here -- from `planned_paths`, which reads `self.path` before
-    anything else in `BarWriter._commit` runs -- leaves the buffer exactly as it was."""
+    """The split-mode commit path (`flush(generation=...)`) only clears the buffer after
+    every planned file has been written, so a refusal here -- from `planned_paths`, which
+    reads `self.path` before anything else in `BarWriter._commit` runs -- leaves the
+    buffer exactly as it was. Since #101 the legacy path answers identically; the pair of
+    tests is what would catch them drifting apart again."""
     monkeypatch.setattr(store_module, "default_root", lambda: tmp_path)
     store = BarStore("s3://convex-hedge-bars/prod")
     store.add([bar()])

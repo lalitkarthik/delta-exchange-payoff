@@ -868,18 +868,76 @@ class BarStore:
         name = f"{earliest.strftime('%Y%m%dT%H%M%SZ')}-g{generation:08d}.parquet"
         return directory / name
 
-    def _flush_generation(self, generation: int) -> int:
+    def _legacy_path(
+        self, day: str, underlying: str, bars: list[Any], ordinal: int
+    ) -> Path:
+        directory = self.path / f"underlying={underlying}" / f"date={day}"
+        earliest = min(bar.minute for bar in bars)
+        name = f"{earliest.strftime('%Y%m%dT%H%M%SZ')}-{ordinal:06d}.parquet"
+        return directory / name
+
+    def _discard(self, paths: list[Path]) -> None:
+        """Remove a rolled-back flush's files, **best effort**.
+
+        A flush fails for reasons that also make deletion fail — a held handle, a
+        permission change, a full disk. Letting that second error replace the first would
+        hide the diagnosis behind the cleanup, so it is logged and swallowed. What it
+        leaves behind is self-correcting rather than duplicated: the ordinal and the
+        generation are both rolled back with the buffer, so the retry addresses the same
+        file name again and overwrites it.
+        """
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    log_events.ENGINE_ERROR,
+                    "store flush %s: could not remove %s while rolling back",
+                    self.dataset,
+                    path,
+                    table=self.dataset,
+                    file=str(path),
+                    exc_info=True,
+                )
+
+    def _flush_buffer(
+        self, name_for: Callable[[str, str, list[Any], int], Path]
+    ) -> int:
+        """Flush every buffered bar or none of them, and keep the buffer until they land.
+
+        **The single implementation of a safe flush** (#101). Both compositions call it
+        and neither owns a copy of the error handling: the monolith's `_flush_legacy` and
+        the split's `_flush_generation` now differ only in what they name a file, which is
+        the one thing that actually differs between them. They had drifted into two error
+        behaviours, one of which destroyed data, and a second copy is how that happens
+        again.
+
+        **All or nothing, because a bar is sealed before it is flushed.** The aggregator
+        will not seal a minute twice, so the buffer is the only copy of a sealed bar and
+        it is not surrendered until the file it belongs in exists. On any failure the
+        files this flush published are removed and the buffer is left exactly as it
+        arrived, so the next interval flushes the same bars into the same names. The
+        alternative — keeping a written group out of the buffer because it is on disk —
+        leaves the counters and the directory describing different sets of rows, and
+        leaves a partial flush to be reasoned about at read time.
+
+        `self.flushes` and `self.rows_written` move only on success, for the same reason.
+        The ordinal is part of the legacy file name and a directory listing is meant to
+        prove nothing is missing, so a flush that wrote nothing must not consume one.
+        """
         if not self._buffer:
             return 0
         buffered = self._buffer
         groups = self._groups(buffered)
-        self.flushes += 1
+        ordinal = self.flushes + 1
         published: list[Path] = []
         flushing: list[Path] = []
         written = 0
         try:
             for (day, underlying), bars in sorted(groups.items()):
-                file_path = self._generation_path(day, underlying, bars, generation)
+                file_path = name_for(day, underlying, bars, ordinal)
                 directory = file_path.parent
                 directory.mkdir(parents=True, exist_ok=True)
                 staging = file_path.with_suffix(file_path.suffix + ".flushing")
@@ -907,17 +965,30 @@ class BarStore:
                     duration_seconds=round(duration, 6),
                 )
         except Exception:
-            for path in flushing:
-                path.unlink(missing_ok=True)
-            for path in published:
-                path.unlink(missing_ok=True)
+            self._discard(flushing)
+            self._discard(published)
             raise
         self._buffer = []
+        self.flushes = ordinal
         self.rows_written += written
         return written
 
+    def _flush_generation(self, generation: int) -> int:
+        """Flush the buffer into generation-stamped files, for the split's `store`.
+
+        **Error behaviour is `_flush_buffer`'s, and identical to `_flush_legacy`'s**: all
+        or nothing, the buffer kept until every file lands. The generation, not the flush
+        ordinal, distinguishes this path's file names, so two processes flushing the same
+        partition cannot collide.
+        """
+        return self._flush_buffer(
+            lambda day, underlying, bars, _ordinal: self._generation_path(
+                day, underlying, bars, generation
+            )
+        )
+
     def _flush_legacy(self) -> int:
-        """Write the buffer and empty it. Returns rows written. **Blocking IO.**
+        """Flush the buffer and empty it. Returns rows flushed. **Blocking IO.**
 
         Called from a worker thread by `BarWriter`, never from the socket reader's path.
 
@@ -932,46 +1003,14 @@ class BarStore:
         three-day hole in this exact store that nothing had logged. Never on the
         per-message path: this runs once per `flush_seconds` interval at most, not once
         per tick, so the record costs nothing the flush interval was not already costing.
+
+        **Error behaviour is `_flush_buffer`'s, and identical to `_flush_generation`'s**:
+        all or nothing, the buffer kept until every file lands, the ordinal consumed only
+        by a flush that wrote something. Before #101 this path emptied its buffer first
+        and caught nothing, so one raising `write_parquet` destroyed a flush interval of
+        sealed bars that the aggregator would never seal again.
         """
-        if not self._buffer:
-            return 0
-
-        buffered, self._buffer = self._buffer, []
-        self.flushes += 1
-
-        groups: dict[tuple[str, str], list[Any]] = {}
-        for bar in buffered:
-            key = (bar.minute.strftime("%Y-%m-%d"), bar.underlying)
-            groups.setdefault(key, []).append(bar)
-
-        written = 0
-        for (day, underlying), bars in sorted(groups.items()):
-            directory = self.path / f"underlying={underlying}" / f"date={day}"
-            directory.mkdir(parents=True, exist_ok=True)
-            earliest = min(bar.minute for bar in bars)
-            name = f"{earliest.strftime('%Y%m%dT%H%M%SZ')}-{self.flushes:06d}.parquet"
-            file_path = directory / name
-            started = time.monotonic()
-            self._frame(bars).write_parquet(file_path)
-            duration = time.monotonic() - started
-            written += len(bars)
-            log_event(
-                logger,
-                logging.INFO,
-                log_events.STORE_FLUSH,
-                "store flush %s: %d rows to %s in %.3fs",
-                self.dataset,
-                len(bars),
-                file_path,
-                duration,
-                table=self.dataset,
-                rows=len(bars),
-                file=str(file_path),
-                duration_seconds=round(duration, 6),
-            )
-
-        self.rows_written += written
-        return written
+        return self._flush_buffer(self._legacy_path)
 
     def _frame(self, bars: list[Any]) -> pl.DataFrame:
         """Bars to a typed frame. The partition columns are deliberately absent: they are
@@ -1916,9 +1955,14 @@ class BarWriter:
         Without it a multi-second write would stop the loop, the reader with it, and Delta
         would close a connection we simply failed to drain.
 
-        A failed flush must not kill the writer: the buffer is already emptied by then, so
-        that flush's rows are lost, but a task that dies takes every later flush with it.
-        Counted, because a silent loss is the lie this project keeps refusing.
+        A failed flush must not kill the writer: a task that dies takes every later flush
+        with it. Counted, because a silent loss is the lie this project keeps refusing.
+
+        Since #101 nothing is lost to the failure itself. Both flush paths roll back and
+        keep their buffers, so the next interval flushes the same bars; `flush_errors`
+        counts a **delayed** flush rather than a destroyed one. Before #101 the monolith's
+        buffer was already empty by the time this caught anything, and that interval's
+        sealed bars were gone for good -- the aggregator does not seal a minute twice.
         """
         now = self.clock()
         if self._last_flush is not None and now - self._last_flush < self.flush_seconds:
