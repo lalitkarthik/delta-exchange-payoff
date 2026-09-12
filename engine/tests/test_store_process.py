@@ -30,6 +30,7 @@ from deltapayoff.events import (
 from deltapayoff.events.redis_wire import stream_name
 from deltapayoff.redis_bus import BusConfig, RedisBus
 from deltapayoff.store import BarStore, BarWriter, read_checkpoint
+from wait_helpers import wait_until
 
 ENGINE = Path(__file__).resolve().parents[1]
 BASE = datetime(2026, 9, 12, 10, 0, tzinfo=timezone.utc)
@@ -113,30 +114,31 @@ def _command(command: str, *, target: str = "store") -> ControlCommand:
 
 
 async def _wait_until(
-    predicate: Callable[[], bool], *, timeout: float = 5.0
+    predicate: Callable[[], bool],
+    *,
+    timeout: float = 5.0,
+    message: str = "condition not met",
 ) -> None:
-    """Poll `predicate` until it is true, or fail loudly past `timeout`.
+    """This file's bound over `wait_helpers.wait_until`, which owns the poll loop.
 
-    #93: this used to poll with `await asyncio.sleep(0)`, which yields control but not
-    time — a busy-wait, not a poll. Rescheduled immediately, it spins as fast as the
-    event loop allows and competes for the loop with the very task whose work the
-    predicate is waiting on, which is worse than a fixed sleep under load: a fixed
-    sleep at least gets out of the way. `0.005` gives the writer task real time to run,
-    matching the poll interval every other `_wait_until`/`until` helper in this suite
-    already uses (`test_process_split.py`, `test_bus_contract.py`, `test_commands.py`).
+    #93 follow-up: the poll loop here is no longer a second implementation. What stays
+    local is one number — the bound — and the reason it is not the shared 2.0s default
+    is below. `poll` is the shared 0.005.
 
-    The bound also moves from 3.0s to 5.0s. #93's own measurement (three concurrent
-    runs of this file, repeated) still timed out occasionally at 3.0s even with the
-    poll fixed — a fixed-duration bet fixed for its interval but still too tight for
+    The bound is 5.0s, moved from 3.0s by #93. That measurement stands: three concurrent
+    runs of this file, repeated, still timed out occasionally at 3.0s even once the poll
+    was fixed — a fixed-duration bet corrected for its interval but still too tight for
     its bound is the same defect half-fixed. 5.0s matches this suite's least generous
     sibling (`test_commands.py`'s `until`); the two others allow 10.0s.
+
+    The poll itself was the other half of that fix and now lives in `wait_helpers`: it
+    used to be `await asyncio.sleep(0)`, which yields control but not time — a busy-wait,
+    not a poll. Rescheduled immediately, it spins as fast as the event loop allows and
+    competes for the loop with the very task whose work the predicate is waiting on,
+    which is worse than a fixed sleep under load: a fixed sleep at least gets out of the
+    way.
     """
-
-    async def wait() -> None:
-        while not predicate():
-            await asyncio.sleep(0.005)
-
-    await asyncio.wait_for(wait(), timeout)
+    await wait_until(predicate, timeout=timeout, message=message)
 
 
 async def _start_writer(
@@ -770,14 +772,34 @@ def test_store_state_publishes_immediately_when_a_state_change_is_signalled(
             store_main.publish_state_forever(process, sleep=sleep)
         )
         try:
-            for _ in range(5):
-                await asyncio.sleep(0)
-            assert len(published) == 1
+            # #93: these two waits replaced `for _ in range(5)` and `range(10)` of
+            # `await asyncio.sleep(0)`. That was this ticket's own defect in a different
+            # unit — a fixed-duration bet counted in scheduler turns instead of seconds,
+            # betting that five yields are enough for the publisher to have run once and
+            # ten for twice. Nothing makes that true; how many passes of a real loop land
+            # inside a fixed number of yields is the scheduler's decision. The gate below
+            # never opens, so the ten-second cadence never fires: a second event can only
+            # come from the signal, which is what this test is named for.
+            #
+            # Forced red before converting, to prove the old form could lose rather than
+            # assuming it: pass `state_changed=` an `asyncio.Event` subclass whose
+            # `wait()` awaits a real `asyncio.sleep(0.02)` after `super().wait()`. That
+            # changes nothing about what the publisher does — it still publishes on the
+            # next pass after the signal — only when the loop gets round to it, which is
+            # the scheduler's decision and never the test's. `measured` 2026-09-12: the
+            # `range(10)` form failed `assert 1 == 2`; these two waits passed, 14/14.
+            # Ten yields resolve in microseconds and cannot cover a 20ms wake, however
+            # many of them you write.
+            await _wait_until(
+                lambda: len(published) == 1,
+                message="the store's first state event",
+            )
             writer.recording = False
             process.state_changed.set()
-            for _ in range(10):
-                await asyncio.sleep(0)
-            assert len(published) == 2
+            await _wait_until(
+                lambda: len(published) == 2,
+                message="a second state event, published on the signal",
+            )
             assert published[-1].recording is False
         finally:
             task.cancel()
