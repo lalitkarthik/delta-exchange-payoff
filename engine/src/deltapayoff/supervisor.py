@@ -40,6 +40,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
+from functools import partial
 
 from .adapters.base import Adapter
 from .controller import ConnectionController
@@ -168,8 +169,8 @@ class FeedSupervisor:
             )
             for controller in self._controllers
         ]
-        for task in self._tasks:
-            task.add_done_callback(_report_finished_controller)
+        for controller, task in zip(self._controllers, self._tasks, strict=True):
+            task.add_done_callback(partial(_report_finished_controller, controller))
 
     async def aclose(self) -> None:
         """Stop every controller, cancel its task, and **detach every one of them**.
@@ -250,18 +251,42 @@ def _counter(source: object, name: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _report_finished_controller(task: asyncio.Task) -> None:
+def _report_finished_controller(
+    controller: ConnectionController, task: asyncio.Task
+) -> None:
     """Say something when a controller's task ends. It should never end on its own.
 
     A controller returns from `run()` when its adapter is finished — a stop, or a spent
     budget — and a task that simply finishes raises nothing. Without this the feed can
     give up and the only symptom is a screen that stopped moving. The spent budget
     already alerts; this catches the endings that do not.
+
+    **A spent budget is not an unexpected ending, and #108 is why that now matters.** On
+    2026-09-12 this line read `the feed controller feed-delta ended unexpectedly:
+    returned without raising`, at ERROR, four seconds after `_spend_reconnect` had
+    already said the same thing properly — with the count, the alert and its own ERROR
+    record. Two error-level records for one designed outcome, one of them calling it a
+    surprise, is how a reader learns that error level means nothing here; #103 lasted two
+    hours behind exactly that habit. The ending is still reported, because a feed that has
+    given up must never be silent, and it is reported as what it is.
+
+    The discriminator is the budget and not the reason: `reason` is `stopped` for a spent
+    budget and for an adapter that simply finished, and only the first leaves nothing to
+    spend.
     """
     if task.cancelled():
         return  # shutdown, which is the one legitimate way for these to end
+    error = task.exception()
+    if error is None and controller.budget_remaining == 0:
+        logger.warning(
+            "the feed controller %s ended because its reconnect budget is spent; it "
+            "will not dial again, a resume is refused for a connection that gave up, "
+            "and only restarting this process revives it",
+            task.get_name(),
+        )
+        return
     logger.error(
         "the feed controller %s ended unexpectedly: %s",
         task.get_name(),
-        task.exception() or "returned without raising",
+        error or "returned without raising",
     )

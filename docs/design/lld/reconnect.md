@@ -168,3 +168,31 @@ Two, deliberately, because they prove different things:
 
 Every guard in this design was red-green verified in #39 by breaking it and watching the
 test fail: the budget check, the redial, the socket-signal rule and the announcement.
+
+## 8. A spent budget is permanent, on purpose - #108
+
+**The budget is spent per redial, not per outage.** Every `connection_closed` increments
+`reconnects` and calls `_spend_reconnect` (`controller.py:662-674`); only
+`message_arrived` (`:594`) restores it. One continuous DNS failure on 2026-09-12 spent all
+ten in 348 s over eleven dials, seven a minute apart at the ceiling. **That is what C6's
+"consecutive" means and it is no defect in the wording:** consecutive is the *reset* rule
+-- failures with no delivered frame between them -- not one coalescing an outage into a
+single charge. The consequence nobody had written down is arithmetic: ten drops at a 60 s
+ceiling is **ten minutes** of outage before this feed dies for good.
+
+**Dead for good, and deliberately.** `resume()` refuses a connection that gave up
+(`controller.py:~516`) and the supervisor restarts nothing (`supervisor.py:20-24`). #103
+rejected automatic restart for a *reader* because re-entering `_read` re-folds delivered
+entries; that argument does not transfer -- a producer holds no position and redialling
+re-folds nothing. **The answer is still no, for a different reason:** the budget exists to
+stop an endless dial against a venue refusing us, Delta allows 150 connections per five
+minutes, and restarting a spent controller undoes the one decision the budget is for.
+
+**So the process is the unit of restart, and `/health` is how it is asked for.** On
+2026-09-12 nothing asked: `docker restart dxp-feed` fixed it in one step, 10.9 minutes
+late, because a person looked. `feed` now answers **503** while stopped, out of budget or
+silent past `feed_main.FEED_STALE_SECONDS`, whose docstring carries the bound's derivation. Compose's `urlopen` check already fails on a 503, so `dxp-feed` stops reading
+`healthy`; **nothing yet acts on unhealthy** -- compose.yml:17 records that trade for
+`dev` deliberately and prod's ECS service is the other half. **One hazard follows:** a
+`pause` reaches `stopped` too and answers 503, rightly, since a paused feed delivers
+nothing -- but whatever restarts an unhealthy container must exclude it.

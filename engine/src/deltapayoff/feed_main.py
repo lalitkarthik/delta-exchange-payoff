@@ -10,9 +10,10 @@ from dataclasses import dataclass, field
 from importlib import import_module
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from .adapters import DeltaAdapter, DeltaFeed
+from .controller import REASON_PAUSED, RECONNECT_AFTER_SECONDS
 from .delta_client import DeltaClient, DeltaUnavailable
 from .events import ConnectionState, ControlCommand
 from .feed_runtime import relist_forever, relist_instruments
@@ -22,6 +23,31 @@ from .redis_bus import BusConfig, RedisBus
 from .supervisor import FeedSupervisor
 
 ADAPTER_ENV = "DELTA_FEED_ADAPTER"
+
+#: **The staleness bound `/health` fails on**, and the one number in this module that is a
+#: judgement rather than a fact. `derived`: three `reconnect_after` intervals, 3 x 45.0 s.
+#:
+#: **A quiet market is not a dead feed — but silence here is not a quiet market.** The
+#: venue pushes a ticker refresh every `measured` 5001 ms whether or not anything trades,
+#: which is the observation `degraded_after` (15 s, three refreshes) was derived from and
+#: `reconnect_after` (45 s, three degraded intervals) after it. This bound is the same
+#: rule applied once more, and it is the only clock available that a quiet market cannot
+#: move: `controller.last_message_age()` is reset in `sink`, by market-data events off the
+#: adapter and by nothing else. Heartbeats, transitions and `control.command` traffic all
+#: publish without touching it -- `CONTEXT.md` section 5 makes that distinction and this
+#: reuses it rather than inventing a second one.
+#:
+#: **Why three intervals and not one.** At 45 s of silence the controller cuts the socket
+#: itself (C7) and redials; a clean recovery costs about 47 s end to end, two consecutive
+#: ones about 93 s. A bound at 45 s would fail the health check for a recovery the
+#: controller completes unaided. At 135 s the feed has failed to deliver across the whole
+#: of its own recovery cycle twice over.
+#:
+#: **503 means "not delivering", not "give up on me".** Nothing in the controller reads
+#: this number and no recovery is cancelled by crossing it; it decides one thing, which is
+#: whether an operator and Docker are told. On 2026-09-12 that answer was ten minutes and
+#: fifty-four seconds late (#108).
+FEED_STALE_SECONDS = RECONNECT_AFTER_SECONDS * 3
 
 
 @dataclass
@@ -161,9 +187,147 @@ app = FastAPI(
 )
 
 
-@app.get("/health", response_model=HealthReport)
-async def health() -> HealthReport:
+def _adapter_problems(row: Any) -> list[str]:
+    """Every reason one adapter is not feeding, in the words an operator would want.
+
+    Each line is a fact the controller already holds and already published; none of them
+    is new information. On 2026-09-12 all three of the first were true at once and the
+    route answered `{"status": "ok"}` over the top of them.
+    """
+    problems: list[str] = []
+    name = row.adapter
+    if row.state is ConnectionState.STOPPED:
+        if row.reason is None:
+            problems.append(
+                f"the {name!r} connection has never been started; this process is not "
+                f"connected to the venue"
+            )
+        elif row.reason == REASON_PAUSED:
+            problems.append(
+                f"the {name!r} connection is stopped because an operator paused it; it "
+                f"delivers nothing until a resume"
+            )
+        else:
+            problems.append(
+                f"the {name!r} connection is stopped (reason {row.reason!r}) and will "
+                f"not dial again on its own; only restarting this process revives it"
+            )
+    if row.budget_remaining == 0:
+        problems.append(
+            f"the {name!r} connection has no reconnect budget left after "
+            f"{row.reconnects} drops; the next drop stops it for good"
+        )
+    age = row.last_message_age_seconds
+    if age is not None and age > FEED_STALE_SECONDS:
+        problems.append(
+            f"the {name!r} connection has delivered no market-data event for "
+            f"{age:.0f}s, past the bound of {FEED_STALE_SECONDS:.0f}s; heartbeats and "
+            f"control traffic do not reset this clock"
+        )
+    return problems
+
+
+def _bus_problems(bus: Any) -> list[str]:
+    """What the feed's own bus says about itself. **`feed` had no view of this at all.**
+
+    The publisher is the half of this process nothing was watching: every event the
+    adapter decodes goes into the outbox and the flusher is what puts it on Redis, so a
+    flusher that has exited is a feed that reads the venue perfectly and publishes
+    nothing. `redis_bus._flusher_exited` already logs it and records it under
+    `bus-flush`; until now no route asked.
+
+    **The bus is asked directly rather than through an `isinstance` guard.** This process
+    builds a `RedisBus` and only a `RedisBus` -- `lifespan` has no other branch -- so a
+    bus here that cannot answer `readers()` is a double, and a double that does not
+    implement what its subject needs should say so loudly at the first call rather than
+    be quietly skipped. `None` is the one real case: the window before `lifespan` sets
+    the state and the window after it clears it, in both of which there is no supervisor
+    either and the adapter clause has already failed the check.
+    """
+    if bus is None:
+        return []
+    problems: list[str] = []
+    for name, reader in bus.readers().items():
+        if reader["gave_up"]:
+            problems.append(
+                f"the {name!r} bus reader gave up after repeated failures and is no "
+                f"longer consuming: {reader['failure']}"
+            )
+        elif not reader["alive"]:
+            problems.append(f"the {name!r} bus reader is not running")
+    for name, detail in bus.reader_exits().items():
+        if name == "bus-flush":
+            problems.append(
+                f"the bus flusher exited and nothing this feed decodes is reaching "
+                f"Redis: {detail}"
+            )
+        else:
+            problems.append(f"the {name!r} task exited: {detail}")
+    return problems
+
+
+def _health_problems(
+    report: HealthReport, bus: Any, control_task: asyncio.Task | None
+) -> list[str]:
+    """Every reason this feed is not fine. **The list is the status; 503 is the word.**
+
+    `store_main._health_problems` is the model and this is deliberately its sibling
+    rather than a call into it -- see `docs/design/lld/reconnect.md` section 8 for the
+    argument. The one thing the two share is the rule: a non-empty list is a 503.
+
+    The empty-adapter clause is the residue this route had in common with the one #103
+    fixed. `supervisor.worst()` returns `stopped` for a supervisor with no controllers on
+    purpose -- "a process with no feed at all, which is the strongest possible not
+    ready" -- and a route that then reported `ok` over it would be the same literal in a
+    new place. Where adapters do exist, each is answered for by its own row, so this
+    clause is the no-adapter case and only that.
+    """
+    problems: list[str] = []
+    if not report.adapters and report.feed is ConnectionState.STOPPED:
+        problems.append(
+            "this feed process has no adapter running; nothing is connected to the venue"
+        )
+    for row in report.adapters:
+        problems.extend(_adapter_problems(row))
+    problems.extend(_bus_problems(bus))
+    if control_task is not None and control_task.done() and not control_task.cancelled():
+        problems.append(
+            f"the feed's control consumer exited and pause, resume and reconnect "
+            f"commands are no longer applied: "
+            f"{control_task.exception() or 'it returned without raising'}"
+        )
+    return problems
+
+
+@app.get("/health")
+async def health(response: Response) -> dict[str, Any]:
+    """**The status code is the contract, not the body** (#103, and #108 after it).
+
+    Compose's check is `urllib.request.urlopen(...)`, which raises on a status and never
+    reads a body. On 2026-09-12 this route answered 200 with `"feed": "stopped"`,
+    `"budget_remaining": 0` and a last message 583 seconds old in the same object, and
+    `docker ps` read `Up (healthy)` throughout. Every field that said the feed was dead
+    was already here; nothing reads a body, so nothing knew.
+
+    `status` stays for what reads it and stops being a constant: `ok` while the list is
+    empty, `error` when it is not, which is the shape `store` took in #103. The rest of
+    `models.HealthReport` is unchanged and still here -- #40's badge, #41's commands and
+    #44's watched set read the same keys they always did.
+    """
     supervisor = getattr(app.state, "supervisor", None)
-    if supervisor is None:
-        return HealthReport(feed=ConnectionState.STOPPED)
-    return supervisor.report()
+    report = (
+        HealthReport(feed=ConnectionState.STOPPED)
+        if supervisor is None
+        else supervisor.report()
+    )
+    payload: dict[str, Any] = report.model_dump(mode="json")
+    problems = _health_problems(
+        report,
+        getattr(app.state, "bus", None),
+        getattr(app.state, "control_task", None),
+    )
+    payload["problems"] = problems
+    if problems:
+        payload["status"] = "error"
+        response.status_code = 503
+    return payload

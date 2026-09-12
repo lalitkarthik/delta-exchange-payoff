@@ -59,6 +59,15 @@ class _Bus:
         for subscription in self.subscriptions:
             subscription.queue.put_nowait(event)
 
+    # `/health` asks the bus what its readers and its flusher are doing (#108). This
+    # double runs neither, so nothing has died -- which is a fact and not an unknown,
+    # and empty is how the real bus says it too.
+    def readers(self) -> dict[str, dict[str, object]]:
+        return {}
+
+    def reader_exits(self) -> dict[str, str]:
+        return {}
+
 
 class _Subscription:
     def __init__(self, name, capacity, lossless, event_types) -> None:
