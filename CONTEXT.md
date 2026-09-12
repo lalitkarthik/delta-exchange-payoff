@@ -81,7 +81,7 @@ steps and two words.
 | checkpoint | `<root>/_store-checkpoint.json`. It holds the watermarks and each aggregator's seal point. | [0010](docs/design/decisions/0010-store-replay.md) R2 |
 | flush intent | `<root>/_store-flush-intent.json`, written before the Parquet files and deleted after the checkpoint. | [0010](docs/design/decisions/0010-store-replay.md) R3 |
 | generation | The number in a flush file's name, so two processes cannot collide on one. | the same |
-| replay gap | A counted, alerted hole, when the watermark was trimmed before `store` came back. | [0010](docs/design/decisions/0010-store-replay.md) R5 |
+| replay gap | A counted, alerted hole: the group's position older than the oldest entry the stream still holds. Checked every poll, never only when `store` comes back. | [0010](docs/design/decisions/0010-store-replay.md) R5 |
 | seal clock | `min(wall clock, the time inside the last stream id of any stream still behind)`. | [0010](docs/design/decisions/0010-store-replay.md) R4 |
 | recording | Whether `store` is folding and flushing. Toggled by a `control.command`. | `store.py` |
 
@@ -145,6 +145,15 @@ publishes one event.
 | `assumed` | Chosen by a person. It is a belief, and a record says what would change it. |
 | `derived` | Computed from `measured` or `assumed` inputs. The arithmetic travels with it. |
 
+**Three tags, because they answer one question: where did this number come from?** Observed
+here, chosen here, computed here — every number has exactly one origin, and the origin does not
+change afterwards. A later run that agrees with an `assumed` value did not pick it and does not
+re-tag it: that run is **evidence**, it belongs beside the number with its run id, and a fourth
+tag for it would cost the reader the one fact they need — that a person chose this and could
+choose again. The only other origin a number has here is a vendor's published specification.
+Write that as AWS's published baseline, naming the page: it was neither observed, chosen nor
+computed in this repository, and it is not a tag either.
+
 ## 7. Words this repository refuses
 
 **Do not write these.** Each one hides a distinction the system depends on.
@@ -154,3 +163,8 @@ publishes one event.
 3. **"Lifetime budget"**. The budget counts consecutive failures and always has.
 4. **"Forward-fill"** anywhere near a bar. A bar summarises events that happened.
 5. **`0` for absent.** `null` is not `0`, and an unknown age is not an age of zero.
+6. **"Supported" as a tag**, in every phrasing it has taken — *supported, no longer `assumed`*;
+   *`assumed`, and now supported*; *supported, not assumed*. It names corroboration, which is
+   not an origin, and a number carrying it has lost the fact that a person chose the value.
+   Write the tag, then name the run that bounds it. #106; `engine/tests/test_nomenclature.py`
+   pins this, and §6 above is the argument.

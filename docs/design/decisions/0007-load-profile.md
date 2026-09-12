@@ -75,7 +75,7 @@ profile controls.
 
 | Rejected | Why |
 |---|---|
-| **A. By what each service produces** | The store writes 2.33 KB/s against a gp3 baseline of 125 MiB/s: 0.002%. The feed reads 6.9 Mbit/s against a 0.937 Gbps baseline: 0.73%. The adjectives are wrong for `store` and `feed`, and would buy disk and network nobody uses |
+| **A. By what each service produces** | The store writes `derived` 2.33 KB/s against gp3's published baseline of 125 MiB/s: 0.002%. The feed reads `derived` 6.9 Mbit/s against the `.large` classes' published baseline of 0.937 Gbps: 0.73%. **Both baselines are AWS-published specifications** — neither `measured`, `assumed` nor `derived` here (gp3: [EBS](https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html), read 2026-09-09; network: [../research/0008-topology.md](../research/0008-topology.md) §1, read 2026-09-12). **0.937 Gbps is kept deliberately as a floor**: it is the `.large` figure and 0008 chose `c7g.xlarge` at 1.876 Gbps, so the true share is `derived` 0.37% and this row over-states the load by 2x. The adjectives are wrong for `store` and `feed`, and would buy disk and network nobody uses |
 | **B. The monolith, divided** | It omits the two costs the bus adds: 29.96 points to encode and publish, and 22–45 points per consumer to decode. So it under-counts by 3.6–5.7×. It is how 0005 reached 6 vCPU at 10× |
 | **C. Memory-led** | The derived need at 1× is 5.05 GiB, with Redis's 3 GiB inside it; the Python services are 50–115 MiB each. 0005's 8 GB is fine, and it is not what binds. Its 3.0 vCPU is |
 

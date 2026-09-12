@@ -46,6 +46,15 @@ as late and replay delivers bytes the store throws away.
 **R5 — A trimmed position replays the retained suffix and says what was lost.** An `alert`, an
 error-level `store.replay_gap` record with both bounds and an exact count, and a counter in
 the store's state. Start-up is never refused for this.
+**When: continuously, on the `store.state` cadence, and at start-up as well — never at
+start-up alone.** The condition becomes true the moment retention passes the watermark, not
+when a process restarts. Counted every poll, alerted once per episode. This sentence is
+#106's: the silence where it stands is what [../cloud/message-bus.md](../cloud/message-bus.md)
+A5 read as "at start-up only", and R5a below is the amendment (#103) that settled it.
+**"Exact count" is qualified.** The count is exact whenever Redis can answer. When the stream
+is absent or its group is gone the count and the retained bound are `null`, because what was
+in it is unknowable — and `null` is not `0` ([../../../CONTEXT.md](../../../CONTEXT.md) §7).
+A record for that case must read *stream absent or empty*, never *lost None entries*.
 
 **R5a (#103) — and the check is continuous, not a start-up step.** A store that never restarts
 never ran R5, so a 97-minute hole reported `replay_gap_entries: 0` for two hours. The test is

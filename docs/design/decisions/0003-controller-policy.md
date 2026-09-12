@@ -138,3 +138,13 @@ nothing for 45 s; there is no latency to lose.
   ordinary gap, and then the adopted rule reconnects a working feed on a schedule.
 - **Delta's heartbeat, once enabled.** It would give a liveness signal independent of
   market data, and the second clock rejected above becomes buildable and worth building.
+
+## Appended 2026-09-12 (#106) — the tag is settled at `assumed`
+
+`reconnect_after` **stays `assumed`**, and that is now the only tag it carries anywhere:
+this record, [../lld/controller.md](../lld/controller.md) §4,
+[../cloud/controller-policies.md](../cloud/controller-policies.md) C3 and
+[../../../CONTEXT.md](../../../CONTEXT.md) §5 agree. Run `20260909T130306Z` **bounds** the value at
+6.6x the worst gap on an unbroken connection; it did not pick it, and a tag says where a
+number came from, not whether a later run agreed with it. The phrasing that briefly made
+this a fourth tag is refused in [../../../CONTEXT.md](../../../CONTEXT.md) §7.
