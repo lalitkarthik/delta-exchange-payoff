@@ -724,6 +724,51 @@ def test_a_configured_stream_missing_from_saved_positions_starts_at_the_group_st
     assert bids == [0.0, 1.0, 2.0]
 
 
+def test_a_lossless_subscriber_that_states_no_group_start_begins_at_the_tail(
+    redis_kind,
+) -> None:
+    """#97: the value a caller gets for free is `$`, never a replay of the window.
+
+    `group_start` defaulted to `"0"` until #97. All three service call sites overrode it,
+    so nothing was broken; what was wrong was which of the two values a caller got by
+    saying nothing. A group created at `0` is handed everything Redis still holds — the
+    whole thirty-minute retention window — and a lossless reader folds every entry of it
+    as if it were new. That is #84 (a restarted store folding five entries twice at a
+    seam) at the scale of the retention window, and #94's two documents disagreeing about
+    the `store` group's start id is the same value written down rather than executed.
+
+    The deliberate `"0"` is not removed and is still reachable by typing it:
+    `test_a_configured_stream_missing_from_saved_positions_starts_at_the_group_start`
+    above passes it and still replays everything retained.
+    """
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            # Published before anyone subscribes. Only a group created at `0` can see
+            # these; a group created at the head cannot.
+            for n in range(3):
+                bus.publish(quote(float(n)))
+            await settle(bus)
+            forgetful = bus.subscribe("forgetful", maxsize=100, lossless=True)
+            await live(bus)
+            bus.publish(quote(99.0))
+            await settle(bus)
+            # `drain`, not `take`: the surplus is the whole point here, and #84 is what
+            # a test satisfied by a count misses.
+            return forgetful.group_start, [event.bid for event in await drain(forgetful)]
+
+    group_start, bids = run(scenario())
+    assert group_start == "$", (
+        "a subscriber that stated no group_start resolved to "
+        f"{group_start!r}; the unstated value must be the conservative one"
+    )
+    assert bids == [99.0], (
+        f"a subscriber that stated no group_start received {bids} — it replayed the "
+        "retained window it never asked for"
+    )
+
+
 def test_replay_positions_keep_the_saved_index_and_count_every_stream_entry(redis_kind):
     kind, url = redis_kind
 

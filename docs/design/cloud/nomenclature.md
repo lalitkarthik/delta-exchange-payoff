@@ -156,6 +156,7 @@ managed Redis, and #57 has not chosen one yet.
 | Group name | the service name, lower case, one word | `store`, `api` |
 | Consumer name | `{service}-{instance}`, the container's short id or `1` | `store-1` |
 | Creation | `XGROUP CREATE <stream> <group> <id> MKSTREAM` | |
+| Start id, unstated | `$` — `RedisBus.subscribe`'s default since #97. `0` replays everything Redis still holds and has to be typed; a caller that says nothing never replays | |
 | Start id, `store` | checkpoint id in `<root>/_store-checkpoint.json` for that stream; on first start the head (`$`, taken once as a concrete id); never `0` — [0010](../decisions/0010-store-replay.md), which supersedes [0002](../decisions/0002-redis-hosting.md) on this point | |
 | Start id, `api` | `$` — never replay; the cache refills from live frames | |
 
