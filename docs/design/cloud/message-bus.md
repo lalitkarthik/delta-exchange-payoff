@@ -91,7 +91,7 @@ above them describe a restart; those two describe what the code does and does no
 | A2 | The durability boundary is the **store flush**, not the ack. `FLUSH_SECONDS` is 300 s (`assumed`, `deltapayoff.store`), so up to five minutes of bars sit in memory until a Parquet file lands. |
 | A3 | `store` restarts from its **checkpoint**, never from the pending list and never from `0`. |
 | A4 | `api` joins at `$` and **never replays**. Its cache refills from the events that arrive next. |
-| A5 | A **trimmed position** is a **replay gap**: `store` replays the retained suffix, reports both bounds and an exact count, alerts, and never refuses start-up ([0010](../decisions/0010-store-replay.md) R5). **`store` runs this check at start-up only.** |
+| A5 | A **trimmed position** is a **replay gap**: `store` replays the retained suffix, reports both bounds and an exact count, alerts, and never refuses start-up ([0010](../decisions/0010-store-replay.md) R5). **The check is continuous, on the `store.state` cadence, not a start-up step** ([0010](../decisions/0010-store-replay.md) R5a, #103). |
 | A6 | While any stream is behind, the **seal clock** is `min(wall clock, the time inside the last stream id of any stream still behind)` ([0010](../decisions/0010-store-replay.md) R4). |
 
 **A3 is what [0010](../decisions/0010-store-replay.md) changed, and it supersedes
@@ -103,15 +103,17 @@ re-record up to thirty minutes the old writer already wrote, as duplicates.
 first drain pass after any absence seals the whole backlog as late, and `store` throws away the
 bytes it just replayed. With no stream behind, the seal clock is the wall clock.
 
-**Do not read A5 as protection for a running `store`. It protects a starting one.**
-`store_main.py` counts the gap inside `_prepare_process`, against the checkpoint it has just
-read, and never again. A `store` that keeps running and stops reading raises nothing:
+**A5 protects a running `store`, not only a starting one — corrected here by #105, verified
+against `store_main.py`.** Before #103, `store_main.py` counted the gap once, inside
+`_prepare_process`, against the checkpoint it had just read, and never again: a `store` that
+kept running and stopped reading raised nothing.
 [#103](https://github.com/lalitkarthik/delta-exchange-payoff/issues/103) records a live store
 that lost **97 minutes** of market data while its own `/health` reported
 `replay_gap_entries: 0` throughout, because its bus reader had died and no restart ever ran the
-check. The continuous form — the group's `last-delivered-id` against the stream's oldest
-surviving id, two `XINFO` calls — is **not built**. Until it is, this section claims start-up
-detection and nothing more.
+check. `store_main.py`'s `poll_bus` now asks Redis where the store's consumer group stands
+every `STORE_BUS_MONITOR_INTERVAL_SECONDS` — the same ten-second cadence `store.state` already
+publishes on, one loop instead of two — and a trimmed position raises the alert whether or not
+anything has restarted since.
 
 **Acking on receipt is deliberate, and it is not the textbook pattern.** The textbook acks after the
 work and recovers from the pending list with `XAUTOCLAIM`. A per-message ack tells us nothing about

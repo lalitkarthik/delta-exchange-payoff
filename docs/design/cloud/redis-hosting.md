@@ -108,7 +108,7 @@ Starting at `0` for the cutover would re-record up to the `derived` thirty minut
 writer already put in Parquet, creating duplicates. The accepted cutover leaves the few
 seconds between stopping that writer and starting `store` unrecorded. `store.state` also
 crosses the pipe as the venue-scoped `store.state:DELTA` key: one extra key and one event every
-ten seconds (`derived`), negligible against the `measured` 1,849.8 events/s bus rate.
+ten seconds (`derived`), negligible against the `derived` 1,849.8 events/s bus rate (§6).
 
 **One consumer group per service, never one per instance** ([nomenclature.md](nomenclature.md)
 §5). Two groups on one stream each receive every entry, which is what makes the store and

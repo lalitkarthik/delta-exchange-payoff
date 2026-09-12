@@ -103,7 +103,7 @@ new service, no database, no lock file. The store's own state reaches the screen
 bus that already exists.
 
 **3. Cost.** One extra `store.state` key and about one event every ten seconds; `derived`
-negligible against the `measured` 1,849.8 events/s already on the bus. `computed.chain`
+negligible against the `derived` 1,849.8 events/s already on the bus. `computed.chain`
 published on the sampling schedule rather than on every recompute is `derived` well under
 1 KiB/s. One `fsync` per Parquet file per five minutes.
 
