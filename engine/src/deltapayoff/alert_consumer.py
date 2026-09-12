@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from . import discord_alerts, log_events
@@ -35,6 +36,7 @@ class AlertConsumer:
         gate: discord_alerts.AlertGate | None = None,
         webhook_url: str | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.bus = bus
         self.group_name = group_name
@@ -44,11 +46,17 @@ class AlertConsumer:
         self.gate = gate if gate is not None else discord_alerts.AlertGate()
         self.webhook_url = webhook_url
         self.clock = clock
+        self.wall_clock = wall_clock
+        #: When this instance subscribed. `None` until `subscribe()` runs, then fixed:
+        #: an alert timestamped before it is dropped in `_run_once`, see the comment
+        #: there for why that is decision #66's "no replay" rather than a second policy.
+        self.started_at: datetime | None = None
 
     def subscribe(self) -> Subscription | Any:
         """Register the lossless alert subscription once."""
         if self.subscription is not None:
             return self.subscription
+        self.started_at = self.wall_clock()
         if isinstance(self.bus, RedisBus):
             self.subscription = self.bus.subscribe(
                 self.group_name,
@@ -74,6 +82,25 @@ class AlertConsumer:
         """Dispatch one queue item, keeping the loop alive after a bad alert."""
         event = await self.subscription.queue.get()
         if not isinstance(event, Alert):
+            return
+        if self.started_at is not None and event.ts_received < self.started_at:
+            # Decision #66: "no replay". `group_start='$'` only keeps a *newly
+            # created* group off the backlog; rejoining an existing group (this
+            # process restarting) reads with `>` from wherever that group's
+            # last-delivered id sits, which is everything published while nothing
+            # read it -- up to the bus's retention window. Rather than a second
+            # Redis client issuing `XGROUP SETID` (considered and rejected, see
+            # docs/design/lld/discord-alerts.md), this consumer records its own
+            # start time and refuses to post anything timestamped before it, here,
+            # ahead of the gate -- so a stale alert cannot spend a real one's
+            # collapse or rate-limit slot.
+            log_event(
+                logger,
+                logging.WARNING,
+                log_events.ALERT,
+                "the alert consumer dropped an alert published before it started: %s",
+                event.code,
+            )
             return
         decision: discord_alerts.GateDecision | None = None
         try:
