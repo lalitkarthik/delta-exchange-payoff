@@ -24,12 +24,16 @@ The three JSON fixtures under `tests/fixtures/`:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -123,13 +127,6 @@ def ws_captured_at(ws_ticker_frames) -> datetime:
     return datetime.fromtimestamp(max(stamps) / 1e6, tz=timezone.utc)
 
 
-#: The test-only Redis port. **Not 6379**: a developer's own Redis, or a `dev` stack
-#: running under Compose, is on the default port, and a suite that trimmed and deleted
-#: keys there would eat a running system's streams. 6399 is the same port
-#: `tools/measure_redis_hosting.py` uses, so one container serves both.
-REDIS_TEST_PORT = 6399
-REDIS_TEST_URL = f"redis://127.0.0.1:{REDIS_TEST_PORT}"
-REDIS_CONTAINER = "deltapayoff-tests-redis-6399"
 #: The pipe's own flags, so the suite runs against the configuration
 #: `docs/design/cloud/redis-hosting.md` §1 fixes — with `maxmemory` at 1gb rather than
 #: prod's 2gb, because this runs on a laptop.
@@ -138,10 +135,87 @@ REDIS_ARGS = (
     "--maxmemory-policy noeviction"
 )
 
+#: Never 6379. A developer's own Redis, or a `dev` stack running under Compose, is on
+#: the default port, and a suite that trimmed and deleted keys there would eat a running
+#: system's streams. #92: it used to be the *only* other rule — one fixed port (6399)
+#: and one fixed container name (`deltapayoff-tests-redis-6399`) for every session. That
+#: made every worktree share one Redis: a second `pytest` session's teardown deleted the
+#: stream keys a first session's live reader was still reading from, 28 seconds after
+#: its own fixture had started it. The fix below is per-session on every axis a second
+#: session could otherwise collide on — container name, port, and (see
+#: `RedisTestSession.session_id`) the docker label that gates removal — rather than
+#: trading the collision for a slower suite, which running out of four worktrees at once
+#: cannot afford.
+REDIS_RESERVED_PORT = 6379
 
-@pytest.fixture(scope="session")
-def redis_server() -> Iterator[str]:
-    """A throwaway Redis on 6399 for the session, started and removed here.
+#: The docker label a container this fixture started carries, valued at its own
+#: `session_id`. Read back before every `docker rm`, so "a session never removes a
+#: container it did not start" holds even if two sessions' names ever collided, not only
+#: while they happen not to.
+SESSION_LABEL = "deltapayoff.test-session"
+
+#: A third axis, deliberately not here: the stream *key* itself carries no per-session
+#: component, because `events/redis_wire.stream_name()` is not allowed to grow one.
+#: #74 removed the last environment section from that grammar on purpose, and
+#: `test_redis_wire.py::test_stream_names_do_not_include_an_environment_section` pins
+#: it — a key a production consumer builds from configuration must be the same key a
+#: test publishes to, or the contract this suite exists to prove stops meaning anything.
+#: `stream_name()` is out of this ticket's scope for the same reason. The isolation this
+#: still needs comes from the other two axes instead: two sessions with different
+#: containers on different ports are never reading or trimming the same keyspace, so a
+#: shared key *string* between them never becomes a shared key.
+
+
+@dataclass(frozen=True)
+class RedisTestSession:
+    """One session's slice of the test-only Redis namespace — never shared, never reused.
+
+    `session_id` seeds the other two fields and doubles as the docker label value, so a
+    container can always be asked "whose are you" rather than trusted by name alone.
+    """
+
+    session_id: str
+    container: str
+    port: int
+
+    @property
+    def url(self) -> str:
+        return f"redis://127.0.0.1:{self.port}"
+
+
+def _free_port(*, avoid: frozenset[int] = frozenset()) -> int:
+    """A TCP port the OS says is free right now, never `REDIS_RESERVED_PORT` and never
+    one already claimed by another session built in this same process (`avoid`) — the
+    OS alone will not repeat a port to us that fast, but two sibling calls asking for a
+    free port in the same microsecond deserve a guarantee rather than a laptop's odds."""
+    for _attempt in range(20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        if port != REDIS_RESERVED_PORT and port not in avoid:
+            return port
+    raise RuntimeError("could not find a free test-Redis port after 20 attempts")
+
+
+def new_redis_test_session(
+    *, avoid_ports: frozenset[int] = frozenset()
+) -> RedisTestSession:
+    """A fresh, unique slice of the namespace. Called once per real session by
+    `redis_server`; called twice in one process by `test_redis_test_session.py` to prove
+    the two never coincide."""
+    session_id = f"{uuid.uuid4().hex[:10]}"
+    return RedisTestSession(
+        session_id=session_id,
+        container=f"deltapayoff-tests-redis-{session_id}",
+        port=_free_port(avoid=avoid_ports),
+    )
+
+
+@contextlib.contextmanager
+def redis_test_session(
+    session: RedisTestSession | None = None,
+) -> Iterator[RedisTestSession]:
+    """Start (or adopt) one throwaway Redis and remove only what this call started.
 
     **Skips loudly rather than passing quietly.** A Redis contract suite that silently
     became zero tests when Docker was not running would let the bus regress with a green
@@ -152,10 +226,12 @@ def redis_server() -> Iterator[str]:
     Nothing here touches the network: the container is local, the port is loopback and
     the image is whatever Docker already has or pulls once.
     """
+    session = session or new_redis_test_session()
     docker = shutil.which("docker")
     hint = (
-        f"docker run -d --rm --name {REDIS_CONTAINER} "
-        f"-p {REDIS_TEST_PORT}:6379 redis:7-alpine {REDIS_ARGS}"
+        f"docker run -d --rm --name {session.container} "
+        f"--label {SESSION_LABEL}={session.session_id} "
+        f"-p {session.port}:6379 redis:7-alpine {REDIS_ARGS}"
     )
     if docker is None:
         pytest.skip(f"SKIPPED LOUDLY: no docker on PATH. Start one by hand: {hint}")
@@ -172,20 +248,23 @@ def redis_server() -> Iterator[str]:
         )
 
     already = subprocess.run(  # noqa: S603
-        [docker, "ps", "-q", "--filter", f"publish={REDIS_TEST_PORT}"],
+        [docker, "ps", "-q", "--filter", f"publish={session.port}"],
         capture_output=True,
         text=True,
     )
     if already.stdout.strip():
-        # Something is already serving the port — `tools/measure_redis_hosting.py`'s own
-        # container, most likely. Use it and leave it alone; removing another process's
-        # container would be a surprise this fixture has no business springing.
-        yield REDIS_TEST_URL
+        # This session's own freshly-chosen port is already spoken for — a race against
+        # something else binding it in the instant between our probe and this check, at
+        # worst. Use it and leave it alone: removing a container this session did not
+        # start is exactly the failure #92 exists to close off, so there is no "reuse
+        # it" branch here that also owns it.
+        yield session
         return
 
     run = subprocess.run(  # noqa: S603
-        [docker, "run", "-d", "--rm", "--name", REDIS_CONTAINER,
-         "-p", f"{REDIS_TEST_PORT}:6379", "redis:7-alpine", *REDIS_ARGS.split()],
+        [docker, "run", "-d", "--rm", "--name", session.container,
+         "--label", f"{SESSION_LABEL}={session.session_id}",
+         "-p", f"{session.port}:6379", "redis:7-alpine", *REDIS_ARGS.split()],
         capture_output=True,
         text=True,
     )
@@ -195,12 +274,57 @@ def redis_server() -> Iterator[str]:
             f"({run.stderr.strip()}). By hand: {hint}"
         )
     try:
-        _await_redis(REDIS_TEST_URL)
-        yield REDIS_TEST_URL
+        _await_redis(session.url)
+        yield session
     finally:
-        subprocess.run(  # noqa: S603
-            [docker, "rm", "-f", REDIS_CONTAINER], capture_output=True, text=True
+        _remove_own_container(docker, session)
+
+
+def _owner_label(docker: str, container: str) -> tuple[bool, str | None]:
+    """`(exists, label)`. `exists` is false when `docker inspect` cannot find the name at
+    all — already gone, nothing to remove, not a foreign owner to report."""
+    inspected = subprocess.run(  # noqa: S603
+        [docker, "inspect", "-f", f'{{{{index .Config.Labels "{SESSION_LABEL}"}}}}',
+         container],
+        capture_output=True,
+        text=True,
+    )
+    if inspected.returncode != 0:
+        return False, None
+    label = inspected.stdout.strip()
+    return True, (label or None)
+
+
+def _remove_own_container(docker: str, session: RedisTestSession) -> None:
+    """The rule that makes the failure impossible, not just unlikely: read the label
+    back and refuse to remove a container this session did not start.
+
+    The name already embeds `session_id`, so nothing else should ever be able to answer
+    to it — this is the check that turns "should never" into "cannot", by naming the
+    foreign owner instead of guessing whose container it is."""
+    exists, owner = _owner_label(docker, session.container)
+    if not exists:
+        return  # already gone -- nothing this session owns is still there to remove
+    if owner != session.session_id:
+        raise RuntimeError(
+            f"refusing to remove {session.container!r}: it is owned by "
+            f"{owner!r}, not this session ({session.session_id!r})"
         )
+    subprocess.run(  # noqa: S603
+        [docker, "rm", "-f", session.container], capture_output=True, text=True
+    )
+
+
+@pytest.fixture(scope="session")
+def redis_server() -> Iterator[str]:
+    """A throwaway Redis, unique to this pytest session, started and removed here.
+
+    See `redis_test_session` for the mechanics and `RedisTestSession` for what "unique"
+    covers. Fixtures downstream (`test_bus_contract.py`, `test_alert_consumer.py`,
+    `test_process_split.py`) only ever see the URL, exactly as before #92.
+    """
+    with redis_test_session() as session:
+        yield session.url
 
 
 def _await_redis(url: str, attempts: int = 50) -> None:
