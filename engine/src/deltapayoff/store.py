@@ -175,9 +175,9 @@ FLUSH_SECONDS = 300.0
 #: were wrong and #104 found out why: the 904-minute span was a **truncated** probe run
 #: taken while 2026-09-04 was still recording, against a day whose own last entry is
 #: 19:40 — 1,181 minutes — and the 24% divided by a span that included 62 minutes the
-#: engine was down, which the probe's own denominator excludes. `tools/measure_computed_gaps.py`
-#: now reports the span it was asked for beside the span it examined, so a run like that
-#: reads as a finding rather than as a column heading.
+#: engine was down, which the probe's own denominator excludes. The probe now reports
+#: the span it was asked for beside the span it examined, so a run like that reads as a
+#: finding rather than as a column heading.
 #:
 #: With one edge-triggered sample and a grace of zero, a cached chain whose stamp fell a
 #: hair on the wrong side of the boundary refused the whole minute. More observations of
