@@ -67,8 +67,8 @@ for, and the first window long enough to see the tail.
 | Longest unbroken connection | 3,976 s (66 min); the five longest 3,976 / 3,801 / 3,020 / 2,928 / 2,004 s |
 | Connected fraction | 21,563.9 of 21,610 s = 99.79% |
 
-**`reconnect_after` = 45 s is now supported, not assumed: the worst quiet gap on a live
-socket is 6.6x inside it.** The 44.785 s gap of 2026-09-07 was, as suspected, a gap across a
+**`reconnect_after` = 45 s stays `assumed` and is now bounded by measurement: the worst
+quiet gap on a live socket is 6.6x inside it.** The 44.785 s gap of 2026-09-07 was, as suspected, a gap across a
 drop and not a quiet market; with tagging on, nothing on an unbroken connection came within
 an order of magnitude of the bound. `degraded_after` = 15 s was never crossed on an unbroken
 connection either.
