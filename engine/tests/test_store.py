@@ -531,6 +531,32 @@ async def wait_until(
         await asyncio.sleep(poll)
 
 
+def wait_until_sync(
+    condition: Callable[[], bool],
+    *,
+    timeout: float = 5.0,
+    poll: float = 0.01,
+    message: str = "condition not met",
+) -> None:
+    """`wait_until`'s sibling for a test with no event loop of its own to await on.
+
+    `TestClient(main.app)` runs the real application, background tasks included, on its
+    own event loop in another thread; a synchronous test body cannot `await` that loop,
+    only poll it from outside. #83: a fixed `time.sleep` guessing how long two passes of
+    a shortened background loop take is exactly the bet that fails under load -- the
+    loop is real and asyncio-scheduled, so how many passes land inside a fixed sleep
+    depends on how promptly the OS runs that other thread, not on anything the test
+    controls. This polls the condition itself instead, real wall-clock slack behind it
+    (`timeout`) for a loaded machine to schedule that thread, and fails on a timeout
+    with `message` rather than on whatever counter the caller was really asking about.
+    """
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{message} (timed out after {timeout}s)")
+        time.sleep(poll)
+
+
 def test_the_writer_subscribes_losslessly(tmp_path: Path) -> None:
     """Drop-oldest systematically shaves the highs and lows, because drops happen under
     load and load is when price moves fastest. That is a bias, not noise, and it is
@@ -2687,9 +2713,20 @@ def test_the_running_app_stores_our_computed_values_too(monkeypatch, tmp_path) -
 
         now = time.time()
         publish(main.app.state.events, "ticker", ticker_frame(symbol, int(now * 1e6)))
-        time.sleep(0.6)  # two of the shortened minute passes
-        assert stream.minute_passes >= 1, "the minute pass never ran"
-        assert writer.computed.stats()["ticks"] > 0, "nothing reached the aggregator"
+        # #83: this used to be a fixed time.sleep(0.6) betting on two 0.2 s passes
+        # landing inside it -- a bet that failed under load because it does not move
+        # any faster just because the loop behind it was scheduled promptly. Wait on
+        # the passes themselves instead.
+        wait_until_sync(
+            lambda: stream.minute_passes >= 1,
+            timeout=5.0,
+            message="the minute pass never ran",
+        )
+        wait_until_sync(
+            lambda: writer.computed.stats()["ticks"] > 0,
+            timeout=5.0,
+            message="nothing reached the aggregator",
+        )
 
     computed = (
         BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
