@@ -9,16 +9,27 @@ The seam is `polars.DataFrame.write_parquet` itself -- the exact call the issue 
 the one a full disk, a held file handle or a permission change actually raises from.
 Writes before the chosen one land for real, so a partial flush is a partial flush and not
 a simulation of one.
+
+The second half of this file is #107, and the same seam answers it: what the *writer*
+does about a failure it has rolled back. #101 left the two compositions with one flush
+implementation and two error handlers, and the two then disagreed -- the monolith counted
+and said nothing while the split logged and alerted. Those tests are parametrised over the
+composition so the two cannot quietly part company again.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
 
-from deltapayoff.store import BarStore
+from deltapayoff import log_events
+from deltapayoff.store import DATASET, BarStore, BarWriter
 from test_store import bar
 
 #: The message the fake failure carries, so a test can prove *which* error propagated.
@@ -167,3 +178,127 @@ def test_a_rollback_that_cannot_delete_still_raises_the_write_error(
 
     assert store.buffered == 2
     assert store.rows_written == 0
+
+
+# --- What the writer says about it -------------------------------------------------
+#
+# The tests above are about the bars. These are about the record: #107 found that a
+# flush failing in the monolith incremented `flush_errors` and told nobody -- no log at
+# any layer and no `alert` -- while the split logged at error and published
+# `store.flush_failed` for the same event. They are parametrised over the composition on
+# purpose, because two copies agreeing by inspection is exactly how the two drifted.
+
+
+#: A fixed clock reading. The commit path stamps a checkpoint and an alert from it, and
+#: a test that read the wall clock for either would behave differently in November.
+CLOCK = datetime(2026, 9, 12, 10, 2, tzinfo=timezone.utc).timestamp()
+
+
+def failing_writer(
+    root: Path, monkeypatch, *, split: bool
+) -> tuple[BarWriter, list[Any]]:
+    """A writer holding one sealed bar, whose next flush raises on the first write.
+
+    `split` selects the composition the way production does: a `checkpoint_root` is what
+    `store_main.py` passes and `main.py` deliberately does not. Both are given a
+    `publish`, so these tests are about the code path rather than about how either
+    process happens to be wired -- see `test_store.py` for the wiring.
+
+    The bar is handed to the store directly. Going through `_hand_to_store` would also
+    publish an `OptionBar` per sealed bar and the alert would have to be picked out of
+    them; this way anything in `published` is the flush's own doing.
+    """
+    published: list[Any] = []
+    writer = BarWriter(
+        BarStore(root),
+        clock=lambda: CLOCK,
+        checkpoint_root=root if split else None,
+        publish=published.append,
+    )
+    writer.store.add([bar()])
+    raising_write(monkeypatch, fail_on=1)
+    return writer, published
+
+
+def flush_failures(caplog) -> list[logging.LogRecord]:
+    """Every error-level engine record. One failed flush must leave exactly one."""
+    return [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and getattr(record, "event", None) == log_events.ENGINE_ERROR
+    ]
+
+
+def alerts(published: list[Any]) -> list[Any]:
+    return [
+        event
+        for event in published
+        if getattr(event, "code", None) == "store.flush_failed"
+    ]
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["monolith", "split"])
+def test_both_compositions_count_log_and_alert_one_failed_flush(
+    tmp_path: Path, monkeypatch, caplog: pytest.LogCaptureFixture, split: bool
+) -> None:
+    """The whole of #107 in one assertion set, driven through the flush loop itself.
+
+    Against the code before #107 the monolith parametrisation fails on the log record --
+    `_maybe_flush` incremented the counter and did nothing else -- and the split
+    parametrisation passes, which is the asymmetry the ticket is about.
+
+    `flush_errors == 1` is the other half. The obvious wrong fix is to move the counting
+    and the logging up into `_maybe_flush` for both paths, which double-counts the split,
+    where `_commit` has always counted its own failure before re-raising.
+    """
+    caplog.set_level(logging.INFO, logger="deltapayoff.store")
+    writer, published = failing_writer(tmp_path, monkeypatch, split=split)
+
+    asyncio.run(writer._maybe_flush())
+
+    assert writer.flush_errors == 1, "a failed flush was not counted exactly once"
+    records = flush_failures(caplog)
+    assert len(records) == 1, [record.getMessage() for record in caplog.records]
+    assert records[0].exc_info is not None, "the failure was logged without exc_info"
+    assert str(records[0].exc_info[1]) == DISK_FULL, "a different error was logged"
+    failures = alerts(published)
+    assert len(failures) == 1, published
+    assert failures[0].severity == "error"
+    assert failures[0].source == "store"
+    assert DISK_FULL in failures[0].detail, "the alert does not name what went wrong"
+    assert writer.buffered_rows == 1, "the bar was not kept for the next interval"
+
+
+def test_a_failed_monolith_flush_names_the_table_it_could_not_write(
+    tmp_path: Path, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The monolith flushes four tables independently, so which one failed is the one
+    thing an operator cannot work out from anything else. The split names a generation
+    instead, because a commit is one transaction over all four."""
+    caplog.set_level(logging.INFO, logger="deltapayoff.store")
+    writer, _published = failing_writer(tmp_path, monkeypatch, split=False)
+
+    asyncio.run(writer._maybe_flush())
+
+    record = flush_failures(caplog)[0]
+    assert record.table == DATASET
+    assert DATASET in record.getMessage()
+
+
+def test_the_record_belongs_to_the_flush_and_not_to_the_interval_loop(
+    tmp_path: Path, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`set_recording(False)` and `aclose` flush through `_flush_all` without going near
+    `_maybe_flush`, and a failure there is exactly as worth knowing about. Counting in
+    the loop meant those two said nothing at all; counting in the flush means every
+    caller is told once, and `_maybe_flush` can go back to its own job of not dying."""
+    caplog.set_level(logging.INFO, logger="deltapayoff.store")
+    writer, published = failing_writer(tmp_path, monkeypatch, split=False)
+
+    with pytest.raises(OSError, match=DISK_FULL):
+        writer._flush_all()
+
+    assert writer.flush_errors == 1
+    assert len(flush_failures(caplog)) == 1
+    assert len(alerts(published)) == 1

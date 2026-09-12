@@ -167,9 +167,18 @@ FLUSH_SECONDS = 300.0
 #: How often table C's chain cache is sampled, on top of the sample the minute boundary
 #: still takes. Roughly six observations of a minute rather than one.
 #:
-#: **One sample per minute lost a quarter of them.** `measured` on the live store on
-#: 2026-09-04 for expiry 25-09-2026: 217 of 904 minutes held quote bars and no computed
-#: bar, and every single gap was exactly one minute long — `run lengths: [(1, 217)]`.
+#: **One sample per minute lost about a fifth of them.** `measured` 2026-09-12 over the
+#: full 2026-09-04 day for expiry 25-09-2026: 214 of the 1,118 minutes holding a quote
+#: bar held no computed bar — 19.1% — and every gap was exactly one minute long.
+#:
+#: The figure read here until 2026-09-12 was "217 of 904 minutes, a quarter". Both halves
+#: were wrong and #104 found out why: the 904-minute span was a **truncated** probe run
+#: taken while 2026-09-04 was still recording, against a day whose own last entry is
+#: 19:40 — 1,181 minutes — and the 24% divided by a span that included 62 minutes the
+#: engine was down, which the probe's own denominator excludes. `tools/measure_computed_gaps.py`
+#: now reports the span it was asked for beside the span it examined, so a run like that
+#: reads as a finding rather than as a column heading.
+#:
 #: With one edge-triggered sample and a grace of zero, a cached chain whose stamp fell a
 #: hair on the wrong side of the boundary refused the whole minute. More observations of
 #: the same cache is the entire change: the same stamps, the same refusal rule.
@@ -1956,7 +1965,13 @@ class BarWriter:
         would close a connection we simply failed to drain.
 
         A failed flush must not kill the writer: a task that dies takes every later flush
-        with it. Counted, because a silent loss is the lie this project keeps refusing.
+        with it. **Swallowing the exception is the whole of this layer's error handling**
+        -- the counting, the log record and the alert belong to the flush transaction
+        itself, `_flush_all` in the monolith and `_commit` in the split, and both reach
+        them through one `_flush_failed` (#107). This loop adding anything of its own is
+        how the two compositions came to disagree: before #107 it counted for the
+        monolith and only for the monolith, which is why a monolith flush failure was a
+        number with no record behind it.
 
         Since #101 nothing is lost to the failure itself. Both flush paths roll back and
         keep their buffers, so the next interval flushes the same bars; `flush_errors`
@@ -1978,8 +1993,9 @@ class BarWriter:
         except FlushInterrupted:
             raise
         except Exception:
-            if self.checkpoint_root is None:
-                self.flush_errors += 1
+            # Already counted, logged and alerted where it was raised. Kept from the
+            # task so the next interval gets to retry the bars still in the buffer.
+            return
 
     def _commit(self, *, interrupt_at: str | None = None) -> int:
         """Commit one generation, or roll it back as one transaction."""
@@ -2057,17 +2073,12 @@ class BarWriter:
                 store._buffer = buffer
                 store.rows_written = row_counts[store]
                 store.flushes = flush_counts[store]
-            self.flush_errors += 1
-            log_event(
-                logger,
-                logging.ERROR,
-                log_events.ENGINE_ERROR,
+            self._flush_failed(
+                error,
                 "store flush generation %d failed and was rolled back",
                 generation,
                 generation=generation,
-                exc_info=True,
             )
-            self._publish_flush_failure(error)
             raise
 
     def _notify_state_change(self) -> None:
@@ -2086,6 +2097,47 @@ class BarWriter:
 
     def _flush_all_generation(self, generation: int) -> int:
         return sum(store.flush(generation=generation) for store in self.stores)
+
+    def _flush_failed(
+        self, error: Exception, message: str, *args: Any, **fields: Any
+    ) -> None:
+        """Count, record and announce one failed store flush. **The only place any of
+        the three happens**, and the only place `flush_errors` moves.
+
+        Two copies is how the two compositions drifted. #101 merged the two flush
+        *implementations* into one `BarStore._flush_buffer` for exactly that reason and
+        left the error handling around them as two; they then disagreed, which is #107.
+        The monolith counted and said nothing -- no log record at any layer and no
+        `alert` -- while the split logged at error and published `store.flush_failed`
+        for the same event, so the composition serving `:8000` was the one an operator
+        could not diagnose. `flush_errors` is on `/health` (#103), so a monolith failure
+        gave a person a number and nowhere to look for its cause.
+
+        The callers keep only what genuinely differs between them, which is what the
+        failure is called: a generation in the split, because a commit is one
+        transaction over all four tables, and a table in the monolith, because there is
+        no transaction there and the four flush independently.
+
+        `exc_info=error` rather than `True`: it names the exception being handled
+        instead of trusting whatever `sys.exc_info()` holds, so this reads the same from
+        a worker thread as from the loop.
+
+        **The alert reaches a consumer only where the writer was given a `publish`.**
+        `store_main.py` hands it `bus.publish`; `main.py`'s monolith hands it nothing,
+        so `_publish_flush_failure` returns early there -- see `docs/design/lld/store.md`
+        section 5.
+        """
+        self.flush_errors += 1
+        log_event(
+            logger,
+            logging.ERROR,
+            log_events.ENGINE_ERROR,
+            message,
+            *args,
+            exc_info=error,
+            **fields,
+        )
+        self._publish_flush_failure(error)
 
     def _publish_flush_failure(self, error: Exception) -> None:
         if self._publish is None:
@@ -2110,18 +2162,34 @@ class BarWriter:
             )
 
     def _flush_all(self) -> int:
-        """Write all three tables. **Blocking IO, and always on a worker thread.**
+        """Write all four tables. **Blocking IO, and always on a worker thread.**
 
-        One thread hop for three files rather than three: the hop is what keeps the disk
-        off the event loop, and three of them per interval would be three chances for the
+        One thread hop for four files rather than four: the hop is what keeps the disk
+        off the event loop, and four of them per interval would be four chances for the
         socket reader to be descheduled instead of one.
+
+        **The monolith's flush transaction, and where its failures are handled** (#107),
+        which is what makes this the mirror of `_commit` rather than a helper below it.
+        A failing table stops the pass -- the tables that already landed keep their
+        files, the failing one and the ones behind it keep their buffers, and the next
+        interval flushes exactly what is still owed. Every caller is told: the loop in
+        `_maybe_flush` swallows it to stay alive, `set_recording` and `aclose` let it
+        reach the caller that asked for the flush, and all of them now leave a record
+        behind them.
         """
-        return (
-            self.store.flush()
-            + self.reference_store.flush()
-            + self.spot_store.flush()
-            + self.computed_store.flush()
-        )
+        written = 0
+        for store in self.stores:
+            try:
+                written += store.flush()
+            except Exception as error:
+                self._flush_failed(
+                    error,
+                    "store flush %s failed and was rolled back",
+                    store.dataset,
+                    table=store.dataset,
+                )
+                raise
+        return written
 
     async def set_recording(self, recording: bool) -> bool:
         """Stop or start aggregating and writing. `docs/recording-contract.md`.

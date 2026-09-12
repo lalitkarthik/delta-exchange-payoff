@@ -24,11 +24,11 @@ table-specific rows are injected as `BarStore.pending_source`; `/smile` (`smile.
 `/chain/minutes` (`historical.list_minutes`), `/chain/at` (`historical.read_ladder_at`) and
 `/bars` (`contract_bars.read_contract_bars`) union disk with that source. Both modes expose
 the newest sealed minute; overlap is one row and disk wins. `BUFFER_HORIZON_SECONDS` bounds
-the buffer; `measured` 4.43 MiB was retained for 12,390 six-minute bars in a `tracemalloc`
-run on 2026-09-12. See [0010-store-replay.md](../decisions/0010-store-replay.md),
-[#81](https://github.com/lalitkarthik/delta-exchange-payoff/issues/81) and the crash
-protocol [store-replay.md](store-replay.md). With `DELTA_BUS` unset, FanOut keeps the
-existing in-process monolith unchanged.
+the buffer, and [store-numbers.md](store-numbers.md) says what it held. See
+[0010-store-replay.md](../decisions/0010-store-replay.md),
+[#81](https://github.com/lalitkarthik/delta-exchange-payoff/issues/81) and the crash protocol
+[store-replay.md](store-replay.md). With `DELTA_BUS` unset, FanOut keeps the existing
+in-process monolith unchanged.
 
 ---
 
@@ -38,18 +38,15 @@ existing in-process monolith unchanged.
 |---|---|---|---|
 | A `quote-bars` | contract × minute | `md.option_quote`, with `md.option_reference`'s own quote as fallback | 8.0 s |
 | B `reference-bars` | contract × minute | `md.option_reference` | 8.0 s |
-| C `computed-bars` | contract × minute | monolith: sampled from its chain cache; split store: folded from `computed.chain`, published by the api on the writer's own sampling schedule | 0.0 s monolith (`derived`); 2.0 s split (`derived` from `measured` maximum transit 1,156.8 ms) |
+| C `computed-bars` | contract × minute | monolith: sampled from its chain cache; split store: folded from `computed.chain`, published by the api on the writer's own sampling schedule | 0.0 s monolith (`derived`); 2.0 s split (`derived`) |
 | D `spot-bars` | underlying × minute | `md.index_quote` | 8.0 s |
 
 **Table C differs by composition.** The monolith samples its own `ChainStream` cache and keeps
 grace `0.0 s`; only the split composition publishes `computed.chain`. The split `BarWriter`
-folds those per-leg events, with `2.0 s` grace (`derived`: 1.45 × the `measured` 1,156.8 ms
-maximum transit, rounded above 1.68 s). The event schedule is the writer's schedule, not a
-store-side resampling of a cache.
-The split event is `schema_version` 2 with separate per-leg `call` and `put` blocks.
-Table C validation requires exact, bit-identical numeric values for rows common to both compositions;
-coverage uses the orchestrator's `measured` tolerance only for rows admitted by split grace that
-the monolith's zero-grace rule refuses. The tolerance is measured, not chosen to pass.
+folds those per-leg events, with `2.0 s` grace (`derived`). The event schedule is the writer's
+schedule, not a store-side resampling of a cache. The split event is `schema_version` 2 with
+separate per-leg `call` and `put` blocks. Both graces, and what table C validation holds the
+two compositions to, are in [store-numbers.md](store-numbers.md).
 
 ### `index-bars` — outside the four
 
@@ -73,8 +70,7 @@ Same layout as the four above: `index-bars/underlying=<asset>/date=<YYYY-MM-DD>/
 it.** Compaction exists to fold many small five-minute flush files into one; this table is
 never flushed in that shape — a backfill run writes it once, in large pages, not on the
 five-minute timer the other four share. It is born straight into the current layout, so
-`migrate_store.py`, which moves older tables into that layout, has nothing to do here
-either.
+`migrate_store.py`, which moves older tables into that layout, has nothing to do here either.
 
 ## 2. The translation, in one place
 
@@ -147,11 +143,11 @@ our arrival time is the one thing this design exists not to do.
 
 ### Graceful stop in split mode
 
-**Never forward-fill.** A minute with no arrivals produces no row — not nulls, never the
-previous close — in every table. The monolith writes a partial stop bar with true tick counts;
-the store process checkpoints the partial open minute, so a restart inside the `derived`
-thirty-minute Redis retention completes it rather than sealing a truncated bar. A stop longer
-than that `derived` retention loses the minutes trimmed from Redis, and the gap signal reports them.
+**Never forward-fill.** A minute with no arrivals produces no row — not nulls, never the previous
+close — in every table. The monolith writes a partial stop bar with true tick counts; the store
+process checkpoints the partial open minute, so a restart inside the `derived` thirty-minute Redis
+retention completes it rather than sealing a truncated bar. A stop longer than that retention loses
+the minutes trimmed from Redis, and the gap signal reports them.
 
 ## 5. Failure modes
 
@@ -163,7 +159,11 @@ than that `derived` retention loses the minutes trimmed from Redis, and the gap 
 | A symbol that will not parse into underlying/expiry/strike/type | `unparseable` grows; never filed under a guess |
 | A reference event quoting neither side | No fallback tick; a pair of absent prices is not a quote |
 | Recording switched off | The subscription is still **drained** and `discarded` grows; a lossless queue nobody empties backs up the socket reader |
-| A flush raises | All or nothing (#101): the files that flush published are removed, the buffer and the flush ordinal are left as they were, `flush_errors` grows, and the next interval flushes the same bars. Both compositions answer this way — one `BarStore._flush_buffer` implements it and `_flush_legacy` and `_flush_generation` differ only in how they name a file |
+| A flush raises | All or nothing (#101): the files that flush published are removed, the buffer and the flush ordinal are left as they were, and the next interval flushes the same bars — one `BarStore._flush_buffer` implements it and `_flush_legacy` and `_flush_generation` differ only in how they name a file. **Both compositions then say the same thing** (#107): `flush_errors` grows by exactly one, an error record carries the exception with `exc_info`, and an `alert` `store.flush_failed` is published (see below for where that lands). One `BarWriter._flush_failed` does all three, reached from `_flush_all` in the monolith and `_commit` in the split, so there is no second copy to drift; the message names a table in the monolith, where the four flush independently, and a generation in the split, where they commit as one |
+
+**A count is not a diagnosis.** `flush_errors` has been on `/health` since #103, so a failing flush
+was already a number; until #107 the monolith wrote nothing saying *why*. The alert needs somewhere
+to go too: `store_main.py` hands the writer the bus, `main.py`'s monolith hands it no `publish`.
 
 ## 6. What still speaks the venue's shape
 

@@ -1,15 +1,18 @@
 # The store -- the numbers behind the design
 
 Split out of [store.md](store.md) by #81, which pushed that file past the 200-line
-bound. Nothing here is new; every row moved unchanged. Each number carries its tag and
-the run that produced it, and a number without a run behind it does not belong here.
+bound, and added to by #107 for the same reason. Nothing here is new; every row moved
+unchanged. Each number carries its tag and the run that produced it, and a number without
+a run behind it does not belong here.
 
 ## Numbers
 
 | Number | Tag | Run |
 |---|---|---|
 | Table A/B/D grace 8.0 s | `derived` | 1.45x the 5,511 ms ceiling from `tools/measure_arrival_lag.py`, 2026-09-04 |
-| Table C grace 0.0 s | `derived` | a sample has no stragglers; see §1 |
+| Table C grace 0.0 s, monolith | `derived` | a sample has no stragglers; see [store.md](store.md) §1 |
+| Table C grace 2.0 s, split | `derived` | 1.45x the `measured` 1,156.8 ms maximum `computed.chain` transit, rounded above 1.68 s |
+| `BUFFER_HORIZON_SECONDS`: 4.43 MiB retained for 12,390 six-minute bars | `measured` | a `tracemalloc` run, 2026-09-12, #81 |
 | Arrival lag: book p50 212.6 ms, max 510.3 ms; reference median 3,176 ms, max 5,298.8 ms | `measured` | `tools/measure_arrival_lag.py`, 2026-09-04 |
 | Flush every 5 minutes, 288 files per table per day before compaction | `derived` | #16, from the measured hourly file sizes |
 | ~7,056 spot observations a minute against ~118 for one contract's book | `measured` | `tools/measure_feed.py`, 2026-09-03 |
@@ -25,6 +28,13 @@ the run that produced it, and a number without a run behind it does not belong h
 | Table A/B/D minimum window-end age before coverage is trustworthy: 308 s | `derived` | `FLUSH_SECONDS` (300 s, `deltapayoff.store`) + `QUOTE_GRACE_SECONDS` (8 s, `deltapayoff.bars`), #82 |
 | I8 (#70): `boto3` and `fsspec`/`s3fs` are absent from `engine/requirements.txt` and `engine/requirements-dev.txt` | `measured` | `grep -c -e boto3 -e fsspec -e s3fs engine/requirements*.txt`, 2026-09-12: `0` in both files. This is what `StoreHomeUnavailable` names as missing; adding one is a decision for whoever holds AWS access, made loudly rather than silently |
 | I8 (#70): 106 tests in `test_store.py` + `test_store_home.py` pass unchanged, and the host-mount write path (`_frame`, `_flush_generation`, `_flush_legacy`, `compact_partition`) has zero lines touched by this ticket's diff | `measured` | `pytest -q tests/test_store_home.py tests/test_store.py`, 2026-09-12 (106 passed); `git diff --stat` on `store.py` scoped to the functions named, same date |
+
+## What table C validation holds the two compositions to
+
+Moved here from [store.md](store.md) by #107, which needed the lines back. Exact,
+bit-identical numeric values are required for rows common to both compositions. Coverage
+uses the orchestrator's `measured` tolerance only for rows admitted by split grace that the
+monolith's zero-grace rule refuses. The tolerance is measured, not chosen to pass.
 
 ## Why conservation, not equality
 

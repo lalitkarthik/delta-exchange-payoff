@@ -169,6 +169,37 @@ def _set_replay_base(process: StoreProcess, stream: str, position: Position) -> 
 
 
 def _gap_detail(gap: Any) -> str:
+    """One sentence about a replay gap, for an `alert` and a `store.replay_gap` record.
+
+    **An absent count is said in words, never rendered as a value.** `replay_gaps`
+    answers `lost = None` when the stream is gone or its consumer group is, because what
+    it held before the saved position is then genuinely unknowable; `first_retained_id`
+    is `None` when nothing survives. Both are correct and neither may become `0` --
+    `CONTEXT.md` section 7 refuses `0` for absent, and a fabricated `0` here is the exact
+    class of lie #103 was about. What was wrong was `!r`, which put the `None` straight
+    into the operator's sentence:
+
+        stream computed.chain:DELTA:BTC lost None entries before saved position
+        1789210919555-2; first retained id is None
+
+    `measured` on the restarted stack, `docker logs dxp-store` at 2026-09-12T15:52:33Z,
+    four times, once per stream. [0010](../../docs/design/decisions/0010-store-replay.md)
+    R5 requires that case to read *absent or empty*.
+
+    A missing group does not make the stream's own contents unknown, so a retained bound
+    that exists is still reported beside the uncountable count. The countable case is
+    untouched.
+    """
+    if gap.lost is None or gap.first_retained_id is None:
+        retained = (
+            "nothing is retained"
+            if gap.first_retained_id is None
+            else f"the first retained id is {gap.first_retained_id}"
+        )
+        return (
+            f"stream {gap.stream} is absent or empty at saved position {gap.saved_id}; "
+            f"what it held before that position cannot be counted ({retained})"
+        )
     return (
         f"stream {gap.stream} lost {gap.lost!r} entries before saved position "
         f"{gap.saved_id}; first retained id is {gap.first_retained_id!r}"
