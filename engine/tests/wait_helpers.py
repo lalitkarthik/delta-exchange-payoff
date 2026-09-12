@@ -19,7 +19,11 @@ from collections.abc import Callable
 
 
 async def wait_until(
-    condition: Callable[[], bool], *, timeout: float = 2.0, poll: float = 0.005
+    condition: Callable[[], bool],
+    *,
+    timeout: float = 2.0,
+    poll: float = 0.005,
+    message: str = "condition not met",
 ) -> None:
     """Poll a real-time condition until it is true, or fail loudly past `timeout`.
 
@@ -29,11 +33,15 @@ async def wait_until(
     `timeout` is real wall-clock slack for a loaded machine to schedule the writer's
     task and, where a flush is involved, its worker thread — it does not move the fake
     clock, which the test alone controls.
+
+    `message` names the thing being waited for, so a timeout reports that rather than
+    whichever counter the caller happened to read (#93). It is the same parameter, with
+    the same default and the same rendering, as `wait_until_sync`'s.
     """
     deadline = time.monotonic() + timeout
     while not condition():
         if time.monotonic() >= deadline:
-            raise AssertionError(f"condition not met within {timeout}s")
+            raise AssertionError(f"{message} (timed out after {timeout}s)")
         await asyncio.sleep(poll)
 
 

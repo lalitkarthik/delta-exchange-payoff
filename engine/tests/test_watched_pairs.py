@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 from deltapayoff import main
 from deltapayoff.stream import GRACE_SECONDS, ChainStream
 from fakes.decoder import events_from_frame
+from wait_helpers import wait_until_sync
 
 #: Far-dated on purpose. `compute.enrich` prices from now to settlement, so a 2026
 #: expiry would have run out and every `iv` here would be null — the ladders would still
@@ -376,7 +377,10 @@ def test_the_pairs_survive_the_grace_after_the_last_socket_closes_and_then_go(
             two.receive_text()
             assert len(watched(live_app)) == 2
 
-    _wait_until(lambda: all(row["viewers"] == 0 for row in watched(live_app)))
+    wait_until_sync(
+        lambda: all(row["viewers"] == 0 for row in watched(live_app)),
+        message="both closed pairs never dropped to zero viewers",
+    )
 
     in_grace = watched(live_app)
     assert len(in_grace) == 2, "a closed pair vanished instead of entering its grace"
@@ -406,9 +410,10 @@ def test_the_recompute_set_changing_is_logged_at_debug(
     url = f"/ws/chain?underlying=BTC&expiry={EXPIRY}&interval=0.02"
     with live_app.websocket_connect(url) as socket:
         socket.receive_text()
-    _wait_until(
+    wait_until_sync(
         lambda: all(row[2] == 0 for row in main.app.state.stream.watching())
-        and main.app.state.stream.watching() != []
+        and main.app.state.stream.watching() != [],
+        message="the watched set never settled with the socket closed",
     )
 
     records = [r for r in caplog.records if r.event == "compute.recompute_set"]
@@ -494,11 +499,3 @@ def test_the_minute_pass_writes_the_board_with_no_socket_open(tmp_path: Path) ->
     }
     assert set(frame["iv"].to_list()) != {None}, "rows carry no implied volatility"
 
-
-def _wait_until(predicate, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.02)
-    raise AssertionError("condition never held")

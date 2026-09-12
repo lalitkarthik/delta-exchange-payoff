@@ -52,6 +52,7 @@ from fakes.decoder import delta_decoder
 from fakes.scripted_adapter import Frames, ScriptedAdapter, Silence
 from test_store import bar as quote_bar
 from test_store import computed_bar, reference, spot
+from wait_helpers import wait_until
 
 RECEIVED_FIRST = 1_788_430_800.5
 RECEIVED_SECOND = 1_788_430_801.5
@@ -106,12 +107,21 @@ async def _cleanup_redis(
         await client.aclose()
 
 
-async def _wait_until(predicate, timeout: float = 10.0) -> None:
-    async def poll() -> None:
-        while not predicate():
-            await asyncio.sleep(0.005)
+async def _wait_until(
+    predicate, timeout: float = 10.0, what: str = "condition not met"
+) -> None:
+    """This file's bound over `wait_helpers.wait_until`, which owns the poll loop.
 
-    await asyncio.wait_for(poll(), timeout)
+    #93 follow-up: not a second poll loop any more. The local part is the bound, 10.0s
+    rather than the shared 2.0s default, because every condition here is reached across
+    a real process seam — a Redis consumer applying a stream, a supervisor's controllers
+    all reaching CONNECTED, a cache refreshed over HTTP — not by an in-process tick.
+
+    `what` is new and defaulted, so the nine existing call sites keep working while a
+    timeout that used to raise a bare `TimeoutError` from `asyncio.wait_for` now says
+    what was being waited for.
+    """
+    await wait_until(predicate, timeout=timeout, message=what)
 
 
 def _changed_frame(frame: dict[str, Any], *, book: bool) -> dict[str, Any]:

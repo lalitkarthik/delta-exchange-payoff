@@ -385,12 +385,14 @@ def test_a_relisted_contract_is_replayed_on_the_redial() -> None:
             lambda: EARLY in sockets[0].subscribed,
             timeout=2.0,
             poll=0.005,
+            message="the early contract was never subscribed on the first connection",
         )
         adapter.subscribe([late])
         await wait_until(
             lambda: LATE in sockets[0].subscribed,
             timeout=2.0,
             poll=0.005,
+            message="the late contract was never subscribed on the live connection",
         )
         # The connection drops. The controller redials and the fresh socket is replayed.
         sockets[0].drop()
@@ -398,6 +400,7 @@ def test_a_relisted_contract_is_replayed_on_the_redial() -> None:
             lambda: len(handed) == 2 and sockets[1].subscribed == {EARLY, LATE},
             timeout=2.0,
             poll=0.005,
+            message="the redial never replayed both contracts onto a second connection",
         )
         controller.stop()
         task.cancel()
@@ -490,7 +493,12 @@ def test_a_listing_that_cannot_be_read_warns_and_leaves_the_feed_alone(
         # #93 triage: bet -- this used to be a fixed time.sleep(0.1) guessing how many
         # of the 0.01s retry ticks it covered. Wait on the retry count itself, which is
         # what the assertion below reads.
-        await wait_until(lambda: adapter.asks >= 3, timeout=6.0, poll=0.005)
+        await wait_until(
+            lambda: adapter.asks >= 3,
+            timeout=6.0,
+            poll=0.005,
+            message="the re-list loop never retried after its first failed read",
+        )
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 

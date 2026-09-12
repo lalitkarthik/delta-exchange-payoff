@@ -47,6 +47,7 @@ from deltapayoff.events import (
 from deltapayoff.events.redis_wire import stream_name
 from deltapayoff.fanout import FanOut
 from deltapayoff.redis_bus import BusConfig, BusUnavailable, Position, RedisBus, Span
+from wait_helpers import wait_until
 
 TS = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 INSTRUMENT = Instrument(
@@ -162,16 +163,17 @@ async def until(predicate, timeout: float = 10.0, what: str = "") -> None:
 
     Not a sleep: it yields until the condition holds and fails at the bound. The bound is
     a fail-safe, which is the only sense in which any test here touches a clock.
+
+    #93 follow-up: the poll loop is `wait_helpers.wait_until`, not a second copy of it.
+    What stays here is this file's own bound, 10.0s rather than the shared 2.0s default.
+    That is not decoration: every condition below is reached by a Redis reader — a real
+    consumer group, a real `XREAD` block, and in the replay tests a restarted subscriber
+    working through a backlog. A bound sized for an in-process `BarWriter` tick is not
+    the same fail-safe as one sized for that.
     """
-
-    async def poll() -> None:
-        while not predicate():
-            await asyncio.sleep(0.005)
-
-    try:
-        await asyncio.wait_for(poll(), timeout)
-    except TimeoutError:  # pragma: no cover - only on a real failure
-        raise AssertionError(f"never became true: {what}") from None
+    await wait_until(
+        predicate, timeout=timeout, message=f"never became true: {what}"
+    )
 
 
 @asynccontextmanager

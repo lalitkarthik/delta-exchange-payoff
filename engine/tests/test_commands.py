@@ -40,6 +40,7 @@ from deltapayoff.events import ConnectionState, ControlCommand, Event, FeedConne
 from deltapayoff.main import app, get_supervisor
 from deltapayoff.supervisor import FeedSupervisor
 from fakes.scripted_adapter import Frames, ScriptedAdapter, Silence
+from wait_helpers import wait_until
 
 SYMBOL = "C-BTC-77600-040926"
 #: A minimal, valid `ob_l2` frame — the same literal `test_controller.py` and
@@ -85,12 +86,19 @@ async def until(condition: Callable[[], bool], what: str, seconds: float = 5.0) 
     A `sleep` long enough to be reliable is a suite that gets slower every ticket, and
     one short enough to be quick is a suite that fails on a loaded machine. `eccf6a8`
     made the same change to the measurement tools' siblings for the same reason.
+
+    #93 follow-up: the poll loop is `wait_helpers.wait_until` now. Two things stay local
+    and both are deliberate. `what` is a **required positional**, so a wait here cannot
+    be written without saying what it waits for — all ten call sites in this file name
+    their condition, and that is worth keeping enforceable. `seconds` is this file's
+    bound, 5.0s rather than the shared 2.0s default, sized for a `ConnectionController`
+    state machine that dials, subscribes and redials on its own schedule.
     """
-    deadline = time.monotonic() + seconds
-    while not condition():
-        if time.monotonic() > deadline:
-            raise AssertionError(f"timed out after {seconds}s waiting for {what}")
-        await asyncio.sleep(0.005)
+    await wait_until(
+        condition,
+        timeout=seconds,
+        message=f"timed out waiting for {what}",
+    )
 
 
 def controller_over(adapter: ScriptedAdapter, published: list[Event], **kwargs):
