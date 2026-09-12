@@ -32,9 +32,16 @@ produces a parseable line with `event: "log"`.
 ## 3. The sinks
 
 One `DailyFileHandler` per process writes `<repo root>/logs/<YYYY-MM-DD>.log`, one JSON line
-per record, checking the date on every `emit()` rather than with a timer. A second coloured
-handler is attached only when `sys.stderr.isatty()` is true, so redirected stderr contains
-no ANSI escape codes.
+per record, checking the date on every `emit()` rather than with a timer.
+
+**A second handler always writes to `sys.stderr`, and `is_terminal` decides only its
+formatter** (#103): `ColorFormatter` at a terminal, `JsonFormatter` otherwise, so redirected
+stderr still contains no ANSI escape codes and a container is no longer silent. The handler
+itself used to be gated on `sys.stderr.isatty()`. In `dxp-store` `/proc/1/fd/2` is a pipe, so
+it was never attached: seven hours of records -- 252 `store.flush` among them -- went only to
+`/app/logs`, which no volume was mounted on, while `docker logs` showed four lines of uvicorn
+and the store had stopped consuming. `compose.yml` now also mounts `./.stack-logs/<service>`
+over `/app/logs`, so the durable copy survives the container as well.
 
 Both handlers are attached to `logging.getLogger("deltapayoff")`, not root, and `propagate`
 stays true so `pytest`'s `caplog` captures through the root handler. Configuration is

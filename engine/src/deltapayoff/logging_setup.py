@@ -202,7 +202,10 @@ def configure_logging(
     level: int = logging.DEBUG,
     is_terminal: Callable[[], bool] = lambda: sys.stderr.isatty(),
 ) -> logging.Logger:
-    """Attach the JSON file handler, and a coloured one when a terminal is attached.
+    """Attach the JSON file handler, and a console handler beside it — always.
+
+    **The console handler is unconditional; `is_terminal` picks its formatter** (#103).
+    Gating the handler itself on a tty is what made a containerised process silent.
 
     **Idempotent.** Importing `main` more than once in a process — which every test
     file that imports it does — must not multiply the handlers, or one call to
@@ -226,10 +229,16 @@ def configure_logging(
     file_handler.setFormatter(JsonFormatter())
     target.addHandler(file_handler)
 
-    if is_terminal():
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setFormatter(ColorFormatter())
-        target.addHandler(console_handler)
+    # **A tty chooses the formatter, never whether the handler exists** (#103). It was
+    # the gate, and in a container `sys.stderr` is a pipe, so the only stream handler
+    # was never attached: seven hours of records — 252 `store.flush` among them — went
+    # to `/app/logs`, which no volume was mounted on, and `docker logs` showed nothing
+    # while the store had stopped consuming. A container is the normal case and not the
+    # exception. Colour is for a person; JSON is for `docker logs`, for the shipper #71
+    # wants, and for anything that parses a line rather than looks at it.
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(ColorFormatter() if is_terminal() else JsonFormatter())
+    target.addHandler(console_handler)
 
     _configured_loggers.add(logger_name)
     return target

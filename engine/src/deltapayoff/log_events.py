@@ -58,6 +58,12 @@ ALERT = "alert"
 #: Redis is otherwise a silent misconfiguration. Also carries the queue's own resync,
 #: which is a **warning**: a drop-oldest reader that jumped counts what it skipped here.
 BUS_SELECTED = "bus.selected"
+#: A bus reader's own lifetime: a read that raised and was retried, a reader that
+#: recovered, and a reader that gave up or exited and is no longer consuming. Warning
+#: while it is still running, error once it is not -- #103, where every reader in three
+#: services died inside 34 seconds and the only record of it was one `engine.error`
+#: apiece in a file no volume was mounted on.
+BUS_READER = "bus.reader"
 #: A catch-all for a defensive branch that should not run: an unexpected exception in a
 #: background task, a watchdog that died, a config value that could not be honoured.
 #: Always error or worse; never on a path this project expects to take.
@@ -80,6 +86,7 @@ ALL = frozenset(
         WS_CLIENT_DETACH,
         ALERT,
         BUS_SELECTED,
+        BUS_READER,
         ENGINE_ERROR,
     }
 )

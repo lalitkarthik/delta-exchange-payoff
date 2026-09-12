@@ -146,11 +146,11 @@ Nine travel outbound from a producer to the bus. One travels inbound.
   failed, or a lossless queue dropped a message — which should be impossible and is logged at
   error.
 - **Payload** `severity`, `code` (a short stable name), `detail`, and `adapter` where one applies.
-- **Codes emitted so far.** The controller (#38): `connection_silent`, when silence passes
-  `reconnect_after` and forces `-> reconnecting`; and `poll_failing`, when the watchdog's own
-  polls keep raising. **`degraded` does not alert, and nor does a `pause`** — fifteen quiet
-  seconds is already a badge and a heartbeat, a pause is something a person just did, and an
-  alert on either is the flood an alert exists to stand out from. Budget codes are #39's.
+- **Codes emitted so far.** The controller (#38): `connection_silent`, silence past
+  `reconnect_after`; `poll_failing`, its watchdog's polls raising. The store (#103):
+  `store.flush_failed`, `store.replay_gap`, `store.consumer_lag`. The bus (#103):
+  `bus.reader_stopped`. **`degraded` does not alert, and nor does a `pause`** — fifteen quiet
+  seconds is already a badge and a heartbeat, a pause is something a person just did, and an alert on either is the flood an alert exists to stand out from.
 
 ### `control.command` — the one inbound event
 

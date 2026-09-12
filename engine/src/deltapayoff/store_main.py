@@ -17,14 +17,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from . import log_events
 from .bars import COMPUTED_SPLIT_GRACE_SECONDS, ComputedAggregator
 from .events import Alert, ControlCommand, StoreState
 from .logging_setup import configure_logging, log_event
 from .main import live_underlyings
-from .redis_bus import Position, RedisBus
+from .redis_bus import Position, RedisBus, StreamLag
 from .store import (
     COMPUTED_DATASET,
     COMPUTED_SCHEMA,
@@ -55,6 +55,45 @@ STORE_STATE_INTERVAL_SECONDS = 10.0
 STORE_QUEUE_SIZE = 100_000
 STORE_CONTROL_QUEUE_SIZE = 100
 
+#: How often the store asks Redis where its own consumer group stands.
+#:
+#: Ten seconds, and it is not a fresh number: it is `STORE_STATE_INTERVAL_SECONDS`, the
+#: cadence this process already publishes its state on. Two loops on one period are one
+#: thing to reason about. The cost is two `XINFO` calls per stream per ten seconds --
+#: `derived` 0.8 calls a second across four streams -- against a `measured` 1,849.8
+#: entries a second flowing the other way.
+STORE_BUS_MONITOR_INTERVAL_SECONDS = STORE_STATE_INTERVAL_SECONDS
+
+#: How far behind a lossless consumer may fall before it is no longer merely busy.
+#:
+#: **`assumed`, and derived from a number this store already declares rather than chosen
+#: beside it.** It is `STORE_QUEUE_SIZE`, the lossless watermark, and the ticket sets the
+#: two bounds it has to sit between: "a store 1.86 million entries behind must not report
+#: ok; a store 500 entries behind on a busy tick must not report failure."
+#:
+#: * 500 is `DEFAULT_READ_COUNT`, one read batch, and `measured` the exact pending count
+#:   at the moment the reader died. One batch in flight is what working looks like.
+#: * 100,000 is 200 batches, and `derived` 54.1 seconds of traffic at 1,849.8 entries a
+#:   second -- 3.0% of the thirty-minute retention window.
+#: * Data starts being destroyed at `derived` about 3.33 million entries, which is the
+#:   whole window at that rate. The incident was 1.86 million on one stream and 2.23
+#:   million across three.
+#:
+#: So the threshold is two hundred times a busy tick and one thirty-third of the point of
+#: no return, which leaves `derived` about 29 minutes to act on it. It is also the depth
+#: at which the bus's own lossless queue is full, so past it back-pressure is the story
+#: whatever else is true.
+#:
+#: **What would change it:** a `measured` rate materially above 1,849.8 entries a second,
+#: or a retention window shorter than thirty minutes. Both move the headroom, not the
+#: reasoning.
+STORE_LAG_ALERT_ENTRIES = STORE_QUEUE_SIZE
+
+#: How many monitor intervals may pass before the monitor itself is presumed stopped.
+#: The whole lesson of #103 is that a loop can die quietly, and this file has just been
+#: given another loop.
+STORE_BUS_MONITOR_STALE_INTERVALS = 3
+
 
 @dataclass
 class StoreProcess:
@@ -71,6 +110,19 @@ class StoreProcess:
     state_last_signature: tuple[bool, int, int] | None = None
     state_last_published_at: float | None = None
     state_changed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    #: The last answer `poll_bus` got, and when. **`/health` reads this and never Redis**:
+    #: a health route that made a round trip would hang on exactly the Redis whose
+    #: sickness it is meant to report, and Compose would read the timeout as the process
+    #: being down rather than the bus being behind.
+    bus_lag: dict[str, int | None] = field(default_factory=dict)
+    bus_gaps: tuple[str, ...] = ()
+    bus_checked_at: float | None = None
+    bus_check_errors: int = 0
+    #: Per stream, the replay-gap loss already added to `replay_gap_entries`, so a
+    #: condition that stays true for two hours is counted once and then only as it grows.
+    replay_gap_counted: dict[str, int] = field(default_factory=dict)
+    replay_gap_alerted: set[str] = field(default_factory=set)
+    lag_alerted: set[str] = field(default_factory=set)
 
     @property
     def config(self) -> Any:
@@ -240,6 +292,11 @@ async def _prepare_process(
                         process, gap.stream, Position(gap.saved_id, gap.trimmed)
                     )
     await bus.start_readers()
+    # Seed the continuous check from the position the readers just took, without
+    # re-announcing what the start-up gap check above has already alerted on. It also
+    # means `/health` has a real answer from the first request rather than after the
+    # monitor's first tick.
+    await poll_bus(process, announce=False)
 
     if checkpoint is None:
         checkpoint = _first_checkpoint(process)
@@ -353,16 +410,237 @@ async def consume_control(process: StoreProcess) -> None:
             process.writer.enqueue_command(event)
 
 
+def _publish_alert(process: StoreProcess, code: str, detail: str) -> None:
+    """One alert on the bus, with the publisher's failure kept inside this function."""
+    try:
+        process.bus.publish(
+            Alert(
+                source="store",
+                ts_received=_utc_from_clock(process.clock),
+                severity="error",
+                code=code,
+                detail=detail,
+            )
+        )
+    except Exception:
+        log_event(
+            logger,
+            logging.ERROR,
+            log_events.ENGINE_ERROR,
+            "the store could not publish a %s alert",
+            code,
+            exc_info=True,
+        )
+
+
+def _note_replay_gaps(
+    process: StoreProcess, lags: dict[str, StreamLag], *, announce: bool
+) -> None:
+    """Count what was trimmed unread, and say so once.
+
+    **Counted every poll, alerted once.** The condition stays true for as long as the
+    store stays stopped -- two hours and 720 polls in the incident -- so the alert marks
+    the transition into it and `/health` carries the standing signal. An alert repeated
+    720 times is an alert nobody reads, and the Discord consumer takes all of them.
+
+    The counter still moves on every poll, because the hole keeps growing while nothing
+    reads: what is added is the increase over what this stream has already contributed.
+    """
+    for stream, lag in lags.items():
+        if not lag.trimmed_past:
+            # Recovered, or never gapped. A later gap on this stream is a new episode.
+            process.replay_gap_alerted.discard(stream)
+            continue
+        lost = lag.lost
+        if lost is not None:
+            already = process.replay_gap_counted.get(stream, 0)
+            if lost > already:
+                process.writer.replay_gap_entries += lost - already
+                process.replay_gap_counted[stream] = lost
+        if not announce or stream in process.replay_gap_alerted:
+            continue
+        process.replay_gap_alerted.add(stream)
+        detail = (
+            f"stream {stream} is at {lag.last_delivered_id} and the oldest entry Redis "
+            f"still holds is {lag.first_retained_id}; {lost!r} entries were trimmed "
+            f"before the store read them and cannot be replayed"
+        )
+        _publish_alert(process, "store.replay_gap", detail)
+        log_event(
+            logger,
+            logging.ERROR,
+            log_events.STORE_REPLAY_GAP,
+            detail,
+            stream=stream,
+            saved_id=lag.last_delivered_id,
+            first_retained_id=lag.first_retained_id,
+            lost=lost,
+        )
+
+
+def _note_lag(
+    process: StoreProcess, lags: dict[str, StreamLag], *, announce: bool
+) -> None:
+    """Alert a lossless consumer past the threshold, once per excursion."""
+    for stream, lag in lags.items():
+        entries = lag.lag
+        if entries is None or entries <= STORE_LAG_ALERT_ENTRIES:
+            # Hysteresis: back under the threshold, and the next excursion is new.
+            process.lag_alerted.discard(stream)
+            continue
+        if not announce or stream in process.lag_alerted:
+            continue
+        process.lag_alerted.add(stream)
+        detail = (
+            f"the store's lossless consumer group is {entries} entries behind on "
+            f"{stream}, past the threshold of {STORE_LAG_ALERT_ENTRIES}"
+        )
+        _publish_alert(process, "store.consumer_lag", detail)
+        log_event(
+            logger,
+            logging.ERROR,
+            log_events.ALERT,
+            detail,
+            stream=stream,
+            lag=entries,
+            threshold=STORE_LAG_ALERT_ENTRIES,
+        )
+
+
+async def poll_bus(process: StoreProcess, *, announce: bool = True) -> None:
+    """Ask Redis where the store's group stands, and act on the answer.
+
+    **This is #103's fifth change and the one with no threshold in it.** The replay-gap
+    check used to live inside `_prepare_process`, so it ran only at start-up -- and
+    `CONTEXT.md`'s "when the watermark was trimmed before `store` came back" was the whole
+    problem. A store that never restarts never came back, so the only code path that could
+    raise a replay gap was never reached, and `replay_gap_entries` reported `0` for two
+    hours through the exact condition it was built to report.
+
+    A replay gap is not an event that happens at start-up. It is a condition that becomes
+    true the moment retention passes the watermark, and it is true right now whether or
+    not anyone restarts.
+
+    `announce=False` is start-up's own call: `_prepare_process` has already alerted on
+    the saved positions it checked, so this seeds the baselines without saying it twice.
+    """
+    try:
+        lags = await process.bus.consumer_lag(process.subscription)
+    except Exception:
+        process.bus_check_errors += 1
+        log_event(
+            logger,
+            logging.ERROR,
+            log_events.ENGINE_ERROR,
+            "the store could not read its own consumer group's position",
+            exc_info=True,
+        )
+        return
+    process.bus_lag = {stream: lag.lag for stream, lag in lags.items()}
+    process.bus_gaps = tuple(
+        sorted(stream for stream, lag in lags.items() if lag.trimmed_past)
+    )
+    _note_replay_gaps(process, lags, announce=announce)
+    _note_lag(process, lags, announce=announce)
+    process.bus_checked_at = process.clock()
+
+
+async def monitor_bus_forever(
+    process: StoreProcess,
+    *,
+    sleep: Callable[[float], Any] = asyncio.sleep,
+) -> None:
+    """Poll on the ten-second cadence. **It may not raise out of itself.**
+
+    `poll_bus` swallows and counts its own failures, and this loop adds nothing that can
+    throw, because a monitoring loop that dies is precisely the shape of the defect it
+    was written to catch. `/health` does not take this loop's word for it either: it
+    reports an error when the last poll is older than three intervals.
+    """
+    while True:
+        await poll_bus(process)
+        await sleep(STORE_BUS_MONITOR_INTERVAL_SECONDS)
+
+
+def _health_problems(process: StoreProcess) -> list[str]:
+    """Every reason this store is not fine, in the words an operator would want.
+
+    **Nothing here is a judgement except the lag threshold.** A reader that is not
+    running, a task that exited, a watermark trimmed past, a monitor that has stopped
+    monitoring: each is a fact, and each one made itself invisible on 2026-09-12.
+    """
+    problems: list[str] = []
+    for name, reader in process.bus.readers().items():
+        if reader["gave_up"]:
+            problems.append(
+                f"the {name!r} bus reader gave up after repeated failures and is no "
+                f"longer consuming: {reader['failure']}"
+            )
+        elif not reader["alive"]:
+            problems.append(f"the {name!r} bus reader is not running")
+    for name, detail in process.bus.reader_exits().items():
+        problems.append(f"the {name!r} task exited: {detail}")
+    for stream in process.bus_gaps:
+        problems.append(
+            f"the consumer group's position on {stream} is older than the oldest entry "
+            f"the stream still holds; data has been trimmed before it was read"
+        )
+    if process.writer.replay_gap_entries:
+        problems.append(
+            f"{process.writer.replay_gap_entries} entries were trimmed before the store "
+            f"read them"
+        )
+    for stream, entries in process.bus_lag.items():
+        if entries is not None and entries > STORE_LAG_ALERT_ENTRIES:
+            problems.append(
+                f"the consumer group is {entries} entries behind on {stream}, past the "
+                f"threshold of {STORE_LAG_ALERT_ENTRIES}"
+            )
+    checked = process.bus_checked_at
+    stale_after = (
+        STORE_BUS_MONITOR_INTERVAL_SECONDS * STORE_BUS_MONITOR_STALE_INTERVALS
+    )
+    if checked is None:
+        problems.append("the store has not yet read its own consumer group's position")
+    elif process.clock() - checked > stale_after:
+        problems.append(
+            f"the store has not read its own consumer group's position for "
+            f"{process.clock() - checked:.0f}s"
+        )
+    return problems
+
+
 def _health_payload(process: StoreProcess) -> dict[str, Any]:
+    """What this process knows about itself, and **whether that is acceptable**.
+
+    `"status": "ok"` was a literal here. It stayed `ok` through two hours in which the
+    store read nothing, 97 minutes of market data were trimmed away unread and every
+    minute in between was sealed empty. `generation` and `rows_written` were advancing
+    and both true; `buffered_rows: 0` reads identically to a quiet market. There was no
+    field in this payload a person could have looked at and known.
+    """
     writer = process.writer
+    problems = _health_problems(process)
+    checked = process.bus_checked_at
     return {
-        "status": "ok",
+        "status": "ok" if not problems else "error",
+        "problems": problems,
         "recording": writer.recording,
         "generation": writer.generation,
         "buffered_rows": writer.buffered_rows,
         "rows_written": writer.rows_written,
         "replay_gap_entries": writer.replay_gap_entries,
         "already_flushed": _already_flushed(process),
+        "flush_errors": writer.flush_errors,
+        "readers": process.bus.readers(),
+        "reader_exits": process.bus.reader_exits(),
+        "consumer_lag": dict(process.bus_lag),
+        "lag_threshold": STORE_LAG_ALERT_ENTRIES,
+        "replay_gap_streams": list(process.bus_gaps),
+        "bus_checked_seconds_ago": (
+            None if checked is None else round(process.clock() - checked, 3)
+        ),
+        "bus_check_errors": process.bus_check_errors,
     }
 
 
@@ -384,6 +662,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         asyncio.create_task(process.writer.run(), name="store-writer"),
         asyncio.create_task(consume_control(process), name="store-control"),
         asyncio.create_task(publish_state_forever(process), name="store-state"),
+        asyncio.create_task(monitor_bus_forever(process), name="store-bus-monitor"),
     ]
     publish_state(process)
     app.state.process = process
@@ -392,6 +671,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.store = process.writer
     app.state.control_task = process.tasks[1]
     app.state.state_task = process.tasks[2]
+    app.state.monitor_task = process.tasks[3]
     try:
         yield
     finally:
@@ -405,6 +685,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "store",
                 "control_task",
                 "state_task",
+                "monitor_task",
             ):
                 setattr(app.state, name, None)
 
@@ -420,11 +701,21 @@ app = FastAPI(
 
 
 @app.get("/health")
-async def health() -> dict[str, Any]:
+async def health(response: Response) -> dict[str, Any]:
+    """**The status code is the contract, not the body** (#103).
+
+    Compose's health check is `urllib.request.urlopen(...)`, which fails on a status and
+    reads nothing at all; every container in the stalled stack reported
+    `Up 7 hours (healthy)` for seven hours because this route answered 200 whatever had
+    happened. A body that said `stalled` behind a 200 would have changed nothing.
+    """
     process = getattr(app.state, "process", None)
     if process is None:
         return {"status": "ok"}
-    return _health_payload(process)
+    payload = _health_payload(process)
+    if payload["status"] != "ok":
+        response.status_code = 503
+    return payload
 
 
 __all__ = [
@@ -435,6 +726,10 @@ __all__ = [
     "consume_control",
     "health",
     "lifespan",
+    "STORE_BUS_MONITOR_INTERVAL_SECONDS",
+    "STORE_LAG_ALERT_ENTRIES",
+    "monitor_bus_forever",
+    "poll_bus",
     "publish_state",
     "publish_state_forever",
     "state_event",

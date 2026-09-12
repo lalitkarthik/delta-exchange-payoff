@@ -90,8 +90,8 @@ drop-oldest semantics. `/chain` and `/expiries` answer from `ChainStream` in tha
 #### The store process
 
 `deltapayoff.store_main:app` owns the lossless `store` consumer group, its checkpoint and
-replay from the last flush, and is the only writer of the four tables. It exposes one route,
-`GET /health`, and publishes `store.state`; the protocol is [store-replay.md](lld/store-replay.md).
+replay from the last flush, and is the only writer of the four tables. It publishes `store.state`;
+the protocol is [store-replay.md](lld/store-replay.md). Its one route, `GET /health`, is **readiness, not liveness** — 503 once its reader stops, its group is trimmed past, or its lag passes the threshold ([store-health.md](lld/store-health.md)).
 
 ### 2.4 The bus
 

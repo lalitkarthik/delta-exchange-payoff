@@ -45,8 +45,9 @@ import contextlib
 import logging
 import os
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from . import log_events
@@ -98,6 +99,43 @@ DEFAULT_READ_BLOCK_MS = 500
 #: the queue depth jumping by more than the watermark it is measured against.
 DEFAULT_READ_COUNT = 500
 
+#: How many **consecutive** failures a reader survives before it gives up and says so.
+#:
+#: **The symmetry with the publisher is deliberate and it is not total** (#103). The
+#: publisher retries forever because its alternative is worse: the batch it is holding
+#: exists nowhere else, its outbox is bounded and counted, and a publisher that stopped
+#: would lose the venue's own data. A reader holds nothing — everything it has not read
+#: is still in the stream — so retrying forever buys it nothing, and on a subscription
+#: that is genuinely broken rather than briefly unreachable it spins silently while the
+#: retention window eats the backlog. That is the failure this ticket is about, reached
+#: by the other road.
+#:
+#: So the retry is bounded and **giving up is loud**: an `alert` on the bus, an error
+#: record, the subscription marked not alive, and every stream it holds reported behind
+#: so the store's seal clock stops advancing over data nobody read. Bounded retry would
+#: be strictly worse than retrying forever without those; with them it is strictly
+#: better, because a reader that cannot recover is a fact an operator should be told
+#: rather than one a counter should hide.
+#:
+#: Five, `assumed`. `derived` about 15.5 s of disturbance ridden out at the backoff
+#: below, which covers a Redis restart (`measured` #61: a `redis:7-alpine` container is
+#: answering again inside 2 s) and the 2.0 s socket timeout that started this several
+#: times over, while staying far short of the 30-minute retention window.
+DEFAULT_READ_RETRIES = 5
+
+#: The first wait after a failed read, doubling to the ceiling below. No jitter, for the
+#: same reason `controller-policies.md` C5 gives: one reader per process per stream, so
+#: there is no herd to disperse.
+DEFAULT_READ_RETRY_SECONDS = 0.5
+
+#: The longest a reader waits between retries. `derived` 0.5+1+2+4+8 = 15.5 s over the
+#: five attempts above.
+DEFAULT_READ_RETRY_CEILING_SECONDS = 8.0
+
+#: The floor under "this reader has not come round recently", in seconds. The real bound
+#: is derived from the socket timeout — see `BusConfig.stale_after_seconds`.
+MIN_READER_STALE_SECONDS = 5.0
+
 #: The outbox ceiling, in entries. `derived` about 108 seconds at 1,849.8 events/s — long
 #: enough to ride out a Redis restart, short enough that it is a bounded number of bytes
 #: rather than "until the process dies".
@@ -126,6 +164,52 @@ class Span:
 
     frm: Mapping[str, str]
     to: Mapping[str, str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class StreamLag:
+    """One consumer group's position in one stream, as Redis reports it.
+
+    **Everything here comes out of `XINFO`, and the two questions it answers are not the
+    same question** (#103). *How far behind* is a number with a threshold on it, because
+    a store half a second behind on a busy tick is working. *Whether the group has been
+    trimmed past* is exact and needs no threshold at all: when the group's
+    `last-delivered-id` is older than the oldest entry the stream still holds, entries
+    existed, were never delivered, and are gone.
+    """
+
+    stream: str
+    #: Redis's own `lag`: entries not yet delivered to the group. `None` when Redis
+    #: cannot compute it, which it says rather than guessing.
+    lag: int | None
+    entries_read: int | None
+    entries_added: int | None
+    length: int | None
+    last_delivered_id: str | None
+    first_retained_id: str | None
+
+    @property
+    def trimmed_past(self) -> bool:
+        """The exact test for a replay gap, and it is one comparison."""
+        if self.last_delivered_id is None or self.first_retained_id is None:
+            return False
+        return _id_before(self.last_delivered_id, self.first_retained_id)
+
+    @property
+    def lost(self) -> int | None:
+        """Entries trimmed away that this group had not read. `None` if unknowable.
+
+        The same arithmetic `replay_gaps` uses at start-up -- `entries-added` minus
+        `length` is what was trimmed -- with the group's own `entries-read` in place of
+        the saved watermark's index. Redis keeps `entries-read` on the same logical scale
+        as `entries-added`, including for a group created at `$`, so the subtraction is
+        exact rather than an estimate.
+        """
+        if self.entries_added is None or self.length is None:
+            return None
+        if self.entries_read is None:
+            return None
+        return max(0, (self.entries_added - self.length) - self.entries_read)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +244,13 @@ class BusConfig:
     read_block_ms: int = DEFAULT_READ_BLOCK_MS
     read_count: int = DEFAULT_READ_COUNT
     max_outbox: int = DEFAULT_MAX_OUTBOX
+    read_retries: int = DEFAULT_READ_RETRIES
+    read_retry_seconds: float = DEFAULT_READ_RETRY_SECONDS
+    read_retry_ceiling_seconds: float = DEFAULT_READ_RETRY_CEILING_SECONDS
+    #: How long a reader may go without completing a pass before it is treated as having
+    #: stopped. `None` derives it from the socket timeout, which is the longest a healthy
+    #: pass can take.
+    reader_stale_seconds: float | None = None
     #: What a reader waits after a read that returned nothing. **Not a poll interval and
     #: not optional**: a blocking `XREAD` already waits, so this only fires when the block
     #: expired empty — but a client that does not honour `BLOCK` (the in-memory fake is
@@ -193,6 +284,24 @@ class BusConfig:
             # back into bytes for `json.loads`, and would decode ids nobody reads as text.
             "decode_responses": False,
         }
+
+    def stale_after_seconds(self) -> float:
+        """How long a silent reader is given before it is presumed stopped.
+
+        **Derived from the socket timeout, not chosen beside it.** A healthy pass cannot
+        outlast the timeout on the socket it reads through — `measured` in the incident,
+        that was 2.0 s — so twice it is a bound no working reader reaches, and the floor
+        keeps it sane on a configuration with a very short timeout.
+
+        The cost of the two mistakes is not symmetric, which is why the bound is tight
+        rather than generous. A reader wrongly called stopped seals a minute late and the
+        next pass corrects it. A reader wrongly called caught up seals a minute **empty**,
+        and a sealed minute is closed: nothing corrects it, and 97 of them are gone.
+        """
+        if self.reader_stale_seconds is not None:
+            return self.reader_stale_seconds
+        socket_timeout = float(self.client_kwargs()["socket_timeout"])
+        return max(MIN_READER_STALE_SECONDS, socket_timeout * 2)
 
     def streams(self) -> tuple[str, ...]:
         return stream_names(
@@ -236,6 +345,15 @@ class RedisSubscription(Subscription):
         "resyncs",
         "undecodable",
         "positioned",
+        "alive",
+        "supervised",
+        "retries",
+        "retries_total",
+        "gave_up",
+        "failure",
+        "last_pass",
+        "stale_after",
+        "monotonic",
         "_delivered",
         "_baseline",
         "_group_missing",
@@ -253,6 +371,8 @@ class RedisSubscription(Subscription):
         start_ids: Mapping[str, Position] | None,
         group_start: str,
         skip: Sequence[Span],
+        stale_after: float = MIN_READER_STALE_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(name, maxsize, lossless=lossless)
         self.streams = streams
@@ -284,13 +404,69 @@ class RedisSubscription(Subscription):
         #: drop-oldest reader**, because `$` means "from now" and its "now" is here.
         #: `RedisBus.ready()` is what a caller waits on rather than guessing.
         self.positioned = asyncio.Event()
+        #: Whether this subscription's reader task is running. **False until it starts**,
+        #: which is the honest answer: a reader that has not started has read nothing.
+        self.alive = False
+        #: Whether a done-callback is watching that task. #103: nothing was.
+        self.supervised = False
+        #: Consecutive failed reads right now, and the lifetime count beside it.
+        #: **Consecutive**, the same sense `controller-policies.md` C6 gives the
+        #: reconnect budget: one successful read restores it in full.
+        self.retries = 0
+        self.retries_total = 0
+        #: Set when the retry bound was reached. The reader is not coming back.
+        self.gave_up = False
+        #: What the last failure was, as text, so a reader's own state carries its cause.
+        self.failure: str | None = None
+        #: A monotonic reading taken at the top of every read pass. The clock is
+        #: monotonic because this is an elapsed duration and never a time of day.
+        self.monotonic = monotonic
+        self.last_pass = monotonic()
+        self.stale_after = stale_after
         self._delivered: dict[str, int] = dict.fromkeys(streams, 0)
         self._baseline: dict[str, int] = dict.fromkeys(streams, 0)
         self._group_missing: set[str] = set()
         self._replaying: set[str] = set()
 
+    def reader_lost(self) -> bool:
+        """Whether this subscription's reader has stopped keeping its answers fresh.
+
+        Two ways, and the second is not the first: a task that **died**, and a loop that
+        is still a task but has not come round. The incident was the first; the socket
+        timeout makes the second unlikely rather than impossible, and both produce the
+        same lie if only the first is checked.
+        """
+        if not self.alive:
+            return True
+        return (self.monotonic() - self.last_pass) > self.stale_after
+
     def behind_streams(self) -> tuple[str, ...]:
-        """Return configured streams whose reader still trails its log."""
+        """Configured streams whose reader still trails its log.
+
+        **Derived, never a cached flag** (#103). `behind` used to be a dict the read loop
+        wrote and nothing else touched, initialised `False`. When the loop died it froze
+        at its last value — caught up — and `store.py`'s seal clock, which is literally
+        `min(wall clock, the times of the behind streams)`, went on advancing on wall
+        clock over two hours of entries nobody had read. Those minutes sealed empty, and
+        a sealed minute is closed for good.
+
+        So the question is asked of the reader's own liveness first. **A reader that is
+        not running cannot know it is caught up**, and every stream it holds a position
+        on is behind, at the position where it stopped.
+
+        A stream whose position is still `0-0` is left out, and that is not a loophole.
+        `0-0` is a stream nobody has written to; its time is the Unix epoch, and handing
+        the seal clock a `min` of zero would stop this store sealing anything ever again
+        — a worse failure than the one being repaired.
+        """
+        if self.reader_lost():
+            return tuple(
+                sorted(
+                    key
+                    for key in self.streams
+                    if (self.positions.get(key) or Position("0-0", 0)).id != "0-0"
+                )
+            )
         return tuple(sorted(key for key, behind in self.behind.items() if behind))
 
 
@@ -312,6 +488,9 @@ class RedisBus:
         self._client: Any = None
         self._subscriptions: dict[str, RedisSubscription] = {}
         self._readers: dict[str, asyncio.Task] = {}
+        #: Every background task that exited when it should not have, and why. Written
+        #: by the done-callbacks below and read by whatever serves `/health`.
+        self._reader_exits: dict[str, str] = {}
         self._prepared_groups: dict[str, set[str]] = {}
         self._outbox: list[tuple[str, dict[str, bytes]]] = []
         self._flusher: asyncio.Task | None = None
@@ -533,12 +712,11 @@ class RedisBus:
             start_ids=selected_start_ids,
             group_start=group_start,
             skip=skip,
+            stale_after=self.config.stale_after_seconds(),
         )
         self._subscriptions[name] = subscription
         if self._client is not None:
-            self._readers[name] = asyncio.create_task(
-                self._read(subscription), name=f"bus-read-{name}"
-            )
+            self._readers[name] = self._start_reader(subscription)
         return subscription
 
     def unsubscribe(self, subscription: Subscription) -> None:
@@ -608,6 +786,7 @@ class RedisBus:
 
         self._client = client
         self._flusher = asyncio.create_task(self._flush_forever(), name="bus-flush")
+        self._flusher.add_done_callback(self._flusher_exited)
         if start_readers:
             await self.start_readers()
 
@@ -623,10 +802,140 @@ class RedisBus:
             raise RuntimeError("start the Redis bus before starting its readers")
         for name, subscription in self._subscriptions.items():
             if name not in self._readers:
-                self._readers[name] = asyncio.create_task(
-                    self._read(subscription), name=f"bus-read-{name}"
-                )
+                self._readers[name] = self._start_reader(subscription)
         await self.ready()
+
+    def _start_reader(self, subscription: RedisSubscription) -> asyncio.Task:
+        """Create a reader task **and watch it**. The two are one operation (#103).
+
+        Both create sites were bare `asyncio.create_task` calls with nothing attached.
+        `self._readers` holds a strong reference, so a task that raised was never
+        garbage collected and Python never printed even its own "Task exception was
+        never retrieved" warning -- the one free safety net the language offers was held
+        shut by the dictionary that was meant to own the task. **A task that can die
+        unobserved is the root of all five of this incident's symptoms.**
+        """
+        task = asyncio.create_task(
+            self._read(subscription), name=f"bus-read-{subscription.name}"
+        )
+        task.add_done_callback(
+            lambda done: self._reader_exited(subscription.name, done)
+        )
+        subscription.supervised = True
+        return task
+
+    def _reader_exited(self, name: str, task: asyncio.Task) -> None:
+        """Record and escalate a reader that stopped. **Never raises.**
+
+        A cancellation is not a death: `aclose` and `unsubscribe` both cancel, and a
+        supervisor that cried wolf at every shutdown is a supervisor someone turns off.
+
+        **It does not restart the reader, and that is a decision rather than an
+        omission.** Re-entering `_read` on a lossless subscription re-runs `_replay`,
+        which reads forward from `start_ids` -- the position saved in the *checkpoint*,
+        not the position this reader has since reached. Everything between the two has
+        already been delivered and folded, so an automatic restart would re-fold it: #84
+        at the scale of the whole run, which is the bug `_replay`'s bound exists to
+        prevent. Rebasing `start_ids` onto the live positions first would make a restart
+        safe, and that is its own change with its own test.
+        """
+        subscription = self._subscriptions.get(name)
+        if subscription is not None:
+            subscription.alive = False
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except Exception:  # pragma: no cover - only during interpreter shutdown
+            return
+        detail = (
+            f"{type(error).__name__}: {error}"
+            if error is not None
+            else "the reader loop returned, which it must never do"
+        )
+        self._reader_exits[name] = detail
+        log_event(
+            logger,
+            logging.ERROR,
+            log_events.BUS_READER,
+            "the bus reader for %r exited and is no longer consuming: %s",
+            name,
+            detail,
+        )
+        if subscription is None or not subscription.gave_up:
+            # `_reader_failed` has already raised the alert when it gave up; this is the
+            # exit nothing else accounted for.
+            self._alert(
+                "bus.reader_stopped",
+                f"the bus reader for {name!r} exited unexpectedly and is no longer "
+                f"consuming: {detail}",
+            )
+
+    def _flusher_exited(self, task: asyncio.Task) -> None:
+        """The publisher's loop is the other unsupervised task in this file."""
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except Exception:  # pragma: no cover - only during interpreter shutdown
+            return
+        detail = (
+            f"{type(error).__name__}: {error}"
+            if error is not None
+            else "the flusher loop returned, which it must never do"
+        )
+        self._reader_exits["bus-flush"] = detail
+        log_event(
+            logger,
+            logging.ERROR,
+            log_events.BUS_READER,
+            "the bus flusher exited and is no longer writing: %s",
+            detail,
+        )
+
+    def _alert(self, code: str, detail: str, *, severity: str = "error") -> None:
+        """Say it on the bus as well as in the log.
+
+        `publish` is synchronous and never raises, which is what makes this callable
+        from a done-callback. If Redis is the thing that is broken the alert waits in
+        the outbox until it is not, so the log record is the immediate signal and this
+        is the one that reaches Discord.
+        """
+        from .events import Alert
+
+        self.publish(
+            Alert(
+                source="bus",
+                ts_received=datetime.fromtimestamp(self._clock(), tz=timezone.utc),
+                severity=severity,
+                code=code,
+                detail=detail,
+            )
+        )
+
+    def readers(self) -> dict[str, dict[str, Any]]:
+        """Per subscription: is its reader running, what has it survived, has it given up.
+
+        **What `/health` had no way to ask** (#103). The store answered `200 OK` with a
+        hardcoded `"status": "ok"` for two hours after its reader had died.
+        """
+        return {
+            name: {
+                "alive": s.alive,
+                "supervised": s.supervised,
+                "lossless": s.lossless,
+                "retries": s.retries,
+                "retries_total": s.retries_total,
+                "gave_up": s.gave_up,
+                "failure": s.failure,
+                "behind": list(s.behind_streams()),
+            }
+            for name, s in self._subscriptions.items()
+        }
+
+    def reader_exits(self) -> dict[str, str]:
+        """Background tasks that exited when they should not have, and why."""
+        return dict(self._reader_exits)
 
     async def ensure_groups(self, subscription: RedisSubscription) -> None:
         """Create or join a lossless subscription's groups without starting its reader."""
@@ -711,6 +1020,8 @@ class RedisBus:
         started" means "nothing published from now on is missed by a subscriber that
         already existed".
         """
+        sub.alive = True
+        sub.last_pass = sub.monotonic()
         try:
             try:
                 if sub.lossless:
@@ -729,53 +1040,147 @@ class RedisBus:
                 await self._read_head(sub)
         except asyncio.CancelledError:
             raise
-        except Exception:  # pragma: no cover - a reader dying is worth a record
+        except Exception:
             log_event(
                 logger,
                 logging.ERROR,
-                log_events.ENGINE_ERROR,
+                log_events.BUS_READER,
                 "the bus reader for %r stopped",
                 sub.name,
                 exc_info=True,
             )
             raise
+        finally:
+            # **Before the done-callback, not instead of it.** Positioning and `_replay`
+            # run outside the retry driver below -- they are not idempotent, so a failure
+            # in either ends the reader -- and this is what stops `behind_streams` saying
+            # "caught up" in the window before the callback has run.
+            sub.alive = False
+
+    async def _run_reader(
+        self, sub: RedisSubscription, pass_once: Callable[[], Any]
+    ) -> None:
+        """Turn one read pass into a loop that survives a transient. **#103's fix.**
+
+        `_flush_forever` already had this shape: catch, log "it keeps running", loop.
+        The reader had the other one -- catch, log "it stopped", re-raise -- and the two
+        sat eleven lines apart in the same file by the same hand. `feed` kept publishing
+        through the disturbance that killed every reader in the stack for exactly that
+        reason.
+
+        The stamp at the top of each pass is what `reader_lost` reads. It is taken
+        before the read rather than after it, so a pass that never returns ages.
+        """
+        while True:
+            sub.last_pass = sub.monotonic()
+            try:
+                await pass_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await self._reader_failed(sub, error)
+            else:
+                if sub.retries:
+                    self._reader_recovered(sub)
+
+    async def _reader_failed(self, sub: RedisSubscription, error: Exception) -> None:
+        """Back off and go round again, or give up loudly at the bound."""
+        sub.retries += 1
+        sub.retries_total += 1
+        sub.failure = f"{type(error).__name__}: {error}"
+        if sub.retries > self.config.read_retries:
+            sub.gave_up = True
+            log_event(
+                logger,
+                logging.ERROR,
+                log_events.BUS_READER,
+                "the bus reader for %r gave up after %d consecutive failures and is no "
+                "longer consuming: %s",
+                sub.name,
+                sub.retries,
+                sub.failure,
+                exc_info=True,
+            )
+            self._alert(
+                "bus.reader_stopped",
+                f"the bus reader for {sub.name!r} gave up after {sub.retries} "
+                f"consecutive failures and is no longer consuming; every stream it "
+                f"reads now reports behind. Last failure: {sub.failure}",
+            )
+            raise error
+        wait = min(
+            self.config.read_retry_ceiling_seconds,
+            self.config.read_retry_seconds * 2 ** (sub.retries - 1),
+        )
+        log_event(
+            logger,
+            logging.WARNING,
+            log_events.BUS_READER,
+            "the bus reader for %r raised; it keeps running -- retry %d of %d in "
+            "%.3fs: %s",
+            sub.name,
+            sub.retries,
+            self.config.read_retries,
+            wait,
+            sub.failure,
+            exc_info=True,
+        )
+        await asyncio.sleep(wait)
+
+    def _reader_recovered(self, sub: RedisSubscription) -> None:
+        """One good read restores the budget in full, as `controller-policies.md` C6
+        already says of the reconnect budget. The lifetime count is what remembers."""
+        log_event(
+            logger,
+            logging.WARNING,
+            log_events.BUS_READER,
+            "the bus reader for %r recovered after %d consecutive failures",
+            sub.name,
+            sub.retries,
+        )
+        sub.retries = 0
 
     async def _read_group(self, sub: RedisSubscription, existing: set[str]) -> None:
         """Lossless: a consumer group, acked on receipt, replayed from a recorded id."""
         await self._replay(sub, existing)
 
         streams = dict.fromkeys(sub.streams, ">")
-        while True:
-            got = await self._client.xreadgroup(
-                sub.group,
-                sub.consumer,
-                streams,
-                count=self.config.read_count,
-                block=self.config.read_block_ms or None,
-            )
-            if not got:
-                for key in sub.streams:
-                    sub.behind[key] = False
-                await asyncio.sleep(self.config.idle_sleep_seconds)
-                continue
-            # **Acked on receipt, before the work.** The flush is the durability boundary,
-            # not the read, so a per-message ack after the work would say nothing true.
-            pipe = self._client.pipeline(transaction=False)
-            full_reads: dict[str, bool] = {}
-            returned = {_text(key) for key, entries in got if entries}
+        await self._run_reader(sub, lambda: self._read_group_pass(sub, streams))
+
+    async def _read_group_pass(
+        self, sub: RedisSubscription, streams: dict[str, str]
+    ) -> None:
+        """One `XREADGROUP`, acked and delivered. The whole of what a retry repeats."""
+        got = await self._client.xreadgroup(
+            sub.group,
+            sub.consumer,
+            streams,
+            count=self.config.read_count,
+            block=self.config.read_block_ms or None,
+        )
+        if not got:
             for key in sub.streams:
-                if key not in returned:
-                    sub.behind[key] = False
-            for key, entries in got:
-                if entries:
-                    pipe.xack(key, sub.group, *[entry_id for entry_id, _ in entries])
-            await pipe.execute()
-            for key, entries in got:
-                name = _text(key)
-                full_reads[name] = len(entries) >= self.config.read_count
-                self._deliver(sub, name, entries)
-            for key, is_full in full_reads.items():
-                sub.behind[key] = is_full
+                sub.behind[key] = False
+            await asyncio.sleep(self.config.idle_sleep_seconds)
+            return
+        # **Acked on receipt, before the work.** The flush is the durability boundary,
+        # not the read, so a per-message ack after the work would say nothing true.
+        pipe = self._client.pipeline(transaction=False)
+        full_reads: dict[str, bool] = {}
+        returned = {_text(key) for key, entries in got if entries}
+        for key in sub.streams:
+            if key not in returned:
+                sub.behind[key] = False
+        for key, entries in got:
+            if entries:
+                pipe.xack(key, sub.group, *[entry_id for entry_id, _ in entries])
+        await pipe.execute()
+        for key, entries in got:
+            name = _text(key)
+            full_reads[name] = len(entries) >= self.config.read_count
+            self._deliver(sub, name, entries)
+        for key, is_full in full_reads.items():
+            sub.behind[key] = is_full
 
     async def _read_head(self, sub: RedisSubscription) -> None:
         """Drop-oldest: no group, everything a read gives, and a jump when far behind.
@@ -788,19 +1193,22 @@ class RedisBus:
         more waiting, and that is when the lag is checked. Below that the reader is
         keeping up and no round trip is spent asking.
         """
+        await self._run_reader(sub, lambda: self._read_head_pass(sub))
+
+    async def _read_head_pass(self, sub: RedisSubscription) -> None:
+        """One `XREAD` from the recorded cursor, and the jump when far behind."""
         count = self.config.read_count
-        while True:
-            cursor = {key: sub.last_ids[key] for key in sub.streams}
-            got = await self._client.xread(
-                cursor, count=count, block=self.config.read_block_ms or None
-            )
-            taken = 0
-            for key, entries in got or ():
-                taken += self._deliver(sub, _text(key), entries)
-            if taken >= count:
-                await self._resync_if_behind(sub)
-            elif not taken:
-                await asyncio.sleep(self.config.idle_sleep_seconds)
+        cursor = {key: sub.last_ids[key] for key in sub.streams}
+        got = await self._client.xread(
+            cursor, count=count, block=self.config.read_block_ms or None
+        )
+        taken = 0
+        for key, entries in got or ():
+            taken += self._deliver(sub, _text(key), entries)
+        if taken >= count:
+            await self._resync_if_behind(sub)
+        elif not taken:
+            await asyncio.sleep(self.config.idle_sleep_seconds)
 
     def _deliver(self, sub: RedisSubscription, key: str, entries: Any) -> int:
         """Decode a stream's entries onto the subscription's queue. Never raises.
@@ -986,6 +1394,68 @@ class RedisBus:
             gaps[key] = ReplayGap(key, saved.id, first_id, lost, trimmed)
         return gaps
 
+    async def consumer_lag(
+        self, subscription: RedisSubscription
+    ) -> dict[str, StreamLag]:
+        """Where this subscription's group stands in each of its streams.
+
+        **One pipeline, two `XINFO` calls a stream, and no state of our own.** The
+        numbers come from Redis every time they are asked for, which is the property the
+        cached `behind` flag did not have. Cheap enough to run on a timer: the ticket's
+        own evidence was captured with exactly these two commands.
+
+        A stream that does not exist, or a group that is not on it, is an answer rather
+        than a failure -- `raise_on_error=False`, and the fields come back `None`.
+        """
+        if self._client is None:
+            return {}
+        keys = list(subscription.streams)
+        pipe = self._client.pipeline(transaction=False)
+        for key in keys:
+            pipe.xinfo_stream(key)
+            pipe.xinfo_groups(key)
+        results = await pipe.execute(raise_on_error=False)
+        lags: dict[str, StreamLag] = {}
+        for index, key in enumerate(keys):
+            info = results[index * 2]
+            groups = results[index * 2 + 1]
+            first_id: str | None = None
+            entries_added: int | None = None
+            length: int | None = None
+            if isinstance(info, dict):
+                first = _info_value(info, "first-entry")
+                first_id = _text(first[0]) if first else None
+                entries_added = int(_info_value(info, "entries-added", 0) or 0)
+                length = int(_info_value(info, "length", 0) or 0)
+            record: Mapping[Any, Any] | None = None
+            if isinstance(groups, (list, tuple)):
+                for group in groups:
+                    if not isinstance(group, Mapping):
+                        continue
+                    if _text(_info_value(group, "name", "")) == subscription.group:
+                        record = group
+                        break
+            if record is None:
+                lags[key] = StreamLag(
+                    key, None, None, entries_added, length, None, first_id
+                )
+                continue
+            raw_lag = _info_value(record, "lag")
+            raw_read = _info_value(record, "entries-read")
+            raw_last = _info_value(record, "last-delivered-id")
+            lags[key] = StreamLag(
+                stream=key,
+                # Redis answers `-1` through some clients where the specification says
+                # nil; both mean "unknown", and neither is a lag of minus one.
+                lag=None if raw_lag is None or int(raw_lag) < 0 else int(raw_lag),
+                entries_read=None if raw_read is None else int(raw_read),
+                entries_added=entries_added,
+                length=length,
+                last_delivered_id=None if raw_last is None else _text(raw_last),
+                first_retained_id=first_id,
+            )
+        return lags
+
     async def _position_at_head(self, sub: RedisSubscription) -> set[str]:
         """Start at `$` — but as a **concrete id**, taken once.
 
@@ -1130,6 +1600,7 @@ __all__ = [
     "RedisBus",
     "RedisSubscription",
     "Span",
+    "StreamLag",
     "selected_bus",
     "trim_floor_ms",
 ]

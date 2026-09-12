@@ -34,6 +34,13 @@ services:
     container_name: dxp-feed
     env_file:
       - stack.env
+    # #103: the engine's daily JSON log files live at /app/logs and nothing was mounted
+    # over them, so seven hours of the only real diagnostics died with the container --
+    # 146 KB in dxp-store alone, copied out by hand before it could be removed. Records
+    # now also reach standard error, which docker logs reads; this is the durable copy,
+    # one directory per service so four writers cannot collide on one day's file.
+    volumes:
+      - ./.stack-logs/feed:/app/logs
     depends_on:
       redis:
         condition: service_healthy
@@ -56,6 +63,12 @@ services:
         condition: service_healthy
     volumes:
       - ./.stack-data:/data
+    # #103: the engine's daily JSON log files live at /app/logs and nothing was mounted
+    # over them, so seven hours of the only real diagnostics died with the container --
+    # 146 KB in dxp-store alone, copied out by hand before it could be removed. Records
+    # now also reach standard error, which docker logs reads; this is the durable copy,
+    # one directory per service so four writers cannot collide on one day's file.
+      - ./.stack-logs/store:/app/logs
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
@@ -73,6 +86,13 @@ services:
       - stack.env
       - path: stack.local.env
         required: false
+    # #103: the engine's daily JSON log files live at /app/logs and nothing was mounted
+    # over them, so seven hours of the only real diagnostics died with the container --
+    # 146 KB in dxp-store alone, copied out by hand before it could be removed. Records
+    # now also reach standard error, which docker logs reads; this is the durable copy,
+    # one directory per service so four writers cannot collide on one day's file.
+    volumes:
+      - ./.stack-logs/discord-alerts:/app/logs
     depends_on:
       redis:
         condition: service_healthy
@@ -100,6 +120,12 @@ services:
     # ticket could change without anyone reading this file.
     volumes:
       - ./.stack-data:/data:ro
+    # #103: the engine's daily JSON log files live at /app/logs and nothing was mounted
+    # over them, so seven hours of the only real diagnostics died with the container --
+    # 146 KB in dxp-store alone, copied out by hand before it could be removed. Records
+    # now also reach standard error, which docker logs reads; this is the durable copy,
+    # one directory per service so four writers cannot collide on one day's file.
+      - ./.stack-logs/api:/app/logs
     # main.lifespan takes the Redis-consumer branch before it consults this flag, so
     # this is belt and braces rather than the mechanism.
     environment:

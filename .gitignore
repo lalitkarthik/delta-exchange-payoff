@@ -29,6 +29,7 @@ data/
 # The local stack's store root. AGENTS.md makes data/ read-only; a second writer into
 # data/ would corrupt the live store.
 .stack-data/
+.stack-logs/
 # The local stack's secrets. stack.env is committed with empty values; the real webhook
 # URL and anything else secret goes here, and this file is never committed. #66 reads it
 # as a second env_file with required:false, so an absent file is simply an unconfigured

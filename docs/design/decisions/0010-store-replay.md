@@ -47,6 +47,17 @@ as late and replay delivers bytes the store throws away.
 error-level `store.replay_gap` record with both bounds and an exact count, and a counter in
 the store's state. Start-up is never refused for this.
 
+**R5a (#103) — and the check is continuous, not a start-up step.** A store that never restarts
+never ran R5, so a 97-minute hole reported `replay_gap_entries: 0` for two hours. The test is
+exact and needs no threshold: the group's `last-delivered-id` older than the stream's oldest
+surviving entry means data has been lost. It is two `XINFO` calls, and it runs on the
+`store.state` cadence. See [store-replay.md](../lld/store-replay.md) §4.2.
+
+**R4a (#103) — "behind" is derived from the reader, not cached by it.** R4's rule was right and
+its input was a flag the read loop wrote. A loop that died froze it at "caught up" and the
+clock advanced over unread data. See [bus-reader.md](../lld/bus-reader.md) §4 -- and the note
+in [store-replay.md](../lld/store-replay.md) §3, because R4 has never actually run.
+
 **R6 — `computed.chain` gains per-leg blocks and a computation stamp, at `schema_version` 2.**
 `ChainStrike` becomes `{strike, call, put}` with `ChainLeg` carrying the venue symbol, `iv`,
 `iv_leg`, `iv_reason` and the five Greeks; `ComputedChain` gains `fetched_at` and makes

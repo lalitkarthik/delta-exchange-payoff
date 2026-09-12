@@ -51,6 +51,17 @@ construction but remains guarded.
 Which bus the process selected at startup. Info with Redis configuration when applicable.
 The same name carries a warning resync record when a drop-oldest reader jumps over entries.
 
+### `bus.reader`
+
+A bus reader's own lifetime. **Warning** while it is still running -- a read raised and is
+being retried, with the attempt number and the backoff; or a reader recovered after one or
+more consecutive failures. **Error** once it is not -- a reader that reached the retry bound
+and gave up, or a task that exited for any other reason, each naming the subscription and
+the failure that ended it. The publisher's loop exiting is reported here too.
+
+Added by #103, where one 2-second Redis read timeout killed every bus reader in three
+services inside 34 seconds and the only trace was a single `engine.error` apiece.
+
 ### `compute.recompute_set`
 
 The set of pairs being recomputed changed. Debug, once per expiry or websocket interest

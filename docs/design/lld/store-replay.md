@@ -78,9 +78,21 @@ element-wise per-stream minimum across all still-open minute origins. With no op
 bar, while ensuring replay includes every event that may still be in memory.
 
 **Log clock.** `seal_now = min(wall_clock, id_seconds(position[s]) for s behind)`. A stream
-is behind while replaying or after a full read batch. The clock follows the log so replayed
-events are judged against the same time live sealing used; once no stream is behind it is
-the wall clock again. The flush interval still uses the wall clock.
+is behind while replaying, after a full read batch, **and whenever its reader is not running
+or has stopped completing passes** (#103) -- `behind` is derived, not a flag the read loop
+caches, because a loop that dies freezes the flag at "caught up" and the clock then advances
+over data nobody read, sealing those minutes empty. [bus-reader.md](bus-reader.md) §4 has the
+derivation. The clock follows the log so replayed events are judged against the same time
+live sealing used; once no stream is behind it is the wall clock again. The flush interval
+still uses the wall clock.
+
+> **Not yet true in running code.** `store.py`'s `_stream_id_seconds` unpacks three names
+> from `value.split("-", 1)`, which yields two, so it raises `ValueError` on every stream id
+> and `seal_clock`'s `except (TypeError, ValueError): continue` swallows it: the list of
+> times is always empty and the clock always falls through to the wall clock. R4 has
+> therefore never run since #63 introduced it. The fix is `partition` for `split`, as
+> `redis_bus._id_parts` already does it. #103 found it and was not allowed to edit
+> `store.py`; `test_store_health.py` pins it until someone is.
 
 **Pause spans.** Commands apply at a drained point, so a pause boundary is a position, not
 an ambiguous wall-clock moment. The store checkpoints `recording: false` and the open span;
@@ -133,6 +145,13 @@ tests assert that the surplus is empty rather than what it was. The store does n
 deduplicate — `BarWriter.ingest` folds every tick and an unsealed minute accepts any tick —
 so the surplus inflates `bid_ticks` on the restart minute and leaves the saved index past
 the end of the stream, which under-reports the next restart's `lost`.
+
+## 4.2 The gap check is continuous, and health can say no
+
+Both are #103's and both live in [store-health.md](store-health.md): the replay-gap test runs
+on a timer rather than only at start-up, because a store that never restarts never ran step 4;
+and `GET /health` consults reader liveness and consumer lag instead of returning a hardcoded
+`ok`.
 
 ## 5. Failure modes and the test seam
 
