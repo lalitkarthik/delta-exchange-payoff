@@ -34,7 +34,12 @@ STORE_FLUSH = "store.flush"
 #: A saved stream position had entries trimmed before it. Error, with both positions
 #: and the exact number of entries that cannot be replayed.
 STORE_REPLAY_GAP = "store.replay_gap"
-#: A generation's files and checkpoint became durable. Info, once per committed flush.
+#: Everything a `store` says about a checkpoint: a generation's files and checkpoint
+#: became durable, info once per committed flush; the checkpoint one start-up adopted,
+#: info exactly once per process start (#110); and a generation committed with zero rows
+#: in all four tables, warning while recording and info while paused. One event name,
+#: because all three are statements about one checkpoint and a second name would split
+#: every "what did this generation do" query in two.
 STORE_CHECKPOINT = "store.checkpoint"
 #: A record was dropped off a **lossless** subscription. Error: `fanout.py` documents
 #: this as impossible by construction, and a guard that never fires is cheap insurance

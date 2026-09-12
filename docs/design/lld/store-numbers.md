@@ -69,3 +69,19 @@ from a live run.
 Moved here from [store.md](store.md) by #107, which needed the line back. A bar sealed at the
 book's 2.0 s closes four seconds before its fallback could arrive, so every fallback quote
 would be counted late, the fallback would be dead code and the flag would be a constant `True`.
+
+The 6,000,000 µs by which `computed-bars`' `sealed_through_us` sits ahead of the other three
+is `derived` from `TICKER_GRACE_SECONDS` 8.0 minus `COMPUTED_SPLIT_GRACE_SECONDS` 2.0. It is a
+property of the graces and says nothing on its own about a loss — but it is also **the width of
+#110's window**, the span after a minute ends during which a seal pass on a restarting store
+refuses that minute in table C and keeps it in A, B and D. Record 0010 R4c.
+
+## Which suite drives which seam
+
+Moved from [store.md](store.md) §7 at its 200-line bound (#109, 2026-09-12).
+
+- `tests/test_bars.py` — the aggregators
+- `tests/test_store.py` — the writer and the files
+- `tests/test_recording.py` — the pause over HTTP
+- `tests/test_composition.py` — a scripted socket into the writer's counters
+- `tests/test_store_restart_seam.py` — the seal-versus-replay window (#110)

@@ -84,6 +84,23 @@ in [store-replay.md](../lld/store-replay.md) §3, because R4 has never actually 
 that commit. See [store-replay.md](../lld/store-replay.md) §3 and
 `test_store_health.py::test_store_stream_id_seconds_parses_well_formed_ids`.
 
+**R4c (#110) — the seal clock bounds the replay, not only the live read.** A restarted `store`
+seals on **every** drain pass, including passes whose readers delivered nothing, and
+`_Watermarked.seal` advances a watermark whether or not anything was open. **A minute open at the
+previous shutdown is lost from table T if a seal pass runs at `minute_end + grace(T)` before the
+replay re-folds it.** Graces are 8.0 s for three tables and 2.0 s for `computed-bars`, so between
+`+2.0` and `+8.0` **`computed-bars` alone loses it** — `measured` 2026-09-12T15:56Z,
+`test_store_restart_seam.py`. Equalising moves the boundary to `+8.0`; it does not close the
+window. **Until a restart holds its seal clock at the replay frontier, it guarantees a minute open
+at shutdown is folded *at most* once per table, never once.**
+
+**R9 (#109) — a pause is not a different transaction.** `set_recording(False)`, a
+`control.command` pause or resume, and `aclose` reach one `BarWriter._seal_and_write`, branching
+once on `checkpoint_root`. **In a checkpoint root every flush file carries a generation, from
+every path**, so a pause survives a restart and the watermark never stays behind bars on disk.
+Before this, a split pause wrote ordinal-named files with no intent and no checkpoint, and the
+next restart wrote those minutes **twice**.
+
 **R6 — `computed.chain` gains per-leg blocks and a computation stamp, at `schema_version` 2.**
 `ChainStrike` becomes `{strike, call, put}` with `ChainLeg` carrying the venue symbol, `iv`,
 `iv_leg`, `iv_reason` and the five Greeks; `ComputedChain` gains `fetched_at` and makes
@@ -146,44 +163,11 @@ only while a reader is behind.
 | HTTP between api and store | #57: no service calls another over HTTP |
 | A separate `store.command` event type | Better by construction — no consumer could ever misroute it — but #63 settles that the toggle becomes a `control.command`. Named in the owner list below rather than decided here |
 
-## What the repository owner should decide, not this record
+## What the owner decided, 2026-09-12
 
-1. **Acceptance criterion 1 for table C.** Tables A, B and D can be compared column for column
-   against the in-process recording. Table C cannot: two processes recompute on their own
-   timing, so the values differ below the second even when the minute keys match. Say what the
-   proof is — key sets equal, or a single-process comparison against the event stream.
-2. **The read paths' right edge in split mode.** With no writer in the api, `/smile`,
-   `/history` and contract bars lose `BarStore.pending()` and read only what is on disk: up to
-   one flush interval plus the open minute behind. Accept it, or open a ticket to feed the api
-   the `md.option_bar` events the catalogue already defines.
-3. **R8, once more.** A separate event type removes the hazard structurally; the settled
-   wording says `control.command`. If the wording is reopened, everything else in this record
-   stands unchanged.
-4. **The store's graceful stop no longer writes partial open-minute bars** — it checkpoints
-   them instead, so a restart within the retention window completes the minute rather than
-   sealing a truncated one. A stop longer than thirty minutes loses those minutes, and the gap
-   signal reports it. This changes a rule stated in `lld/store.md` §4 for the store process.
-5. **The cutover from I3 to I4.** The first start has no checkpoint and begins at the head, so
-   the seconds between stopping the old writer and starting `store` are not recorded. The
-   alternative — starting at `0` per 0002 — would re-record up to thirty minutes the engine had
-   already written, as duplicates.
-
-## The owner's answers, 2026-09-12
-
-1. **Table C is compared numerically, within a stated tolerance** — not by key sets alone.
-   The tolerance is justified by what actually differs, two processes recomputing against a
-   moving book, and is measured rather than chosen to pass. #63 carries it as a named
-   constant.
-2. **The read paths' right edge is not accepted as lost.** [#81](https://github.com/lalitkarthik/delta-exchange-payoff/issues/81)
-   gives `/smile`, `/history` and the contract-bar routes their live edge back by folding
-   `md.option_bar` in the api. #63 does not fix it, and the store LLD states the lag as
-   current behaviour until #81 lands.
-3. **R8 stands**: `control.command` with `target`, and the feed supervisor drops what is not
-   addressed to it.
-4. **R4's graceful stop stands**: the store checkpoints partial open-minute bars rather than
-   writing a truncated minute.
-5. **The I3 → I4 cutover's few unrecorded seconds are accepted**; re-recording thirty
-   minutes as duplicates is refused.
+The questions this record put to the owner, and the answers given, are in
+[../research/0010b-owner-questions.md](../research/0010b-owner-questions.md). They are
+settled; the rules above carry their outcome.
 
 ## What would change this decision
 

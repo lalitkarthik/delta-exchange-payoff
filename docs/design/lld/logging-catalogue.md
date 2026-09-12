@@ -37,9 +37,24 @@ exact `lost` count.
 
 ### `store.checkpoint`
 
-One committed generation became durable. Info, emitted once per generation, carrying the
-generation, stream count and four `sealed_through_us` values. It is bounded by the flush
+Everything a `store` says about a checkpoint, which is three sentences and one event name.
+
+**One committed generation became durable.** Info, once per generation, carrying the
+generation, stream count and four `sealed_through_us` values. Bounded by the flush
 interval, exactly as `store.flush` is, not by message rate.
+
+**One start-up adopted a checkpoint.** Info, exactly once per process start whether or
+not a replay gap was found (#110), adding `replayed_from` — every stream and the position
+it reads forward from — plus `recording` and `replay_gap_entries`. `initialized` is a root
+with no checkpoint in it; `restored` is every other start. Before #110 a clean replay was
+**silent**, and a restart that dropped a minute from one of four tables left no record of
+the restart at all.
+
+**One generation committed zero rows across all four tables.** Warning while recording and
+info while paused, with `rows` 0 and `tables` 4, beside an `alert`
+`store.empty_generation` on the recording case only. Sealed empty is correct behaviour and
+is indistinguishable from a dead system on disk, so the store says which it was. All three
+of 2026-09-12's losses wore this face (#103, #108, #110).
 
 ### `queue.drop`
 

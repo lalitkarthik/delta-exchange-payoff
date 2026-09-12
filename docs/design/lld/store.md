@@ -158,6 +158,7 @@ the minutes trimmed from Redis, and the gap signal reports them.
 | A reference event quoting neither side | No fallback tick; a pair of absent prices is not a quote |
 | Recording switched off | The subscription is still **drained** and `discarded` grows; a lossless queue nobody empties backs up the socket reader |
 | A flush raises | All or nothing (#101): the files that flush published are removed, the buffer and the flush ordinal are left as they were, and the next interval flushes the same bars — one `BarStore._flush_buffer` implements it and `_flush_legacy` and `_flush_generation` differ only in how they name a file. **Both compositions then say the same thing** (#107): `flush_errors` grows by exactly one, an error record carries the exception with `exc_info`, and an `alert` `store.flush_failed` is published. One `BarWriter._flush_failed` does all three, reached from `_flush_all` in the monolith and `_commit` in the split, so there is no second copy to drift; the message names a table in the monolith, where the four flush independently, and a generation in the split, where they commit as one. **The alert lands only where the writer was given a `publish`.** `store_main.py` hands the split `bus.publish`; `main.py` hands the monolith `StoreAlertSeam`, which forwards the `alert`, refuses every other event because the writer subscribes to that same fanout, and delivers through `loop.call_soon_threadsafe` because `_flush_all` raises on an `asyncio.to_thread` worker and `asyncio.Queue.put_nowait` is not thread-safe |
+| A pause, a resume or a shutdown | One `BarWriter._seal_and_write`, branching once on `checkpoint_root` (#109). The split seals on `seal_clock()` and commits a generation — intent, four generation-named files, checkpoint — and does **not** drain the open minute, which the replay re-folds. The monolith seals on the wall clock, drains the open minute at `aclose` only, and calls `_flush_all`. Before #109 these were three copies and two had drifted: a split pause wrote ordinal-named files with no intent and no checkpoint, so the next restart wrote those minutes **twice** |
 
 **A count is not a diagnosis.** `flush_errors` has been on `/health` since #103, so a failing flush
 was already a number; until #107 the monolith wrote nothing saying *why*. The alert needed somewhere
@@ -188,9 +189,8 @@ instrument to parse in the first place.
 
 `BarWriter.attach(bus)` and `ingest(event)`, with `BarStore` on a `tmp_path` and an injected
 clock, so sealing and flushing are test parameters rather than races. Events come from the
-real adapter through `tests/fakes/decoder.py`. `tests/test_bars.py` drives the aggregators,
-`tests/test_store.py` the writer and the files, `tests/test_recording.py` the pause over
-HTTP, and `tests/test_composition.py` a scripted socket into the writer's counters.
+real adapter through `tests/fakes/decoder.py`. Which suite drives which seam is listed in
+[store-numbers.md](store-numbers.md).
 
 ## 8. Numbers
 
