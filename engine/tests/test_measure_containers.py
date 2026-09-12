@@ -316,6 +316,7 @@ def test_summarize_reports_hand_computed_means_maxima_and_throughput(
             "block_read": {"mean": 7.5, "max": 10.0},
             "block_write": {"mean": 12.0, "max": 16.0},
         },
+        "counters_flat": [],
         "health": {
             "started_at": "2026-09-12T00:00:00Z",
             "healthy_at": "2026-09-12T00:00:10Z",
@@ -876,3 +877,63 @@ def test_a_short_batched_answer_is_topped_up_per_container_with_its_own_stamp(
     sweep_record = next(r for r in _records(output) if r.get("type") == "sweep")
     assert sweep_record["containers_seen"] == 6
     assert sweep_record["containers_read"] == 6
+
+
+def test_summarize_names_the_counters_that_never_advanced(tmp_path: Path) -> None:
+    """A flat counter is not evidence of no work, and the digest has to say so.
+
+    The I13 collection reported `block_read` 0.0 B/s for all six containers across
+    5h12m and `block_write` 25.4 B/s for `store`, while `store` wrote `measured`
+    1,491.4 B/s of Parquet into its bind mount over the same window -- a 59x
+    under-report. `docker stats` BlockIO does not observe a bind mount on this host.
+    The tool cannot know the true figure, but it can refuse to present a counter that
+    never moved as though it had measured something. #79.
+    """
+    fixture = tmp_path / "flat.jsonl"
+    records = [
+        _sample(
+            "flat-disk",
+            second,
+            10.0,
+            100,
+            net_rx=rx,
+            net_tx=tx,
+            block_read=0,
+            block_write=write,
+        )
+        for second, rx, tx, write in ((0, 0, 0, 0), (10, 100, 200, 0), (20, 300, 400, 0))
+    ]
+    _write_jsonl(fixture, records)
+
+    facts = summarize_paths([fixture])["containers"]["flat-disk"]
+
+    assert facts["counters_flat"] == ["block_read", "block_write"]
+    rendered = render_summary(summarize_paths([fixture]))
+    assert "counters that never advanced: block_read, block_write" in rendered
+
+
+def test_summarize_reports_no_flat_counters_when_every_counter_advances(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / "moving.jsonl"
+    records = [
+        _sample(
+            "moving",
+            second,
+            10.0,
+            100,
+            net_rx=n,
+            net_tx=n,
+            block_read=n,
+            block_write=n,
+        )
+        for second, n in ((0, 0), (10, 100), (20, 300))
+    ]
+    _write_jsonl(fixture, records)
+
+    facts = summarize_paths([fixture])["containers"]["moving"]
+
+    assert facts["counters_flat"] == []
+    assert "counters that never advanced" not in render_summary(
+        summarize_paths([fixture])
+    )

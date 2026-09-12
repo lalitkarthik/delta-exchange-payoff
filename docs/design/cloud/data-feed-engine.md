@@ -78,28 +78,31 @@ order**, whichever comes first. The cell-by-cell comparison is
 
 ### 2.1 What each container reserves, and what it actually costs
 
-**Compare the reservation against the `derived` cost beside it: `feed` is the one that is
-deliberately over-reserved.**
+**Compare the reservation against the cost beside it: `feed` is the one that is deliberately
+over-reserved, and I13 (#79) has now `measured` how deliberately.**
 
-| Container | Reserved | `derived` at 1x | Bound by |
-|---|---|---|---|
-| `feed` | 1.0 vCPU, 1 GB | 0.52–0.71 core | CPU, one event loop |
-| `store` | 0.5 vCPU, 1 GB | 0.28–0.51 core; 2.33 KB/s to disk | CPU, decode and fold |
-| `api` | 1.0 vCPU, 2 GB | 0.25–0.49 core, + 0.05–0.14 a watched expiry | CPU, set by viewers |
-| `web` and proxy | 0.5 vCPU, 1 GB | ~0 core | memory |
-| `redis` | 0.5 vCPU, 3 GB | — | memory, `maxmemory 2gb` plus overhead |
+| Container | Reserved | `measured` at 1x | `derived` at 1x | Bound by |
+|---|---|---|---|---|
+| `feed` | 1.0 vCPU, 1 GB | **0.3592 core**, 97.1 MiB | 0.52–0.71 core | CPU, one event loop |
+| `store` | 0.5 vCPU, 1 GB | **0.3048 core**; 1.49 KB/s to disk | 0.28–0.51 core; 2.33 KB/s | CPU, decode and fold |
+| `api` | 1.0 vCPU, 2 GB | **0.3045 core**; +0.0466 the first viewer, +0.0168 each of the next two | 0.25–0.49 core, + 0.05–0.14 a watched expiry | CPU, set by viewers |
+| `web` and proxy | 0.5 vCPU, 1 GB | **0.0388 / 0.0109 core**, 110.6 / 17.1 MiB | ~0 core | memory |
+| `redis` | 0.5 vCPU, 3 GB | **0.0706 core**, 761.8 MiB | — | memory, `maxmemory 2gb` plus overhead |
 
-The `derived` column is [0007](../decisions/0007-load-profile.md); the reservations are
-[compute.md](compute.md) §4, and ECS spells `feed`'s whole vCPU as **1,024 CPU units**
-([0008](../decisions/0008-topology.md)). **`feed` reserves a whole vCPU, because a starved `feed`
-leaves holes.** It falls behind the socket. The receive buffer fills. Delta then closes the
-connection.
+The `measured` column is [../research/0007a-container-measurement.md](../research/0007a-container-measurement.md),
+`measured` over **5h12m and not one day**, at `derived` 0.86x of 1x; the `derived` column is
+[0007](../decisions/0007-load-profile.md); the reservations are [compute.md](compute.md) §4, and
+ECS spells `feed`'s whole vCPU as **1,024 CPU units** ([0008](../decisions/0008-topology.md)).
+**`feed` reserves a whole vCPU, because a starved `feed` leaves holes.** It falls behind the
+socket. The receive buffer fills. Delta then closes the connection. **Every reservation still
+holds at the `measured` figures, `feed`'s with 0.64 core to spare.**
 
 **One event loop caps every Python service at one core.** Nothing is disk-bound or network-bound
-at 1x or at 10x: `store` writes `derived` 2.33 KB/s against gp3's published baseline of
-125 MiB/s, and `feed` reads `derived` 6.9 Mbit/s against the `.large` classes' published baseline
-of 0.937 Gbps. Both comparisons are [0007](../decisions/0007-load-profile.md)'s, and the chosen
-`c7g.xlarge` has twice that bandwidth, so the second is a floor.
+at 1x or at 10x, and the measurement confirms it with room: `store` writes `measured` 1.49 KB/s
+against gp3's published baseline of 125 MiB/s, and `feed` reads `measured` 5.80 Mbit/s against
+the `.large` classes' published baseline of 0.937 Gbps — 0.62% of a figure the chosen
+`c7g.xlarge` doubles. **`store`'s disk cell is measured at the source**, 248 flush files into
+`.stack-data/`: `docker stats` BlockIO does not observe a bind mount and reported 25.4 B/s.
 
 ### 2.2 The durable store, tailored
 
