@@ -93,8 +93,11 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    # main.build_consumer_stack() constructs a BarWriter in this process. Read-only
-    # makes store the only writer into the shared root.
+    # Read-only because store is the only writer into the shared root. Since #63,
+    # main.build_consumer_stack() returns writer=None -- this process has no BarWriter
+    # at all, so the mount could not write even if it were allowed to. Left read-only
+    # anyway: the guarantee belongs to the mount, not to a line in main.py that a later
+    # ticket could change without anyone reading this file.
     volumes:
       - ./.stack-data:/data:ro
     # main.lifespan takes the Redis-consumer branch before it consults this flag, so

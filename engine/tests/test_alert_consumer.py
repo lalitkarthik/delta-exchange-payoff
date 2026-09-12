@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,11 +20,18 @@ from deltapayoff.redis_bus import BusConfig, RedisBus
 
 TS = datetime(2026, 9, 12, tzinfo=timezone.utc)
 
+#: Fixture-only stand-in for `AlertConsumer`'s real wall clock, fixed well before every
+#: alert timestamp in this file so no dispatch test is accidentally starved by the
+#: staleness drop `_run_once` applies (#86) -- that mechanism gets its own tests below
+#: with wall clocks placed deliberately around the alerts under test. Never `now()` in a
+#: test, per this repo's `AGENTS.md`.
+EARLY_WALL_CLOCK = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
-def _alert(code: str = "connection_silent") -> Alert:
+
+def _alert(code: str = "connection_silent", *, ts: datetime = TS) -> Alert:
     return Alert(
         source="feed",
-        ts_received=TS,
+        ts_received=ts,
         severity="error",
         code=code,
         detail="the feed stopped",
@@ -86,6 +95,7 @@ def _consumer_for_fanout(
         gate=discord_alerts.AlertGate(),
         webhook_url="https://discord.test/webhook",
         clock=clock,
+        wall_clock=lambda: EARLY_WALL_CLOCK,
     )
     consumer.subscribe()
     return consumer, bus, calls
@@ -168,8 +178,35 @@ def test_an_existing_alert_group_can_be_joined_again_without_a_busygroup_failure
 
         second = RedisBus(config, client_factory=factory)
         try:
-            AlertConsumer(second).subscribe()
+            second_subscription = AlertConsumer(second).subscribe()
             await second.start()
+            assert second_subscription.positioned.is_set()
+
+            # `positioned` is set even when the reader died while positioning (the bus
+            # sets it in a `finally`, so `ready()` never hangs on a dead reader) -- so
+            # on its own it proves nothing about a BUSYGROUP failure being handled. The
+            # reader task itself is the fact that would be false if `_ensure_group`'s
+            # BUSYGROUP branch were removed: `_read` logs the error and re-raises, so a
+            # `RedisBus` subclass that always raises BUSYGROUP leaves this task done,
+            # with that `ResponseError` as its exception, well before anything is
+            # published.
+            reader = second._readers[second_subscription.name]
+            assert not reader.done(), (
+                "the rejoined group's reader task ended while positioning instead of "
+                "settling into its read loop"
+            )
+
+            second.publish(_alert("rejoined"))
+            assert await second.flush() == 1
+            received = await asyncio.wait_for(
+                second_subscription.queue.get(), timeout=1.0
+            )
+            assert isinstance(received, Alert)
+            assert received.code == "rejoined"
+
+            assert not reader.done(), (
+                "the rejoined group's reader task died after delivering the message"
+            )
         finally:
             await second.aclose()
 
@@ -213,6 +250,7 @@ def test_pending_alerts_from_a_previous_consumer_are_not_replayed_on_restart(
                 poster=poster,
                 webhook_url="https://discord.test/webhook",
                 clock=_Clock(),
+                wall_clock=lambda: EARLY_WALL_CLOCK,
             )
             consumer.subscribe()
             await bus.start()
@@ -233,6 +271,101 @@ def test_pending_alerts_from_a_previous_consumer_are_not_replayed_on_restart(
             cleanup = _redis_client(kind, url, server)
             await cleanup.delete("alert")
             await cleanup.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_alerts_published_while_no_consumer_ran_are_dropped_as_stale(
+    redis_kind,
+) -> None:
+    """#86: a rejoin must not post what fired during this consumer's own downtime.
+
+    Mirrors the audit's fakeredis repro (`scratchpad/repro_replay.py` scenario 3): a
+    consumer receives one alert, is closed, three more are published with nothing
+    reading, and a new consumer starts on the same group. `_read_group` still delivers
+    all three -- Redis's `>` cursor has no notion of "while nothing read" -- so the
+    guarantee has to live in `AlertConsumer._run_once`, which is what this asserts.
+    """
+    kind, url = redis_kind
+    server = fakeredis.aioredis.FakeServer() if kind == "redis-fake" else None
+    config = BusConfig(
+        url=url or "redis://127.0.0.1:6399",
+        underlyings=(),
+        read_block_ms=0,
+        idle_sleep_seconds=0.001,
+    )
+    factory = _factory(server) if server is not None else None
+
+    stale_ts = TS
+    started_at = datetime(2026, 9, 12, 0, 5, tzinfo=timezone.utc)
+    fresh_ts = datetime(2026, 9, 12, 0, 10, tzinfo=timezone.utc)
+
+    async def scenario() -> None:
+        cleanup = _redis_client(kind, url, server)
+        await cleanup.delete("alert")
+        await cleanup.aclose()
+
+        first = RedisBus(config, client_factory=factory)
+        try:
+            first_subscription = AlertConsumer(first).subscribe()
+            await first.start()
+            first.publish(_alert("while up", ts=stale_ts))
+            assert await first.flush() == 1
+            received = await asyncio.wait_for(
+                first_subscription.queue.get(), timeout=1.0
+            )
+            assert received.code == "while up"
+        finally:
+            await first.aclose()
+
+        # Nothing reads while these three publish directly onto the stream -- the
+        # "published while down" case the existing pending-replay test does not cover.
+        writer = _redis_client(kind, url, server)
+        try:
+            for i in range(3):
+                await writer.xadd("alert", encode(_alert(f"stale {i}", ts=stale_ts)))
+        finally:
+            await writer.aclose()
+
+        second = RedisBus(config, client_factory=factory)
+        poster, calls = _poster()
+        clock = _Clock(0.0)
+        try:
+            consumer = AlertConsumer(
+                second,
+                poster=poster,
+                webhook_url="https://discord.test/webhook",
+                clock=clock,
+                wall_clock=lambda: started_at,
+            )
+            consumer.subscribe()
+            await second.start()
+
+            # A fresh alert reusing a stale alert's code: if the dropped backlog had
+            # touched the gate, this would be collapsed instead of posted, so posting
+            # it also pins the "rate limit and collapse rule still hold" criterion.
+            second.publish(_alert("stale 0", ts=fresh_ts))
+            assert await second.flush() == 1
+
+            # Each dispatch clears both the collapse window and the global floor
+            # (`ALERT_COLLAPSE_WINDOW_SECONDS` and `ALERT_MIN_POST_INTERVAL_SECONDS`)
+            # ahead of the next one, so a static clock cannot rate-limit a later item
+            # into looking dropped for the wrong reason: only the staleness check can
+            # explain the count and content asserted below.
+            for _ in range(4):
+                clock.value += 1000.0
+                await consumer._run_once()
+
+            assert consumer.subscription.queue.empty()
+            assert len(calls) == 1, [c["content"] for c in calls]
+            assert "stale 0" in calls[0]["content"]
+            assert "collapsed" not in calls[0]["content"]
+        finally:
+            await second.aclose()
+
+        cleanup = _redis_client(kind, url, server)
+        await cleanup.delete("alert")
+        await cleanup.aclose()
 
     asyncio.run(scenario())
 
@@ -304,6 +437,7 @@ def test_a_poster_refusal_does_not_lose_a_collapsed_count() -> None:
         gate=discord_alerts.AlertGate(),
         webhook_url="https://discord.test/webhook",
         clock=clock,
+        wall_clock=lambda: EARLY_WALL_CLOCK,
     )
     consumer.subscribe()
 
@@ -423,6 +557,7 @@ def test_a_bad_alert_does_not_kill_the_consumer_loop(
         gate=FailingOnceGate(),
         webhook_url="https://discord.test/webhook",
         clock=clock,
+        wall_clock=lambda: EARLY_WALL_CLOCK,
     )
     consumer.subscribe()
 
@@ -452,6 +587,7 @@ def test_run_auto_subscribes_and_dispatches_until_cancelled() -> None:
         gate=discord_alerts.AlertGate(),
         webhook_url="https://discord.test/webhook",
         clock=clock,
+        wall_clock=lambda: EARLY_WALL_CLOCK,
     )
 
     async def scenario() -> None:
@@ -485,6 +621,7 @@ def test_redis_wire_alert_reaches_the_poster() -> None:
             gate=discord_alerts.AlertGate(),
             webhook_url="https://discord.test/webhook",
             clock=clock,
+            wall_clock=lambda: EARLY_WALL_CLOCK,
         )
         consumer.subscribe()
         try:
@@ -500,3 +637,43 @@ def test_redis_wire_alert_reaches_the_poster() -> None:
     assert len(calls) == 1
     for field in ("error", "connection_silent", "delta", "the feed stopped"):
         assert field in calls[0]["content"]
+
+
+def test_every_test_in_this_module_has_an_assertion() -> None:
+    """#91's own fix, kept honest: a test with no `assert` and no `pytest.raises`.
+
+    completes whether or not the thing it names is true. The audit found exactly this
+    shape in
+    `test_an_existing_alert_group_can_be_joined_again_without_a_busygroup_failure`
+    with an AST scan of the test tree; this is that scan, scoped to this file rather
+    than the whole tree -- the audit's own scan named one other instance, a
+    pre-existing supervisor test elsewhere, which is out of this ticket's allowed scope
+    to touch. A future test added here with no assertion fails this one instead of
+    shipping green and meaning nothing.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            continue
+        if node.name == "test_every_test_in_this_module_has_an_assertion":
+            continue
+        has_assertion = any(
+            isinstance(inner, ast.Assert)
+            or (
+                isinstance(inner, ast.Call)
+                and (
+                    (isinstance(inner.func, ast.Name) and inner.func.id == "raises")
+                    or (
+                        isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == "raises"
+                    )
+                )
+            )
+            for inner in ast.walk(node)
+        )
+        if not has_assertion:
+            offenders.append(node.name)
+    assert offenders == [], (
+        f"test function(s) with no assert and no pytest.raises: {offenders}"
+    )

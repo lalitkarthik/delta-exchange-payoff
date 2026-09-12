@@ -2,10 +2,11 @@
 
 ## 1. What it is
 
-The local stack is one Compose project named `dxp`: six containers, `feed`, `store`, `api`,
-`web`, Redis, and an `nginx:alpine` reverse proxy. One command starts the stack, and one
-host port serves the dashboard and API. Every service defines a health check, so Compose can
-wait for the whole stack instead of guessing from process startup.
+The local stack is one Compose project named `dxp`: seven containers, `feed`, `store`,
+`discord-alerts`, `api`, `web`, Redis, and an `nginx:alpine` reverse proxy. One command
+starts the stack, and one host port serves the dashboard and API. Every service defines a
+health check, so Compose can wait for the whole stack instead of guessing from process
+startup.
 
 ## 2. The one command
 
@@ -86,16 +87,19 @@ the default is the real venue adapter.
 
 | Variable | Read by |
 |---|---|
-| `DELTA_BUS` | `feed`, `store`, `api` |
-| `DELTA_REDIS_URL` | `feed`, `store`, `api` |
-| `DELTA_BUS_BATCH_MS` | `feed`, `store`, `api` |
-| `DELTA_BUS_RETENTION_SECONDS` | `feed`, `store`, `api` |
-| `DELTA_BUS_INSTANCE` | `feed`, `store`, `api` |
+| `DELTA_BUS` | `feed`, `store`, `api`, `discord-alerts` |
+| `DELTA_REDIS_URL` | `feed`, `store`, `api`, `discord-alerts` |
+| `DELTA_BUS_BATCH_MS` | `feed`, `store`, `api`, `discord-alerts` |
+| `DELTA_BUS_RETENTION_SECONDS` | `feed`, `store`, `api`, `discord-alerts` |
+| `DELTA_BUS_INSTANCE` | `feed`, `store`, `api`, `discord-alerts` |
 | `DELTA_STORE_ROOT` | `store`, `api` |
 | `FLUSH_SECONDS` | `store` |
 | `DELTA_FEED_ADAPTER` | `feed` |
-| `DISCORD_WEBHOOK_URL=` | future `alert` consumer for #66; empty here |
+| `DISCORD_WEBHOOK_URL=` | `discord-alerts` (landed, #66); empty in the committed file |
 | `NEXT_PUBLIC_ENGINE_URL=http://localhost:8080/api` | `web` image build |
+
+The real webhook value belongs in `stack.local.env`, a git-ignored overlay Compose loads
+after `stack.env` for the `discord-alerts` service; no secret is ever committed here.
 
 `NEXT_PUBLIC_ENGINE_URL` is a build argument, not a run-time variable. `NEXT_PUBLIC_` values
 are inlined by `next build`, so changing the proxy mount or origin requires a web rebuild,

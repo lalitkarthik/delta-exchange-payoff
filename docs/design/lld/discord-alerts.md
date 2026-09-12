@@ -21,11 +21,25 @@ group reads with `>` and therefore receives new entries without adding replay lo
 This is intentionally different from the store's lossless replay-from-last-flush policy in
 [redis-bus.md](redis-bus.md) §2: a stale Discord notification is not a durable record.
 
+**#66's "no replay" is enforced by the consumer, not by the bus.** `group_start="$"` only
+keeps a *newly created* group off the backlog. Rejoining an existing group — this process
+restarting — reads with `>` from wherever that group's `last-delivered-id` already sits,
+which is everything published while nothing was reading, up to the retention window. So
+`AlertConsumer.subscribe()` records its own start time and `_run_once` drops, before the gate
+sees it, any alert whose `ts_received` predates that time. A restart therefore still
+*receives* everything Redis held, and *posts* none of it; only an alert published after this
+instance started can reach Discord. Audited as #86, which reproduced three alerts published
+during a consumer's downtime being delivered to its replacement.
+
 RedisBus's existing group reader acknowledges each batch before it calls this consumer's
 queue offer. Acknowledgement therefore happens inside the bus read path, before alert code
 sees an entry; this service adds no acknowledgement logic of its own. The FanOut path uses
 the same lossless queue but has no broker-side event filter, so the consumer's `isinstance`
 check is also the pause guard.
+
+The drop happens **ahead of** the gate deliberately: a stale alert that reached the gate
+would spend a real alert's collapse slot or its rate-limit slot, so the first genuine alert
+after an outage could be silently swallowed by the noise of the outage itself.
 
 `AlertGate` returns the frozen `GateDecision(post, collapsed_count, rate_limited)`. A
 signature is `(code, adapter, severity)`. `assumed` (ticket #66, pending orchestrator
@@ -64,6 +78,7 @@ posted.
 | `derived` (ticket R5) Discord status `429` | Read `retry_after` or use the `assumed` `1.0`-second fallback, then block and drop. |
 | `derived` (ticket R5) Discord status `5xx` | Log at error and drop without changing `_blocked_until`. |
 | HTTP exception | Log only its safe exception type at error, never the URL, then continue. |
+| An alert timestamped before this consumer instance started | Dropped in `_run_once` before the gate sees it, so it cannot spend a real alert's collapse or rate-limit slot; logged at warning under `ALERT`. |
 | Feed pause or any non-`Alert` queue item | Consume it and do not call Discord; a pause is not an alert. |
 
 ## 4. Test seam and numbers
@@ -75,6 +90,16 @@ test starts `uvicorn` as a subprocess on loopback and checks `/health` in the un
 case; this is the only process-launch test. `engine/tests/test_alert_main.py` also checks
 that the committed `stack.env` value is empty and the real secret belongs in the optional,
 git-ignored `stack.local.env` overlay.
+
+Two tests pin the restart seam specifically, both parametrised over fakeredis **and**
+Docker-Redis. `test_alerts_published_while_no_consumer_ran_are_dropped_as_stale` publishes
+with nothing reading, rejoins the group, and asserts one post — the fresh alert, carrying no
+collapse suffix, which is what pins the rate-limit and collapse rules across the restart.
+`test_an_existing_alert_group_can_be_joined_again_without_a_busygroup_failure` asserts the
+rejoined reader **task is still alive** and delivers, not merely that no exception reached the
+test body: the bus sets `positioned` in a `finally`, so a reader that died while positioning
+still looks ready, and the old form of that test passed with `_ensure_group` raising
+`BUSYGROUP` unconditionally (#91).
 
 All timing figures above are `assumed` from ticket #66 pending orchestrator confirmation;
 the stream, status, and queue behaviours are `derived` from the landed code and the tests.
