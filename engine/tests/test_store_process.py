@@ -149,11 +149,19 @@ async def _start_writer(
     `flush_seconds` used to default to `0.0`. `BarWriter`'s flush guard is
     `now - last_flush < flush_seconds`, and at `0.0` that guard never holds against the
     `Clock` fixture used throughout this file (it does not advance on its own, so
-    `now - last_flush` is `0` on every pass) — every 10ms tick ran a full `_commit`:
-    an `Intent`, four tables flushed, a checkpoint rewritten. Idle that is cheap; under
-    load it competed with its own I/O and slowed one test up to 12x (#96). Production's
-    `FLUSH_SECONDS` (300) is not the answer either — a test's own `_wait_until` bounds
-    are 5-10s, nowhere close.
+    `now - last_flush` is `0` on every pass) — so every pass of the drain loop ran a
+    full `_commit`: an `Intent`, four tables flushed, a checkpoint rewritten.
+    Production's `FLUSH_SECONDS` (300) is not the answer either — a test's own
+    `_wait_until` bounds are 5-10s, nowhere close.
+
+    **The size of that storm is smaller than #96 estimated, and the number now here is
+    `measured` rather than `derived`.** The ticket reasoned that a 1.1s run at
+    `tick_seconds = 0.01` is about 110 ticks and therefore about 110 commits. It is not:
+    the writer only makes a pass while the test leaves it running, and every test here
+    kills it as soon as its condition is met. Counted by wrapping `_commit` itself,
+    `measured` 2026-09-12 on the one test that takes this default: **3 commits at `0.0`**
+    (4 in 2 of 6 runs), **exactly 2 at `0.05`** in 6 of 6. Most of that run's wall time
+    is process set-up, not the loop.
 
     `0.05` — five ticks — is the smallest interval that survives one tick's scheduler
     jitter without immediately reopening, so a slow tick under load cannot turn back
@@ -162,6 +170,15 @@ async def _start_writer(
     test deliberately moves `clock.value` forward past it — see
     `test_store_restart_replays_only_after_the_saved_positions`, the one test in this
     file that takes this default rather than overriding it.
+
+    **What the cadence buys is determinism, not speed.** Under 24 competing processes
+    (`tools/loadgen.py run --count 24`), 10 consecutive runs of that test passed at each
+    setting and the times overlap: `measured` 2026-09-12, `0.0` 0.77-11.80s and `0.05`
+    6.76-9.00s as pytest reported them. The 12x slowdown #96 attributed to this cadence
+    was contention, which is #99's finding and not this knob. What does change is what
+    the test observes: at `0.0` the commit count varies run to run and one of them lands
+    on an aggregator with **zero** ticks in it, while at `0.05` it is two commits at
+    exactly 2 ticks then 1, every run.
     """
     process.writer.tick_seconds = 0.01
     process.writer.flush_seconds = flush_seconds
@@ -314,6 +331,15 @@ def test_store_restart_replays_only_after_the_saved_positions(tmp_path: Path) ->
     same timer production runs on. The fixed `Clock` does not advance on its own, so the
     guard needs a nudge forward before the wait can ever resolve; the earlier minutes
     are already sealed by the clock's starting position and are unaffected by it.
+
+    **It is gated on that timer and was forced red to prove it.** With every call site in
+    this file forced to production's 300s, this is the one test that fails — the +1.0s
+    nudge cannot open a 300s guard, `_maybe_flush` is entered 325 times, commits nothing,
+    and the wait below times out at its 5.0s bound (`measured` 2026-09-12, reproduced in
+    4 of 4 whole-file runs). So the assertions below are reached because the periodic
+    commit ran, not in spite of it. **It is also not testing the storm**: it needs one
+    commit and `0.05` gives it one, where `0.0` gave 3 or 4 of which one landed on an
+    empty aggregator.
     """
 
     async def scenario() -> None:
@@ -572,6 +598,15 @@ def test_store_pause_resume_commits_a_span_and_leaves_paused_minutes_empty(
             # own commit (`_apply_pending_commands`), not the periodic timer — an
             # incidental timer commit would still pass `generation >= 1` but for the
             # wrong reason and would hide a broken pause/resume commit path.
+            #
+            # **That is not hypothetical, and this pin is the only thing preventing it.**
+            # `measured` 2026-09-12, #96's "what to notice": with resume's own commit
+            # made a no-op and nothing else changed, this test FAILS at the pin
+            # (`1 failed in 5.98s`) and PASSES at `flush_seconds=0.0` (`1 passed in
+            # 0.96s`) — the storm's commits satisfy `generation >= 2` and rewrite the
+            # checkpoint that the assertions below read. A fast cadence here would make
+            # this a test of the timer wearing the name of pause/resume. The exact
+            # counts below exist so that removing the pin fails loudly instead.
             await _start_writer(process, flush_seconds=10_000.0)
             process.bus.publish(_quote_event(0, bid=100.0))
             await process.bus.flush()
@@ -581,6 +616,9 @@ def test_store_pause_resume_commits_a_span_and_leaves_paused_minutes_empty(
             await process.bus.flush()
             await _wait_until(lambda: process.writer.recording is False)
             await _wait_until(lambda: process.writer.generation >= 1)
+            # Exactly one, and it is pause's. Anything else committed here came from a
+            # timer that this test has pinned out of the way.
+            assert process.writer.generation == 1
             checkpoint = read_checkpoint(tmp_path)
             assert checkpoint is not None
             assert checkpoint.recording is False
@@ -595,6 +633,9 @@ def test_store_pause_resume_commits_a_span_and_leaves_paused_minutes_empty(
             await process.bus.flush()
             await _wait_until(lambda: process.writer.recording is True)
             await _wait_until(lambda: process.writer.generation >= 2)
+            # And exactly two: pause's, then resume's. This is the assertion the storm
+            # was able to satisfy on its own — see the cadence note above.
+            assert process.writer.generation == 2
             final_checkpoint = read_checkpoint(tmp_path)
             assert final_checkpoint is not None
             assert final_checkpoint.recording is True
