@@ -98,7 +98,7 @@ you conclude your change broke something.
   248  docs/design/cloud/epic.md                          grown    #74 (ceb9911)
   295  docs/iv-vs-rv.md                                   grown    #54 (4209ec2)
   640  docs/architecture.md                               grown    #77 (01710dd)
-  944  docs/storage.md                                    grown    #77 (01710dd)
+  962  docs/storage.md                                    grown    #77, #104
   ```
 
   Legacy — already over the bound before the epic touched them, and named here for the
@@ -129,7 +129,7 @@ you conclude your change broke something.
 
   `docs/design/lld/logging.md` is no longer over: #63 split it, 213 becomes **92** plus a
   75-line `logging-catalogue.md`, and generalised the parser from one file to a tuple.
-  `docs/design/hld.md` is **193**; it was 219 before #62 moved its evidence into
+  `docs/design/hld.md` is **197**; it was 219 before #62 moved its evidence into
   `hld-evidence.md`. `docs/design/lld/store.md` is **191**; it was 204 before #81 moved its
   evidence into `store-numbers.md`, then lost a paragraph #87 found stale. Three times now,
   a design note filling up has been fixed the same way — the design stays and the evidence

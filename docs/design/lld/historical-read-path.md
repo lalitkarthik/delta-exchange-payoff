@@ -91,8 +91,10 @@ scrubber's polish work (throttling, a pending indicator) becoming necessary yet.
 ## What is not measured
 
 **The live gap rate between `quote-bars` and `reference-bars`/`spot-bars`.**
-`docs/storage.md` records `quote-bars` vs `computed-bars`: 217 of 904 minutes for one
-expiry on one day carried quotes and no computed bar. Whether `reference-bars` and
+`docs/storage.md` records `quote-bars` vs `computed-bars`: 214 of 1,118 quoted minutes for
+one expiry on one day carried quotes and no computed bar (`measured` 2026-09-12, #104's
+re-read; the 217 of 904 it replaces came from a run truncated part-way through that day).
+Whether `reference-bars` and
 `spot-bars` show the same gap, a different one, or none — they are folded from ticks
 rather than sampled, so the mechanism `tools/measure_computed_gaps.py` diagnoses does
 not obviously apply to them — is unmeasured. The ticket's own *What to notice* section

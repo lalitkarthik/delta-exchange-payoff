@@ -188,6 +188,9 @@ Fields, emitters, consumers and timing are in [events.md](events.md).
 [HLD evidence](hld-evidence.md) contains every measured, assumed, and derived number, the run
 and caveat behind each, and the explicit out-of-scope decisions.
 
+[The instruments](instruments.md) is the other half: what produced those numbers, and
+whether each tool's denominator comes from the data or from the request. #104.
+
 ## 6. Where it runs, and the words it uses
 
 The bus is [cloud/message-bus.md](cloud/message-bus.md) and the engine is

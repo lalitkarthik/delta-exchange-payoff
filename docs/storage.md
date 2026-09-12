@@ -387,6 +387,18 @@ expiry 25-09-2026: **217 of 904 minutes had quote bars and no computed bar — 2
 every single gap was exactly one minute long, `run lengths: [(1, 217)]`. A separate 62
 minutes had no quote bars at all, which is the engine having been down and is not this.
 
+**That run was truncated, and #104 found out by checking rather than assuming.** The same
+store, the same day and the same expiry, re-read `measured` 2026-09-12 on the changed
+probe, hold **00:00 – 19:40 — 1,181 minutes, 214 of 1,118 quoted minutes lost, 19.1%**.
+The 904-minute span above ends at 15:03: the probe was run while 2026-09-04 was still
+being recorded and reported the part of the day it could see as though it were the day.
+Two further corrections travel with it. **24% is 217 ÷ 904**, the span including the 62
+minutes the engine was down; the probe itself printed 217 ÷ 842 = 25.8%, because its
+denominator is the minutes that had a quote. And the loss count is **not reproducible**:
+the same 00:00 – 15:03 prefix of the same store reads 196 today, not 217. Why 21 minutes
+gained a computed bar after the fact is unknown, and unknown is the honest answer — take
+19.1% over 1,181 minutes as the figure with a run behind it.
+
 One sample per minute and a grace of zero are individually correct and together refuse a
 whole minute for one unlucky instant. **#23 samples every ten seconds instead**, keeping
 the boundary sample as well — `store.COMPUTED_SAMPLE_SECONDS` carries the cost argument.
@@ -395,6 +407,10 @@ the same refusal. **It narrows the window from one instant to ten seconds; it do
 close it**, and the minutes already lost stay lost. What remains is a number to measure
 with `tools/measure_computed_gaps.py` once the change has run a day, not to predict — and
 that probe is how the 24% above was taken, so the before and after are the same query.
+The probe now reports the span it was asked for beside the span it examined, and coverage
+beside loss, so a before or an after taken on a truncated day says so — #104, and
+[design/instruments.md](design/instruments.md) for the same question asked of every other
+tool under `tools/`.
 
 **Its grace is zero**, and that is what enforces the no-invention rule rather than merely
 stating it. `ChainStream._computed` keeps answering after the socket dies — it holds the
@@ -765,7 +781,8 @@ row.
 The one table under its ceiling is `computed-bars`, at 81.8% — 562.6 rows a minute against
 688 listed contracts. That is not silence either: it is legs whose expiry had no computed
 chain in that minute, plus §8's boundary effect — which was assumed small here and was
-later `measured` at 24% of minutes per expiry, and is what #23 addresses. This ratio was
+later `measured` at 24% of minutes per expiry (**19.1%** on #104's re-read of the whole
+recorded day), and is what #23 addresses. This ratio was
 taken before that change and should be re-taken after it.
 
 **And the total is 109.9% of #5's stated ceiling**, which is not a contradiction: #5's
@@ -925,7 +942,8 @@ skipped, so 4.7x at sixteen is a floor for a year at 730.
   it at all.
 - **The boundary attribution has now been measured, and the residual has not.** §8's
   estimate of one minute in a hundred was `measured` at 24% on 2026-09-04 by
-  `tools/measure_computed_gaps.py`, and #23 answered it by sampling every ten seconds.
+  `tools/measure_computed_gaps.py` — re-read at **19.1%** over the whole recorded day by
+  #104, see §8 — and #23 answered it by sampling every ten seconds.
   The rate that survives that change needs the same probe run over a day the new
   sampling recorded; until then it is unknown, not zero. The transit-lag half of §8 —
   a sample within ~200 ms of a boundary attributed to the wrong side — is untouched by
