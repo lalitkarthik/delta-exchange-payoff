@@ -47,6 +47,18 @@ def test_compose_names_the_project_and_only_publishes_the_proxy_port() -> None:
     assert 'NEXT_PUBLIC_ENGINE_URL: "http://localhost:8080/api"' in text
 
 
+def _command_line(block: str) -> str:
+    """The service's own `command:` line, with its comments stripped away.
+
+    A service block holds its comments as well as its keys, so a substring test against the
+    whole block can be satisfied by a sentence that merely mentions a value. Every assertion
+    about what a container is actually told to do goes through here.
+    """
+    for line in block.splitlines():
+        if line.strip().startswith("command:"):
+            return line
+    raise AssertionError("the service block declares no command")
+
 def test_compose_prefixes_every_container_and_gives_redis_the_bounded_command() -> None:
     text = COMPOSE.read_text(encoding="utf-8")
     blocks = _service_blocks(text)
@@ -62,9 +74,14 @@ def test_compose_prefixes_every_container_and_gives_redis_the_bounded_command() 
         "dxp-proxy",
     }
     assert names and all(name.startswith("dxp-") for name in names)
-    redis = blocks["redis"]
+    # Read the command LINE, not the whole service block. The block includes the comments
+    # above the command, and those comments have always named a memory ceiling -- so
+    # `"1gb" in blocks["redis"]` was satisfied by prose and never once looked at the
+    # configuration. It passed unchanged when the real ceiling moved from 1gb to 2gb.
+    redis = _command_line(blocks["redis"])
     assert "--maxmemory" in redis
-    assert "1gb" in redis
+    assert "2gb" in redis
+    assert "1gb" not in redis
     assert "--maxmemory-policy" in redis
     assert "noeviction" in redis
     assert "--appendonly" in redis
