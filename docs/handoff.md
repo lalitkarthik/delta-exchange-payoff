@@ -1,210 +1,108 @@
-# Handoff — picking this project up from GitHub
+# Handoff — 2026-09-12
 
-**For a collaborator joining with repository access only.** Everything you need is in this
-repo or in the issues. Nothing here depends on a machine you cannot reach.
+## Start here
 
-This file deliberately does **not** restate the issues, the commits or the four findings
-documents. Those are the record. This is the context they cannot carry: what is decided,
-what is deliberately unbuilt, and what the repo currently gets wrong.
-
----
-
-## 1. Read these first, in this order
-
-| Read | For |
-|---|---|
-| [issue #1](https://github.com/lalitkarthik/delta-exchange-payoff/issues/1) | The whole study, and why each ticket exists |
-| [`docs/delta-api-scope.md`](./delta-api-scope.md) | What Delta's API actually gives you, and the padding trap |
-| [`docs/settlement.md`](./settlement.md) | **Delta is vanilla, USD-settled — not inverse.** The project's highest-risk unknown, now measured |
-| [`docs/forward.md`](./forward.md) | Four ways to get a forward, and why the choice matters |
-| [`docs/implied-vol.md`](./implied-vol.md) | Two models, four solvers, the agreement matrix |
-| [`docs/ingestion.md`](./ingestion.md) | One socket, the fan-out, what it costs |
-| [`docs/chain-contract.md`](./chain-contract.md) | The engine ↔ web interface |
-| [`docs/smile-contract.md`](./smile-contract.md) | `/smile` — a day of stored IV per expiry, disk **and** buffer |
-
-Then read `git log`. Twenty-one commits, each message written to explain a decision rather
-than to label a diff. They are worth more than a summary of them.
-
-**If an issue and a file disagree, the issue wins.** That rule is in the root README and
-it still holds.
-
-## 2. Running it from a clean clone
-
-Install steps live in [`engine/README.md`](../engine/README.md) — Python 3.13, a venv,
-`requirements-dev.txt`. **No API key and no `.env`:** every endpoint and channel this
-project touches is public market data.
-
-The web side is Next.js 16 with Bun; `cd web && bun install`.
-
-Two processes, engine first:
-
-```sh
-cd engine && .venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.main:app --port 8000
+```
+pwsh -File "C:\Users\Acer\AppData\Local\Temp\claude\D--second-brain-convex-hedge-vault\0d0309cd-6f7e-4201-adff-bbf0e1a2ac41\scratchpad\live63.ps1"
 ```
 
-```sh
-cd web && bun run dev
-```
+Runs #63's live steps 1–4: a full split stack against a scratch root beside the untouched
+live monolith, three flush intervals (~20 min), then `tools/compare_store_runs.py` over the
+window. It is first because #63's criteria 4 and 6 need **24 h of wall clock that only starts
+at the I3→I4 cutover**, and the cutover is the step after this one. Everything else can
+proceed in parallel.
 
-Engine on 8000, web on 3000. **CORS allows only port 3000** (`localhost` and `127.0.0.1`),
-so serving the web side from another port fails in a way that looks like the engine being
-down. Note that CORS does not cover the `/ws/chain` websocket route — a handshake is not
-subject to it — which is fine while the server binds to loopback and carries only public
-market data, and stops being fine the moment either changes.
+## In flight
 
-Paths throughout the docs are Windows-flavoured (`.venv/Scripts/`) because that is where
-this was built. On macOS or Linux use `.venv/bin/` and the equivalents; nothing in the
-code is platform-specific.
+- **`p81-right-edge` (worktree `D:\Convex Hedge\dxp-81`)** — #81, stopped on the owner's
+  instruction, not by failure. 2 of 15 micro-tickets done: P81-01 (`OptionBar` gained
+  `underlying` plus a validator) and P81-02 (`translate_bar_columns` in `store.py`).
+  **Verified coherent:** 246 passed on the three touched test files, ruff clean. Nothing
+  committed. **Resume the same Codex session rather than restarting** — it is the same
+  attempt, not a new rung:
+  `codex exec resume 01a09417-93d4-7163-81c0-a5fbeffd90b0 -m gpt-5.6-luna -c model_reasoning_effort=max -c 'sandbox_mode="workspace-write"'`
+  (from `dxp-81`; `resume` takes no `-s` and no `-C`). Brief: `scratchpad/brief81code.txt`.
+- **`i6-compose` (worktree `dxp-65`)** — fully landed and merged into main; branch and
+  worktree are disposable. **`dxp-65/web/node_modules` and `dxp-65/engine/.venv` are both
+  junctions into the main checkout: `cmd /c rmdir` each one BEFORE `git worktree remove`**, or
+  the removal follows them and deletes the real ones. `dxp-81/engine/.venv` is a junction too.
+- **`dxp-plan`** (detached at `ccb0064`) — a pristine snapshot used for planning. Disposable.
+- **`rv-backfill` / `dxp-54`** — #54, stopped by the owner earlier. Leave exactly as is.
+- **#63, #65, #79 are landed but their issues are still OPEN, uncommented, and absent from
+  `runs.tsv`.** That is the biggest gap: `AGENTS.md` says the issues are the state of record,
+  and right now they disagree with the code. Comment drafts: `scratchpad/c63.md` (placeholders
+  `@@COMMIT@@`, `@@SUITE@@`, `@@WINDOW@@`, `@@COMPARE@@`, `@@COVERAGE@@`, `@@BEHIND@@`,
+  `@@LOGGING_LINES@@`, `@@CATALOGUE_LINES@@`; fill with `scratchpad/fill.py`),
+  `scratchpad/v65-gate.txt` and `scratchpad/v79-gate.txt` hold #65's and #79's numbers.
 
-## 3. What is built, and what is deliberately not
+## What changed this session
 
-Verified on `main` at the time of writing: **291 tests passing, ruff clean, frontend
-typecheck clean.**
-
-The page streams. One Delta websocket connection for the whole process, all 588 live BTC
-options subscribed on both the `ticker` and `ob_l2` channels, pushed to the browser as a
-complete `ChainResponse` once a second. There is no Refresh button.
-
-Three things are **not** built, and each is deliberate rather than forgotten:
-
-**Nothing is stored.** No disk, no Parquet, no database. `ChainStream` is two dictionaries
-of ~588 entries that overwrite each other. Restart the engine and every quote ever
-received is gone. That is [issue #5](https://github.com/lalitkarthik/delta-exchange-payoff/issues/5)'s
-job and it is the natural next ticket.
-
-**Nothing is computed on the live path.** The implied vols and Greeks on screen are
-Delta's own values, passed straight through. Everything built for #2 and #4 — Black-76,
-Black-Scholes, four solvers, the forward recovery — exists, is tested, and is not wired
-in. Connecting them is the point of the remaining tickets, not an oversight.
-
-**The fan-out has exactly one subscriber.** `ChainStream`. `FanOut` is a seam built for
-#5 and #4 to plug into, not a fan-out doing real work yet. Be straight about that if it
-comes up.
-
-## 4. Two things the repo currently gets wrong
-
-Both are worth fixing early, and both are the kind of drift that costs a day if you
-believe them.
-
-**The root README contradicts `docs/settlement.md`.** [`README.md`](../README.md) still
-says crypto options here are *"inverse-settled — quoted in USD, margined and settled in
-the underlying"*. That was the assumption the project started from. It was measured and
-found **false**: Delta India's options are vanilla, linear, USD-settled, and textbook
-Black-Scholes and put-call parity apply with no correction term. `docs/settlement.md` is
-correct; the README was never updated behind it.
-
-**Issue #5's storage estimate is roughly 7x too small.** The ticket asks you to check the
-footprint against "~16M rows/day". That figure is unsourced in the spec, and the
-arithmetic that reproduces it is `ticker` alone at 187 msg/s × 86,400 s = 16.2M — a
-single-channel estimate from when 967 options were listed.
-
-What the socket actually delivers today, **measured** on a live connection 2026-09-03 by
-`tools/measure_feed.py`: **1,322.9 msg/s at 636.5 KB/s** across both channels. Which is:
-
-| | |
+| Commit | Ticket |
 |---|---|
-| Rows per day | 1,322.9 × 86,400 = **~114M** (derived) |
-| Raw JSON per day | 636.5 KB/s × 86,400 = **~52 GB** (derived) |
+| `83120d6` | #63 I4 — the store as its own process, replaying from its last flush |
+| `142f200` | #65 I6 — five services behind one proxy on one port |
+| `5cbe672` | #79 I13 — a committed tool to measure each service on its own container |
 
-It does not break the design. It decides how hard the compression and the buffer have to
-work, and whether a day reads back in Polars in seconds or in minutes. Measure it rather
-than trusting either number.
+**Verified after landing:** 1,312 passed / 0 failed with Docker up, ruff clean, `tsc --noEmit`
+clean, `next build` exit 0, main clean. No PRs — this repo commits straight to `main`.
 
-## 5. Decisions already made — do not silently reopen
+## Decisions made
 
-**All 588 contracts on both channels.** An `ob_l2` narrowing optimisation was built —
-subscribe only the watched expiry, reference-count the watchers, 637 → ~183 KB/s — and
-then deliberately reverted: *"just all contract connected and receiving properly rather
-than optimising for per page"*. It is about twenty minutes of work if it is ever wanted
-again. **Do not rebuild it unprompted.**
+- #63's live step 2 as written was impossible; the comparison is two independent recorders on
+  one venue stream — `scratchpad/rulings63-live.md`.
+- #65's api moved under a `/api/` prefix instead of a per-route proxy table, amending R7/R8 —
+  reasoning in `plan65.json`'s `unsettled_decisions`, and in `proxy/nginx.conf`'s own comments.
+- The proxy answers its own `/healthz` so its healthcheck does not depend on `web` —
+  `engine/tests/test_stack_proxy.py` pins it.
+- #81's R5 was corrected: the target is the newest **sealed** minute, not the open one —
+  `scratchpad/brief81code.head.txt`.
+- #66 must **not** touch `redis_bus.py`: #63 already landed `group_start` — see
+  `redis_bus.py:443` and the correction inside `plan66.json`'s I7-03.
+- Every Compose service must declare a `healthcheck`, or #79 cannot measure start-to-healthy —
+  `docs/design/cloud/local-stack.md`.
+- `docs/design/events.md` stays one file at 239 lines, over the bound, because
+  `test_events.py` parses it. Follow-up written: `scratchpad/followup-events-parser.md`.
 
-**In-process fan-out, not ZeroMQ.** OpenAlgo fans out over ZeroMQ because it serves 36
-brokers across separate processes. This is one venue, one user, 82 KB/s per consumer. The
-reasoning, and the conditions that would reverse it, are in the `fanout.py` module
-docstring.
+## Open questions
 
-**Overflow drops the oldest — for the screen.** A four-second-old quote is worthless, not
-slightly worse. Storage will need the opposite policy, because a dropped message there is
-a permanent hole in the historical record. That per-subscription choice is #5's work and
-is flagged in the same docstring.
+- **Assumed, not verified:** that #79's day-long collection should run with the real venue
+  feed rather than the smoke override. The plan says "live feed, one full trading day", but it
+  means a second venue subscriber for 24 h. Worth one sentence from the owner.
+- Two follow-up tickets are drafted and **not filed**: `scratchpad/followup-events-parser.md`
+  and `scratchpad/followup-live-feed-flag.md`.
+- `docs/design/cloud/redis-hosting.md` states a 2 GB Redis standard; the local stack uses 1 GB.
+  Not a contradiction — different things — but the local-stack doc should say why.
+- The `store.state` flushed-through position would retire #81's `BUFFER_HORIZON_SECONDS`
+  entirely. File it after #81 lands, not before.
 
-## 6. Open questions carried forward
+## Traps found
 
-The full lists are in `docs/implied-vol.md` §6 and `docs/ingestion.md` §6. The headline
-ones, largest first:
+- **Windows Python writes CRLF.** A `mapfile` fed from a Python one-liner gives every array
+  entry a trailing `\r`, so `[ -e "$f" ]` is false for all of them and a land script reports
+  "nothing to stage" against a plainly dirty tree. Pipe through `tr -d '\r'`. The first attempt
+  at this very fix was itself corrupted the same way.
+- **A green suite does not prove a script runs, twice over.** `tools/smoke_stack.py` had
+  `main(argv)` and then `del argv`, so `--help` built six containers while 1,214 tests passed.
+  Probe every new tool with `--help` and assert it exits 0 **with `PATH` emptied**.
+- **`fakeredis` hides real bugs.** #63's `behind` flag never cleared on an empty blocking
+  `XREADGROUP`; only the Docker-Redis parametrisation showed it. Workers' sandboxes skip those
+  — re-run them yourself.
+- **`compare_store_runs.py` refuses a timestamp without a UTC offset.** Minute-only strings
+  fail *after* the recording window. Send `yyyy-MM-ddTHH:mm:ssZ`.
+- **`next build` cannot run in a worktree** whose `web/node_modules` is a junction: Turbopack
+  refuses to cross it. `tsc --noEmit` and `next build --webpack` both work; run the real build
+  in the main checkout.
+- **Codex sandbox process creation is the first thing to fail under memory pressure**
+  (`STATUS_DLL_INIT_FAILED`). It is bursts, not levels: the pagefile grows to a 32 GB maximum
+  but not instantly. Two workers maximum, and stagger their starts by ~60 s.
+- **PowerShell `>` writes UTF-16 with a BOM**, which Compose's `env_file` cannot parse.
 
-- **Mid versus mark is unmeasured.** Every implied vol in the project inverts a bid/ask
-  midpoint. `mark_price` is Delta's own model output, so fitting *that* recovers Delta's
-  surface rather than the market's. Nobody has measured how far apart they are.
-- **Our Greeks have never been compared** against Delta's reference columns. #4 asked for
-  it and it was not done.
-- **`greeks.rho` does not reconcile** with a textbook vanilla rho.
-- **`R2` versus `R1` was never run** as a direct rate-versus-rate table — the one #4
-  acceptance criterion left unticked, and noted as such on the issue.
-- **The `under a day` expiry band is empty** in the agreement matrix.
-- **The 1 Hz push discards intermediate states.** Thirty seconds on the at-the-money call
-  produced 40 distinct quotes and showed 30. Harmless for a screen; #5's writer must
-  therefore subscribe to the bus directly rather than to the pushed chain.
+## Read these
 
-## 7. Conventions — these are not negotiable
-
-**Tag every number `measured` or `assumed`,** naming the request or run that produced it.
-This convention has paid for itself at least four times: every source consulted on this
-project has given a good design and a bad number. Do not relax it.
-
-**Read source, not READMEs.** This rule cost a full revision of the spec to learn.
-OpenAlgo's `delta_websocket.py` was eventually read in full and it surfaced three failure
-modes that would otherwise have shipped, plus a stale constant that would otherwise have
-been copied — their `MAX_SYMBOLS_PER_FRAME[ob_l2] = 1`, against 300 symbols measured
-accepted in a single subscribe message.
-
-**Never forward-fill.** A gap in the data is a gap in the data. This is both a technical
-rule and the project's moral: forward-filling is precisely the defect caught in Delta's
-own `/v2/history/candles`, where `C-BTC-60000-270624` returns 801 daily bars of which 797
-are fabricated. Do not build the same thing into our store.
-
-**Commits carry the repository owner's name only.** No AI or assistant attribution in
-commit messages, trailers or pull request descriptions. All 21 commits follow this.
-
-## 8. How this project is meant to be worked
-
-This is a **learning project, not a delivery project.** The owner said so explicitly and
-reshaped the spec around it. Every ticket carries six sections — concept, why this way,
-learn first, task, how you will know, what to notice — and they are meant to be honoured
-in that order: understand and explain the concept first, state what was rejected and why,
-then build, then point at what to notice in the result.
-
-Tickets are worked **one at a time**, and the order follows the owner's interest rather
-than what parallelises best.
-
-**Measure rather than assert.** Almost every question on this project has been better
-answered by running something for twenty seconds than by reasoning about it. A table of
-real numbers beats a paragraph of explanation, every time.
-
-**Still open:** [#5](https://github.com/lalitkarthik/delta-exchange-payoff/issues/5)
-(storage), [#6](https://github.com/lalitkarthik/delta-exchange-payoff/issues/6)
-(parallelisation), [#7](https://github.com/lalitkarthik/delta-exchange-payoff/issues/7)
-(caching and the live read path),
-[#8](https://github.com/lalitkarthik/delta-exchange-payoff/issues/8) (findings).
-#5 is the one to start on.
-
-## 9. Suggested skills
-
-If you are working this repo with an AI agent, these earned their keep here:
-
-- **`superpowers:test-driven-development`** — every module in `engine/src/deltapayoff/`
-  was built test-first and it repeatedly caught errors in the *expectation* rather than
-  the code. #5's storage layer is pure functions over frames: ideal territory.
-- **`superpowers:verification-before-completion`** — before claiming any acceptance
-  criterion is met. Four claims on this project have outrun their evidence.
-- **`code-review`** — run it before every commit of substance. It found a retry-budget bug
-  and an unbounded push interval, both of which had already been written and read twice.
-- **`superpowers:systematic-debugging`** — for anything in the Parquet or partitioning
-  layer that misbehaves.
-- **`mattpocock-skills:research`** — if #5 needs Polars or hive-partitioning specifics.
-  Primary docs and source, not blog posts.
-- **`superpowers:brainstorming`** — for anything outside the seven tickets. The existing
-  work is already specced; do not re-brainstorm it.
-
-Avoid dispatching parallel background agents on these tickets. It has been asked for
-explicitly: the token cost is not repaid on work this sequential.
+1. `C:\Users\Acer\AppData\Local\Temp\handoff-delta-exchange-payoff-LIVE.md` — the running log,
+   newest first. Everything below is detail on it.
+2. `gh issue view 63 / 65 / 79 / 81 / 66` — the state of record.
+3. `scratchpad/` at the path in **Start here** — every brief, gate, land script and comment
+   draft. Naming is `plan<N>.json` → `brief<N>*.txt` → `gate<N>.sh` → `land<N>*.sh` → `c<N>.md`.
+4. `docs/design/decisions/0010-store-replay.md` — #63's rulings and the owner's five answers.
+5. `~/.claude/skills/codex-route/SKILL.md` §"Verified 2026-09-12" — the measured traps.
