@@ -86,13 +86,11 @@ derivation. The clock follows the log so replayed events are judged against the 
 live sealing used; once no stream is behind it is the wall clock again. The flush interval
 still uses the wall clock.
 
-> **Not yet true in running code.** `store.py`'s `_stream_id_seconds` unpacks three names
-> from `value.split("-", 1)`, which yields two, so it raises `ValueError` on every stream id
-> and `seal_clock`'s `except (TypeError, ValueError): continue` swallows it: the list of
-> times is always empty and the clock always falls through to the wall clock. R4 has
-> therefore never run since #63 introduced it. The fix is `partition` for `split`, as
-> `redis_bus._id_parts` already does it. #103 found it and was not allowed to edit
-> `store.py`; `test_store_health.py` pins it until someone is.
+> **History.** `_stream_id_seconds` unpacked three names from `value.split("-", 1)`, which
+> yields two, so from #63 (`83120d6`) it raised `ValueError` on every stream id and
+> `seal_clock`'s `except (TypeError, ValueError): continue` swallowed it: R4 never ran.
+> #103 (`720036d`) changed it to `partition`, matching `redis_bus._id_parts`.
+> `test_store_health.py::test_store_stream_id_seconds_parses_well_formed_ids` pins the fix.
 
 **Pause spans.** Commands apply at a drained point, so a pause boundary is a position, not
 an ambiguous wall-clock moment. The store checkpoints `recording: false` and the open span;

@@ -67,6 +67,12 @@ its input was a flag the read loop wrote. A loop that died froze it at "caught u
 clock advanced over unread data. See [bus-reader.md](../lld/bus-reader.md) §4 -- and the note
 in [store-replay.md](../lld/store-replay.md) §3, because R4 has never actually run.
 
+**R4b (#113) — R4a's closing clause was wrong the moment it was written.** `720036d`, the
+#103 commit that wrote R4a, is the same commit that changed `_stream_id_seconds` from
+`split` to `partition` -- the one call `behind`'s pin still depended on. R4 has run since
+that commit. See [store-replay.md](../lld/store-replay.md) §3 and
+`test_store_health.py::test_store_stream_id_seconds_parses_well_formed_ids`.
+
 **R6 — `computed.chain` gains per-leg blocks and a computation stamp, at `schema_version` 2.**
 `ChainStrike` becomes `{strike, call, put}` with `ChainLeg` carrying the venue symbol, `iv`,
 `iv_leg`, `iv_reason` and the five Greeks; `ComputedChain` gains `fetched_at` and makes
