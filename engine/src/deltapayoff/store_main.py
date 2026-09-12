@@ -36,9 +36,9 @@ from .store import (
     BarStore,
     BarWriter,
     Checkpoint,
-    default_root,
     read_checkpoint,
     recover_intent,
+    resolve_root,
     write_checkpoint,
 )
 
@@ -60,7 +60,7 @@ STORE_CONTROL_QUEUE_SIZE = 100
 class StoreProcess:
     """The components owned by the standalone store process."""
 
-    root: Path
+    root: Path | str
     writer: BarWriter
     bus: RedisBus
     subscription: Any
@@ -125,12 +125,17 @@ def _gap_detail(gap: Any) -> str:
 
 async def _prepare_process(
     *,
-    root: Path | None = None,
+    root: Path | str | None = None,
     bus: RedisBus | None = None,
     clock: Callable[[], float] = time.time,
 ) -> StoreProcess:
-    """Read metadata, position Redis, then construct the store composition."""
-    root = default_root() if root is None else Path(root)
+    """Read metadata, position Redis, then construct the store composition.
+
+    `resolve_root` rather than `Path(root)`: an explicit `s3://` root must stay a string
+    (I8, #70) or `read_checkpoint` below mangles it into a local path silently, rather
+    than raising `StoreHomeUnavailable` where the failure is actually legible.
+    """
+    root = resolve_root(root)
     checkpoint = read_checkpoint(root)
     committed_generation = 0 if checkpoint is None else checkpoint.generation
     recover_intent(root, committed_generation)

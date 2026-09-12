@@ -128,6 +128,14 @@ counted late, the fallback would be dead code and the flag would be a constant `
 (including two stores) must never share a root: both would flush into the same directories and
 corrupt the root-level `_store-checkpoint.json` and `_store-flush-intent.json` as well.
 
+**The same variable is also the home switch, R3's decision (I8, #70):** an ordinary path
+stays the host mount, unconditionally the default; `s3://bucket/prefix` names S3
+Standard, the chosen home ([0004](../decisions/0004-durable-store.md)), parsed by the
+pure, `BarStore`-free `store_home.py`. `BarStore.path` is the seam every
+filesystem-touching method reaches disk through, and refuses loudly —
+`StoreHomeUnavailable`, never a silent local fallback — since no backend reaches S3 from
+this build. [store-numbers.md](store-numbers.md) says what closes it.
+
 `ts_venue` alone decides which minute a tick belongs to, converted to microseconds by
 integer arithmetic in `bars._micros` — never through `timestamp()`, which returns a float
 that has already spent its 15–16 significant digits on the integer part of a microsecond

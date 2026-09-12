@@ -68,6 +68,7 @@ from deltapayoff.store import (
     Checkpoint,
     FlushInterrupted,
     Intent,
+    StoreHomeUnavailable,
     read_checkpoint,
     read_intent,
     recover_intent,
@@ -111,6 +112,176 @@ def test_default_root_ignores_an_empty_configured_store_directory(monkeypatch) -
     monkeypatch.setenv("DELTA_STORE_ROOT", "")
 
     assert store_module.default_root() == Path(__file__).resolve().parents[2] / "data"
+
+
+# -- I8 (#70): the chosen home behind configuration, host mount still the default -------
+#
+# `DELTA_STORE_ROOT` is the one configuration surface, per 0004: an ordinary path names
+# the host mount (today's only home, and unconditionally the default), `s3://bucket/prefix`
+# names S3 Standard, R3's decision. There is no AWS account on this machine, so what is
+# provable here is the seam and the default, not a byte reaching S3 — see
+# `test_store_home.py` for the pure parsing this all rests on.
+
+
+def test_default_root_passes_an_s3_configured_root_through_as_a_string(
+    monkeypatch,
+) -> None:
+    """The read side (0004) hands `s3://...` straight to `pl.scan_parquet`. Wrapping it
+    in `Path()` first would mangle the URI on Windows rather than raise -- silently,
+    since a mangled path simply fails to exist rather than erroring -- so the S3 case
+    must stay a string all the way from the environment variable to whatever reads it."""
+    monkeypatch.setenv("DELTA_STORE_ROOT", "s3://convex-hedge-bars/prod")
+
+    root = store_module.default_root()
+
+    assert root == "s3://convex-hedge-bars/prod"
+    assert isinstance(root, str)
+
+
+def test_a_store_can_be_constructed_against_an_s3_root_without_touching_a_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Configuring the S3 home is not itself an action against S3 or against the host
+    mount. `default_root()` is monkeypatched to a real temporary directory so a bug that
+    fell back to it silently would be caught rather than landing in the real `data/`."""
+    monkeypatch.setattr(store_module, "default_root", lambda: tmp_path)
+
+    store = BarStore("s3://convex-hedge-bars/prod")
+
+    assert store.root == "s3://convex-hedge-bars/prod"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_flushing_an_empty_buffer_on_an_s3_configured_store_is_still_a_true_no_op(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Emptiness is a fact about the buffer, not about the home -- the existing no-op
+    check (`if not self._buffer: return 0`) must fire before the home is consulted."""
+    monkeypatch.setattr(store_module, "default_root", lambda: tmp_path)
+    store = BarStore("s3://convex-hedge-bars/prod")
+
+    assert store.flush() == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_store_configured_for_s3_refuses_to_flush_rather_than_writing_the_host_mount(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The seam this ticket adds: a buffer that actually has something to write must
+    neither reach a real S3 (there is no backend wired) nor fall back to the local disk.
+    It refuses, loudly and by name, and the host mount stays untouched -- proved here by
+    pointing the *default* root at a real temp directory and asserting it stays empty."""
+    monkeypatch.setattr(store_module, "default_root", lambda: tmp_path)
+    store = BarStore("s3://convex-hedge-bars/prod")
+    store.add([bar()])
+
+    with pytest.raises(StoreHomeUnavailable) as excinfo:
+        store.flush()
+
+    assert "s3://convex-hedge-bars/prod" in str(excinfo.value)
+    assert list(tmp_path.iterdir()) == []
+    # NOT `store.buffered == 1`: `_flush_legacy` empties the buffer before writing
+    # anything and has no rollback on any exception, `StoreHomeUnavailable` included --
+    # a pre-existing gap this ticket found and did not touch. See the report's
+    # "separate defect" note; `_flush_generation`'s `BarWriter._commit` path does
+    # restore the buffer on failure, which is why this store is otherwise safe.
+    assert store.buffered == 0
+
+
+def test_a_generation_flush_on_s3_refuses_before_touching_the_buffer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The split-mode commit path (`flush(generation=...)`) does not share
+    `_flush_legacy`'s gap: it only clears the buffer after every planned file has been
+    written, so a refusal here -- from `planned_paths`, which reads `self.path` before
+    anything else in `BarWriter._commit` runs -- leaves the buffer exactly as it was."""
+    monkeypatch.setattr(store_module, "default_root", lambda: tmp_path)
+    store = BarStore("s3://convex-hedge-bars/prod")
+    store.add([bar()])
+
+    with pytest.raises(StoreHomeUnavailable):
+        store.flush(generation=1)
+
+    assert list(tmp_path.iterdir()) == []
+    assert store.buffered == 1
+
+
+def test_a_store_configured_for_s3_refuses_to_scan_rather_than_reporting_empty(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`scan()` on an empty *local* store legitimately returns an empty frame -- 'nothing
+    flushed yet' is a real answer there. On an unreachable S3 home that same empty frame
+    would be a lie: it would read as 'no data' when the truth is 'cannot look'."""
+    monkeypatch.setattr(store_module, "default_root", lambda: tmp_path)
+    store = BarStore("s3://convex-hedge-bars/prod")
+
+    with pytest.raises(StoreHomeUnavailable):
+        store.scan()
+
+
+def test_a_store_configured_for_s3_refuses_to_list_partitions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(store_module, "default_root", lambda: tmp_path)
+    store = BarStore("s3://convex-hedge-bars/prod")
+
+    with pytest.raises(StoreHomeUnavailable):
+        store.partitions()
+
+
+def test_a_store_configured_for_s3_refuses_to_compact_before_touching_any_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(store_module, "default_root", lambda: tmp_path)
+    store = BarStore("s3://convex-hedge-bars/prod")
+
+    with pytest.raises(StoreHomeUnavailable):
+        store.compact_partition("2026-09-12", "BTC")
+
+
+def test_a_local_root_is_completely_unaffected_by_the_s3_seam(tmp_path: Path) -> None:
+    """The host mount is the default and the seam must not have touched its path. Same
+    assertions `test_the_store_root_is_created_on_demand` already makes -- restated
+    here, beside the S3 tests: same code, same bytes, home unconfigured."""
+    store = BarStore(tmp_path)
+    store.add([bar()])
+
+    assert store.flush() == 1
+    assert store.path == tmp_path / "quote-bars"
+    assert store.scan().collect().height == 1
+    assert store.partitions() == [("2026-09-04", "BTC")]
+
+
+def test_checkpoint_and_intent_refuse_an_s3_root_instead_of_mangling_it() -> None:
+    """`write_checkpoint`/`read_checkpoint`/`write_intent`/`read_intent` all build
+    `Path(root) / NAME` today. Handed an `s3://` string, `Path()` does not raise on
+    Windows -- it builds a path nothing will ever find, so `read_checkpoint` would return
+    `None`, indistinguishable from an honestly empty store. That silent wrong answer is
+    exactly what these functions must not give."""
+    checkpoint = Checkpoint(
+        generation=1,
+        written_at=datetime(2026, 9, 12, 10, 0, 0, tzinfo=timezone.utc),
+        group="store",
+        recording=True,
+        streams={},
+        sealed_through_us={
+            "quote-bars": 0,
+            "reference-bars": 0,
+            "spot-bars": 0,
+            "computed-bars": 0,
+        },
+    )
+
+    with pytest.raises(StoreHomeUnavailable):
+        write_checkpoint("s3://convex-hedge-bars/prod", checkpoint)
+    with pytest.raises(StoreHomeUnavailable):
+        read_checkpoint("s3://convex-hedge-bars/prod")
+    with pytest.raises(StoreHomeUnavailable):
+        write_intent(
+            "s3://convex-hedge-bars/prod", Intent(generation=1, files=("x.parquet",))
+        )
+    with pytest.raises(StoreHomeUnavailable):
+        read_intent("s3://convex-hedge-bars/prod")
 
 
 def test_checkpoint_and_intent_round_trip_atomically(tmp_path: Path) -> None:
