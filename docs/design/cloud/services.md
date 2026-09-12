@@ -56,16 +56,23 @@ moving there is one endpoint string.
 **Check a monthly bill against this table first.** An unexpected line is usually a NAT gateway or a
 forgotten public IPv4 ([compute.md](compute.md) §6).
 
-| Line | 1x | 10x | Tag | Run behind it |
-|---|---|---|---|---|
-| ECS on EC2, all-in | $78.07 | $295.72–582.39 | `derived` | [0008](../decisions/0008-topology.md) §3, Price List Bulk API published 2026-09-10, read 2026-09-12 |
-| S3 Standard, compacted | $1.52 | $15.18 | `derived` | [0004](../decisions/0004-durable-store.md) §3, month 12, at `measured` 143 MB/day |
-| Redis container | $0 | $0 | `derived` | [0002](../decisions/0002-redis-hosting.md) §3; its memory is bought inside the compute |
-| **Total** | **$79.59** | **$310.90–597.57** | `derived` | the three rows above, added |
+**Every row states the underlying set it was sized on.** The compute rows carry BTC and ETH; the
+S3 row was sized on BTC alone, and the BTC+ETH figure sits beside it.
 
-**The S3 row is low, and the reason is a unit rather than a price.** Its 143 MB/day is `measured`
-for BTC alone; [compute.md](compute.md) §4 puts BTC and ETH at `derived` 201.5 MB/day. Re-run
-[0004](../decisions/0004-durable-store.md) §3 against the larger figure before quoting $1.52.
+| Line | Underlying set | 1x | 10x | Tag | Run behind it |
+|---|---|---|---|---|---|
+| ECS on EC2, all-in | BTC+ETH | $78.07 | $295.72–582.39 | `derived` | [0008](../decisions/0008-topology.md) §3, Price List Bulk API published 2026-09-10, read 2026-09-12 |
+| S3 Standard, compacted | **BTC alone** | $1.52 | $15.18 | `derived` | [0004](../decisions/0004-durable-store.md) §3, month 12, at 143 MB/day retained (`derived` from run F's `measured` bytes/row, `docs/storage.md` §10) |
+| S3 Standard, compacted | **BTC+ETH** | **$1.92** | **$19.19** | `derived` | [durable-store.md](durable-store.md) §3: 167.4 MB/day retained and 2,304 objects a day, arithmetic there |
+| Redis container | BTC+ETH | $0 | $0 | `derived` | [0002](../decisions/0002-redis-hosting.md) §3; its memory is bought inside the compute |
+| **Total, BTC+ETH throughout** | | **$79.99** | **$314.91–601.58** | `derived` | the compute, BTC+ETH S3 and Redis rows added |
+
+**The old $79.59 total mixed two underlying sets**: BTC+ETH compute against a BTC-only S3 bill.
+The S3 line is small enough that the difference is $0.40 a month, which is why it went unnoticed
+for as long as it did — the error is the mixing, not the amount. **Quote the BTC+ETH row**, and
+re-run [../research/0004a-prices-and-sources.md](../research/0004a-prices-and-sources.md) §3 for
+an exact figure when a bucket exists; ours rescales that section's cells rather than re-deriving
+them from an AWS reading.
 
 ## 5. What nobody has measured
 

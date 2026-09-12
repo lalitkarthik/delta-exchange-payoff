@@ -64,9 +64,11 @@ order, cleanly, is the achieved period.
 - **50 ms is the largest request still within about 1.4x of what the process achieves**, and
   177 entries a batch is the shape #69 `measured` in isolation at 37 µs an entry.
 
-The bus costs the publisher `derived` **24.3 points of a core** at 10 ms and 29.6 at 50 ms —
-control 40.77% against 65.10% and 70.73% — for encoding, the pipeline and the trim over
-1,850 events a second.
+The bus costs the publisher `derived` **24.33 points of a core** at 10 ms and **29.96 at 50 ms**
+— control 40.77% against 65.10% and 70.73% — for encoding, the pipeline and the trim over
+1,850 events a second. **29.96 is the chosen interval's figure and the one to size `feed` from**
+([../decisions/0007-load-profile.md](../decisions/0007-load-profile.md)); this line read 29.6
+until #95, which is 70.73 − 40.77 rounded wrong rather than a different quantity.
 
 **Flush wall time is not Redis's cost.** `measured` 301.8, 278.0 and 254.2 µs an entry
 across the three phases against #69's isolated 31.8 µs: `await pipe.execute()` yields, the
@@ -77,8 +79,10 @@ reported as the publisher's flush latency in situ and never as a Redis figure.
 
 `measured` **1,107,735,240 B**, `INFO memory` `used_memory`, after the three bus phases ran
 back to back — thirty continuous minutes of live BTC+ETH — at 1,831,703 entries on the
-busiest of the sixteen keys. #58 `derived` 1,051.5 MB for this encoding at this rate before
-any of it existed; the run came in **0.5% above it**.
+busiest of the sixteen keys. #58 `derived` 1,051.5 **MiB** for this encoding at this rate
+before any of it existed; the run came in **0.5% above it**. The unit is binary and the
+arithmetic settles it: `derived` 598.2 KiB/s = 612,556.8 B/s over the 1,800 s window is
+1,102,577,664 B, and 1,102,577,664 ÷ 1,048,576 = 1,051.5 exactly. This file wrote MB until #95.
 
 **The container started at `--maxmemory 1gb` and was raised to 1.5gb mid-run**, at minute 18
 with `used_memory` at 642.9 MiB, because the ten-minute reading of 354.5 MiB projected past
@@ -119,5 +123,9 @@ run ended. Every one of the 41,651 trims before that was a no-op, at no measurab
 - **`feed` alone in its process.** These numbers are one process doing the socket, the
   decode and the publish. After I5 that is exactly what `feed` is, so the CPU column should
   be re-read then; the split does not change the memory column at all.
-- **Ten times the rate.** 10.5 GiB at thirty minutes, `derived` from the row above, needs a
-  different node before it needs a different interval.
+- **Ten times the rate.** `derived` **10.269 GiB** at thirty minutes — ten times the
+  1,102,577,664 B above — needs a different node before it needs a different interval.
+  10.3 GiB, which [../decisions/0007-load-profile.md](../decisions/0007-load-profile.md)
+  carries, is that rounded; `../cloud/compute.md` §8 now writes 10.269. **This line read 10.5 GiB until #95**: that
+  was 10,515 "M" divided by 1,000, a decimal divide of a binary quantity, and it is the third
+  figure #95 found for one number.

@@ -63,7 +63,7 @@ readable event at 02:00 on a laptop. MessagePack and protobuf print bytes; proto
 `.proto`, a codegen step and a version-skew failure mode for a team of two or three. Fourteen
 stream keys are a line of configuration; 1,564 are an inventory.
 
-**3. Cost.** `derived` 1,051.5 MB at thirty minutes, against 974.8 MB for MessagePack and 674.4 MB
+**3. Cost.** `derived` 1,051.5 MiB at thirty minutes, against 974.8 MiB for MessagePack and 674.4 MiB
 for protobuf, from `measured` per-entry sizes and the `measured` 1,693.6 frames/s. The premium for
 readability is 76.7 MB against MessagePack — 7%, and less than one node size anywhere.
 
@@ -84,14 +84,14 @@ is I2's measurement and dominates any encoding difference, against a `measured` 
 | Per contract | Criterion 1: streams appear daily and `XREAD` has no wildcard. `measured` 1.15x memory and 4,797 B per key is the smaller half of the objection |
 | One stream per event type only | Criterion 4: a BTC screen would read ETH, and every venue added would tax every reader |
 | Numbered databases | Redis's own page: don't "run multiple unrelated applications in a single Redis instance"; Cluster "only supports database zero"; Redis Software blocks it. A wrong `-n` also looks exactly like an empty stream |
-| JSON in one field | 1,558.7 MB against 1,051.5 MB, and the stream name is the only thing a reader could dispatch on without parsing |
+| JSON in one field | 1,558.7 MiB against 1,051.5 MiB, and the stream name is the only thing a reader could dispatch on without parsing |
 | Payload spread across Redis fields | Criterion 1: there is no null in a Redis field |
 | MessagePack | Criterion 2 beats criterion 3 at this size: 76.7 MB, 7%, against a wire nobody can read |
 | Protobuf | Criteria 1 and 2: proto3 presence is a trap for 23 nullable prices, and a `.proto` plus codegen in three services is a build step this team does not have |
 
 ## What would change this decision
 
-- **Ten times the rate.** 10.3 GB at thirty minutes buys a bigger Redis; MessagePack's 9.5 GB may
+- **Ten times the rate.** 10.3 GiB at thirty minutes buys a bigger Redis; MessagePack's 9.5 GiB may
   not, but 3.7 GB of protobuf's saving might. The change is one function and no name change —
   `payload` stops being JSON — because nothing else on the wire moves.
 - **A second consumer that is not ours.** If a third party reads the bus, protobuf's schema becomes

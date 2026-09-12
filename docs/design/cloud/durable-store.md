@@ -60,7 +60,8 @@ deletes inputs only after a verified read-back, and versioning would keep the de
 inputs alive and let a naive `list` read the day doubled. Block Public Access **on**.
 Default encryption SSE-S3. One lifecycle rule, and it only aborts incomplete multipart
 uploads after 7 days; nothing transitions and nothing expires — bars are kept indefinitely,
-which at `measured` 143 MB/day is `derived` $1.23 a month of storage in month 12.
+which at `derived` 143 MB/day retained for **BTC alone** is `derived` $1.23 a month of storage in
+month 12, and $1.44 at `derived` 167.4 MB/day for BTC+ETH (§3).
 
 ## 3. How the store service writes to it
 
@@ -69,13 +70,20 @@ memory and are written **every five minutes**, one object per table per partitio
 flush. The flush interval *is* the crash-loss budget, and after #65 (I6) `store` also
 replays from its last flushed message ID, which closes it.
 
-| Number | Tag | Run |
-|---|---|---|
-| Objects written per day, per underlying | `derived` | 288 flushes × 4 tables = **1,152**; 34,560 a month, 420,480 a year |
-| Bytes written per day, before compaction | `derived` | **172.1 MB** — 143 ÷ (1 − 0.169) |
-| Bytes retained per day, after compaction | `measured` | **143 MB** (`docs/storage.md` §10, run F) |
-| `PUT` charge at that rate | `derived` | **$0.173/month**, ap-south-1, 2026-09-09 |
-| Median object size, `quote-bars` / `reference-bars` / `computed-bars` / `spot-bars` | `measured` | 73,442 / 230,112 / 90,240 / 2,334 B — `tools/measure_store_cloud.py`, 2026-09-09 |
+**These rows are sized on BTC alone.** Run F subscribed 688 listed **BTC** options and nothing else (`docs/storage.md` §10), so every cell in the BTC column is one underlying; the stack runs BTC **and** ETH, and the column beside it is that.
+
+| Number | Tag | BTC alone | BTC+ETH | Run |
+|---|---|---|---|---|
+| Objects written per day | `derived` | **1,152** — 288 flushes × 4 tables; 34,560 a month | **2,304** — the flush writes **8 files** for two underlyings, `measured` (`../lld/store-numbers.md`); 69,120 a month | one `underlying=` partition per table per flush |
+| Bytes written per day, before compaction | `derived` | **172.1 MB** — 143 ÷ (1 − 0.169) | **201.5 MB** — 699,591 B a scheduled flush `measured` × 288 ([../research/0007-load-profile.md](../research/0007-load-profile.md) D1) | D1's own cross-check from a part day lands within 2.4% |
+| Bytes retained per day, after compaction | `derived` | **143 MB** — from run F's `measured` bytes/row and rows/minute (`docs/storage.md` §10) | **167.4 MB** — 201.5 × (1 − 0.169) | cross-checked `measured` below: §4's real BTC+ETH day retained 144.81 MiB over 255 of 288 flushes, a full day of which is 171.5 MB, 2.4% above |
+| Storage charge, month 12 | `derived` | **$1.233** — 49.34 GB × $0.025 | **$1.444** — 57.75 GB × $0.025 | 11.5 months' average of a store growing at the row above |
+| `PUT` charge at that rate | `derived` | **$0.173/month** | **$0.346/month** | ap-south-1, 2026-09-09; $0.005/1,000 |
+| Compaction requests, and `assumed` 1,000 ladder reads a day | `derived` | **$0.016 + $0.096** | **$0.033 + $0.096** | [../research/0004a-prices-and-sources.md](../research/0004a-prices-and-sources.md) §3. A ladder read is one underlying, so it does not double |
+| **S3 Standard, compacted, a month** | `derived` | **$1.52** | **$1.92** | the four charge rows added; $15.18 and $19.19 at ten times the rate |
+| Median object size, `quote-bars` / `reference-bars` / `computed-bars` / `spot-bars` | `measured` | 73,442 / 230,112 / 90,240 / 2,334 B | unmeasured | `tools/measure_store_cloud.py`, 2026-09-09 |
+
+**Do not put 201.5 MB/day beside 143 MB/day and call the gap 1.4×.** They are different quantities: 201.5 is bytes **written** before compaction, 143 is bytes **retained** after it. Like for like the second underlying costs `derived` **1.17× the bytes** and **2× the objects**, and the bill moves from $1.52 to $1.92 — a **1.26×** that is mostly the object count.
 
 **A write is one whole object; there is no append.** That is already how `flush` behaves —
 each flush writes its own uniquely named file and never reopens an earlier one — so the

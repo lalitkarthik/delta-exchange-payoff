@@ -47,6 +47,16 @@ OS ≤ 90% of RAM, burstable only for `store`, `web`, proxy or Redis below basel
 T4's `c7g.medium` holds `api` at 68% with one viewer; a second viewer on the largest ladder takes it
 to 82%, past the rule, and the next size is `c7g.large`.
 
+**Seven containers, not six — `discord-alerts` (#66) is the seventh, and it is inside every row
+above.** R6's profile and every unit in this file predate it, so it appears in none of them by
+name. It costs `assumed` **0.05 core and 0.25 GiB** ([compute.md](compute.md) §4): it subscribes
+`event_types=("alert",)` and nothing else ([../lld/discord-alerts.md](../lld/discord-alerts.md)
+§1), so it pays none of the 0.22–0.45 core decode every **raw-stream** consumer costs at 1×
+([../research/0007-load-profile.md](../research/0007-load-profile.md) §6). Added to R6's 1×
+upper bound of 1.95 cores it gives `derived` **2.00**, which is inside 0008's 2.8-core split
+threshold and moves no row of §2 or §3. **Where it sits under T4 is `assumed`**: beside `api` on
+box B, because nothing on the lossless path reads alerts. A `measured` figure is I13's (#79).
+
 ## 4. The hop, per consumer
 
 `derived` at a 1 ms same-AZ round-trip ceiling. AWS's documentation gives no figure; the ceiling comes

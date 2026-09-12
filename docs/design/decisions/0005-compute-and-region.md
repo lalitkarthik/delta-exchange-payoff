@@ -116,7 +116,7 @@ the real measurement are written out, ready to run, in
 | **ECS on Fargate** | Criterion 3, then 1. 82% dearer at 1× and 35% at 10×, and `awsvpc` is not optional there: six tasks puts a VPC hop between `feed` and Redis, breaking the loopback assumption I2's batch interval was chosen on; one task keeps loopback and throws away the independent deployability that is the point of #57. **Kept as the fallback if host operations become the constraint** — it is the only option with no host at all |
 | **EC2 with Compose** | Criterion 2 only, and by a small margin. Identical bill, identical host work, but nothing records a container restart and a deploy is an `ssh`. **Kept as the named fallback**, because it is the same instance and the same images |
 | **`awsvpc` network mode on EC2** | Criteria 1 and 3. Task ENIs "aren't given public IP addresses… tasks must be launched in a private subnet that's configured to use a NAT gateway", which costs `derived` $165.00/month at our inbound volume and $1,282.09 at ten times — more than the compute — and puts a hop between `feed` and Redis for no gain |
-| **`t4g.medium`** | Criterion 1. $26.20/month cheaper and a baseline of 20% per vCPU — 0.4 of a core against a `measured` 0.31 plus the publisher's 5.88%. Running out of credits raises nothing; it makes the feed slower precisely when the market got loud enough to exhaust them, which is the silent failure the first criterion exists to refuse. `t4g.large` at $39.09 has the memory and a 0.6-core baseline and is the honest cheap option; $9.85 buys the credit model away |
+| **`t4g.medium`** | Criterion 1. $26.20/month cheaper and a baseline of 20% per vCPU — 0.4 of a core against a `measured` 0.31 plus the publisher's 5.88% at a 100 ms batch (*condition added 2026-09-12, #95: at the 50 ms interval 0008 chose, the publisher costs `derived` 29.96 points, and the split's need is 1.21–1.95 cores — which makes this rejection wider, not narrower*). Running out of credits raises nothing; it makes the feed slower precisely when the market got loud enough to exhaust them, which is the silent failure the first criterion exists to refuse. `t4g.large` at $39.09 has the memory and a 0.6-core baseline and is the honest cheap option; $9.85 buys the credit model away |
 | **x86 (`m7i.large`)** | Criterion 3 only. 82% more than `m7g.large` in ap-south-1 for the same 2 vCPU and 8 GiB. The images are ours to build `arm64` |
 | **ap-northeast-1 (Tokyo)** | Criteria 3 and 4 over 5. The venue's own region, and `derived` $137.75/month more at ten times the rate, offshore for NSE, buying freshness on a feed with no order path |
 | **ap-southeast-1 (Singapore)** | Every criterion. 65% dearer than Mumbai at 1×, 71% at 10×, no closer to the origin than Mumbai, and offshore for NSE. It is on the list because #68 named it; nothing recommends it |
@@ -147,3 +147,35 @@ the real measurement are written out, ready to run, in
 ## I13 (#79) status
 
 I13 has not run (#65/I6 has not landed as of this writing, so there is no docker-compose.yml and no per-container image); R4's re-cost threshold is: "If the split costs materially more than the monolith's measured 30.89% of a core, m7g.large is the first thing that stops fitting and the 1x row moves to m7g.xlarge at $94.24." crossed: pending; see docs/design/research/0007a-container-measurement.md. This note is appended, not rewritten, per this repository's rule that a decision record is superseded rather than edited in place; the substantive determination (crossed or not) is written here once docs/design/research/0007a-container-measurement.md carries measured values.
+
+## #95 correction — seven containers, and the route to 6 vCPU
+
+**Appended, not rewritten**, and this record is already *Superseded in part* by
+[0008](0008-topology.md) on the instance class.
+
+**1. Six containers are counted here; seven run.** `compose.yml` declares `redis`, `feed`,
+`store`, `discord-alerts`, `api`, `web` and `proxy`. `discord-alerts` (#66) landed after this
+record and appears in it only as "the Discord alert consumer" under criterion 4, never in a
+sizing or cost table. It is `assumed` **0.05 core and 0.25 GiB** (`../cloud/compute.md` §4): it
+subscribes `event_types=("alert",)` and nothing else, so it pays none of the 0.22–0.45 core
+decode a raw-stream consumer costs. **Nothing in this record's cost table moves** — the bill is
+the instance, and a seventh container on the same host is $0 — and the platform argument gains
+from it, since criterion 4 predicted exactly this: "a new consumer is a container in the task".
+
+**2. The 5.88% this record rejects `t4g.medium` against is the 100 ms figure.** It is #69's
+publisher measured alone, on loopback, at a **100 ms** batch. At the 50 ms interval I2 (#61)
+chose, the same publisher inside the feed costs `derived` **29.96 points** (`measured` 70.73%
+against the bus-off control's 40.77%). `../cloud/compute.md` §4 is re-sized on the second figure
+by #95. **The `t4g.medium` rejection is not weakened by this — it is strengthened**: 0.4 of a
+core against the split's `derived` 1.21–1.95 cores is three to five times over, where the
+original comparison had it merely coinciding.
+
+**3. The threshold this record names is crossed, and was crossed before #95.** *What would change
+this decision* says: "If the split costs materially more than the monolith's `measured` 30.89% of
+a core, `m7g.large` is the first thing that stops fitting and the 1× row moves to `m7g.xlarge` at
+$94.24." R6 put the split at `derived` 1.10–1.75 cores and `../research/0007-load-profile.md` §8
+records the trigger as met; [0008](0008-topology.md) then superseded the class with `c7g.xlarge`
+at $78.07. **So #95 crosses no new threshold.** What it corrects is a document that was still
+sizing from the route this record's successor had already abandoned — the same route
+[0007-load-profile.md](0007-load-profile.md) rejects as option B, of which it says: "It is how
+0005 reached 6 vCPU at 10×."

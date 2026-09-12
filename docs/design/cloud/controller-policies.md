@@ -64,11 +64,10 @@ seconds after making connection."* So we notice before the venue would drop us. 
 above Delta's own recommended heartbeat window of 35 s. Crossing it publishes an `alert` at
 severity `error`, code `connection_silent`.
 
-**Bounded above by measurement that is not finished.** The longest gap on a tagged,
-unbroken connection is `measured` **0.724 s** over 610 s (run `20260909T125124Z`). An
-earlier *untagged* hour recorded 44.785 s — 0.215 s inside this bound — but that hour
-contained two reconnects and the recorder could not say which gaps spanned them. A
-six-hour tagged run is in flight; until it lands, 45 s stays `assumed`.
+**Bounded above by measurement, and the measurement has landed.** Run `20260909T130306Z` finished
+**2026-09-09T19:03Z**: six hours, 21,610 s, 502 BTC symbols, both channels, 23,713,768 messages, 13 connections. The longest gap on an **unbroken** connection is `measured` **6.792 s**, 6.6× inside the bound; the longest gap *spanning* a connection event is `measured` 22.83 s and is a drop, not a quiet market. The untagged hour's 44.785 s was, as suspected, the same thing, and the `measured` 0.724 s over 610 s (run `20260909T125124Z`) says nothing either way.
+
+**That changes the bound, not the setting.** 45 s is still `assumed` in that nothing measured picked it — three degraded intervals under Delta's 60 s — and the run gives no reason to move it; what it is no longer is unevidenced. [../quiet-gap.md](../quiet-gap.md) puts that as "supported, not assumed"; [../decisions/0003-controller-policy.md](../decisions/0003-controller-policy.md) says "stays `assumed`" in a decision body written while the run was in flight and records the landing in its triggers, a decision record here being appended to and never rewritten. **Same value, better evidence.** Every run so far is an active BTC session, so a thin ETH chain or a weekend could still make 45 s an ordinary gap — 0003's own remaining trigger.
 
 ### C4 — Grace is given to a new socket, and to an attempt
 

@@ -86,6 +86,7 @@ you conclude your change broke something.
   Grown or created since `d163bbc`, the point before #62-#81 landed:
 
   ```
+  200  docs/design/research/0001-stream-naming-and-payload-format.md  grown  #95
   200  docs/design/research/0009-compaction-cadence.md   created  #76 (f7df53c)
   236  docs/design/events.md                              grown    #81 (f2fd905)
   248  docs/design/cloud/epic.md                          grown    #74 (ceb9911)
@@ -114,6 +115,11 @@ you conclude your change broke something.
   `architecture.md` and `storage.md`: large legacy documents; splitting either is its own
   ticket with its own risk, not attempted here. `0009-compaction-cadence.md` sits exactly
   at the bound and is a plausible near-term split candidate.
+
+  `0001-stream-naming-and-payload-format.md` was **199** before #95 and is **200** after, so
+  every future addition to it must move something out first. #95's units-correction evidence
+  already went to a sibling, `0001-units-reconciliation.md`; the record keeps a one-line
+  pointer. Split it properly the next time it is touched — it is the tightest file here.
 
   `docs/design/lld/logging.md` is no longer over: #63 split it, 213 becomes **92** plus a
   75-line `logging-catalogue.md`, and generalised the parser from one file to a tuple.

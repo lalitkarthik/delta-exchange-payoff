@@ -135,16 +135,17 @@ because one ticker frame is two events. Retention 1,800 s.
 
 | Encoding | bytes/s | 30 minutes | at ten times the rate |
 |---|---|---|---|
-| A `json:one-field` | 886.8 KB/s | **1,558.7 MB** | 15.2 GB |
-| **B `json:envelope-flat`** | 598.2 KB/s | **1,051.5 MB** | 10.3 GB |
-| C `msgpack:envelope-flat` | 554.5 KB/s | **974.8 MB** | 9.5 GB |
-| D `msgpack:one-field` | 557.4 KB/s | **979.7 MB** | 9.6 GB |
-| E `protobuf:one-field` | 383.7 KB/s | **674.4 MB** | 6.6 GB |
+| A `json:one-field` | 886.8 KiB/s | **1,558.7 MiB** | 15.2 GiB |
+| **B `json:envelope-flat`** | 598.2 KiB/s | **1,051.5 MiB** | 10.3 GiB |
+| C `msgpack:envelope-flat` | 554.5 KiB/s | **974.8 MiB** | 9.5 GiB |
+| D `msgpack:one-field` | 557.4 KiB/s | **979.7 MiB** | 9.6 GiB |
+| E `protobuf:one-field` | 383.7 KiB/s | **674.4 MiB** | 6.6 GiB |
 
 All `derived` from `measured` per-entry sizes and rates. Excluded: the other six types — five are
 rare by construction, and `computed.chain` is `derived` under 1% of the above at one pass a minute
-per live expiry and is **not measured**. **B against C is 76.7 MB; B against E is 377.1 MB** — at
-ten times the rate, 0.8 GB and 3.7 GB, and 3.7 GB is a different Redis node.
+per live expiry and is **not measured**. **B against C is 76.7 MiB; B against E is 377.1 MiB** — at
+ten times the rate, 0.8 GiB and 3.7 GiB, and 3.7 GiB is a different Redis node. Units corrected
+2026-09-12 (#95), values unchanged: [0001-units-reconciliation.md](0001-units-reconciliation.md).
 
 ## What I learned
 
@@ -184,9 +185,9 @@ bytes handed over, 315.6 held. Mix three types into one stream and it stops — 
 **JSON is not twice the size of binary. It is 1.07x here.** The factor of two shows up only
 against protobuf (1.49x), which writes a `double` as eight bytes with no field name. MessagePack
 barely helps: most of an entry is the envelope's text — event id, timestamps, symbol — which
-MessagePack writes as text too. So thirty minutes of our feed is `derived` 1,051.5 MB, the number
-R5 will spend; ten times the rate is 10.3 GB, where moving the payload to MessagePack — one
-function, no name change — buys back 0.8 GB.
+MessagePack writes as text too. So thirty minutes of our feed is `derived` 1,051.5 MiB, the number
+R5 will spend; ten times the rate is 10.3 GiB, where moving the payload to MessagePack — one
+function, no name change — buys back 0.8 GiB.
 
 **Redis's own advice is to separate with names, not database numbers.** Numbered databases are a
 trap: Cluster does not have them, managed Redis blocks them, and picking the wrong one looks like

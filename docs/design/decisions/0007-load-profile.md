@@ -98,3 +98,32 @@ profile controls.
 ## I13 (#79) status
 
 I13 has not run (#65/I6 has not landed as of this writing); R6's re-cost threshold is: "I13 (#79) moving any cell by more than 25%, measured per container on the host. api comes first, at 0, 1 and 3 viewers. Then feed, whose derived 0.52 disagrees with I2's measured 0.71." crossed: pending; see docs/design/research/0007a-container-measurement.md. This note is appended, not rewritten, per this repository's rule that a decision record is superseded rather than edited in place; the substantive determination (crossed or not) is written here once docs/design/research/0007a-container-measurement.md carries measured values.
+
+## #95 correction — the seventh service, and where 29.96 is now quoted
+
+**Appended, not rewritten.** Every figure in this record stands; #95 verified 29.96 against the
+run and changed nothing here.
+
+**`discord-alerts` (#66) is a seventh service and is in none of the tables above.** It reads
+`event_types=("alert",)` only (`../lld/discord-alerts.md` §1), so the rule this record states —
+"every raw-stream consumer we add pays a 0.22–0.45 core decode at 1×" — **does not apply to it**;
+alerts are rare by construction. It is `assumed` 0.05 core and 0.25 GiB. Added to §4's 1× upper
+bound of 1.95 cores that gives `derived` **2.00**, inside [0008](0008-topology.md)'s 2.8-core
+split threshold, so no row of §4, §5 or §8 moves and no decision reopens. I13 (#79) measures it
+with the rest.
+
+**Option B's 29.96 points is now what `../cloud/compute.md` §4 sizes `feed` on.** That file
+carried #69's 100 ms 5.88% until #95 — the under-count this record rejects — so §4's reservation
+table and the profile above now agree. `feed` reserves 1,024 CPU units, as
+[0008](0008-topology.md) already required.
+
+**Redis's 10× figure, reconciled.** The table above reads **10.3 GiB**; `../research/0002-redis-hosting.md`
+reads **10.269 GiB** and `../research/0061-batch-interval.md` read **10.5**. There is one number:
+ten times the `derived` 1,051.5 MiB working set is 11,025,776,640 B = **10.269 GiB**, and 10.3 is
+that rounded — both correct, and this record's rounding stands. 10.5 was a decimal divide of a
+binary quantity and is corrected in 0061 by #95. The 12 GiB ceiling is unaffected.
+
+**One tagging note.** 29.96 points is `derived`, not `measured`: it is `measured` 70.73% minus
+`measured` 40.77%, from I2's run of 2026-09-09. Both it and the 5.88% it replaces trace to real
+runs, and the tag was no help in telling them apart — what separated them was the batch interval.
+`../cloud/compute-numbers.md` §2 sets out the two conditions side by side.

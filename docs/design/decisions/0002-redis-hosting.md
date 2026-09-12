@@ -133,3 +133,30 @@ endpoint that choice is re-measured, not carried over.
 - **A measurement we did not take.** `computed.chain` is `derived` under 1% and never
   measured (#58). If it is large, 1,051.5 MiB is low, and `cache.t4g.medium` — not the
   container — is the first thing that stops fitting.
+
+## #95 correction — the unit of the working set
+
+**Appended, not rewritten.** Nothing in this decision changes; one unit is fixed so that the
+`cache.t4g.small` rejection can be read.
+
+The working set is `derived` **1,051.5 MiB** and the same figure is written **MB** in
+[0001-stream-naming-and-payload-format.md](0001-stream-naming-and-payload-format.md) and in
+`../research/0061-batch-interval.md` (corrected there by #95). The gap between the two readings
+is 4.8%, and **this record's rejection of `cache.t4g.small` turns on 0.06%**, so the unit had to
+be settled rather than preferred. The arithmetic settles it: the rate is `derived` 598.2 KiB/s =
+612,556.8 B/s (#58, encoding B; `../research/0002b-prices-and-sources.md` §3), which over the
+1,800 s retention window is 1,102,577,664 B, and 1,102,577,664 ÷ 1,048,576 = **1,051.5 exactly**.
+Divided decimally it is 1,102.6, a figure nobody carries. **The number is binary and `MiB` is its
+unit, everywhere.**
+
+**The rejection stands, restated in that unit.** `cache.t4g.small` offers 1,103,269,724 usable
+bytes (`maxmemory` 1,471,026,299 × 0.75) against 1,102,577,664 needed: **692,060 bytes, 1.027 GiB
+against 1.027 GiB, a margin of 0.0628%** — a coincidence, not a fit, exactly as *Rejected* says.
+Read as decimal MB the same node would have fitted by 4.9% and this row would have needed a
+different reason. It does not. Ten times the rate is `derived` **10.269 GiB**, unchanged, and
+10.3 GiB wherever it appears is that rounded.
+
+**No threshold in *What would change this decision* is crossed.** The unit fix confirms
+1,051.5 as the figure rather than moving it, so the `computed.chain` trigger — "if it is large,
+1,051.5 MiB is low" — is where it was: still unmeasured, still the first thing that would move
+`cache.t4g.medium`.
