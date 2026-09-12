@@ -158,7 +158,7 @@ managed Redis, and #57 has not chosen one yet.
 | Creation | `XGROUP CREATE <stream> <group> <id> MKSTREAM` | |
 | Start id, unstated | `$` — `RedisBus.subscribe`'s default since #97. `0` replays everything Redis still holds and has to be typed; a caller that says nothing never replays | |
 | Start id, `store` | checkpoint id in `<root>/_store-checkpoint.json` for that stream; on first start the head (`$`, taken once as a concrete id); never `0` — [0010](../decisions/0010-store-replay.md), which supersedes [0002](../decisions/0002-redis-hosting.md) on this point | |
-| Start id, `api` | `$` — never replay; the cache refills from live frames | |
+| Start id, `api` | `$` — never replay; the cache refills from the decoded events that arrive next, and `api` never sees a venue frame | |
 
 **No environment and no venue in a group name.** A group lives inside one stream and the stream key
 already carries the venue; repeating it would be two places for one fact.
