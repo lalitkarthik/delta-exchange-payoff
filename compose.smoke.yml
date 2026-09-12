@@ -1,0 +1,14 @@
+# Smoke only. Never used by docker compose up on its own - it is the second -f file.
+#
+# The frame is stamped at run time rather than taken from
+# engine/tests/fixtures/ws-ob-l2-04-09-2026.json. bars._Watermarked._bucket refuses a
+# tick whose minute is at or before the watermark, and BarWriter advances that watermark
+# on its first loop pass, so a 2026-09-04 stamp would be counted late and no bar would
+# reach disk.
+services:
+  feed:
+    volumes:
+      - ./engine/tests:/app/engine/tests:ro
+    environment:
+      PYTHONPATH: /app/engine/tests
+      DELTA_FEED_ADAPTER: fakes.smoke_feed:build_adapter

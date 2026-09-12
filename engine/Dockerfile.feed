@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1
+FROM python:3.13-slim-bookworm AS base
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app/engine
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.txt
+
+FROM base AS runtime
+COPY src ./src
+EXPOSE 8000
+CMD ["python", "-m", "uvicorn", "--app-dir", "src", "deltapayoff.feed_main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,8 @@
+.venv/
+tests/
+.pytest_cache/
+.ruff_cache/
+.sandbox-tmp/
+__pycache__/
+*.pyc
+README.md

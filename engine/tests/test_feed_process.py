@@ -11,10 +11,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from deltapayoff import feed_main, feed_runtime, main
-from deltapayoff.delta_client import DeltaUnavailable
+from deltapayoff.adapters import DeltaAdapter
+from deltapayoff.delta_client import DeltaClient, DeltaUnavailable
 from deltapayoff.events import ConnectionState, ControlCommand
 from deltapayoff.models import HealthReport
 from deltapayoff.redis_bus import BusUnavailable
+from fakes.scripted_adapter import ScriptedAdapter
 
 TS = datetime(2026, 9, 12, tzinfo=timezone.utc)
 
@@ -270,3 +272,46 @@ def test_feed_entrypoint_shutdown_cancels_relisting_before_supervisor_redis_and_
     assert events.index("relist.cancel") < events.index("supervisor.close")
     assert events.index("supervisor.close") < events.index("bus.close")
     assert events.index("bus.close") < events.index("client.close")
+
+
+def test_build_adapter_defaults_to_the_real_delta_adapter(monkeypatch) -> None:
+    monkeypatch.delenv("DELTA_FEED_ADAPTER", raising=False)
+
+    adapter = feed_main.build_adapter(DeltaClient(client=object()), ("BTC",))
+
+    assert isinstance(adapter, DeltaAdapter)
+    assert adapter.venue == "DELTA"
+
+
+def test_build_adapter_resolves_a_factory_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "DELTA_FEED_ADAPTER", "fakes.scripted_adapter:ScriptedAdapter"
+    )
+
+    adapter = feed_main.build_adapter(DeltaClient(client=object()), ("BTC",))
+
+    assert isinstance(adapter, ScriptedAdapter)
+
+
+def test_build_adapter_rejects_a_value_without_module_and_attribute(monkeypatch) -> None:
+    monkeypatch.setenv("DELTA_FEED_ADAPTER", "nocolon")
+
+    with pytest.raises(ValueError, match="DELTA_FEED_ADAPTER"):
+        feed_main.build_adapter(DeltaClient(client=object()), ("BTC",))
+
+
+def test_lifespan_uses_build_adapter_for_the_process_adapter(monkeypatch) -> None:
+    _patch_feed_components(monkeypatch)
+    expected_underlyings = feed_main.live_underlyings()
+    returned = ScriptedAdapter()
+    calls: list[tuple[object, tuple[str, ...]]] = []
+
+    def build_adapter(client, underlyings):
+        calls.append((client, underlyings))
+        return returned
+
+    monkeypatch.setattr(feed_main, "build_adapter", build_adapter)
+
+    with TestClient(feed_main.app):
+        assert calls[0][1] == expected_underlyings
+        assert feed_main.app.state.adapter is returned

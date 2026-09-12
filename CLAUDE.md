@@ -51,6 +51,16 @@ succeeding against live data.
 `probe_api.py`, `probe_ws.py`. The numbers in the docs came from these; re-run them rather
 than trusting a quoted figure.
 
+The local stack is documented in [docs/design/cloud/local-stack.md](docs/design/cloud/local-stack.md).
+```sh
+docker compose --project-name dxp --env-file stack.env up -d --wait --wait-timeout 120
+engine/.venv/Scripts/python.exe tools/smoke_stack.py
+docker compose --project-name dxp --env-file stack.env down --remove-orphans
+```
+The stack serves everything on `http://localhost:8080` through the proxy; nothing publishes
+3000 or 8000 because the live `next dev` and live engine own them, and its store root is
+`./.stack-data/`, never `data/`.
+
 ## Architecture
 
 **One socket, one cache, many browsers.** `DeltaFeed` (`feed.py`) owns the single connection to

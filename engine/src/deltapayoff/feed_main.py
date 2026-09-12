@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from importlib import import_module
 from typing import Any
 
 from fastapi import FastAPI
@@ -18,6 +20,8 @@ from .main import live_underlyings
 from .models import HealthReport
 from .redis_bus import BusConfig, RedisBus
 from .supervisor import FeedSupervisor
+
+ADAPTER_ENV = "DELTA_FEED_ADAPTER"
 
 
 @dataclass
@@ -32,6 +36,31 @@ class FeedProcess:
     relist_task: asyncio.Task | None = None
     control_subscription: Any = None
     control_task: asyncio.Task | None = None
+
+
+def build_adapter(client: DeltaClient, underlyings: tuple[str, ...]) -> Any:
+    """Build the venue adapter, with one smoke-only seam.
+
+    The default is the venue and stays the venue: an unset or empty variable uses the
+    venue adapter. The only reason this seam exists is that a smoke run must drive this
+    process from a script with no socket, while production images must not carry test
+    code.
+    """
+    value = os.environ.get(ADAPTER_ENV, "")
+    if not value.strip():
+        return DeltaAdapter(
+            client=client,
+            underlyings=underlyings,
+            feed_factory=DeltaFeed,
+        )
+
+    try:
+        module_name, attribute = value.split(":", 1)
+    except ValueError as exc:
+        raise ValueError(f"{ADAPTER_ENV}={value!r} is not module:attribute") from exc
+    if not module_name.strip() or not attribute.strip():
+        raise ValueError(f"{ADAPTER_ENV}={value!r} is not module:attribute")
+    return getattr(import_module(module_name), attribute)(underlyings)
 
 
 def _set_state(app: FastAPI, process: FeedProcess) -> None:
@@ -86,11 +115,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     process: FeedProcess | None = None
     try:
         await client.__aenter__()
-        adapter = DeltaAdapter(
-            client=client,
-            underlyings=underlyings,
-            feed_factory=DeltaFeed,
-        )
+        adapter = build_adapter(client, underlyings)
         supervisor = FeedSupervisor([adapter], bus.publish)
         process = FeedProcess(
             bus=bus,

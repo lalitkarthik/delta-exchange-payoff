@@ -26,6 +26,15 @@ tools/out/
 # estimated) a year of it would be about 52 GB in a git history.
 data/
 
+# The local stack's store root. AGENTS.md makes data/ read-only; a second writer into
+# data/ would corrupt the live store.
+.stack-data/
+# The local stack's secrets. stack.env is committed with empty values; the real webhook
+# URL and anything else secret goes here, and this file is never committed. #66 reads it
+# as a second env_file with required:false, so an absent file is simply an unconfigured
+# consumer rather than a broken stack.
+stack.local.env
+
 # Windows download metadata. `curl`-ing a file into WSL from a browser leaves one of
 # these beside every download; they are not part of the repository.
 *:Zone.Identifier
