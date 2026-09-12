@@ -1,10 +1,9 @@
 # High-level design: the feed, end to end
 
 **What the platform is:** in split mode, `feed` owns the venue connection, turns venue frames
-into canonical events, and publishes them to Redis; `store` folds the lossless events into
-sealed one-minute Parquet bars while the engine consumes its screen events into the newest
-ladder, our implied volatility and Greeks.
-`docs/chain-contract.md` stays the authority on the page.
+into canonical events, and publishes them to Redis; `store` folds the lossless events into sealed
+one-minute Parquet bars while the engine consumes its screen events into the newest ladder, our
+implied volatility and Greeks. `docs/chain-contract.md` stays the authority on the page.
 
 This document says **what the parts are and how they talk**, never how one is built inside —
 that is a low-level design, written when the part lands ([lld/index.md](lld/index.md)). What
@@ -132,14 +131,13 @@ they never open `feed`, `store` or `api` to do this.
 
 In split mode, feed has `GET /health`, which is its local `FeedSupervisor.report`. The engine
 serves `/expiries`, `/chain`, `/smile`, `/iv-vs-rv`, `/recording`, `/health` and `/ws/chain`,
-while store has `GET /health`.
-Its `/health` is authoritative about remote feed state from the `feed.connection` and
-`heartbeat` observations in `FeedConnectionCache`, while retaining process liveness and
-watched pairs. The websocket badge is derived from that same projection, including its
-heartbeat-silence rule. Screen commands enter through the existing
-`POST /feed/{adapter}/{command}` route: the API publishes `control.command` and the feed
-returns state through the bus. No service-to-service HTTP is added. The default
-no-`DELTA_BUS` engine keeps the existing combined surface and synchronous command path.
+while store has `GET /health`. Its `/health` is authoritative about remote feed state from the
+`feed.connection` and `heartbeat` observations in `FeedConnectionCache`, while retaining process
+liveness and watched pairs. The websocket badge is derived from that same projection, including
+its heartbeat-silence rule. Screen commands enter through the existing
+`POST /feed/{adapter}/{command}` route: the API publishes `control.command` and the feed returns
+state through the bus. No service-to-service HTTP is added. The default no-`DELTA_BUS` engine
+keeps the existing combined surface and synchronous command path.
 
 `web/` renders and computes nothing. It will wear a badge on the ladder header whenever the feed
 is not `connected`, clearing on recovery (#40); gain a chart panel of a contract's minute candles
@@ -194,3 +192,8 @@ Fields, emitters, consumers and timing are in [events.md](events.md).
 
 [HLD evidence](hld-evidence.md) contains every measured, assumed, and derived number, the run
 and caveat behind each, and the explicit out-of-scope decisions.
+
+## 6. Where it runs, and the words it uses
+
+The bus is [cloud/message-bus.md](cloud/message-bus.md) and the engine is
+[cloud/data-feed-engine.md](cloud/data-feed-engine.md). Both resolve their terms to [../../CONTEXT.md](../../CONTEXT.md).
