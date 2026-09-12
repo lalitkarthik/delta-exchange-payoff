@@ -50,9 +50,10 @@ def test_compose_names_the_project_and_only_publishes_the_proxy_port() -> None:
 def _command_line(block: str) -> str:
     """The service's own `command:` line, with its comments stripped away.
 
-    A service block holds its comments as well as its keys, so a substring test against the
-    whole block can be satisfied by a sentence that merely mentions a value. Every assertion
-    about what a container is actually told to do goes through here.
+    A service block holds its comments as well as its keys, so a substring test
+    against the whole block can be satisfied by a sentence that merely mentions a
+    value. Every assertion about what a container is actually told to do goes
+    through here.
     """
     for line in block.splitlines():
         if line.strip().startswith("command:"):
