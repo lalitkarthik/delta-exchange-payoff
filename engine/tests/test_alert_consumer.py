@@ -469,7 +469,23 @@ def test_a_poster_refusal_does_not_lose_a_collapsed_count() -> None:
     assert calls[-1]["content"].endswith(" (collapsed 1 times since last post)")
 
 
-def test_a_pause_produces_no_discord_post() -> None:
+def test_a_pause_produces_no_discord_post(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pause is ignored *quietly*, which is the only observable that pins the guard.
+
+    `docs/design/events.md` lines 152-153: "`degraded` does not alert, and nor does a
+    `pause`" -- a pause is something a person just did. The consumer honours that by
+    refusing every event that is not an `Alert`, in `_run_once`.
+
+    Asserting only `calls == []` did not test that guard at all. `measured` here on
+    2026-09-12: with `if not isinstance(event, Alert): return` deleted, the pause falls
+    into the dispatch body, `gate.decide()` raises `AttributeError` reaching
+    `event.code`, the handler swallows it -- and `calls` is still empty, so both pause
+    tests went on passing. All 32 tests in this file, `test_discord_alerts.py` and
+    `test_alert_main.py` passed with the guard gone. The error log is what separates
+    "ignored by design" from "crashed on the way to the same place", so it is asserted.
+    """
     clock = _Clock()
     consumer, bus, calls = _consumer_for_fanout(clock)
 
@@ -485,12 +501,24 @@ def test_a_pause_produces_no_discord_post() -> None:
         bus.publish(paused)
         await consumer._run_once()
 
-    asyncio.run(scenario())
+    with caplog.at_level(logging.DEBUG, logger="deltapayoff.alert_consumer"):
+        asyncio.run(scenario())
 
     assert calls == []
+    # Scoped to this module's own logger by name. `caplog` installs its handler on the
+    # root, so it also captures the poster's delivery line from another logger, and an
+    # unfiltered list assertion here passed or failed depending on test ordering.
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "deltapayoff.alert_consumer"
+    ] == []
 
 
-def test_a_paused_feed_followed_by_an_alert_posts_only_the_real_alert() -> None:
+def test_a_paused_feed_followed_by_an_alert_posts_only_the_real_alert(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The pause must cost the real alert nothing -- not a slot, not a log line."""
     clock = _Clock()
     consumer, bus, calls = _consumer_for_fanout(clock)
 
@@ -508,10 +536,22 @@ def test_a_paused_feed_followed_by_an_alert_posts_only_the_real_alert() -> None:
         bus.publish(_alert())
         await consumer._run_once()
 
-    asyncio.run(scenario())
+    with caplog.at_level(logging.DEBUG, logger="deltapayoff.alert_consumer"):
+        asyncio.run(scenario())
 
     assert len(calls) == 1
     assert "connection_silent" in calls[0]["content"]
+    # Scoped to this module's own logger by name. `caplog` installs its handler on the
+    # root, so it also captures the poster's delivery line from another logger, and an
+    # unfiltered list assertion here passed or failed depending on test ordering.
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "deltapayoff.alert_consumer"
+    ] == []
+    # The pause did not spend the global floor either: had it reached the gate, the
+    # real alert 0 s later would have been rate-limited instead of posted.
+    assert consumer.gate.rate_limited_count == 0
 
 
 def test_a_bad_alert_does_not_kill_the_consumer_loop(
@@ -637,6 +677,147 @@ def test_redis_wire_alert_reaches_the_poster() -> None:
     assert len(calls) == 1
     for field in ("error", "connection_silent", "delta", "the feed stopped"):
         assert field in calls[0]["content"]
+
+
+# --- The seven alerts of the 2026-09-12T15:52Z restart --------------------------------
+#
+# `measured` on the live `dxp` stack, 2026-09-12T16:30Z: `XLEN alert` was 7 and
+# `XINFO GROUPS alert` reported `entries-read 7`, `pending 0`, `lag 0` for group
+# `discord-alerts`. Seven published, seven read, none pending -- and yet
+# `.stack-logs/discord-alerts/2026-09-12.log` held exactly one record, a
+# `ConnectTimeout`. Three numbers that look contradictory until the gate is replayed.
+#
+# The seven, from `XRANGE alert - +`, with their `ts_received` as offsets from the
+# first. Every one is severity `error`.
+LIVE_ALERTS_2026_09_12: tuple[tuple[float, str, str | None], ...] = (
+    (0.000000, "store.replay_gap", None),
+    (0.004565, "store.replay_gap", None),
+    (0.005813, "store.replay_gap", None),
+    (0.006754, "store.replay_gap", None),
+    (259.857097, "bus.reader_stopped", None),
+    (259.948102, "bus.reader_stopped", None),
+    (1267.118962, "reconnect_budget_spent", "DELTA"),
+)
+
+
+def _live_alert(code: str, adapter: str | None) -> Alert:
+    return Alert(
+        source="feed",
+        ts_received=TS,
+        severity="error",
+        code=code,
+        detail="replayed from the live alert stream",
+        adapter=adapter,
+    )
+
+
+def test_the_seven_live_alerts_reach_the_poster_as_exactly_three_posts() -> None:
+    """Seven acked alerts, three Discord attempts, four folded by the collapse rule.
+
+    This is the arithmetic that explains the live run: the four `store.replay_gap`
+    entries share one signature and arrive 7 ms apart, so three of them fold into the
+    first; the two `bus.reader_stopped` entries do the same; `reconnect_budget_spent`
+    is a signature of its own. The 2.0 s global floor never bites here -- the gaps are
+    260 s and 1,007 s -- so collapse alone accounts for all four drops.
+    """
+    clock = _Clock()
+    consumer, bus, calls = _consumer_for_fanout(clock)
+
+    async def scenario() -> None:
+        for offset, code, adapter in LIVE_ALERTS_2026_09_12:
+            clock.value = 10.0 + offset
+            bus.publish(_live_alert(code, adapter))
+            await consumer._run_once()
+
+    asyncio.run(scenario())
+
+    posted = [call["content"] for call in calls]
+    assert len(posted) == 3, posted
+    assert "store.replay_gap" in posted[0]
+    assert "bus.reader_stopped" in posted[1]
+    assert "reconnect_budget_spent" in posted[2]
+    # None of the three revealed a folded count: each was the first of its signature.
+    assert not any("collapsed" in content for content in posted)
+    # The mechanism, not only the total. Three posts survive a broken collapse window
+    # as well, because the 2.0 s floor happens to absorb the same four repeats -- so
+    # counting posts alone would pass while the rule under test was gone. What
+    # separates the two readings is which counter moved: collapse leaves
+    # `rate_limited_count` at zero.
+    assert consumer.gate.rate_limited_count == 0
+
+
+def test_the_four_folded_live_alerts_are_still_unreported_after_the_run() -> None:
+    """The repeats are held, not counted out loud, until the signature recurs.
+
+    Reveal-on-next-occurrence is #66's deliberate choice over buffering the window.
+    Its cost is visible here: at the end of the live run the gate is still holding
+    three folded `store.replay_gap` repeats and one `bus.reader_stopped` repeat, and
+    if neither signature ever recurs, nothing ever says they happened.
+    """
+    clock = _Clock()
+    consumer, bus, _calls = _consumer_for_fanout(clock)
+
+    async def scenario() -> None:
+        for offset, code, adapter in LIVE_ALERTS_2026_09_12:
+            clock.value = 10.0 + offset
+            bus.publish(_live_alert(code, adapter))
+            await consumer._run_once()
+
+    asyncio.run(scenario())
+
+    suppressed = consumer.gate._suppressed_count_by_signature
+    assert suppressed[("store.replay_gap", None, "error")] == 3
+    assert suppressed[("bus.reader_stopped", None, "error")] == 1
+
+
+def test_the_live_connect_timeout_loses_its_alert_and_says_which_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The live failure, reproduced: the seventh alert is acked and never delivered.
+
+    `reconnect_budget_spent` was the alert that said the venue connection would not
+    come back without a resume. Its post raised, the occurrence was committed anyway
+    because the HTTP seam *was* attempted, and no replay exists to bring it back. The
+    consumer keeps running, which is the point of the trade -- and the log now names
+    what it cost, which before this test it did not.
+    """
+    clock = _Clock()
+    from deltapayoff.fanout import FanOut
+
+    calls: list[dict[str, Any]] = []
+
+    async def post(_url: str, payload: dict[str, Any]) -> SimpleNamespace:
+        calls.append(payload)
+        if "reconnect_budget_spent" in payload["content"]:
+            raise ConnectionError("offline")
+        return SimpleNamespace(status=204)
+
+    bus = FanOut()
+    consumer = AlertConsumer(
+        bus,
+        poster=discord_alerts.DiscordPoster(post),
+        gate=discord_alerts.AlertGate(),
+        webhook_url="https://discord.test/webhook",
+        clock=clock,
+        wall_clock=lambda: EARLY_WALL_CLOCK,
+    )
+    consumer.subscribe()
+
+    async def scenario() -> None:
+        for offset, code, adapter in LIVE_ALERTS_2026_09_12:
+            clock.value = 10.0 + offset
+            bus.publish(_live_alert(code, adapter))
+            await consumer._run_once()
+
+    with caplog.at_level(logging.ERROR, logger="deltapayoff.discord_alerts"):
+        asyncio.run(scenario())
+
+    assert len(calls) == 3
+    assert "reconnect_budget_spent" in caplog.text
+    assert "dropped, not retried" in caplog.text
+    assert "https://discord.test/webhook" not in caplog.text
+    # Acked on receipt and committed as spent: nothing is pending and nothing retries.
+    assert consumer.gate._pending_post is None
 
 
 def test_every_test_in_this_module_has_an_assertion() -> None:

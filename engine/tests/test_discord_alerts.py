@@ -245,3 +245,139 @@ def test_a_post_exception_is_swallowed_and_logged(
     assert len(calls) == 1
     assert any(record.levelno == logging.ERROR for record in caplog.records)
     assert "https://discord.test/webhook" not in caplog.text
+
+
+# --- What a lost alert leaves behind -----------------------------------------------
+#
+# This consumer acks on receipt and never replays (#66's own decision). So an alert
+# whose post does not reach Discord is gone: no retry, no pending entry, no second
+# chance. That trade is defensible for an alert consumer, but only if the loss is
+# recorded -- and until these tests it was not. `measured` 2026-09-12 on the live
+# `dxp` stack: seven alerts were consumed and acked, one post failed, and the only
+# record of it was
+#
+#     ERROR deltapayoff.discord_alerts engine.error: Discord webhook post failed:
+#     ConnectTimeout
+#
+# which names the exception type and nothing else. The alert it lost was
+# `reconnect_budget_spent` -- the one saying the venue connection would not come back
+# without a resume -- and no reader of that line could have known that.
+
+
+def test_a_failed_post_names_the_alert_it_lost(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The exception path must say which alert died, not only how it died."""
+    _calls, post = _fake_post(error=ConnectionError("offline"))
+    poster = DiscordPoster(post)
+
+    with caplog.at_level(logging.ERROR, logger="deltapayoff.discord_alerts"):
+        asyncio.run(
+            poster.post_alert("https://discord.test/webhook", _alert(), 0, now=10.0)
+        )
+
+    assert "connection_silent" in caplog.text
+    assert "error" in caplog.text
+    assert "delta" in caplog.text
+    assert "ConnectionError" in caplog.text
+    # The reason this line exists at all: it must say the alert is not coming back.
+    assert "dropped" in caplog.text
+    # The URL must still never reach a log record.
+    assert "https://discord.test/webhook" not in caplog.text
+
+
+def test_a_dropped_5xx_names_the_alert_it_lost(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 5xx is logged and dropped without retry, so it loses an alert too."""
+    _calls, post = _fake_post(SimpleNamespace(status=503))
+    poster = DiscordPoster(post)
+
+    with caplog.at_level(logging.ERROR, logger="deltapayoff.discord_alerts"):
+        asyncio.run(
+            poster.post_alert("https://discord.test/webhook", _alert(), 0, now=10.0)
+        )
+
+    assert "503" in caplog.text
+    assert "connection_silent" in caplog.text
+    assert "dropped" in caplog.text
+
+
+def test_a_429_drop_names_the_alert_it_lost(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 429 is never retried either, so the alert it refuses is lost as well."""
+    _calls, post = _fake_post(SimpleNamespace(status=429, json_body={"retry_after": 3.0}))
+    poster = DiscordPoster(post)
+
+    with caplog.at_level(logging.WARNING, logger="deltapayoff.discord_alerts"):
+        asyncio.run(
+            poster.post_alert("https://discord.test/webhook", _alert(), 0, now=10.0)
+        )
+
+    assert "connection_silent" in caplog.text
+    assert "dropped" in caplog.text
+
+
+def test_a_lost_post_records_the_collapsed_count_that_died_with_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The folded repeats go with it, so the line must say how many.
+
+    The gate hands the accumulated count to the post that reveals it, and
+    `post_alert` reports the exception path as *attempted*, so the consumer commits
+    the occurrence and that count is cleared. Four repeats can die in one failed post
+    and the log is the only place that can say so.
+    """
+    _calls, post = _fake_post(error=ConnectionError("offline"))
+    poster = DiscordPoster(post)
+
+    with caplog.at_level(logging.ERROR, logger="deltapayoff.discord_alerts"):
+        asyncio.run(
+            poster.post_alert("https://discord.test/webhook", _alert(), 4, now=10.0)
+        )
+
+    assert "collapsed 4" in caplog.text
+
+
+def test_a_lost_alert_with_no_adapter_is_named_engine_in_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The log uses the same null-adapter spelling the Discord message does."""
+    _calls, post = _fake_post(error=ConnectionError("offline"))
+    poster = DiscordPoster(post)
+
+    with caplog.at_level(logging.ERROR, logger="deltapayoff.discord_alerts"):
+        asyncio.run(
+            poster.post_alert(
+                "https://discord.test/webhook", _alert(adapter=None), 0, now=10.0
+            )
+        )
+
+    assert "engine" in caplog.text
+
+
+def test_a_successful_post_is_logged_with_its_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Delivery must leave a record, or the absence of one proves nothing.
+
+    Until now a 2xx returned silently, so the only evidence a post had succeeded was
+    that no failure had been logged. That is why the live run of 2026-09-12 read as a
+    contradiction: `XINFO GROUPS alert` said seven entries read with none pending, and
+    the container's log held one line. Three posts were attempted and two delivered,
+    but nothing recorded the two -- they had to be reconstructed from the gate's rules.
+    An alert consumer whose successes are invisible cannot be audited after the fact.
+    """
+    _calls, post = _fake_post(SimpleNamespace(status=204))
+    poster = DiscordPoster(post)
+
+    with caplog.at_level(logging.INFO, logger="deltapayoff.discord_alerts"):
+        asyncio.run(
+            poster.post_alert("https://discord.test/webhook", _alert(), 0, now=10.0)
+        )
+
+    assert "204" in caplog.text
+    assert "connection_silent" in caplog.text
+    assert any(record.levelno == logging.INFO for record in caplog.records)
+    assert "https://discord.test/webhook" not in caplog.text

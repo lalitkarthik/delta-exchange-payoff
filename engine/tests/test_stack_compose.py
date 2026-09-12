@@ -38,8 +38,31 @@ def _service_blocks(text: str) -> dict[str, str]:
     return {name: "\n".join(lines) for name, lines in blocks.items()}
 
 
-def test_compose_names_the_project_and_only_publishes_the_proxy_port() -> None:
+def _with_defaults(text: str) -> str:
+    """Resolve `${VAR:-default}` to its default, the way a bare `up` would.
+
+    Two values in `compose.yml` are interpolated so a second Compose project can run
+    the same file beside a live one. Every assertion below is about what an
+    un-overridden `docker compose up` does, so it reads the resolved text -- pinning
+    the raw `${...}` spelling instead would pin the syntax and stop checking the
+    value, which is the mistake `_command_line` below already had to undo once.
+    """
+    return re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}", r"\1", text)
+
+
+def test_the_interpolated_defaults_are_the_live_stacks_own_values() -> None:
+    """A bare `up` must still produce exactly what it produced before #65's fix."""
     text = COMPOSE.read_text(encoding="utf-8")
+
+    assert "${DXP_CONTAINER_PREFIX:-dxp}" in text
+    assert "${DXP_PROXY_PORT:-8080}" in text
+    resolved = _with_defaults(text)
+    assert "${" not in resolved
+    assert resolved.count('- "8080:80"') == 1
+
+
+def test_compose_names_the_project_and_only_publishes_the_proxy_port() -> None:
+    text = _with_defaults(COMPOSE.read_text(encoding="utf-8"))
 
     assert "name: dxp" in text
     assert len(re.findall(r'^\s*-\s*"?(3000|8000):', text, re.MULTILINE)) == 0
@@ -61,7 +84,7 @@ def _command_line(block: str) -> str:
     raise AssertionError("the service block declares no command")
 
 def test_compose_prefixes_every_container_and_gives_redis_the_bounded_command() -> None:
-    text = COMPOSE.read_text(encoding="utf-8")
+    text = _with_defaults(COMPOSE.read_text(encoding="utf-8"))
     blocks = _service_blocks(text)
     names = re.findall(r"^\s+container_name:\s*([^\s#]+)", text, re.MULTILINE)
 

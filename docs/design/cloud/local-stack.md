@@ -111,7 +111,29 @@ Run from the repository root:
 
 ```sh
 engine/.venv/Scripts/python.exe tools/smoke_stack.py
+engine/.venv/Scripts/python.exe tools/smoke_stack.py --project-name smoke65 --proxy-port 8099
 ```
+
+**The second form is the one to use while a stack is already running**, and until
+2026-09-12 it did not work. `--project-name` had been there since #65 and both #65 and #66
+deferred their end-to-end run on the strength of it, each recording the blocker as "a second
+Compose project cannot bind host port 8080". The port was only half of it: `compose.yml` also
+pinned `container_name: dxp-redis` and its six siblings, and `container_name` overrides
+Compose's own project-service-index naming outright, so a second project collided on
+`/dxp-redis` and never started. Both are now interpolated --
+`${DXP_CONTAINER_PREFIX:-dxp}` and `${DXP_PROXY_PORT:-8080}`, defaulting to exactly their
+old values, so a bare `docker compose up` is unchanged -- and `smoke_stack.py` sets them from
+its own flags.
+
+The default project name is **`dxp-smoke`**, not `dxp`. The script's `finally` branch runs
+`docker compose down --remove-orphans` on whatever project it was given, so the old default
+meant a bare `smoke_stack.py` tore down the live stack.
+
+**First green end-to-end run: 2026-09-12T16:43:32Z**, `--project-name smoke65 --proxy-port
+8099`, exit **0**, one row for `C-BTC-77600-040926` in
+`.stack-data/quote-bars/underlying=BTC/date=2026-09-12/20260912T164300Z-g00000001.parquet`
+(`measured`). All seven containers reached healthy; all seven were removed afterwards, and
+`docker ps -a` was byte-identical before and after.
 
 The smoke test starts Compose with the smoke-only `compose.smoke.yml` override, mounts the
 scripted fake adapter, and sets `DELTA_FEED_ADAPTER` to that fake. The fake emits its script,
@@ -132,18 +154,19 @@ straight down afterward.
 
 ## 9. Measurements
 
-I6-11 fills this table after the orchestrator's run. No image size or start-to-healthy value
-has been measured here.
+Every figure is `measured` on Docker 29.7.2. The tables, the runs behind them and the
+caveats that must travel with them live in
+[local-stack-numbers.md](local-stack-numbers.md) -- the same split
+`hld-evidence.md`, `logging-catalogue.md` and `store-numbers.md` each made when the design
+note filled up. The headlines:
 
-| Measurement | Value | Command | Date |
-|---|---|---|---|
-| `feed` image size | pending the orchestrator's run | pending the orchestrator's run | pending the orchestrator's run |
-| `store` image size | pending the orchestrator's run | pending the orchestrator's run | pending the orchestrator's run |
-| `api` image size | pending the orchestrator's run | pending the orchestrator's run | pending the orchestrator's run |
-| `web` image size | pending the orchestrator's run | pending the orchestrator's run | pending the orchestrator's run |
-| Redis image size | pending the orchestrator's run | pending the orchestrator's run | pending the orchestrator's run |
-| `nginx:alpine` proxy image size | pending the orchestrator's run | pending the orchestrator's run | pending the orchestrator's run |
-| Start-to-healthy seconds | pending the orchestrator's run | pending the orchestrator's run | pending the orchestrator's run |
+- **Images**: `feed`, `store`, `api` and `discord-alerts` 761 MB each (one shared base
+  stage, so not 3,044 MB on disk), `web` 1.08 GB, `redis:7-alpine` 57.8 MB,
+  `nginx:alpine` 103 MB.
+- **Start-to-healthy**: 2.61 s (`redis`) to 6.64 s (`discord-alerts`) per container;
+  **14.11 s** for the whole stack, first container start to last container healthy.
+- **A `feed` restart costs 2.961 s** from container start to its first market-data event on
+  the bus -- the number #65 asks for and R4 needs.
 
 ## 10. What this is not
 

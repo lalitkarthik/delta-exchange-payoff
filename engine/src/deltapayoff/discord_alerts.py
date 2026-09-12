@@ -167,6 +167,8 @@ class DiscordPoster:
         if collapsed_count > 0:
             text += f" (collapsed {collapsed_count} times since last post)"
 
+        lost = self._lost(alert, collapsed_count)
+
         try:
             response = await self.post_fn(webhook_url, {"content": text})
         except Exception as exc:
@@ -175,12 +177,29 @@ class DiscordPoster:
                 logger,
                 logging.ERROR,
                 log_events.ENGINE_ERROR,
-                "Discord webhook post failed: %s",
+                "Discord webhook post failed: %s; %s",
                 type(exc).__name__,
+                lost,
             )
             return True
 
         if 200 <= response.status < 300:
+            # Delivery is logged, not silent. A consumer that records only its failures
+            # cannot be audited afterwards: on 2026-09-12 the live stack showed seven
+            # alerts read, none pending, and one log line, and the two that were
+            # actually delivered had to be reconstructed from the gate's rules rather
+            # than read off anything. One line per delivered alert is affordable --
+            # `ALERT_MIN_POST_INTERVAL_SECONDS` already floors the post rate.
+            log_event(
+                logger,
+                logging.INFO,
+                log_events.ALERT,
+                "Discord accepted HTTP %d: [%s] %s -- %s",
+                response.status,
+                alert.severity,
+                alert.code,
+                adapter,
+            )
             return True
         if response.status == 429:
             retry_after = self._retry_after(response)
@@ -189,8 +208,9 @@ class DiscordPoster:
                 logger,
                 logging.WARNING,
                 log_events.ENGINE_ERROR,
-                "Discord rate-limited this consumer for %.3f seconds",
+                "Discord rate-limited this consumer for %.3f seconds; %s",
                 retry_after,
+                lost,
             )
             return True
         if response.status >= 500:
@@ -198,18 +218,44 @@ class DiscordPoster:
                 logger,
                 logging.ERROR,
                 log_events.ENGINE_ERROR,
-                "Discord returned HTTP %d",
+                "Discord returned HTTP %d; %s",
                 response.status,
+                lost,
             )
             return True
         log_event(
             logger,
             logging.ERROR,
             log_events.ENGINE_ERROR,
-            "Discord returned unexpected HTTP %d",
+            "Discord returned unexpected HTTP %d; %s",
             response.status,
+            lost,
         )
         return True
+
+    @staticmethod
+    def _lost(alert: Any, collapsed_count: int) -> str:
+        """Name the alert this consumer is about to throw away.
+
+        Every branch below the HTTP call drops its message: #66 decided this consumer
+        acks on receipt and never replays, so there is no pending entry to come back
+        to and no retry behind it. That is the right trade for an alert -- a stale
+        Discord notification is worth less than a consumer blocked behind it -- but it
+        is only defensible if the loss leaves a record, and for one live failure on
+        2026-09-12 it did not: the line named `ConnectTimeout` and nothing else, while
+        the alert it lost was `reconnect_budget_spent`.
+
+        Only engine-generated fields go in. `detail` is left out to keep this to one
+        line, and the webhook URL cannot reach it, which is the rule the exception
+        branch above exists to honour.
+        """
+        adapter = "engine" if alert.adapter is None else alert.adapter
+        lost = (
+            f"alert dropped, not retried: [{alert.severity}] {alert.code} -- {adapter}"
+        )
+        if collapsed_count > 0:
+            lost += f" (collapsed {collapsed_count} folded repeats lost with it)"
+        return lost
 
     @staticmethod
     def _retry_after(response: Any) -> float:

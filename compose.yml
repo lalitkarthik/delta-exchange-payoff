@@ -1,11 +1,26 @@
 name: dxp
 
+# Two values are parameterised so that a SECOND project can run this same file beside a
+# live one. Both default to exactly what they were, so `docker compose up` unchanged
+# produces `dxp-redis` ... `dxp-proxy` on host port 8080 as before.
+#
+#   DXP_CONTAINER_PREFIX  the container-name prefix   (default `dxp`)
+#   DXP_PROXY_PORT        the one published host port (default 8080)
+#
+# Why: `tools/smoke_stack.py` has always taken `--project-name`, and #65 and #66 both
+# recorded the smoke run as blocked because "a second Compose project cannot bind 8080".
+# The port was only half of it. `container_name` overrides Compose's own
+# project-service-index naming outright, so a second project did not get its own
+# container names either -- it collided on `/dxp-redis` and failed to start. A flag that
+# cannot isolate anything is worse than no flag, because both tickets deferred a run on
+# the strength of it.
+#
 # No restart policy here: a dead container stays visible in docker compose ps; prod's
 # ECS service restarts are the other half of that trade.
 services:
   redis:
     image: redis:7-alpine
-    container_name: dxp-redis
+    container_name: ${DXP_CONTAINER_PREFIX:-dxp}-redis
     # 2gb, matching prod, because 1gb contradicts a measurement this repo already
     # published. #61 ran thirty continuous minutes of BTC+ETH and recorded 1,056.4 MiB
     # (`measured`) against #58's 1,051.5 MiB (`derived`) -- and had to raise its own
@@ -31,7 +46,7 @@ services:
     build:
       context: ./engine
       dockerfile: Dockerfile.feed
-    container_name: dxp-feed
+    container_name: ${DXP_CONTAINER_PREFIX:-dxp}-feed
     env_file:
       - stack.env
     # #103: the engine's daily JSON log files live at /app/logs and nothing was mounted
@@ -55,7 +70,7 @@ services:
     build:
       context: ./engine
       dockerfile: Dockerfile.store
-    container_name: dxp-store
+    container_name: ${DXP_CONTAINER_PREFIX:-dxp}-store
     env_file:
       - stack.env
     depends_on:
@@ -81,7 +96,7 @@ services:
     build:
       context: ./engine
       dockerfile: Dockerfile.discord-alerts
-    container_name: dxp-discord-alerts
+    container_name: ${DXP_CONTAINER_PREFIX:-dxp}-discord-alerts
     env_file:
       - stack.env
       - path: stack.local.env
@@ -107,7 +122,7 @@ services:
     build:
       context: ./engine
       dockerfile: Dockerfile.api
-    container_name: dxp-api
+    container_name: ${DXP_CONTAINER_PREFIX:-dxp}-api
     env_file:
       - stack.env
     depends_on:
@@ -142,7 +157,7 @@ services:
       context: ./web
       args:
         NEXT_PUBLIC_ENGINE_URL: "http://localhost:8080/api"
-    container_name: dxp-web
+    container_name: ${DXP_CONTAINER_PREFIX:-dxp}-web
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
       interval: 3s
@@ -152,9 +167,9 @@ services:
 
   proxy:
     image: nginx:alpine
-    container_name: dxp-proxy
+    container_name: ${DXP_CONTAINER_PREFIX:-dxp}-proxy
     ports:
-      - "8080:80"
+      - "${DXP_PROXY_PORT:-8080}:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:

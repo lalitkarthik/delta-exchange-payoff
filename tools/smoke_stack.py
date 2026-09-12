@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -12,14 +13,47 @@ from pathlib import Path
 
 import polars as pl
 
-PROJECT = "dxp"
+#: The project a live stack runs under. This tool must never be pointed at it by
+#: default: its `finally` branch runs `docker compose down --remove-orphans`, so the
+#: old default of "dxp" meant a bare `smoke_stack.py` tore down the running system.
+LIVE_PROJECT = "dxp"
+PROJECT = "dxp-smoke"
+PROXY_PORT = 8080
 COMPOSE_FILES = ("compose.yml", "compose.smoke.yml")
 ENV_FILE = "stack.env"
-# The api, reached THROUGH the proxy - which is the thing worth proving, and which
-# /health no longer is: with the api under /api/, a bare /health falls to the web
-# catch-all and 404s. The proxy's own liveness is /healthz, answered by nginx itself.
-PROXY_HEALTH = "http://127.0.0.1:8080/api/health"
-PROXY_SELF_HEALTH = "http://127.0.0.1:8080/healthz"
+
+
+def _health_urls(port: int) -> tuple[str, str]:
+    """The two probes, for whichever host port this stack published.
+
+    The api is reached THROUGH the proxy - which is the thing worth proving, and which
+    /health no longer is: with the api under /api/, a bare /health falls to the web
+    catch-all and 404s. The proxy's own liveness is /healthz, answered by nginx itself.
+    """
+    return (
+        f"http://127.0.0.1:{port}/api/health",
+        f"http://127.0.0.1:{port}/healthz",
+    )
+
+
+PROXY_HEALTH, PROXY_SELF_HEALTH = _health_urls(PROXY_PORT)
+
+
+def _isolating_env(project: str, proxy_port: int) -> dict[str, str]:
+    """The two variables `compose.yml` interpolates, so a second stack is its own.
+
+    `container_name` overrides Compose's project-service-index naming, so without
+    `DXP_CONTAINER_PREFIX` a second project collides on `/dxp-redis` and never starts;
+    `DXP_PROXY_PORT` is the other half, because only one project can bind 8080. Naming
+    the prefix after the project keeps `docker ps` readable: one prefix, one stack.
+    """
+    return {
+        **os.environ,
+        "DXP_CONTAINER_PREFIX": project,
+        "DXP_PROXY_PORT": str(proxy_port),
+    }
+
+
 HEALTH_TIMEOUT_SECONDS = 60.0
 SETTLE_SECONDS = 5.0
 SYMBOL = "C-BTC-77600-040926"
@@ -31,7 +65,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _compose(
-    arguments: list[str], project: str = PROJECT
+    arguments: list[str],
+    project: str = PROJECT,
+    proxy_port: int = PROXY_PORT,
 ) -> subprocess.CompletedProcess[str]:
     command = [
         "docker",
@@ -52,6 +88,7 @@ def _compose(
         capture_output=True,
         text=True,
         check=False,
+        env=_isolating_env(project, proxy_port),
     )
 
 
@@ -71,13 +108,15 @@ def _skip(reason: str) -> int:
 
 
 def _wait_for_proxy(
-    started: float, timeout: float = HEALTH_TIMEOUT_SECONDS
+    started: float,
+    timeout: float = HEALTH_TIMEOUT_SECONDS,
+    url: str = PROXY_HEALTH,
 ) -> tuple[float | None, str]:
     last_error = "no response yet"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(PROXY_HEALTH, timeout=2) as response:
+            with urllib.request.urlopen(url, timeout=2) as response:
                 if response.status == 200:
                     return time.monotonic() - started, ""
                 last_error = f"HTTP {response.status}"
@@ -112,6 +151,16 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--proxy-port",
+        type=int,
+        default=PROXY_PORT,
+        metavar="PORT",
+        help=(
+            "host port the proxy publishes, and so the port both health probes use "
+            f"(default: {PROXY_PORT}). Give a second stack its own, or it cannot bind."
+        ),
+    )
+    parser.add_argument(
         "--health-timeout",
         type=float,
         default=HEALTH_TIMEOUT_SECONDS,
@@ -133,6 +182,8 @@ def main(argv: list[str]) -> int:
     """Run the smoke stack, or return a loud skip when Docker is unavailable."""
     options = _parser().parse_args(argv)
     project = options.project_name
+    proxy_port = options.proxy_port
+    api_health, _proxy_self_health = _health_urls(proxy_port)
 
     if shutil.which("docker") is None:
         return _skip("no docker on PATH.")
@@ -160,6 +211,7 @@ def main(argv: list[str]) -> int:
         stack_started = True
         up = _compose(
             project=project,
+            proxy_port=proxy_port,
             arguments=["up", "-d", "--wait", "--wait-timeout", "120"],
         )
         if up.returncode != 0:
@@ -170,7 +222,9 @@ def main(argv: list[str]) -> int:
             )
             return EXIT_FAIL
 
-        healthy_seconds, health_error = _wait_for_proxy(started, options.health_timeout)
+        healthy_seconds, health_error = _wait_for_proxy(
+            started, options.health_timeout, api_health
+        )
         if healthy_seconds is None:
             print(
                 f"start-to-healthy: {time.monotonic() - started:.1f}s",
@@ -182,6 +236,7 @@ def main(argv: list[str]) -> int:
 
         store_health = _compose(
             project=project,
+            proxy_port=proxy_port,
             arguments=[
                 "exec",
                 "-T",
@@ -203,7 +258,9 @@ def main(argv: list[str]) -> int:
         # margin, not a race dressed up as a delay.
         time.sleep(SETTLE_SECONDS)
 
-        stop_store = _compose(project=project, arguments=["stop", "store"])
+        stop_store = _compose(
+            project=project, proxy_port=proxy_port, arguments=["stop", "store"]
+        )
         if stop_store.returncode != 0:
             print(_captured(stop_store), file=sys.stderr)
             return EXIT_FAIL
@@ -212,7 +269,9 @@ def main(argv: list[str]) -> int:
             set(dataset_root.glob("underlying=BTC/date=*/*.parquet")) - baseline
         )
         if not new_files:
-            logs = _compose(project=project, arguments=["logs", "store"])
+            logs = _compose(
+                project=project, proxy_port=proxy_port, arguments=["logs", "store"]
+            )
             print(f"no new parquet file under {dataset_root}", file=sys.stderr)
             print(*_captured(logs).splitlines()[-50:], sep=chr(10), file=sys.stderr)
             return EXIT_FAIL
@@ -244,7 +303,11 @@ def main(argv: list[str]) -> int:
         return EXIT_OK
     finally:
         if stack_started and not options.keep_up:
-            down = _compose(project=project, arguments=["down", "--remove-orphans"])
+            down = _compose(
+                project=project,
+                proxy_port=proxy_port,
+                arguments=["down", "--remove-orphans"],
+            )
             if down.returncode != 0:
                 print(_captured(down), file=sys.stderr)
 
