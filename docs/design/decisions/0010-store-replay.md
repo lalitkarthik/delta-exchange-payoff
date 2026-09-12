@@ -38,6 +38,17 @@ written before the files and deleted after the checkpoint — the compaction man
 pattern. Flush files gain the generation in their name, so no two processes can collide on
 one. A failed store-mode flush keeps its bars. 0010a §2 walks every failure point.
 
+**R3a — The pending list a restart inherits belongs to the replay, not to the reader** (#111).
+A lossless pass that fails after `XREADGROUP` returned strands its batch in the consumer group's
+pending list, and the reader now reads that list back before it reads `>`. At a restart the two
+overlap: every pending entry has an id at or below the group's `last-delivered-id`, so for a
+stream `store` holds a watermark for it lies inside `(watermark, last-delivered]` — exactly what
+R3's replay re-reads from the raw stream. **So `store` acks its inherited pending list and does
+not deliver it**, counted as `deferred`; delivering it as well would fold it twice and R3 would
+no longer be exactly-once. A subscription with no watermark has no replay, and its inherited
+list is delivered instead. `message-bus.md` A3 is unchanged: `store` still restarts from its
+checkpoint and never from the pending list.
+
 **R4 — The seal clock follows the log while a reader is behind.** `min(wall clock, the time
 inside the last stream id of any stream still behind)`. With nothing behind it is the wall
 clock, unchanged. Without this the first drain pass after any absence seals the whole backlog
