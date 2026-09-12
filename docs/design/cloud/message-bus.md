@@ -15,7 +15,8 @@ Nothing in `prod` is built. The bus itself runs today, in the local stack and in
 
 1. **No AWS message service carries the bus.** Redis Streams does, in a container.
 2. **Amazon ECS on EC2** runs that container beside `feed`, `store` and `api`.
-3. **Amazon EC2**, one `c7g.xlarge` in `ap-south-1`, is the box it shares with them.
+3. **Amazon EC2**, one `c7g.xlarge` in `ap-south-1`, is the instance it shares with them
+   ([0008](../decisions/0008-topology.md)).
 4. **`host` network mode** keeps the publisher on `127.0.0.1`, with no hop to Redis.
 5. **ElastiCache for Valkey is the named fallback**, `derived` $47.30 a month, one endpoint string.
 
@@ -36,8 +37,9 @@ redis-server --save "" --appendonly no --maxmemory 2gb --maxmemory-policy noevic
 | Ceiling | whatever the laptop has | `maxmemory 2gb` |
 
 **A container, not a managed cache, because the bus is a pipe.** Losing it costs a restart and not
-history: `store` replays from its checkpoint and `api` refills its cache from live frames in a
-`measured` 508 ms. That is [0002](../decisions/0002-redis-hosting.md), and the rules it implies are
+history: `store` replays from its checkpoint, and `api` refills its cache from the live events that
+follow, inside one book refresh — `measured` 508 ms a contract (`tools/measure_feed.py`,
+2026-09-03). That is [0002](../decisions/0002-redis-hosting.md), and the rules it implies are
 [redis-hosting.md](redis-hosting.md).
 
 ## 3. The names and the format on the wire
@@ -69,9 +71,9 @@ crosses the bus.
 | input to the bus | `alert` | any service | the Discord alert consumer |
 | output of the bus | `control.command` | `api` | `feed`, `store` |
 
-`control.command` is the one inbound type: a screen command enters the bus and the addressed service
-reads it. Its `target` field says which service, and the feed supervisor drops anything not addressed
-to it ([0010](../decisions/0010-store-replay.md) R8).
+`control.command` is the one inbound type: `api` publishes one `command` from the screen, and the
+addressed service reads it. Its `target` field names that service, and the feed supervisor drops
+anything not addressed to it ([0010](../decisions/0010-store-replay.md) R8).
 
 ## 4. Acknowledgement, trimming and persistence
 
@@ -80,18 +82,36 @@ change any one of them.
 
 ### 4.1 Acknowledgement
 
+**Read A5 and A6 before you trust a `store` that has been running for hours.** The five rules
+above them describe a restart; those two describe what the code does and does not watch.
+
 | Rule | What it says |
 |---|---|
 | A1 | Every consumer acks a batch **on receipt**, before the work, never after it. |
-| A2 | The durability boundary is the **store flush**, not the ack. Five minutes of bars sit in memory until a Parquet file lands. |
+| A2 | The durability boundary is the **store flush**, not the ack. `FLUSH_SECONDS` is 300 s (`assumed`, `deltapayoff.store`), so up to five minutes of bars sit in memory until a Parquet file lands. |
 | A3 | `store` restarts from its **checkpoint**, never from the pending list and never from `0`. |
-| A4 | `api` joins at `$` and **never replays**. Its cache refills from live frames. |
-| A5 | A **trimmed position** replays the retained suffix, reports both bounds and an exact count, and never refuses start-up. |
+| A4 | `api` joins at `$` and **never replays**. Its cache refills from the events that arrive next. |
+| A5 | A **trimmed position** is a **replay gap**: `store` replays the retained suffix, reports both bounds and an exact count, alerts, and never refuses start-up ([0010](../decisions/0010-store-replay.md) R5). **`store` runs this check at start-up only.** |
+| A6 | While any stream is behind, the **seal clock** is `min(wall clock, the time inside the last stream id of any stream still behind)` ([0010](../decisions/0010-store-replay.md) R4). |
 
 **A3 is what [0010](../decisions/0010-store-replay.md) changed, and it supersedes
 [0002](../decisions/0002-redis-hosting.md).** The watermark is per stream and carries an id and a
 logical index, so "how much did Redis trim" is an exact number. Starting at `0` instead would
 re-record up to thirty minutes the old writer already wrote, as duplicates.
+
+**A6 is what makes a replay produce the bars a live run would have produced.** Without it the
+first drain pass after any absence seals the whole backlog as late, and `store` throws away the
+bytes it just replayed. With no stream behind, the seal clock is the wall clock.
+
+**Do not read A5 as protection for a running `store`. It protects a starting one.**
+`store_main.py` counts the gap inside `_prepare_process`, against the checkpoint it has just
+read, and never again. A `store` that keeps running and stops reading raises nothing:
+[#103](https://github.com/lalitkarthik/delta-exchange-payoff/issues/103) records a live store
+that lost **97 minutes** of market data while its own `/health` reported
+`replay_gap_entries: 0` throughout, because its bus reader had died and no restart ever ran the
+check. The continuous form — the group's `last-delivered-id` against the stream's oldest
+surviving id, two `XINFO` calls — is **not built**. Until it is, this section claims start-up
+detection and nothing more.
 
 **Acking on receipt is deliberate, and it is not the textbook pattern.** The textbook acks after the
 work and recovers from the pending list with `XAUTOCLAIM`. A per-message ack tells us nothing about
@@ -99,21 +119,26 @@ what reached a file, so the store records the id it last flushed and reads forwa
 
 ### 4.2 Trimming
 
+**Set the retention window before you size Redis: the two are one decision.**
+
 | Rule | Value |
 |---|---|
 | T1 | Retention is **thirty minutes**, `assumed`, by age and never by count. |
 | T2 | The command is `XTRIM <stream> MINID ~ <now − 1800s>`. |
 | T3 | The trim rides **in the same pipeline as that batch's `XADD`s**, on every batch write. |
-| T4 | `XACK` frees no stream memory; only `XTRIM` does (`measured`, #69). |
+| T4 | `XACK` frees no stream memory; only `XTRIM` does — `measured`, `tools/measure_redis_hosting.py`, 2026-09-09 (#69): 5,000 entries acked, `XLEN` still 5,000, `MEMORY USAGE` unchanged at 1.81 MB. |
 
-**Age, not `MAXLEN`, because a count is a guess about rate.** Thirty minutes is the promise made to a
-restarting `store`. A count would hold hours in a quiet market and four minutes in a loud one.
+**Trim by age and never by `MAXLEN`, because a count is a guess about rate.** Thirty minutes is
+what the bus promises a restarting `store`. A count would hold hours in a quiet market and four
+minutes in a loud one.
 
 **The trim is free at our shape.** `measured` 2026-09-09, `tools/measure_redis_hosting.py`, 100 ms
 batches of 185 entries: 31.8 µs an entry with the trim and 31.8 µs without. A separate trim timer
 would be one more thing that can stop.
 
 ### 4.3 Persistence
+
+**Start Redis with all five of these, or the bus buys a disk and a fork nobody asked for.**
 
 | Rule | Value | Why |
 |---|---|---|
@@ -125,31 +150,10 @@ would be one more thing that can stop.
 
 **P5 is a data-loss decision and not a tuning one.** Under `allkeys-lru` Redis evicts whole keys, and
 one of our keys is one stream: `md.option_quote:DELTA:BTC` would stop existing with nothing raised.
-A managed node must pin this in its parameter group, because ElastiCache defaults to `volatile-lru`.
+A managed cache must pin this in its parameter group, because ElastiCache defaults to `volatile-lru`.
 
 ## 5. The numbers, and what nobody has measured
 
-**Quote a number from this table, never from a sentence elsewhere.**
-
-| Number | Tag | Run behind it |
-|---|---|---|
-| Retention thirty minutes; `maxmemory 2gb` | `assumed` | chosen in [0002](../decisions/0002-redis-hosting.md); see the judged tags in #72 |
-| 1,849.8 events/s on the bus | `derived` | #58, from `measured` per-entry sizes and 1,693.6 frames/s |
-| 1,835–1,854 events/s, 3,330,235 events | `measured` | `tools/measure_bus_live.py`, 2026-09-09, 774 live BTC+ETH contracts |
-| 1,056.4 MiB after thirty continuous minutes | `measured` | same run, `INFO memory` `used_memory` 1,107,735,240 B |
-| 1,051.5 MiB at thirty minutes, forecast | `derived` | #58, before any of it was built; the run came in 0.5% above |
-| Batch interval **50 ms**, achieved period 96.4 ms | `measured` / `derived` | same run; 10 ms is not honoured, 100 ms costs 45 ms of period |
-| Publish to consumer receipt, p50 195.2 ms, p99 847.8 ms | `measured` | same run, 50 ms phase, ~55,000 samples |
-| Publisher cost 29.96 points of a core at 50 ms | `derived` | same run, 70.73% against control's 40.77% |
-| `XADD` pipelined at 100 ms: 31.8 µs an entry, 5.88% of a core | `measured` | `tools/measure_redis_hosting.py`, 2026-09-09, loopback, isolated |
-| Outbox ceiling 200,000 entries, about 108 s of traffic | `assumed` / `derived` | `redis_bus.py`; the seconds are `derived` at 1,849.8 events/s |
-| Dropped, skipped, undecodable, failed batches: 0 | `measured` | `tools/measure_bus_live.py`, whole run |
-| Latency to a managed endpoint | **unmeasured** | no AWS account; [services.md](services.md) §5 |
-
-**Every loopback figure passes through Docker Desktop's WSL2 port forward.** It is an upper bound for
-a co-located container and a floor for anything with a network hop.
-
-**Two figures in this table disagree with each other and both are `measured`.** 5.88% of a core is
-the publisher alone, on loopback, at 100 ms. 29.96 points is the same publisher inside the feed
-process at the chosen 50 ms. Size `feed` from the second ([0007](../decisions/0007-load-profile.md)),
-and read the first as Redis's own cost.
+**Moved to [message-bus-numbers.md](message-bus-numbers.md)** by #72, this file being close to the
+200-line bound: every figure with its tag and its run, the two publisher measurements side by side,
+and the one line nobody has measured. **Quote it from there, never from a sentence here.**

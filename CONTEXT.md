@@ -45,8 +45,12 @@ thing and are never used for each other.
 | envelope | The seven keys every event carries, flat across Redis fields. | [nomenclature.md](docs/design/cloud/nomenclature.md) §2 |
 | payload | The type's own keys, as one JSON object in one Redis field. | the same |
 | outbox | The publisher's in-memory list of encoded entries, bounded at `max_outbox`. | `redis_bus.py` |
+| publisher | The part of `feed` that encodes an event, appends it to the outbox, and never blocks the socket reader. | `redis_bus.py` |
+| flusher | The publisher's own loop. It performs one bus flush every batch interval and keeps running when one raises. | `redis_bus.py` |
 | batch | One pipeline of `XADD`s plus one `XTRIM` per stream it touched. | `redis_bus.py` |
 | **bus flush** | Writing one batch from the outbox to Redis. Always qualified. | `RedisBus.flush` |
+| market-data event | One of the three `md.*` events. Control traffic is not one, and only this resets the staleness clock. | [events.md](docs/design/events.md) |
+| pending list | Redis's per-group list of entries delivered and not yet acked. Nothing here reads it. | [message-bus.md](docs/design/cloud/message-bus.md) §4.1 |
 | trim | `XTRIM <stream> MINID ~`, removing entries older than the retention window. | [message-bus.md](docs/design/cloud/message-bus.md) §4.2 |
 | retention | Thirty minutes, by age and never by count. The promise made to a restarting `store`. | the same |
 | consumer group | A named reader of one stream. One per service, never one per instance. | [nomenclature.md](docs/design/cloud/nomenclature.md) §5 |
@@ -63,11 +67,12 @@ steps and two words.
 
 | Term | What it is | Where it lives |
 |---|---|---|
-| frame | The venue's own JSON object, off the socket, undecoded. Only an adapter sees one. | `adapters/delta_socket.py` |
+| **venue frame** | The venue's own JSON object, off the socket, undecoded. Only an adapter sees one. Always qualified: §5's **ping frame** is a websocket control frame and is not one. | `adapters/delta_socket.py` |
 | tick | One decoded observation the writer folds into a bar. | `bars.py` |
 | bar | A lossy one-minute summary that keeps the extremes and destroys the path. | `bars.py` |
 | seal | Closing a minute's bucket so nothing more can enter it. | `BarAggregator.seal` |
 | **store flush** | Writing sealed bars to Parquet, every `FLUSH_SECONDS`. Always qualified. | `BarStore.flush` |
+| durability boundary | The store flush, and nothing before it. An ack is not one. | [message-bus.md](docs/design/cloud/message-bus.md) §4.1 |
 | table | One of four: `quote-bars`, `reference-bars`, `computed-bars`, `spot-bars`. | `store.py` |
 | partition | One `date=`/`underlying=` directory inside a table. Nothing else is a partition key. | `store.py` |
 | compaction | Folding a closed partition's flush files into one object per table. Nightly. | `compact_partition` |
@@ -130,6 +135,8 @@ publishes one event.
 |---|---|
 | `dev` | Compose on a laptop. The same images, the same containers, one Redis of its own. |
 | `prod` | ECS on one EC2 instance. The same images, one Redis of its own. Stream names do not differ. |
+| instance | One EC2 machine. **Not "box" and not "node"** — one word for one thing, and this is it. |
+| reservation | What a container asks ECS for: vCPU and memory, guaranteed under contention and free when idle. ECS spells a whole vCPU as 1,024 CPU units; **this repository writes vCPU**. |
 | task definition | The ECS object holding every container. A deploy registers a revision of it. |
 | `host` network mode | Every container on the instance's own network stack, so `feed` reaches Redis on `127.0.0.1`. |
 | 1x, 10x | Today's `measured` rate, and ten times it. Every cost table carries both. |

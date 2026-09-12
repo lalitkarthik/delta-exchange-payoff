@@ -7,6 +7,8 @@ Parquet store folds the same stream into one-minute bars.
 **Architecture, the thesis, and the reasoning: `CLAUDE.md`.** Read it before changing
 anything in `engine/src/deltapayoff/`. It is not repeated here.
 
+**The words this repository uses are `CONTEXT.md`. Look a term up there before you write it in a design note, a log field or a consumer-group name.**
+
 **State lives in the GitHub issues, not in files. If an issue and a file disagree, the
 issue wins.**
 

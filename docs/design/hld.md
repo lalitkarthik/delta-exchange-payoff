@@ -112,7 +112,7 @@ own their independent subscriptions. Lossless remains acked and replayed from a 
 drop-oldest still jumps to the newest entries and **counts what it skipped**. Details are
 [lld/redis-bus.md](lld/redis-bus.md); names and encoding are
 [cloud/nomenclature.md](cloud/nomenclature.md); ack, trim and persistence are
-[cloud/redis-hosting.md](cloud/redis-hosting.md).
+[cloud/message-bus.md](cloud/message-bus.md) §4.
 
 ### 2.5 The consumers
 
@@ -146,15 +146,10 @@ is every stored minute of the day (#45).
 
 ## 3. The connection states
 
-Five states, and a connection is in exactly one of them.
-
-| State | Meaning |
-|---|---|
-| `connecting` | An attempt is open; no messages yet. |
-| `connected` | The socket is up and messages are arriving. |
-| `degraded` | The socket is up and nothing has arrived for the staleness interval. |
-| `reconnecting` | The socket is gone or unusable; backoff is running. |
-| `stopped` | Not running: paused by command, or the reconnect budget is spent. |
+**The five states, and what each one means, are
+[cloud/data-feed-engine.md](cloud/data-feed-engine.md) §4** — one table, in one place, beside the
+rules that move a connection between them. A connection is in exactly one of them at every moment.
+These are the transitions:
 
 | From | To | Trigger |
 |---|---|---|

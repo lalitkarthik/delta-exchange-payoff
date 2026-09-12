@@ -47,7 +47,8 @@ and is therefore an upper bound for a container and a floor for anything with a 
 | Backups | none | There is nothing in Redis that Parquet does not also hold |
 
 **Redis here is a pipe, not an archive.** Losing it costs a restart: `store` replays from
-its last flushed ID, `api` refills its cache from live frames in a `measured` 508 ms.
+its last flushed ID, and `api` refills its cache from the events that arrive next, inside one
+book refresh — `measured` 508 ms a contract.
 
 **The disk growth the senior fights never starts here** — and, separately, is diagnosed in
 [../research/0002a-disk-bloat-diagnosis.md](../research/0002a-disk-bloat-diagnosis.md),
@@ -99,7 +100,7 @@ goes loud, it would hold four minutes. The promise has to be the unit.
 | Consumer group | `store` | `api` |
 | Group start id | checkpoint id in `<root>/_store-checkpoint.json` for that stream; on first start the head (`$`, taken once as a concrete id); never `0` | `$` — never replay |
 | Ack | **on receipt**, before the work | **on receipt** |
-| After a restart | reads forward from each stream's recorded `Position` (id plus index) in `<root>/_store-checkpoint.json` | joins at `$`; the cache refills from live frames in a `measured` 508 ms |
+| After a restart | reads forward from each stream's recorded `Position` (id plus index) in `<root>/_store-checkpoint.json` | joins at `$`; the cache refills from the events that arrive next, inside one `measured` 508 ms book refresh |
 | Trimmed position | replays the retained suffix; counts, alerts and logs the loss with both bounds; never refuses start-up | not applicable |
 | Pending list | never used for recovery | never used |
 
