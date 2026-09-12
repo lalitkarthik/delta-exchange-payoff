@@ -112,7 +112,30 @@ quoted.** That is why these took a day to find and why the sweep in
 [design/instruments.md](design/instruments.md) exists: every tool under `tools/` is now recorded
 against one question — does its denominator come from the data, or from the request?
 
-## 6. The suite
+## 6. What each health route can actually detect
+
+`measured` 2026-09-12, from inside each container. **Read the last column first.** A route that
+returns 200 whatever happens is a literal, not an assessment, and this repository has now been
+bitten by that three times — #103, #108 and #115.
+
+| Service | Status on failure | What it detects | What it cannot |
+|---|---|---|---|
+| `feed` | **503** | stopped, paused, spent budget, silence past 135 s, a dead bus reader, a dead flusher | whether `store` is keeping up |
+| `store` | **503** | reader liveness, gave-up, task exits, trimmed watermarks, lag, monitor staleness | **a dead producer** — lag stays 0 when nothing arrives |
+| `discord-alerts` | **503** | the consumer is not running, the last post failed | — |
+| `api` | **always 200** | the feed's state, mirrored off the bus | **a spent budget** — `reconnects` and `budget_remaining` are `null` by construction; its own bus reader; its bar buffer |
+| proxy | never | that nginx is running | **every upstream being down** |
+| `web` | on non-2xx | the page renders | whether data is flowing |
+| Redis | on non-PONG | the server answers | memory, evictions, stream depth |
+
+**Three of the seven still cannot fail.** `api`'s is the one that matters: it is the route a
+person is most likely to check, and it is always 200.
+
+**A dead producer and a healthy consumer are identical from the consumer's side.** `store`'s lag
+stayed 0 on all four streams through #108, because there was nothing arriving to be behind on.
+#103's `consumer_lag` field cannot see that, by construction.
+
+## 7. The suite
 
 **1,541 tests pass, 0 fail, `ruff check .` clean**, `measured` 2026-09-12 on `main`. It was
 1,401 that morning.
