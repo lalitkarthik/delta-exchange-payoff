@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ROOT / "compose.yml"
 ENV_FILE = ROOT / "stack.env"
-SERVICE_NAMES = {"redis", "feed", "store", "api", "web", "proxy"}
+SERVICE_NAMES = {"redis", "feed", "store", "api", "web", "proxy", "discord-alerts"}
 ENV_KEYS = {
     "DELTA_BUS",
     "DELTA_REDIS_URL",
@@ -66,14 +66,11 @@ def test_compose_prefixes_every_container_and_gives_redis_the_bounded_command() 
     names = re.findall(r"^\s+container_name:\s*([^\s#]+)", text, re.MULTILINE)
 
     assert set(blocks) == SERVICE_NAMES
-    assert set(names) == {
-        "dxp-redis",
-        "dxp-feed",
-        "dxp-store",
-        "dxp-api",
-        "dxp-web",
-        "dxp-proxy",
-    }
+    # Derived from SERVICE_NAMES, not written out a second time. A hand-written copy of
+    # this list is one more thing every new service has to remember to update, and #66
+    # found it the hard way: adding the alert consumer failed here for no reason other
+    # than the duplication.
+    assert set(names) == {f"dxp-{service}" for service in SERVICE_NAMES}
     assert names and all(name.startswith("dxp-") for name in names)
     # Read the command LINE, not the whole service block. The block includes the comments
     # above the command, and those comments have always named a memory ceiling -- so

@@ -124,6 +124,9 @@ canonical market events only from Redis and drives `/chain`, `/expiries` and `/w
 stream into four Parquet tables; a minute with no arrivals produces no row. In that mode it
 folds `computed.chain` published by the api rather than sampling a cache. The pricing core
 remains pure, and venue IV and Greeks remain reference columns, never inputs.
+**Discord alerts** (`alert_main.py`) are the sixth container: they subscribe only to the
+`alert` stream in their own consumer group and post to Discord through a configured webhook;
+they never open `feed`, `store` or `api` to do this.
 
 ### 2.6 The public surface and the screens
 
