@@ -139,21 +139,13 @@ because one ticker frame is two events. Retention 1,800 s.
 | **B `json:envelope-flat`** | 598.2 KiB/s | **1,051.5 MiB** | 10.3 GiB |
 | C `msgpack:envelope-flat` | 554.5 KiB/s | **974.8 MiB** | 9.5 GiB |
 | D `msgpack:one-field` | 557.4 KiB/s | **979.7 MiB** | 9.6 GiB |
-
-> **Units corrected 2026-09-12 (#95). The values did not change; the labels were wrong.**
-> This table read `KB/s`, `MB` and `GB`. Every row reconciles only as binary: 598.2 x 1024 x
-> 1800 = 1,102,602,240 bytes, which is **1,051.5 MiB exactly** and 1,102.6 MB. Checked on all
-> five rows — A 1558.8, B 1051.5, C 974.7, D 979.8, E 674.5 against the stated 1558.7, 1051.5,
-> 974.8, 979.7, 674.4 — and the decimal reading matches none of them. This mattered: record
-> 0002 rejects `cache.t4g.small` on a margin of 692,060 bytes, **0.0628%**, computed from this
-> figure. Read as decimal MB the node would have fitted by 4.9% and the rejection would have
-> needed a different reason.
 | E `protobuf:one-field` | 383.7 KiB/s | **674.4 MiB** | 6.6 GiB |
 
 All `derived` from `measured` per-entry sizes and rates. Excluded: the other six types — five are
 rare by construction, and `computed.chain` is `derived` under 1% of the above at one pass a minute
 per live expiry and is **not measured**. **B against C is 76.7 MiB; B against E is 377.1 MiB** — at
-ten times the rate, 0.8 GiB and 3.7 GiB, and 3.7 GiB is a different Redis node.
+ten times the rate, 0.8 GiB and 3.7 GiB, and 3.7 GiB is a different Redis node. Units corrected
+2026-09-12 (#95), values unchanged: [0001-units-reconciliation.md](0001-units-reconciliation.md).
 
 ## What I learned
 
@@ -195,7 +187,7 @@ against protobuf (1.49x), which writes a `double` as eight bytes with no field n
 barely helps: most of an entry is the envelope's text — event id, timestamps, symbol — which
 MessagePack writes as text too. So thirty minutes of our feed is `derived` 1,051.5 MiB, the number
 R5 will spend; ten times the rate is 10.3 GiB, where moving the payload to MessagePack — one
-function, no name change — buys back 0.8 GB.
+function, no name change — buys back 0.8 GiB.
 
 **Redis's own advice is to separate with names, not database numbers.** Numbered databases are a
 trap: Cluster does not have them, managed Redis blocks them, and picking the wrong one looks like
