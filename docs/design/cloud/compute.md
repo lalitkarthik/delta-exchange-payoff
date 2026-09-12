@@ -15,7 +15,7 @@ Landed by #68 and #78 as standards, not as code; nothing here is built, and #65 
 ## 1. The platform, in one line
 
 **ECS on EC2: one `c7g.xlarge` instance in a public subnet of `ap-south-1` (Mumbai), one task
-definition holding all six containers, `host` network mode.** `derived` **$78.07 a month**,
+definition holding all seven containers, `host` network mode.** `derived` **$78.07 a month**,
 on-demand, 2026-09-12. The class is [0008](../decisions/0008-topology.md)'s; 0005 chose `m7g.large` ($48.94).
 
 | | `dev` | `prod` |
@@ -23,7 +23,7 @@ on-demand, 2026-09-12. The class is [0008](../decisions/0008-topology.md)'s; 000
 | Runs on | Docker Compose on a laptop | ECS on one EC2 instance |
 | Region | — | `ap-south-1` |
 | Instance | — | `c7g.xlarge`, Graviton3, 4 vCPU, 8 GiB, 30 GB gp3 root; `feed` reserves 1,024 CPU units |
-| Containers | the same six | the same six |
+| Containers | the same seven | the same seven |
 | Networking | the Compose network | `host` mode — every container on the instance's stack |
 | Reachable from | the laptop | a tunnel or Tailscale only; **never a public listener** (#57) |
 | Stream names | no environment in the name: `md.option_quote:DELTA:BTC` ([0006](../decisions/0006-stream-names-without-environment.md)) | the same names; one Redis each, never shared |
@@ -43,7 +43,7 @@ it. Every dollar figure is `derived` from `measured` AWS Price List Bulk API uni
 |---|---|---|---|---|---|
 | **ECS on EC2** ← chosen | a dead container restarts **and the restart is an alarmable ECS event** | one AMI to patch; restarts and deploys are the platform's | **$48.94 → $179.43** | a new consumer is a container in the task, or its own service | Redis on `127.0.0.1` under `host` mode; venue path unchanged |
 | EC2 with Compose | identical, but **nothing records that it restarted** | the same AMI, plus you are the only restarter and every deploy is an `ssh` | **$48.94 → $179.43** — ECS adds $0 | one YAML file on one box | same |
-| ECS on Fargate | identical; no host to misconfigure | lightest of the four: no AMI, no agent, no disk | $89.33 → $242.41 | best per-service isolation | `awsvpc` is mandatory: six tasks puts a VPC hop between `feed` and Redis |
+| ECS on Fargate | identical; no host to misconfigure | lightest of the four: no AMI, no agent, no disk | $89.33 → $242.41 | best per-service isolation | `awsvpc` is mandatory: seven tasks puts a VPC hop between `feed` and Redis |
 | EKS | identical | heaviest: a Kubernetes minor upgrade at least yearly, add-ons in sequence, manifests | $121.94 → $252.43 one node; $170.89 → $431.86 two | the most, and the most unused | same as ECS on EC2 |
 | *any of them behind a NAT gateway* | — | — | *+$165.00 → +$1,282.09* | — | — |
 
@@ -75,26 +75,39 @@ IPv6-only egress through an egress-only internet gateway is free of both charges
 ## 4. Sizing, and what each container reserves
 
 `derived` from `measured` footprint, and stated as reservations rather than measurements —
-#65 has not split the monolith, so nothing per-container has been measured yet.
+#65 has not split the monolith, so nothing per-container has been measured yet. **Sized at the
+50 ms batch interval I2 (#61) chose**, which is the only interval this system is configured to
+run at; the 100 ms figures belong to a run, not to a deployment.
 
 | Container | vCPU | Memory | Basis |
 |---|---|---|---|
-| `feed` | 0.5 | 1 GB | `measured` 30.89% of a core for the whole monolith, plus the publisher's `measured` 5.88% |
-| `store` | 0.5 | 1 GB | `derived` 201.5 MB/day for BTC+ETH ([0007](../research/0007-load-profile.md) D1; 143 was BTC alone), five-minute flush buffer |
+| `feed` | **1.0** | 1 GB | `derived` 0.52–0.71 of a core **at 50 ms**: 22.1 points of the monolith's `measured` 30.89% ([0007](../research/0007-load-profile.md) §2) plus `derived` **29.96 points** to encode and publish; upper bound `measured` 70.73%, I2's feed-shaped process. **1,024 CPU units**, as §1 and [0008](../decisions/0008-topology.md) already say |
+| `store` | 0.5 | 1 GB | `derived` 201.5 MB/day **written** for BTC+ETH ([0007](../research/0007-load-profile.md) D1; the `measured` 143 MB/day is **retained**, and BTC alone), five-minute flush buffer |
 | `api` | 1.0 | 2 GB | `measured` 175.227 ms full solve pass; the pre-#44 all-expiry loop was `derived` ~64% of a core |
 | `web` | 0.25 | 0.5 GB | `measured` 203.1 MiB private, 0.00% of a core with no viewer |
+| `discord-alerts` | 0.05 | 0.25 GB | `assumed` (#66). It subscribes `event_types=("alert",)` and nothing else ([../lld/discord-alerts.md](../lld/discord-alerts.md) §1), so it pays **no market-data decode** — the 0.22–0.45 core every raw-stream consumer costs (0007 §6) does not apply. Memory is `measured` m5's ~50 MiB import base |
 | proxy | 0.25 | 0.5 GB | `assumed` |
 | **`redis`** | 0.5 | **3 GB** | the `maxmemory 2gb` ceiling ([redis-hosting.md](redis-hosting.md)) plus overhead |
-| **Total** | **3.0** | **8.0 GB** | → 0005's `m7g.large` (2 vCPU, 8 GiB); the host overcommits vCPU, which is why Fargate — where reservations are the bill — costs more |
+| **Total, seven containers** | **3.55** | **8.25 GB** | → [0008](../decisions/0008-topology.md)'s `c7g.xlarge` (4 vCPU, 8 GiB); the host overcommits vCPU, which is why Fargate — where reservations are the bill — costs more |
 
-**These reservations under-count CPU** (0007): 1× needs 4 vCPU and 10× 16–32, so the instance is
-`c7g.xlarge`, and `c7g.4xlarge`–`c7g.8xlarge` at 10×, `derived` $295.72–582.39 (§9).
+**`feed` is sized on 29.96 points and not on 5.88%, and the difference is five-fold.** 5.88% is
+#69's publisher measured **alone, on loopback, at a 100 ms batch** — Redis's own write cost. At
+the chosen 50 ms the same publisher inside the feed costs `derived` 29.96 points (`measured`
+70.73% against the bus-off control's 40.77%, I2/#61). Sizing from the smaller figure is the route
+[0007](../decisions/0007-load-profile.md) rejects as option B: it "under-counts by 3.6–5.7×. It
+is how 0005 reached 6 vCPU at 10×." **Both figures are real**;
+[compute-numbers.md](compute-numbers.md) §2 puts them side by side with the conditions that
+separate them. **These reservations still under-count CPU and over-count memory** (0007: the
+`derived` need at 1× is 1.21–1.95 cores and 5.05 GiB): 1× needs 4 vCPU and 10× 16–32, so the
+instance is `c7g.xlarge`, and `c7g.4xlarge`–`c7g.8xlarge` at 10×, `derived` $295.72–582.39 (§9).
 
 **Why not `t4g.medium` at $22.74.** Burstable instances have a CPU baseline — 20% per vCPU on
-`t4g.medium`, so **0.4 of a core** against a `measured` 0.31 today plus the publisher's 5.88%.
-That is a coincidence, not headroom, and out of credits the instance is throttled back to
-baseline **with nothing raised**. `t4g.large` at $39.09 has 8 GiB and a 0.6-core baseline and
-is the honest cheap option; $9.85 a month removes the credit model entirely.
+`t4g.medium`, so **0.4 of a core**. 0005 set that against the monolith's `measured` 0.31 plus the
+isolated publisher's 5.88% at a 100 ms batch and called it a coincidence, not headroom; at the
+chosen 50 ms the split's `derived` 1.21–1.95 cores is three to five times the baseline, so the
+rejection is not close. Out of credits the instance is throttled to baseline **with nothing
+raised**. `t4g.large` at $39.09 has 8 GiB and a 0.6-core baseline and is the honest cheap
+option; $9.85 a month removes the credit model entirely.
 
 ## 5. The region
 
@@ -159,22 +172,9 @@ cost, becomes the constraint.
 
 ## 7. The numbers behind this section
 
-| Number | Tag | Source |
-|---|---|---|
-| Engine 30.89% of one core; 117.1 MiB resident, 178.6 MiB private | `measured` | 60.69 s `Get-Process` sample, 2026-09-09 13:18 UTC, **no viewer attached** |
-| `web` 0.00% of a core, 203.1 MiB private | `measured` | same sample |
-| 1,693.6 msg/s, 843.4 KB/s, BTC+ETH | `measured` | `tools/measure_feed.py`, 2026-09-08 (`../hld.md` §5) |
-| Full solve pass 175.227 ms; pre-#44 loop ~64% of a core | `measured` / `derived` | `../lld/chain-cache.md` §9 |
-| Redis publisher 5.88% of a core at 100 ms batches; 1,051.5 MiB at thirty minutes | `measured` / `derived` | #58, #69 |
-| Inbound 2,216.5 GB/month; NAT gateway $165.00/month | `derived` | 843.4 KB/s × 730 h × $0.056/GB |
-| `m7g.large` $48.94/mo; `m7g.2xlarge` $179.43/mo, ap-south-1 (0005's classes; 0008's are in §9) | `derived` | AWS Price List Bulk API, read 2026-09-09 |
-| EKS control plane $73.00/month; ECS on EC2 $0 | `measured` | AWS Price List Bulk API; [ECS pricing](https://aws.amazon.com/ecs/pricing/) |
-| Delta endpoints are CloudFront; POP `BOM78-P11`; edge↔origin `derived` ~167 ms | `measured` / `derived` | `tools/measure_venue_latency.py`, 2026-09-09 (**through a Cloudflare WARP tunnel**) |
-| Latency from ap-south-1 and ap-northeast-1 | **unmeasured** | no AWS access; commands in `../research/0005a-venue-latency-run.md` §3 |
-| Image sizes and per-container footprint | **unmeasured** | #65 has not landed; **re-cost this section when it does** |
-
-**Nothing here is fixed against #65.** When it produces the images, re-run §2, §4 and §9 against the
-`measured` image sizes and per-container CPU and memory, and note any change in the decision records.
+**Moved to [compute-numbers.md](compute-numbers.md)** by #95, this file being at the 200-line
+bound: every figure with its tag and its run, the two publisher measurements side by side, and
+the unit behind the Redis working set. **Quote it from there, never from a sentence here.**
 
 ## 8. The load profile, per service
 
@@ -186,7 +186,7 @@ belief in [../decisions/0007-load-profile.md](../decisions/0007-load-profile.md)
 | `feed` | CPU, one core | 0.52–0.71 core | 5.2–7.1 cores: 8–11 processes, one Python process is one core |
 | `store` | CPU (decode), not disk | 0.28–0.51 core; 2.33 KB/s to disk | 2.8–5.1 cores |
 | `api` | CPU, set by viewers | 0.25–0.49, + 0.05–0.14 a watched expiry | 2.5–4.9, + viewers |
-| `web` / Redis | memory | 240.8 MiB / 1,056.4 MiB `measured` | unchanged / 10.3 GiB |
+| `web` / Redis | memory | 240.8 MiB / 1,056.4 MiB `measured` | unchanged / 10.269 GiB |
 
 **The split costs 1.10–1.75 cores against the monolith's 0.31**: §4 under-counts CPU and over-counts memory.
 

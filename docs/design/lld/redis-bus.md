@@ -163,14 +163,14 @@ that the process cannot flush faster than `derived` 69.7 ms whatever it is asked
 bought nothing back. 50 ms is the largest request still within about 1.4x of what the
 process achieves, at the 177-entry batch shape #69 `measured` in isolation at 37 µs an entry.
 
-**The bus costs the publisher `derived` 24.3 points of a core** (65.10% against control's
-40.77%), for encoding, the pipeline and the trim over 1,850 events a second. Flush wall time
+**The bus costs the publisher `derived` 29.96 points of a core at the chosen 50 ms** (70.73%
+against control's 40.77%; 24.33 at 10 ms, which is not the row to size from) for encoding, the pipeline and the trim over 1,850 events a second. Flush wall time
 — `measured` 254–302 µs an entry against #69's isolated 31.8 µs — is the event loop, not
 Redis: `pipe.execute()` yields and the socket decode runs inside that await.
 
 **Memory: `measured` 1,107,735,240 B — 1,056.4 MiB — after thirty continuous minutes**,
 `INFO memory` `used_memory`, 1,831,703 entries on the busiest of sixteen keys. #58 `derived`
-1,051.5 MB before any of it was built; the run came in 0.5% above. The container was started
+1,051.5 MiB before any of it was built; the run came in 0.5% above. The container was started
 at `--maxmemory 1gb` and raised to 1.5gb at minute 18, which is the finding rather than a
 workaround: **1 GiB is not enough for thirty minutes of BTC+ETH and #69's 2gb is.**
 

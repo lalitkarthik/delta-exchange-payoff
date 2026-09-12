@@ -118,3 +118,28 @@ measured hop, and how intents travel. Findings §12.
 ## I13 (#79) status
 
 I13 has not run (#65/I6 has not landed as of this writing); R7's re-cost threshold is: "I13 (#79) measuring the 1x total at 1.4 cores or less brings back m7g.large at $48.94. Past 2.8 cores, the threshold above applies." crossed: pending; see docs/design/research/0007a-container-measurement.md. This note is appended, not rewritten, per this repository's rule that a decision record is superseded rather than edited in place; the substantive determination (crossed or not) is written here once docs/design/research/0007a-container-measurement.md carries measured values.
+
+## #95 correction — seven containers against the 2.8-core threshold
+
+**Appended, not rewritten.** The class, the topology and the threshold are unchanged.
+
+**This record counts six containers; seven run.** Criterion 1 reads "the six containers want 1.95
+of 2 vCPU"; `compose.yml` declares seven, the seventh being `discord-alerts` (#66), which landed
+after R6's profile and appears in no unit of T1–T4. It is `assumed` **0.05 core and 0.25 GiB**
+(`../cloud/compute.md` §4) — it subscribes `event_types=("alert",)` and nothing else, so it pays
+none of the raw-stream decode — and under T4 it is `assumed` to sit beside `api` on box B, since
+nothing on the lossless path reads alerts. `../cloud/compute-topology.md` §3 records that.
+
+**The threshold is not crossed.** This record splits into T4 "when the box's load passes 2.8
+cores (70% of 4 vCPU, measured by I13 or CloudWatch)". R6's 1× upper bound of 1.95 cores plus
+0.05 is `derived` **2.00** — 0.8 of a core clear — and the trigger is a *measured* one in any
+case, which nothing here supplies. The `m7g.large` trigger in the other direction ("I13 measuring
+the 1× total at 1.4 cores or less") is equally untouched. **No row of §3's cost table moves**: a
+seventh container on the same host is $0, and on T3, where it would be its own box, `discord-alerts`
+is a `t4g.small`-class job that T3 already loses on criteria 1, 2 and 3.
+
+**Criterion 1's arithmetic is unaffected.** It rejects `m7g.large` because `api`'s viewers can
+take `feed`'s core at the upper bound, and it holds `feed`'s vCPU with 1,024 CPU units regardless
+of what else is on the box. `../cloud/compute.md` §4 now reserves that whole vCPU for `feed` in
+its own table too, which it did not before #95 — it reserved 0.5, sized on a 100 ms publisher
+figure — so the two documents now say the same thing.

@@ -137,7 +137,7 @@ A managed node must pin this in its parameter group, because ElastiCache default
 | 1,849.8 events/s on the bus | `derived` | #58, from `measured` per-entry sizes and 1,693.6 frames/s |
 | 1,835–1,854 events/s, 3,330,235 events | `measured` | `tools/measure_bus_live.py`, 2026-09-09, 774 live BTC+ETH contracts |
 | 1,056.4 MiB after thirty continuous minutes | `measured` | same run, `INFO memory` `used_memory` 1,107,735,240 B |
-| 1,051.5 MB at thirty minutes, forecast | `derived` | #58, before any of it was built; the run came in 0.5% above |
+| 1,051.5 MiB at thirty minutes, forecast | `derived` | #58, before any of it was built; the run came in 0.5% above |
 | Batch interval **50 ms**, achieved period 96.4 ms | `measured` / `derived` | same run; 10 ms is not honoured, 100 ms costs 45 ms of period |
 | Publish to consumer receipt, p50 195.2 ms, p99 847.8 ms | `measured` | same run, 50 ms phase, ~55,000 samples |
 | Publisher cost 29.96 points of a core at 50 ms | `derived` | same run, 70.73% against control's 40.77% |

@@ -168,3 +168,32 @@ create one bucket in the region R4 (#68) chooses, sync one compacted day into it
 read times over the network; capture the actual request count per Parquet read from S3
 server access logs, which replaces the `assumed` 2; and re-run the §3 table with the
 `measured` request count. Budget one hour and under a dollar.
+
+## #95 correction — which underlyings §3 is sized on
+
+**Appended, not rewritten.** The cost ordering and the decision are unchanged; what is added is
+the set of underlyings behind the numbers, which §3 did not state.
+
+**§3's `measured` 143 MB/day is BTC alone.** It comes from run F, which subscribed 688 listed
+**BTC** options and nothing else (`docs/storage.md` §10) — and it is `derived` from that run's
+`measured` bytes per row and rows per minute rather than `measured` directly. The stack runs BTC
+**and** ETH. Beside it:
+
+| | BTC alone | BTC+ETH |
+|---|---|---|
+| Bytes written a day, before compaction | `derived` 172.1 MB | `derived` **201.5 MB** (`../research/0007-load-profile.md` D1, from a `measured` 699,591 B flush × 288) |
+| Bytes retained a day, after compaction | `derived` 143 MB | `derived` **167.4 MB** — 201.5 × (1 − 0.169) |
+| Objects a day | `derived` 1,152 | `measured` 8 files a flush → **2,304** |
+| **S3 Standard, compacted** | **$1.52** | `derived` **$1.92**; $19.19 at ten times |
+
+The arithmetic is in `../cloud/durable-store.md` §3 and the bill is restated in
+`../cloud/services.md` §4. **The gap is 1.26×, not the 1.4× a reader gets from putting 201.5
+beside 143** — those are bytes *written* against bytes *retained*, and like for like the second
+underlying costs 1.17× the bytes and 2× the objects. A `measured` cross-check agrees: §4's real
+compaction run on 2026-09-08 BTC+ETH retained 144.81 MiB over 255 of 288 flushes, a full day of
+which is 171.5 MB, 2.4% above the `derived` 167.4.
+
+**No threshold in *What would change this decision* is crossed.** None of them is a dollar figure
+on this row: they are an OMS on the bus, a different read pattern, a measured S3 latency, R4's
+compute, #65's object count, and a second venue's retention obligation. A $0.40 a month move on a
+$79.99 bill reverses no ordering, and the re-run against a real bucket is already *Still open*.
