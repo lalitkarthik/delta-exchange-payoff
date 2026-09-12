@@ -35,6 +35,11 @@ The folder names carry the date and the asset. A reader skips a day without open
 two root JSON files are human-readable incident evidence and safe to delete: deletion costs a
 reported gap, never a duplicate.
 
+**`DELTA_STORE_ROOT` can also name `s3://bucket/prefix`**, S3 Standard, R3's chosen home
+([0004](design/decisions/0004-durable-store.md)) — the switch and the default are done
+(I8, #70), no backend is wired, so this raises `StoreHomeUnavailable` rather than write
+here or nowhere. Item 7 below.
+
 ---
 
 ## The five tables
@@ -62,8 +67,6 @@ reported gap, never a duplicate.
 Most of those messages repeat. Delta republishes a price whether or not it changed.
 
 **One minute becomes one line per option.** Four prices survive: the first, the largest, the smallest, and the last.
-
----
 
 ## Restart loss depends on the mode
 
@@ -121,23 +124,17 @@ sampled from a store-local cache; the minute keeps the freshest sample.
 | **compaction** | join a day's 288 flush files into one daily file |
 | **forward-fill** | copy the last price into an empty minute. **We never do this** |
 
----
-
 ## Three things that proved the spec wrong
 
 **1. The size estimate was too small.** I predicted 50–100 MB/day. Measured: **143 MB/day**. `reference-bars` is 62% of the store on its own.
 **2. Nothing goes quiet.** I predicted far-dated options would be silent. Measured across 71 minutes: **688.0 lines per minute**, with no silent contract-minute. Delta republishes.
 **3. The two channels need different waits.** The slower channel timestamps run median **3,176 ms** behind arrival, against **212.6 ms** for the fast one. They cannot share a watermark.
 
----
-
 ## Two bugs this work uncovered
 
 **Fixed.** `scan_parquet` on a bare folder *raises* if one non-Parquet file sits in it. Compaction writes a temp file there — so every partition would have been unreadable during compaction, and permanently unreadable after a crash.
 
 **Open — [#14](https://github.com/lalitkarthik/delta-exchange-payoff/issues/14).** The ladder labels a **six-hour change** as "open interest in USD". It matches `oi_change_usd_6h` on all 136 options and **goes below zero**, which open interest cannot. Not fixed here: the fix changes the chain contract, and that was out of scope for a storage ticket.
-
----
 
 ## Commands
 
@@ -191,6 +188,11 @@ cd engine && ./.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.sto
    seconds; it does not close it, and the 217 stay lost. A day-long `tools/measure_computed_gaps.py`
    run scheduled by #63 fills in the surviving rate; leave that number blank until the run.
    Always a **missing** row, never an invented one.
+7. I8 (#70)'s seam is done; S3 is unreachable from this build — no AWS account here, no
+   `boto3`/`fsspec` dependency (`measured` 0, `docs/design/lld/store-numbers.md`). With
+   access: wire a backend behind `BarStore.path`'s S3 branch, run
+   `tools/measure_store_cloud.py --root s3://…` for criterion 4, a live minute's
+   read-back for criterion 2, one compaction with full read-back for criterion 3.
 
 ---
 

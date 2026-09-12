@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine" / "src"))
 
-from deltapayoff.store import all_stores, default_root  # noqa: E402
+from deltapayoff.store import all_stores, resolve_root  # noqa: E402
 
 
 def main() -> int:
@@ -49,7 +49,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    root = Path(args.root) if args.root else default_root()
+    # `resolve_root`, not `Path(args.root) if args.root else default_root()`: that idiom
+    # is exactly what silently mangled an explicit `s3://` root before I8 (#70) — S3
+    # compaction is #70's criterion 3 and needs AWS credentials this machine does not
+    # have, but a `--root s3://...` typed here should refuse loudly, not report a
+    # 0-partition no-op against a local path nobody meant.
+    root = resolve_root(args.root)
     # The same cutoff `BarStore.compact` applies by default, computed here so `--dry-run`
     # reports exactly what a real run would do. Without it this loop would reach past the
     # cutoff and compact the partition the writer is still flushing into.

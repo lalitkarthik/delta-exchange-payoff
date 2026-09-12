@@ -127,6 +127,7 @@ from .iv_index import ContractIv
 from .logging_setup import log_event
 from .realised_vol import Bar as RvBar
 from .redis_bus import Position, Span
+from .store_home import StoreHomeUnavailable, is_s3_root, parse_s3_root
 
 logger = logging.getLogger(__name__)
 
@@ -472,7 +473,8 @@ def _checkpoint_payload(checkpoint: Checkpoint) -> dict[str, Any]:
 
 
 def write_checkpoint(root: Path | str, checkpoint: Checkpoint) -> None:
-    write_json_atomic(Path(root) / CHECKPOINT_NAME, _checkpoint_payload(checkpoint))
+    payload = _checkpoint_payload(checkpoint)
+    write_json_atomic(_local_root(root) / CHECKPOINT_NAME, payload)
 
 
 def _read_json(path: Path, expected_format: str) -> dict[str, Any]:
@@ -498,7 +500,7 @@ def _position_payload(value: Any) -> Position:
 
 
 def read_checkpoint(root: Path | str) -> Checkpoint | None:
-    path = Path(root) / CHECKPOINT_NAME
+    path = _local_root(root) / CHECKPOINT_NAME
     if not path.exists():
         return None
     try:
@@ -556,11 +558,11 @@ def _intent_payload(intent: Intent) -> dict[str, Any]:
 
 
 def write_intent(root: Path | str, intent: Intent) -> None:
-    write_json_atomic(Path(root) / INTENT_NAME, _intent_payload(intent))
+    write_json_atomic(_local_root(root) / INTENT_NAME, _intent_payload(intent))
 
 
 def read_intent(root: Path | str) -> Intent | None:
-    path = Path(root) / INTENT_NAME
+    path = _local_root(root) / INTENT_NAME
     if not path.exists():
         return None
     try:
@@ -576,12 +578,12 @@ def read_intent(root: Path | str) -> Intent | None:
 
 
 def clear_intent(root: Path | str) -> None:
-    (Path(root) / INTENT_NAME).unlink(missing_ok=True)
+    (_local_root(root) / INTENT_NAME).unlink(missing_ok=True)
 
 
 def clear_stray_tmp(root: Path | str) -> int:
     count = 0
-    for path in Path(root).glob("*.tmp"):
+    for path in _local_root(root).glob("*.tmp"):
         if path.is_file():
             path.unlink()
             count += 1
@@ -589,7 +591,7 @@ def clear_stray_tmp(root: Path | str) -> int:
 
 
 def recover_intent(root: Path | str, committed_generation: int) -> None:
-    root = Path(root)
+    root = _local_root(root)
     intent = read_intent(root)
     if intent is None:
         return
@@ -603,12 +605,49 @@ def recover_intent(root: Path | str, committed_generation: int) -> None:
     clear_intent(root)
 
 
-def default_root() -> Path:
-    """The configured store root, or `<repo>/data` by default."""
+def default_root() -> Path | str:
+    """The configured store root, or `<repo>/data` by default.
+
+    **The default is always the host mount.** `DELTA_STORE_ROOT` unset, empty, or an
+    ordinary path all return a `Path` exactly as before I8 (#70) — nothing changes for a
+    caller that has not opted into the chosen home. `s3://bucket/prefix` is the one new
+    shape, and it is returned as the string it arrived as: wrapping it in `Path()` would
+    not raise, it would silently build a local path nothing will ever find, which is the
+    kind of wrong answer this store refuses everywhere else. See `store_home.py`.
+    """
     configured = os.environ.get(STORE_ROOT_ENV, "")
     if configured:
-        return Path(configured)
+        return configured if is_s3_root(configured) else Path(configured)
     return Path(__file__).resolve().parents[3] / "data"
+
+
+def resolve_root(root: Path | str | None) -> Path | str:
+    """The one place a `--root` flag, a constructor argument or `None` becomes a root.
+
+    Mirrors `default_root()`'s rule for an explicit value: `None` defers to
+    `default_root()`, an `s3://` string stays a string, and anything else becomes a
+    `Path` exactly as `Path(root)` always did. Every call site that used to write
+    `Path(root) if root is not None else default_root()` should call this instead —
+    that exact idiom is what silently mangled an explicit `s3://` root before I8 (#70).
+    """
+    if root is None:
+        return default_root()
+    text = str(root)
+    return text if is_s3_root(text) else Path(root)
+
+
+def _local_root(root: Path | str) -> Path:
+    """Coerce a resolved root to a local `Path`, or refuse loudly.
+
+    The checkpoint and intent files have no S3 backend in this build even though
+    `BarStore.path` does — see `store.py`'s LLD note "Criterion 1" for the boundary.
+    Refusing here rather than calling `Path(root)` is what stops an s3 root from
+    quietly becoming a local path that simply does not exist, which `read_checkpoint`
+    would otherwise report as "no checkpoint yet" instead of "cannot reach the home".
+    """
+    if is_s3_root(root):
+        raise StoreHomeUnavailable(parse_s3_root(str(root)))
+    return Path(root)
 
 
 # --------------------------------------------------------------------------------------
@@ -746,7 +785,13 @@ class BarStore:
         *,
         pending_source: Callable[[], list[Any]] | None = None,
     ) -> None:
-        self.root = Path(root) if root is not None else default_root()
+        #: `Path` on the host mount (unchanged, and still the default), or the raw
+        #: `s3://bucket/prefix` string when the chosen home (0004) is configured. Kept as
+        #: a string rather than parsed eagerly: constructing a store against a home this
+        #: build cannot reach is not itself an error — see `path` below, the one place
+        #: that distinction is enforced. `resolve_root` is `Path(root)`'s exact prior
+        #: behaviour for anything that is not an `s3://` string.
+        self.root = resolve_root(root)
         self.dataset = dataset
         self.schema: dict[str, Any] = dict(SCHEMA if schema is None else schema)
         self.pending_source = pending_source
@@ -756,7 +801,15 @@ class BarStore:
 
     @property
     def path(self) -> Path:
-        return self.root / self.dataset
+        """This table's directory on the host mount.
+
+        **The seam for I8 (#70).** Every method that touches a file — `flush`, `scan`,
+        `partitions`, `compact_partition` — reaches the filesystem through this one
+        property, so it is the single place that has to know the chosen home might not
+        be the host mount. Today it knows exactly one thing about that: refuse loudly
+        rather than pretend. `_local_root` is what does the refusing.
+        """
+        return _local_root(self.root) / self.dataset
 
     @property
     def buffered(self) -> int:
@@ -1286,7 +1339,7 @@ def compact_all(
     scheduler is the operator's to choose, and a function is the thing a test, a cron
     entry and a person at a prompt can all call.
     """
-    root_path = Path(root) if root is not None else default_root()
+    root_path = resolve_root(root)
     intent = read_intent(root_path)
     if intent is not None:
         raise CompactionBlocked(

@@ -23,6 +23,8 @@ the run that produced it, and a number without a run behind it does not belong h
 | Table C computed rows differ at 93.1% where the paired quote row is byte-identical and 93.9% where it is not -- the same rate | `measured` | same run |
 | Table C `theta`: largest absolute gap 1.000 (ATM 0DTE straddle, -114.5 vs -115.5, 0.87% relative, from a 0.82% iv difference); the 21 rows with relative gap above 1 all have `\|theta\| <= 0.34` | `measured` | same run |
 | Table A/B/D minimum window-end age before coverage is trustworthy: 308 s | `derived` | `FLUSH_SECONDS` (300 s, `deltapayoff.store`) + `QUOTE_GRACE_SECONDS` (8 s, `deltapayoff.bars`), #82 |
+| I8 (#70): `boto3` and `fsspec`/`s3fs` are absent from `engine/requirements.txt` and `engine/requirements-dev.txt` | `measured` | `grep -c -e boto3 -e fsspec -e s3fs engine/requirements*.txt`, 2026-09-12: `0` in both files. This is what `StoreHomeUnavailable` names as missing; adding one is a decision for whoever holds AWS access, made loudly rather than silently |
+| I8 (#70): 106 tests in `test_store.py` + `test_store_home.py` pass unchanged, and the host-mount write path (`_frame`, `_flush_generation`, `_flush_legacy`, `compact_partition`) has zero lines touched by this ticket's diff | `measured` | `pytest -q tests/test_store_home.py tests/test_store.py`, 2026-09-12 (106 passed); `git diff --stat` on `store.py` scoped to the functions named, same date |
 
 ## Why conservation, not equality
 
