@@ -7,7 +7,7 @@ measurements — is
 [../decisions/0002-redis-hosting.md](../decisions/0002-redis-hosting.md); the names on the
 wire are [nomenclature.md](nomenclature.md).
 
-Landed by #69 as a standard, not as code. Nothing here is built yet.
+Landed by #69 as a standard; I4 (#63) adds the store's recovery rule below.
 
 ---
 
@@ -97,10 +97,17 @@ goes loud, it would hold four minutes. The promise has to be the unit.
 | Thing | `store` | `api` |
 |---|---|---|
 | Consumer group | `store` | `api` |
-| Group start id | `0` — take everything Redis still holds | `$` — never replay |
+| Group start id | checkpoint id in `<root>/_store-checkpoint.json` for that stream; on first start the head (`$`, taken once as a concrete id); never `0` | `$` — never replay |
 | Ack | **on receipt**, before the work | **on receipt** |
-| After a restart | reads forward from **the id of the last message it flushed**, which it records with each flush | joins at `$`; the cache refills from live frames in a `measured` 508 ms |
+| After a restart | reads forward from each stream's recorded `Position` (id plus index) in `<root>/_store-checkpoint.json` | joins at `$`; the cache refills from live frames in a `measured` 508 ms |
+| Trimmed position | replays the retained suffix; counts, alerts and logs the loss with both bounds; never refuses start-up | not applicable |
 | Pending list | never used for recovery | never used |
+
+Starting at `0` for the cutover would re-record up to the `derived` thirty minutes the old
+writer already put in Parquet, creating duplicates. The accepted cutover leaves the few
+seconds between stopping that writer and starting `store` unrecorded. `store.state` also
+crosses the pipe as the venue-scoped `store.state:DELTA` key: one extra key and one event every
+ten seconds (`derived`), negligible against the `measured` 1,849.8 events/s bus rate.
 
 **One consumer group per service, never one per instance** ([nomenclature.md](nomenclature.md)
 §5). Two groups on one stream each receive every entry, which is what makes the store and

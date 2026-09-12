@@ -99,7 +99,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,18 +110,23 @@ import polars as pl
 from . import log_events
 from .bars import (
     BUCKET_US,
+    COMPUTED_GRACE_SECONDS,
+    COMPUTED_SPLIT_GRACE_SECONDS,
     BarAggregator,
     ComputedAggregator,
     ReferenceAggregator,
     SpotAggregator,
     computed_ticks_from_chain,
+    computed_ticks_from_event,
     samples_from_reference,
     spot_from_index,
     tick_from_option_quote,
 )
+from .events import Alert, ComputedChain
 from .iv_index import ContractIv
 from .logging_setup import log_event
 from .realised_vol import Bar as RvBar
+from .redis_bus import Position, Span
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +187,24 @@ FLUSH_SECONDS = 300.0
 #: rate is a number to re-measure with `tools/measure_computed_gaps.py` after this has
 #: run a day, not one to predict.
 COMPUTED_SAMPLE_SECONDS = 10.0
+
+
+def computed_sample_due(
+    now: float,
+    sampled_at: float | None,
+    sampled_minute_us: int | None,
+    *,
+    force: bool = False,
+) -> bool:
+    """The shared timer-plus-minute-edge rule for computed-chain sampling."""
+    if force:
+        return True
+    minute_us = int(now * 1e6) - int(now * 1e6) % BUCKET_US
+    return (
+        sampled_at is None
+        or now - sampled_at >= COMPUTED_SAMPLE_SECONDS
+        or minute_us != sampled_minute_us
+    )
 
 #: How often the writer wakes to seal bars when the bus is quiet. Well under the grace
 #: period, so a bar is written within a second or so of becoming eligible — and it costs
@@ -356,6 +379,205 @@ HIVE_SCHEMA: dict[str, Any] = {"underlying": pl.Categorical, "date": pl.Date}
 
 STORE_ROOT_ENV = "DELTA_STORE_ROOT"
 
+CHECKPOINT_NAME = "_store-checkpoint.json"
+INTENT_NAME = "_store-flush-intent.json"
+CHECKPOINT_FORMAT = "deltapayoff.store-checkpoint"
+INTENT_FORMAT = "deltapayoff.store-flush-intent"
+CHECKPOINT_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class Checkpoint:
+    generation: int
+    written_at: datetime
+    group: str
+    recording: bool
+    streams: Mapping[str, Position]
+    sealed_through_us: Mapping[str, int]
+    pauses: tuple[Span, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Intent:
+    generation: int
+    files: tuple[str, ...]
+
+
+class CheckpointUnreadable(RuntimeError):
+    """The store metadata exists but cannot be trusted."""
+
+    def __init__(self, path: Path, detail: str = "") -> None:
+        self.path = path
+        suffix = f": {detail}" if detail else ""
+        super().__init__(f"store metadata {path} is unreadable{suffix}")
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON through a flushed, synced sibling before replacing the destination."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _checkpoint_payload(checkpoint: Checkpoint) -> dict[str, Any]:
+    return {
+        "format": CHECKPOINT_FORMAT,
+        "version": CHECKPOINT_VERSION,
+        "generation": checkpoint.generation,
+        "written_at": checkpoint.written_at.isoformat(),
+        "group": checkpoint.group,
+        "recording": checkpoint.recording,
+        "streams": {
+            key: {"id": position.id, "index": position.index}
+            for key, position in checkpoint.streams.items()
+        },
+        "sealed_through_us": dict(checkpoint.sealed_through_us),
+        "pauses": [
+            {"from": dict(span.frm), "to": None if span.to is None else dict(span.to)}
+            for span in checkpoint.pauses
+        ],
+    }
+
+
+def write_checkpoint(root: Path | str, checkpoint: Checkpoint) -> None:
+    write_json_atomic(Path(root) / CHECKPOINT_NAME, _checkpoint_payload(checkpoint))
+
+
+def _read_json(path: Path, expected_format: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("top level is not an object")
+        if payload.get("format") != expected_format:
+            raise ValueError(f"unknown format {payload.get('format')!r}")
+        if payload.get("version") != CHECKPOINT_VERSION:
+            raise ValueError(f"unknown version {payload.get('version')!r}")
+        return payload
+    except CheckpointUnreadable:
+        raise
+    except Exception as error:
+        raise CheckpointUnreadable(path, str(error)) from error
+
+
+def _position_payload(value: Any) -> Position:
+    if not isinstance(value, dict):
+        raise ValueError("stream position is not an object")
+    return Position(str(value["id"]), int(value["index"]))
+
+
+def read_checkpoint(root: Path | str) -> Checkpoint | None:
+    path = Path(root) / CHECKPOINT_NAME
+    if not path.exists():
+        return None
+    try:
+        payload = _read_json(path, CHECKPOINT_FORMAT)
+        written_at = datetime.fromisoformat(payload["written_at"])
+        if written_at.tzinfo is None or written_at.utcoffset() is None:
+            raise ValueError("written_at is not timezone-aware")
+        streams = {
+            str(key): _position_payload(value)
+            for key, value in payload["streams"].items()
+        }
+        sealed = payload["sealed_through_us"]
+        if set(sealed) != {
+            DATASET,
+            REFERENCE_DATASET,
+            SPOT_DATASET,
+            COMPUTED_DATASET,
+        }:
+            raise ValueError("sealed_through_us does not name the four datasets")
+        sealed_values = {str(key): int(value) for key, value in sealed.items()}
+        pauses: list[Span] = []
+        for value in payload["pauses"]:
+            if not isinstance(value, dict):
+                raise ValueError("pause is not an object")
+            frm = {str(key): str(item) for key, item in value["from"].items()}
+            to_value = value.get("to")
+            to = None if to_value is None else {
+                str(key): str(item) for key, item in to_value.items()
+            }
+            pauses.append(Span(frm, to))
+        if not isinstance(payload["recording"], bool):
+            raise ValueError("recording is not a boolean")
+        return Checkpoint(
+            generation=int(payload["generation"]),
+            written_at=written_at,
+            group=str(payload["group"]),
+            recording=payload["recording"],
+            streams=streams,
+            sealed_through_us=sealed_values,
+            pauses=tuple(pauses),
+        )
+    except CheckpointUnreadable:
+        raise
+    except Exception as error:
+        raise CheckpointUnreadable(path, str(error)) from error
+
+
+def _intent_payload(intent: Intent) -> dict[str, Any]:
+    return {
+        "format": INTENT_FORMAT,
+        "version": CHECKPOINT_VERSION,
+        "generation": intent.generation,
+        "files": [str(path).replace("\\", "/") for path in intent.files],
+    }
+
+
+def write_intent(root: Path | str, intent: Intent) -> None:
+    write_json_atomic(Path(root) / INTENT_NAME, _intent_payload(intent))
+
+
+def read_intent(root: Path | str) -> Intent | None:
+    path = Path(root) / INTENT_NAME
+    if not path.exists():
+        return None
+    try:
+        payload = _read_json(path, INTENT_FORMAT)
+        files = tuple(str(value).replace("\\", "/") for value in payload["files"])
+        if any(Path(value).is_absolute() or ".." in value.split("/") for value in files):
+            raise ValueError("intent contains a non-relative path")
+        return Intent(generation=int(payload["generation"]), files=files)
+    except CheckpointUnreadable:
+        raise
+    except Exception as error:
+        raise CheckpointUnreadable(path, str(error)) from error
+
+
+def clear_intent(root: Path | str) -> None:
+    (Path(root) / INTENT_NAME).unlink(missing_ok=True)
+
+
+def clear_stray_tmp(root: Path | str) -> int:
+    count = 0
+    for path in Path(root).glob("*.tmp"):
+        if path.is_file():
+            path.unlink()
+            count += 1
+    return count
+
+
+def recover_intent(root: Path | str, committed_generation: int) -> None:
+    root = Path(root)
+    intent = read_intent(root)
+    if intent is None:
+        return
+    if intent.generation <= committed_generation:
+        clear_intent(root)
+        return
+    for relative in intent.files:
+        final = root / Path(relative)
+        final.unlink(missing_ok=True)
+        final.with_suffix(final.suffix + ".flushing").unlink(missing_ok=True)
+    clear_intent(root)
+
 
 def default_root() -> Path:
     """The configured store root, or `<repo>/data` by default."""
@@ -457,6 +679,10 @@ class CompactionInterrupted(RuntimeError):
     """Test-only: a simulated crash at a named stage. See `COMPACTION_STAGES`."""
 
 
+class CompactionBlocked(RuntimeError):
+    """A whole-root compaction cannot race a generation flush recovery."""
+
+
 @dataclass(frozen=True, slots=True)
 class Compaction:
     """What one partition's compaction did. Returned rather than logged, because the
@@ -525,7 +751,84 @@ class BarStore:
             self._buffer.append(bar)
         return len(self._buffer)
 
-    def flush(self) -> int:
+    def planned_paths(self, generation: int) -> list[Path]:
+        """Return the generation-stamped files the current buffer will occupy."""
+        groups = self._groups(self._buffer)
+        return sorted([
+            self._generation_path(day, underlying, bars, generation)
+            for (day, underlying), bars in sorted(groups.items())
+        ])
+
+    def flush(self, *, generation: int | None = None) -> int:
+        """Write the buffer, optionally publishing a generation atomically."""
+        if generation is None:
+            return self._flush_legacy()
+        return self._flush_generation(generation)
+
+    def _groups(self, buffered: list[Any]) -> dict[tuple[str, str], list[Any]]:
+        groups: dict[tuple[str, str], list[Any]] = {}
+        for bar in buffered:
+            key = (bar.minute.strftime("%Y-%m-%d"), bar.underlying)
+            groups.setdefault(key, []).append(bar)
+        return groups
+
+    def _generation_path(
+        self, day: str, underlying: str, bars: list[Any], generation: int
+    ) -> Path:
+        directory = self.path / f"underlying={underlying}" / f"date={day}"
+        earliest = min(bar.minute for bar in bars)
+        name = f"{earliest.strftime('%Y%m%dT%H%M%SZ')}-g{generation:08d}.parquet"
+        return directory / name
+
+    def _flush_generation(self, generation: int) -> int:
+        if not self._buffer:
+            return 0
+        buffered = self._buffer
+        groups = self._groups(buffered)
+        self.flushes += 1
+        published: list[Path] = []
+        flushing: list[Path] = []
+        written = 0
+        try:
+            for (day, underlying), bars in sorted(groups.items()):
+                file_path = self._generation_path(day, underlying, bars, generation)
+                directory = file_path.parent
+                directory.mkdir(parents=True, exist_ok=True)
+                staging = file_path.with_suffix(file_path.suffix + ".flushing")
+                flushing.append(staging)
+                started = time.monotonic()
+                self._frame(bars).write_parquet(staging)
+                with staging.open("r+b") as handle:
+                    os.fsync(handle.fileno())
+                os.replace(staging, file_path)
+                published.append(file_path)
+                duration = time.monotonic() - started
+                written += len(bars)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    log_events.STORE_FLUSH,
+                    "store flush %s: %d rows to %s in %.3fs",
+                    self.dataset,
+                    len(bars),
+                    file_path,
+                    duration,
+                    table=self.dataset,
+                    rows=len(bars),
+                    file=str(file_path),
+                    duration_seconds=round(duration, 6),
+                )
+        except Exception:
+            for path in flushing:
+                path.unlink(missing_ok=True)
+            for path in published:
+                path.unlink(missing_ok=True)
+            raise
+        self._buffer = []
+        self.rows_written += written
+        return written
+
+    def _flush_legacy(self) -> int:
         """Write the buffer and empty it. Returns rows written. **Blocking IO.**
 
         Called from a worker thread by `BarWriter`, never from the socket reader's path.
@@ -940,9 +1243,32 @@ def compact_all(
     scheduler is the operator's to choose, and a function is the thing a test, a cron
     entry and a person at a prompt can all call.
     """
+    root_path = Path(root) if root is not None else default_root()
+    intent = read_intent(root_path)
+    if intent is not None:
+        raise CompactionBlocked(
+            f"compaction blocked by {root_path / INTENT_NAME} at generation "
+            f"{intent.generation}"
+        )
     return [
-        result for store in all_stores(root) for result in store.compact(before=before)
+        result
+        for store in all_stores(root_path)
+        for result in store.compact(before=before)
     ]
+
+
+FLUSH_STAGES = (
+    "before-intent",
+    "after-intent",
+    "during-files",
+    "after-files",
+    "after-checkpoint",
+    "after-intent-delete",
+)
+
+
+class FlushInterrupted(RuntimeError):
+    """Test-only interruption seam for the store's generation commit."""
 
 
 class BarWriter:
@@ -988,7 +1314,18 @@ class BarWriter:
         spot_store: BarStore | None = None,
         computed_store: BarStore | None = None,
         chains: Callable[[], Iterable[Any]] | None = None,
+        subscription: Any = None,
+        group: str = "store",
+        checkpoint_root: Path | None = None,
+        computed: ComputedAggregator | None = None,
+        publish: Callable[[Any], None] | None = None,
+        interrupt_at: str | None = None,
+        on_state_change: Callable[[], None] | None = None,
     ) -> None:
+        if chains is not None and checkpoint_root is not None:
+            raise ValueError(
+                "chain-cache and computed.chain sources are mutually exclusive"
+            )
         self.store = store or BarStore()
         self.aggregator = aggregator or BarAggregator()
         self.reference_store = reference_store or BarStore(
@@ -1002,7 +1339,13 @@ class BarWriter:
         self.computed_store = computed_store or BarStore(
             self.store.root, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA
         )
-        self.computed = ComputedAggregator()
+        self.computed = computed or ComputedAggregator(
+            grace_seconds=(
+                COMPUTED_SPLIT_GRACE_SECONDS
+                if checkpoint_root is not None
+                else COMPUTED_GRACE_SECONDS
+            )
+        )
         #: Where table C comes from: a callable handing back the chains the recompute
         #: loop has already computed. A **callable** rather than the `ChainStream`
         #: itself, so this module never learns that a chain cache exists and a test can
@@ -1017,7 +1360,21 @@ class BarWriter:
         self.clock = clock
         self.flush_seconds = flush_seconds
         self.tick_seconds = tick_seconds
-        self._subscription = None
+        self._subscription = subscription
+        self.group = group
+        self.checkpoint_root = None if checkpoint_root is None else Path(checkpoint_root)
+        self.publish = publish
+        self.on_state_change = on_state_change
+        self.committed_generation = 0
+        self.interrupt_at = interrupt_at
+        self.prev_positions: dict[str, Position] = dict(
+            getattr(subscription, "positions", {})
+        )
+        self.origins: dict[int, dict[str, Position]] = {}
+        self.pause_spans: list[Span] = []
+        self.replay_gap_entries = 0
+        self.control_ignored = 0
+        self._pending_commands: list[Any] = []
         self._last_flush: float | None = None
         #: Bus records this writer stored nothing from — an event of a type it does not
         #: aggregate, or one carrying no venue stamp to bucket on. Counted, because "the
@@ -1053,9 +1410,135 @@ class BarWriter:
             self.computed_store,
         )
 
+    @property
+    def buffered_rows(self) -> int:
+        return sum(store.buffered for store in self.stores)
+
+    @property
+    def rows_written(self) -> int:
+        return sum(store.rows_written for store in self.stores)
+
+    @property
+    def generation(self) -> int:
+        return self.committed_generation
+
+    def restore_checkpoint(self, checkpoint: Checkpoint) -> None:
+        """Restore all start-up state before the writer drains its first event."""
+        for aggregator, dataset in zip(
+            (self.aggregator, self.reference, self.spot, self.computed),
+            (DATASET, REFERENCE_DATASET, SPOT_DATASET, COMPUTED_DATASET),
+            strict=True,
+        ):
+            aggregator.restore(checkpoint.sealed_through_us[dataset])
+        self.committed_generation = checkpoint.generation
+        self.recording = checkpoint.recording
+        self.pause_spans = list(checkpoint.pauses)
+        self.prev_positions = dict(checkpoint.streams)
+
+    def seal_clock(self) -> float:
+        """Use the log's newest seen timestamp while a lossless reader is behind."""
+        wall = self.clock()
+        if self._subscription is None:
+            return wall
+        times: list[float] = []
+        for key in self._subscription.behind_streams():
+            position = self._subscription.positions.get(key)
+            if position is None:
+                continue
+            try:
+                times.append(_stream_id_seconds(position.id))
+            except (TypeError, ValueError):
+                continue
+        return min([wall, *times]) if times else wall
+
+    def current_positions(self) -> dict[str, Position]:
+        if self._subscription is not None:
+            return dict(self._subscription.positions)
+        return {}
+
+    def replay_positions(self) -> dict[str, Position]:
+        """The earliest position needed to replay every still-open minute."""
+        current = self.current_positions()
+        open_minutes = self._open_minutes()
+        if not open_minutes:
+            return current
+        result: dict[str, Position] = {}
+        for key in set(current) | {
+            stream for origin in (self.origins[minute] for minute in open_minutes)
+            for stream in origin
+        }:
+            candidates = [
+                self.origins[minute][key]
+                for minute in open_minutes
+                if key in self.origins[minute]
+            ]
+            if candidates:
+                result[key] = min(candidates, key=lambda position: position.index)
+            elif key in current:
+                result[key] = current[key]
+        return result
+
+    def _open_minutes(self) -> set[int]:
+        return {
+            minute
+            for aggregator in (self.aggregator, self.reference, self.spot, self.computed)
+            for _key, minute in aggregator._open
+        }
+
+    def _remember_fold(self, minute_us: int) -> None:
+        if minute_us not in self.origins:
+            self.origins[minute_us] = dict(self.prev_positions)
+
+    def _prune_origins(self) -> None:
+        aggregators = (self.aggregator, self.reference, self.spot, self.computed)
+        for minute in list(self.origins):
+            if all(
+                aggregator._sealed_through_us is not None
+                and minute <= aggregator._sealed_through_us
+                for aggregator in aggregators
+            ):
+                del self.origins[minute]
+
+    def _finish_drain_pass(self) -> None:
+        if self._subscription is not None and hasattr(self._subscription, "positions"):
+            self.prev_positions = dict(self._subscription.positions)
+
+    def enqueue_command(self, command: Any) -> None:
+        """Queue a store command for application after the next market-data drain."""
+        self._pending_commands.append(command)
+
+    async def _apply_pending_commands(self) -> None:
+        while self._pending_commands:
+            command = self._pending_commands.pop(0)
+            if getattr(command, "target", "feed") != "store":
+                self.control_ignored += 1
+                continue
+            positions = self.current_positions()
+            ids = {key: position.id for key, position in positions.items()}
+            if command.command == "pause":
+                self.recording = False
+                self.pause_spans.append(Span(ids, None))
+                self._seal(self.seal_clock())
+                await asyncio.to_thread(self._commit)
+            elif command.command == "resume":
+                self.recording = True
+                for index in range(len(self.pause_spans) - 1, -1, -1):
+                    span = self.pause_spans[index]
+                    if span.to is None:
+                        self.pause_spans[index] = Span(
+                            span.frm,
+                            {key: position.id for key, position in positions.items()},
+                        )
+                        break
+                self._seal(self.seal_clock())
+                await asyncio.to_thread(self._commit)
+
     def attach(self, fanout, maxsize: int = QUEUE_WATERMARK, name: str = "bar-writer"):
         """Take a lossless queue on the bus. `run` drains it."""
+        if self._subscription is not None:
+            return self._subscription
         self._subscription = fanout.subscribe(name, maxsize=maxsize, lossless=True)
+        self.prev_positions = dict(getattr(self._subscription, "positions", {}))
         return self._subscription
 
     def ingest(self, event: Any) -> None:
@@ -1085,14 +1568,34 @@ class BarWriter:
             self.discarded += 1
             return
 
+        if isinstance(event, ComputedChain):
+            if self.chains is not None:
+                self.skipped += 1
+                return
+            ticks = computed_ticks_from_event(event)
+            for tick in ticks:
+                before = self.computed.ticks
+                self.computed.add(tick)
+                if self.computed.ticks > before:
+                    self._remember_fold(tick.exchange_us - tick.exchange_us % BUCKET_US)
+            if not ticks:
+                self.skipped += 1
+            return
+
         tick = tick_from_option_quote(event)
         if tick is not None:
+            before = self.aggregator.ticks
             self.aggregator.add(tick)
+            if self.aggregator.ticks > before:
+                self._remember_fold(tick.exchange_us - tick.exchange_us % BUCKET_US)
             return
 
         spot = spot_from_index(event)
         if spot is not None:
+            before = self.spot.ticks
             self.spot.add(spot)
+            if self.spot.ticks > before:
+                self._remember_fold(spot.exchange_us - spot.exchange_us % BUCKET_US)
             return
 
         sample = samples_from_reference(event)
@@ -1100,9 +1603,20 @@ class BarWriter:
             self.skipped += 1
             return
         if sample.quote is not None:
+            before = self.aggregator.ticks
             self.aggregator.add(sample.quote)
+            if self.aggregator.ticks > before:
+                self._remember_fold(
+                    sample.quote.exchange_us - sample.quote.exchange_us % BUCKET_US
+                )
         if sample.reference is not None:
+            before = self.reference.ticks
             self.reference.add(sample.reference)
+            if self.reference.ticks > before:
+                self._remember_fold(
+                    sample.reference.exchange_us
+                    - sample.reference.exchange_us % BUCKET_US
+                )
 
     async def run(self) -> None:
         """Drain, seal, flush, forever. Cancel to stop.
@@ -1143,6 +1657,8 @@ class BarWriter:
                 except asyncio.QueueEmpty:
                     break
 
+            self._finish_drain_pass()
+            await self._apply_pending_commands()
             now = self.clock()
             # **The drain above runs whether or not this writer is recording.** Only
             # the three lines below stop. A paused writer that stopped taking messages
@@ -1154,7 +1670,7 @@ class BarWriter:
             if not self.recording:
                 continue
             self._sample_computed(now)
-            self._seal(now)
+            self._seal(self.seal_clock() if self.checkpoint_root is not None else now)
             await self._maybe_flush()
             self.loops += 1
 
@@ -1204,17 +1720,13 @@ class BarWriter:
             return 0
 
         minute_us = int(now * 1e6) - int(now * 1e6) % BUCKET_US
-        if not force:
-            due = (
-                self._sampled_at is None
-                or now - self._sampled_at >= COMPUTED_SAMPLE_SECONDS
-                # The minute edge, kept as a trigger of its own: the timer alone would
-                # leave the last observation of a minute up to ten seconds short of its
-                # close, and this table's row is meant to be the state at the boundary.
-                or minute_us != self._sampled_minute_us
-            )
-            if not due:
-                return 0
+        if not computed_sample_due(
+            now,
+            self._sampled_at,
+            self._sampled_minute_us,
+            force=force,
+        ):
+            return 0
         self._sampled_minute_us = minute_us
         self._sampled_at = now
 
@@ -1277,11 +1789,145 @@ class BarWriter:
             return
         self._last_flush = now
         try:
-            await asyncio.to_thread(self._flush_all)
+            if self.checkpoint_root is None:
+                await asyncio.to_thread(self._flush_all)
+            else:
+                await asyncio.to_thread(self._commit, interrupt_at=self.interrupt_at)
         except asyncio.CancelledError:
             raise
+        except FlushInterrupted:
+            raise
         except Exception:
+            if self.checkpoint_root is None:
+                self.flush_errors += 1
+
+    def _commit(self, *, interrupt_at: str | None = None) -> int:
+        """Commit one generation, or roll it back as one transaction."""
+        if self.checkpoint_root is None:
+            return self._flush_all()
+        if interrupt_at is not None and interrupt_at not in FLUSH_STAGES:
+            raise ValueError(f"unknown flush stage {interrupt_at!r}")
+
+        def trip(stage: str) -> None:
+            if stage == interrupt_at:
+                raise FlushInterrupted(stage)
+
+        root = self.checkpoint_root
+        generation = self.committed_generation + 1
+        snapshots = {store: list(store._buffer) for store in self.stores}
+        row_counts = {store: store.rows_written for store in self.stores}
+        flush_counts = {store: store.flushes for store in self.stores}
+        planned = [
+            path for store in self.stores for path in store.planned_paths(generation)
+        ]
+        files = tuple(path.relative_to(root).as_posix() for path in planned)
+        intent = Intent(generation=generation, files=files)
+        positions = self.replay_positions()
+        sealed = {
+            DATASET: self.aggregator._sealed_through_us or 0,
+            REFERENCE_DATASET: self.reference._sealed_through_us or 0,
+            SPOT_DATASET: self.spot._sealed_through_us or 0,
+            COMPUTED_DATASET: self.computed._sealed_through_us or 0,
+        }
+        trip("before-intent")
+        try:
+            write_intent(root, intent)
+            trip("after-intent")
+            trip("during-files")
+            written = self._flush_all_generation(generation)
+            trip("after-files")
+            checkpoint = Checkpoint(
+                generation=generation,
+                written_at=datetime.fromtimestamp(self.clock(), tz=timezone.utc),
+                group=self.group,
+                recording=self.recording,
+                streams=positions,
+                sealed_through_us=sealed,
+                pauses=tuple(self.pause_spans),
+            )
+            write_checkpoint(root, checkpoint)
+            self.committed_generation = generation
+            log_event(
+                logger,
+                logging.INFO,
+                log_events.STORE_CHECKPOINT,
+                "store checkpoint generation %d committed",
+                generation,
+                generation=generation,
+                streams=len(positions),
+                quote_sealed_through_us=sealed[DATASET],
+                reference_sealed_through_us=sealed[REFERENCE_DATASET],
+                spot_sealed_through_us=sealed[SPOT_DATASET],
+                computed_sealed_through_us=sealed[COMPUTED_DATASET],
+            )
+            trip("after-checkpoint")
+            clear_intent(root)
+            trip("after-intent-delete")
+            self._prune_origins()
+            self._notify_state_change()
+            return written
+        except FlushInterrupted:
+            raise
+        except Exception as error:
+            for path in planned:
+                path.unlink(missing_ok=True)
+                path.with_suffix(path.suffix + ".flushing").unlink(missing_ok=True)
+            clear_intent(root)
+            for store, buffer in snapshots.items():
+                store._buffer = buffer
+                store.rows_written = row_counts[store]
+                store.flushes = flush_counts[store]
             self.flush_errors += 1
+            log_event(
+                logger,
+                logging.ERROR,
+                log_events.ENGINE_ERROR,
+                "store flush generation %d failed and was rolled back",
+                generation,
+                generation=generation,
+                exc_info=True,
+            )
+            self._publish_flush_failure(error)
+            raise
+
+    def _notify_state_change(self) -> None:
+        if self.on_state_change is None:
+            return
+        try:
+            self.on_state_change()
+        except Exception:  # pragma: no cover - a notification cannot break a commit
+            log_event(
+                logger,
+                logging.ERROR,
+                log_events.ENGINE_ERROR,
+                "store state-change notification failed",
+                exc_info=True,
+            )
+
+    def _flush_all_generation(self, generation: int) -> int:
+        return sum(store.flush(generation=generation) for store in self.stores)
+
+    def _publish_flush_failure(self, error: Exception) -> None:
+        if self.publish is None:
+            return
+        try:
+            self.publish(
+                Alert(
+                    source="store",
+                    ts_received=datetime.fromtimestamp(self.clock(), tz=timezone.utc),
+                    severity="error",
+                    code="store.flush_failed",
+                    detail=str(error),
+                )
+            )
+        except Exception:
+            log_event(
+                logger,
+                logging.ERROR,
+                log_events.ENGINE_ERROR,
+                "store flush failure alert could not be published",
+                exc_info=True,
+            )
 
     def _flush_all(self) -> int:
         """Write all three tables. **Blocking IO, and always on a worker thread.**
@@ -1342,6 +1988,10 @@ class BarWriter:
         The partial bars this produces carry their **true** tick counts and no flag —
         the counts already say they are short.
         """
+        if self.checkpoint_root is not None:
+            self._seal(self.seal_clock())
+            await asyncio.to_thread(self._commit)
+            return
         # The open minute's computed state is a real observation too, so the cache is
         # sampled once more before the aggregators are drained. A cache that stopped
         # being recomputed some minutes ago yields a sample that is late and refused, so
@@ -1394,6 +2044,11 @@ class BarWriter:
 
 
 # --- shared by every read path that unions disk and buffer ----------------------------
+
+
+def _stream_id_seconds(value: str) -> float:
+    milliseconds, _, _sequence = value.split("-", 1)
+    return int(milliseconds) / 1000.0
 
 
 def scan_and_pending(store: BarStore, clause: pl.Expr) -> pl.LazyFrame:

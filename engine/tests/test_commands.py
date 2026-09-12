@@ -662,6 +662,30 @@ def test_dispatch_command_routes_a_published_event_without_republishing_it() -> 
     assert not any(isinstance(event, ControlCommand) for event in published)
 
 
+def test_dispatch_command_drops_a_store_command_before_any_controller() -> None:
+    published: list[Event] = []
+    first = ScriptedAdapter(venue="ONE")
+    second = ScriptedAdapter(venue="TWO")
+    supervisor = FeedSupervisor([first, second], published.append)
+    for controller in supervisor.controllers:
+        controller.start()
+    published.clear()
+
+    command = ControlCommand(
+        source="operator",
+        ts_received=datetime(2026, 6, 1, tzinfo=UTC),
+        adapter="TWO",
+        command="pause",
+        target="store",
+    )
+    assert supervisor.dispatch_command(command) is False
+    assert [controller.state for controller in supervisor.controllers] == [
+        ConnectionState.CONNECTING,
+        ConnectionState.CONNECTING,
+    ]
+    assert published == []
+
+
 def test_dispatch_command_offers_to_every_controller_after_one_accepts() -> None:
     offered: list[str] = []
 

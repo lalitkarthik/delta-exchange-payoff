@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -184,3 +185,99 @@ def test_recursive_hive_readers_find_the_same_new_layout_fixture(tmp_path: Path)
     assert spot.height == 2
     assert set(spot["underlying"].to_list()) == {UNDERLYING}
     assert set(spot["date"].to_list()) == {datetime(2026, 9, 3).date()}
+
+
+def _compare_command(
+    left: Path, right: Path, *extra: str
+) -> subprocess.CompletedProcess[str]:
+    tool = TOOLS / "compare_store_runs.py"
+    return subprocess.run(
+        [
+            sys.executable,
+            str(tool),
+            "--left",
+            str(left),
+            "--right",
+            str(right),
+            "--start",
+            "2026-09-03T18:00:00Z",
+            "--end",
+            "2026-09-03T20:00:00Z",
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_compare_store_runs_identical_trees_are_inside_tolerance(tmp_path: Path) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    _write_fixture(left)
+    _write_fixture(right)
+
+    result = _compare_command(left, right)
+
+    assert result.returncode == 0
+    assert "quote-bars" in result.stdout
+    assert "common=2" in result.stdout
+
+
+def test_compare_store_runs_reports_a_value_difference_and_exits_one(
+    tmp_path: Path,
+) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    _write_fixture(left)
+    _write_fixture(right)
+    path = next((right / "quote-bars").rglob("*.parquet"))
+    frame = pl.read_parquet(path).with_columns(
+        (pl.col("bid_open") + 1.5).alias("bid_open")
+    )
+    frame.write_parquet(path)
+
+    result = _compare_command(left, right, "--table", "quote-bars")
+
+    assert result.returncode == 1
+    assert "bid_open" in result.stdout
+    assert "differing=1" in result.stdout
+    assert "1.5" in result.stdout
+
+
+def test_compare_store_runs_separates_coverage_from_value_differences(
+    tmp_path: Path,
+) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    _write_fixture(left)
+    _write_fixture(right)
+    path = next((right / "quote-bars").rglob("*.parquet"))
+    path.unlink()
+
+    result = _compare_command(left, right, "--table", "quote-bars")
+
+    assert result.returncode == 1
+    assert "left_only=1" in result.stdout
+    assert "coverage difference" in result.stdout
+    assert "value difference:" not in result.stdout
+
+
+def test_compare_store_runs_treats_null_against_number_as_a_difference(
+    tmp_path: Path,
+) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    _write_fixture(left)
+    _write_fixture(right)
+    path = next((left / "quote-bars").rglob("*.parquet"))
+    frame = pl.read_parquet(path).with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("bid_open")
+    )
+    frame.write_parquet(path)
+
+    result = _compare_command(left, right, "--table", "quote-bars")
+
+    assert result.returncode == 1
+    assert "bid_open" in result.stdout
+    assert "differing=1" in result.stdout

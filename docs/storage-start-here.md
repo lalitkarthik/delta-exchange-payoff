@@ -23,13 +23,17 @@ D:\Convex Hedge\delta-exchange-payoff\data\
 
 ```
 data/
-├── quote-bars/       underlying=BTC/date=2026-09-04/*.parquet
-├── reference-bars/   underlying=BTC/date=2026-09-04/*.parquet
-├── computed-bars/    underlying=BTC/date=2026-09-04/*.parquet
-└── spot-bars/        underlying=BTC/date=2026-09-04/*.parquet
+|-- _store-checkpoint.json
+|-- _store-flush-intent.json
+|-- quote-bars/       underlying=BTC/date=2026-09-04/*.parquet
+|-- reference-bars/   underlying=BTC/date=2026-09-04/*.parquet
+|-- computed-bars/    underlying=BTC/date=2026-09-04/*.parquet
+`-- spot-bars/        underlying=BTC/date=2026-09-04/*.parquet
 ```
 
-The folder names carry the date and the asset. A reader skips a day without opening a file.
+The folder names carry the date and the asset. A reader skips a day without opening a file. The
+two root JSON files are human-readable incident evidence and safe to delete: deletion costs a
+reported gap, never a duplicate.
 
 ---
 
@@ -61,23 +65,21 @@ Most of those messages repeat. Delta republishes a price whether or not it chang
 
 ---
 
-## The restart-loss window is five minutes
+## Restart loss depends on the mode
 
-**The engine has no graceful stop.** Whatever is sitting in the buffer when the process
-dies — a crash, a closed laptop, a `taskkill`, a restart to pick up a code change — is
-gone, and no restart can recover it. The flush interval *is* that window.
+### Split store: replay within retention
 
-It was an hour. That cost real data three times in one day, so [#16](https://github.com/lalitkarthik/delta-exchange-payoff/issues/16)
-made it **five minutes**.
+With `DELTA_BUS=redis`, `store` replays from the id of its last flush. Redis retains `derived`
+thirty minutes whether or not anyone acked, so a crash loses nothing inside that window. A
+graceful stop checkpoints an open minute instead of writing a truncated one. A stop longer than
+retention loses whatever fell out, counted and reported as a gap, never silently.
 
-Two consequences worth carrying:
+### Default in-process monolith: five-minute window
 
-- **Time a restart just after a flush.** Restarting five minutes into an interval throws
-  away the five minutes. There is no way to ask the engine to flush first.
-- **288 files per table per day** before compaction, not 24. Compaction folds them back
-  to one overnight — which means compaction now matters more than it did.
-
----
+With `DELTA_BUS` unset, the old rule is unchanged: a crash loses the buffer and the `derived`
+five-minute flush interval is the loss window ([#16](https://github.com/lalitkarthik/delta-exchange-payoff/issues/16)).
+Time a restart just after a flush applies to this monolith only; the `derived` 288 files per
+table per day figure is unchanged, and compaction folds them back to one overnight.
 
 ## The one rule that matters
 
@@ -96,15 +98,13 @@ Aggregation is compression. Forward-filling is fabrication.
 1. **A tick arrives.** One price message from Delta, on one of two channels.
 2. **It joins a minute.** Bucketed by *Delta's* clock, not ours — so our network cannot move a price into the wrong minute.
 3. **The minute seals.** We wait 8 seconds past the boundary for stragglers, then close it. Late arrivals are counted and dropped, never silently lost.
-4. **Bars flush to disk.** Every five minutes. A crash costs at most 5 minutes.
-5. **A day compacts.** 24 files become 1. Verified by full read-back *before* anything is deleted.
+4. **Bars flush to disk.** The monolith flushes every five minutes; split `store` commits a checkpoint with each flush, so replay covers the retained suffix.
+5. **A day compacts.** The `derived` 288 files per table become one, verified by full read-back *before* anything is deleted.
 
-**`computed-bars` does not come this way.** Our IV and Greeks are never on the wire, so
-that table is **sampled** from the chain cache — **every ten seconds**, plus once as each
-minute boundary passes — and the minute keeps the freshest sample taken inside it.
-Sampling once a minute lost a quarter of them; see below.
-
----
+**`computed-bars` differs by mode.** In the monolith, our IV and Greeks are sampled from the
+local chain cache — every ten seconds and at each minute edge. In split mode, table C is folded
+from `computed.chain` events (`schema_version` 2) published by the api on that schedule, not
+sampled from a store-local cache; the minute keeps the freshest sample.
 
 ## Word list
 
@@ -126,10 +126,8 @@ Sampling once a minute lost a quarter of them; see below.
 ## Three things that proved the spec wrong
 
 **1. The size estimate was too small.** I predicted 50–100 MB/day. Measured: **143 MB/day**. `reference-bars` is 62% of the store on its own.
-
-**2. Nothing goes quiet.** I predicted far-dated options would be silent for long stretches. Measured across 71 minutes: **688.0 lines per minute, exactly, with no silent contract-minute.** Delta republishes; it does not wait for a change.
-
-**3. The two channels need different waits.** The slower channel's timestamps run a median **3,176 ms** behind arrival, against **212.6 ms** for the fast one. They cannot share a watermark.
+**2. Nothing goes quiet.** I predicted far-dated options would be silent. Measured across 71 minutes: **688.0 lines per minute**, with no silent contract-minute. Delta republishes.
+**3. The two channels need different waits.** The slower channel timestamps run median **3,176 ms** behind arrival, against **212.6 ms** for the fast one. They cannot share a watermark.
 
 ---
 
@@ -151,6 +149,11 @@ cd engine && ./.venv/Scripts/python.exe -c "import polars as pl; print(pl.scan_p
 **Run the engine (it writes as it runs):**
 ```bash
 cd engine && ./.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.main:app --port 8000
+```
+
+**Run the store (split mode; use a free store port):**
+```bash
+cd engine && ./.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.store_main:app --port <store-port>
 ```
 
 **Compact yesterday:**
@@ -181,14 +184,13 @@ cd engine && ./.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.mai
 3. No lock stops two compactors running at once. Documented, not defended against.
 4. The aggregator is not yet checked against a raw frame capture.
 5. `lts`'s meaning is unverified. It is stored and decides nothing.
-6. Table C loses a row when the cache is stale for a whole minute. `measured` on
-   2026-09-04, expiry 25-09-2026: sampling once a minute lost **217 of 904 minutes —
-   24%** — every gap exactly one minute long, while the quotes for those minutes were
-   captured all along. [#23](https://github.com/lalitkarthik/delta-exchange-payoff/issues/23)
+6. In the default monolith, Table C loses a row when the cache is stale for a whole minute. `measured` on 2026-09-04,
+   expiry 25-09-2026: sampling once a minute lost **217 of 904 minutes — 24%** — every gap
+   exactly one minute long, while quotes for those minutes were captured. [#23](https://github.com/lalitkarthik/delta-exchange-payoff/issues/23)
    samples every ten seconds instead. That **narrows** the window from one instant to ten
-   seconds; it does not close it, and the 217 stay lost. The rate that survives it is
-   unmeasured — run `tools/measure_computed_gaps.py` after a full day. Always a
-   **missing** row, never an invented one.
+   seconds; it does not close it, and the 217 stay lost. A day-long `tools/measure_computed_gaps.py`
+   run scheduled by #63 fills in the surviving rate; leave that number blank until the run.
+   Always a **missing** row, never an invented one.
 
 ---
 

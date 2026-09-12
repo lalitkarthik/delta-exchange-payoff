@@ -2,7 +2,7 @@
 
 **An event is the contract between two parts that never call each other.** If a producer and a
 consumer agree on the events, each can be built, tested and replaced without the other being
-opened. This document is that agreement: the envelope, the nine events, and the rule for changing
+opened. This document is that agreement: the envelope, the ten events, and the rule for changing
 one. It is the authority on names and directions; where it and [hld.md](hld.md) disagree it wins,
 and where it and `docs/chain-contract.md` disagree about what reaches the browser that contract
 wins, because it is the engine↔web authority.
@@ -20,7 +20,7 @@ Seven fields, on every event. Frozen once built, extra fields forbidden, registe
 
 | Field | Meaning |
 |---|---|
-| `type` | The event's name, one of the nine below. Registered; parsing an unregistered type raises. |
+| `type` | The event's name, one of the ten below. Registered; parsing an unregistered type raises. |
 | `event_id` | Unique per event. What lets a consumer deduplicate, and what a log record joins on. |
 | `schema_version` | Integer, starts at `1`. See *Versioning*. |
 | `source` | Who built it — the adapter's venue name, or the engine component that emitted it. |
@@ -48,9 +48,9 @@ that fails fast rather than a silent guess.
 
 ---
 
-## The nine events
+## The ten events
 
-Eight travel outbound from a producer to the bus. One travels inbound.
+Nine travel outbound from a producer to the bus. One travels inbound.
 
 ### `md.option_quote` — top of book
 
@@ -108,9 +108,19 @@ Eight travel outbound from a producer to the bus. One travels inbound.
 - **When** a pair is recomputed: the live pass for watched pairs, and the minute-cadence pass for
   every expiry with a frame since its last pass (#44).
 - **Payload** `underlying`, `expiry`, `forward`, `discount`, `forward_method`, `years_to_expiry`,
-  and per strike our `iv`, `iv_leg`, `iv_reason`, `delta`, `gamma`, `vega`, `theta`, `rho`,
+  `fetched_at`, `model_version`, `solver`, and per strike `strike`, `symbol`, `iv`, `iv_leg`,
+  `iv_reason`, `delta`, `gamma`, `vega`, `theta`, `rho`,
   stamped with `model_version` and the solver that produced it. `instrument` is `null` — the
   event is about an expiry, not a contract. **`iv` is `null` and never `0`.**
+
+### `store.state` — the store's venue-scoped state
+
+- **Direction** outbound. **Emitted by** the `store` process.
+- **Consumed by** the api's `StoreStateCache`.
+- **When** every ten seconds and on every change of recording, committed generation or replay
+  gap counter.
+- **Payload** `recording`, `buffered_rows`, `rows_written`, `replay_gap_entries`,
+  `already_flushed`, `flush_errors`, `generation`.
 
 ### `feed.connection` — a state transition
 
@@ -154,7 +164,9 @@ Eight travel outbound from a producer to the bus. One travels inbound.
 - **When** on demand. Effects: `pause` → `stopped`, reason `paused`, **spending no reconnect
   budget**; `resume` → `connecting`, budget restored in full; `reconnect` → cut the socket
   and let ordinary close handling reach `reconnecting`.
-- **Payload** `adapter`, `command` (one of `pause`, `resume`, `reconnect`).
+- **Payload** `adapter`, `command` (one of `pause`, `resume`, `reconnect`), `target`.
+  `target` defaults to `feed`; a store command never reaches a controller, and `reconnect` is
+  feed-only.
 
 ---
 
@@ -183,6 +195,11 @@ still at `1`. #60 (I1) is the same rule applied to `Instrument`: `quote_currency
 `settlement_currency` are optional and default to `"USD"`, so an event built exactly as
 every producer built one before I1 still parses, and the `instrument` field's own
 `schema_version` — inherited by every event that carries one — stays at `1` too.
+
+`computed.chain` is the first type to leave version 1: the strike's single Greek set could not
+describe two legs whose delta, theta, rho and venue symbol differ, and nothing had ever
+published the event, so there was no compatibility to keep. `ControlCommand.target` is an
+optional field with a default, so it is a compatible change and that type remains at `1`.
 
 The version is per type, so bumping `md.option_reference` leaves the other eight at `1`. A
 consumer that does not know a version it receives must fail loudly rather than guess. The

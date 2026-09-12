@@ -17,6 +17,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import Counter
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -41,25 +42,55 @@ from deltapayoff.bars import (
 )
 from deltapayoff.chain import EXPIRY_FORMAT, nearest_strike
 from deltapayoff.compute import MODEL_VERSION, enrich
-from deltapayoff.events import ConnectionState, Heartbeat
+from deltapayoff.events import (
+    ConnectionState,
+    Heartbeat,
+    Instrument,
+    OptionQuote,
+    Right,
+)
 from deltapayoff.fanout import FanOut
 from deltapayoff.forward import DAYS_PER_YEAR, SETTLEMENT_HOUR_UTC
 from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
+from deltapayoff.redis_bus import Position, Span
 from deltapayoff.store import (
+    CHECKPOINT_VERSION,
     COMPUTED_DATASET,
     COMPUTED_SCHEMA,
+    FLUSH_STAGES,
     REFERENCE_DATASET,
     REFERENCE_SCHEMA,
     SPOT_DATASET,
     SPOT_SCHEMA,
     BarStore,
     BarWriter,
+    Checkpoint,
+    FlushInterrupted,
+    Intent,
+    read_checkpoint,
+    read_intent,
+    recover_intent,
+    write_checkpoint,
+    write_intent,
 )
 from deltapayoff.wire import chain_from_frames
 from fakes.decoder import events_from_frame
 
 MINUTE_US = int(datetime(2026, 9, 4, 9, 0, 0, tzinfo=timezone.utc).timestamp() * 1e6)
 MINUTE = 60_000_000
+
+FLUSH_MINUTES = (
+    datetime(2026, 9, 12, 10, 0, tzinfo=timezone.utc),
+    datetime(2026, 9, 12, 10, 1, tzinfo=timezone.utc),
+)
+FLUSH_INSTRUMENT = Instrument(
+    venue="DELTA",
+    underlying="BTC",
+    expiry=date(2026, 9, 27),
+    strike=77600.0,
+    right=Right.CALL,
+    venue_symbol="C-BTC-77600-270926",
+)
 
 
 def test_default_root_uses_the_repository_data_directory_when_unset(monkeypatch) -> None:
@@ -78,6 +109,40 @@ def test_default_root_ignores_an_empty_configured_store_directory(monkeypatch) -
     monkeypatch.setenv("DELTA_STORE_ROOT", "")
 
     assert store_module.default_root() == Path(__file__).resolve().parents[2] / "data"
+
+
+def test_checkpoint_and_intent_round_trip_atomically(tmp_path: Path) -> None:
+    checkpoint = Checkpoint(
+        generation=17,
+        written_at=datetime(2026, 9, 12, 10, 5, 0, 123456, tzinfo=timezone.utc),
+        group="store",
+        recording=True,
+        streams={
+            "md.option_quote:DELTA:BTC": Position("1789163972987-4", 9123456)
+        },
+        sealed_through_us={
+            "quote-bars": 1789163880000000,
+            "reference-bars": 1789163880000000,
+            "spot-bars": 1789163880000000,
+            "computed-bars": 1789163940000000,
+        },
+        pauses=(Span({"md.option_quote:DELTA:BTC": "1789163972987-0"}, None),),
+    )
+    intent = Intent(
+        generation=18,
+        files=(
+            "quote-bars/underlying=BTC/date=2026-09-12/"
+            "20260912T100000Z-g00000018.parquet",
+        ),
+    )
+
+    write_checkpoint(tmp_path, checkpoint)
+    write_intent(tmp_path, intent)
+
+    assert read_checkpoint(tmp_path) == checkpoint
+    assert read_intent(tmp_path) == intent
+    assert not list(tmp_path.glob("*.tmp"))
+    assert CHECKPOINT_VERSION == 1
 
 
 def bar(
@@ -648,6 +713,156 @@ def test_a_flush_lands_every_buffered_bar_exactly_once(tmp_path: Path) -> None:
     assert landed == sorted(expected), "disk does not match what left the buffer"
     assert store.rows_written == len(expected)
     assert len(list(store.path.rglob("*.parquet"))) == 12, "a flush wrote no file"
+
+
+def test_planned_generation_paths_match_the_files_written(tmp_path: Path) -> None:
+    store = BarStore(tmp_path)
+    store.add(
+        [
+            bar(minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)),
+            bar(
+                symbol="C-ETH-3000-040926",
+                underlying="ETH",
+                strike=3000.0,
+                minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc),
+            ),
+            bar(minute=datetime(2026, 9, 5, 10, 0, tzinfo=timezone.utc)),
+        ]
+    )
+
+    planned = [path.relative_to(tmp_path).as_posix() for path in store.planned_paths(18)]
+    written = store.flush(generation=18)
+
+    assert written == 3
+    assert planned == [
+        "quote-bars/underlying=BTC/date=2026-09-04/20260904T090000Z-g00000018.parquet",
+        "quote-bars/underlying=BTC/date=2026-09-05/20260905T100000Z-g00000018.parquet",
+        "quote-bars/underlying=ETH/date=2026-09-04/20260904T090000Z-g00000018.parquet",
+    ]
+    assert sorted(
+        path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*.parquet")
+    ) == planned
+    assert not list(tmp_path.rglob("*.flushing"))
+
+
+def test_a_failed_generation_flush_restores_every_bar_and_file(tmp_path: Path) -> None:
+    class FailingStore(BarStore):
+        calls = 0
+
+        def _frame(self, bars):
+            type(self).calls += 1
+            if type(self).calls == 2:
+                raise RuntimeError("injected second-file failure")
+            return super()._frame(bars)
+
+    store = FailingStore(tmp_path)
+    store.add(
+        [
+            bar(minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)),
+            bar(minute=datetime(2026, 9, 5, 9, 0, tzinfo=timezone.utc)),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="second-file"):
+        store.flush(generation=18)
+
+    assert store.buffered == 2
+    assert list(tmp_path.rglob("*g00000018*")) == []
+
+
+def _generation_writer(root: Path) -> tuple[BarWriter, Counter]:
+    """Ingest two fixture minutes into a store-mode writer before its first commit."""
+    now = (FLUSH_MINUTES[-1] + timedelta(minutes=2)).timestamp()
+    writer = BarWriter(
+        BarStore(root),
+        clock=lambda: now,
+        checkpoint_root=root,
+    )
+    expected: Counter = Counter()
+    for index, minute in enumerate(FLUSH_MINUTES):
+        stamp = minute + timedelta(seconds=5)
+        writer.ingest(
+            OptionQuote(
+                source="test",
+                ts_venue=stamp,
+                ts_received=stamp,
+                instrument=FLUSH_INSTRUMENT,
+                bid=100.0 + index,
+                ask=101.0 + index,
+            )
+        )
+        expected[(FLUSH_INSTRUMENT.venue_symbol, minute)] += 1
+    writer._seal(now)
+    return writer, expected
+
+
+def _quote_keys(root: Path) -> Counter:
+    frame = BarStore(root).scan().collect()
+    return Counter(zip(frame["symbol"], frame["minute"], strict=True))
+
+
+def _recover_generation(root: Path) -> Checkpoint | None:
+    checkpoint = read_checkpoint(root)
+    recover_intent(
+        root, committed_generation=0 if checkpoint is None else checkpoint.generation
+    )
+    return checkpoint
+
+
+@pytest.mark.parametrize("stage", FLUSH_STAGES)
+def test_a_generation_flush_interrupted_at_any_stage_replays_each_minute_once(
+    tmp_path: Path, stage: str
+) -> None:
+    """Every interrupted commit preserves the two fixture minutes exactly."""
+    writer, expected = _generation_writer(tmp_path)
+
+    with pytest.raises(FlushInterrupted, match=stage):
+        writer._commit(interrupt_at=stage)
+
+    checkpoint = _recover_generation(tmp_path)
+    if checkpoint is None:
+        replay, _ = _generation_writer(tmp_path)
+        assert replay._commit() == len(expected)
+    else:
+        restarted = BarWriter(
+            BarStore(tmp_path),
+            clock=lambda: (FLUSH_MINUTES[-1] + timedelta(minutes=2)).timestamp(),
+            checkpoint_root=tmp_path,
+        )
+        restarted.restore_checkpoint(checkpoint)
+
+    landed = _quote_keys(tmp_path)
+    assert landed == expected, f"{stage}: disk keys differ from ingested minutes"
+    assert all(count == 1 for count in landed.values()), f"{stage}: duplicate minute"
+
+
+@pytest.mark.parametrize("stage", FLUSH_STAGES)
+def test_a_generation_flush_recovery_leaves_no_staging_or_intent(
+    tmp_path: Path, stage: str
+) -> None:
+    writer, _expected = _generation_writer(tmp_path)
+
+    with pytest.raises(FlushInterrupted, match=stage):
+        writer._commit(interrupt_at=stage)
+
+    _recover_generation(tmp_path)
+
+    assert read_intent(tmp_path) is None, f"{stage}: intent left behind"
+    assert not list(tmp_path.rglob("*.flushing")), f"{stage}: staging file left behind"
+
+
+def test_the_crash_tests_cover_every_flush_stage() -> None:
+    """A stage added to `_commit` without a crash test to go with it is untested."""
+    covered = {
+        mark.args[1]
+        for test in (
+            test_a_generation_flush_interrupted_at_any_stage_replays_each_minute_once,
+            test_a_generation_flush_recovery_leaves_no_staging_or_intent,
+        )
+        for mark in test.pytestmark
+    }
+    assert covered == {FLUSH_STAGES}
+    assert len(FLUSH_STAGES) == 6
 
 
 def test_a_slow_flush_cannot_block_the_socket_reader(tmp_path: Path) -> None:

@@ -71,7 +71,12 @@ WITH_UNDERLYING = (
 #: Event types whose stream is per venue and carries no underlying. One socket per venue
 #: for the first two; the third is **inbound**, and per venue because a DELTA feed must
 #: never read an NSE command.
-WITH_VENUE_ONLY = ("feed.connection", "heartbeat", "control.command")
+WITH_VENUE_ONLY = (
+    "feed.connection",
+    "heartbeat",
+    "control.command",
+    "store.state",
+)
 
 #: The one type whose stream carries neither a venue nor an underlying. `adapter` is
 #: nullable and no reader wants a subset: the logger and the Discord consumer take all
@@ -121,7 +126,7 @@ def stream_names(
 ) -> tuple[str, ...]:
     """Every key this configuration can produce or read. **Sorted, and never scanned.**
 
-    Fourteen for one venue and two underlyings. A reader takes this list whole; the
+    Fifteen for one venue and two underlyings. A reader takes this list whole; the
     underlyings in it are the same configured set the feed is given, which is what makes
     "what does this service read" one answer rather than two.
     """

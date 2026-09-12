@@ -1,7 +1,7 @@
 r"""Structured logging: the formatter, the daily file handler, and the catalogue.
 
-**The catalogue is `docs/design/lld/logging.md` and it is the authority**, the same
-discipline `test_events.py` holds `events.md` to. One test here parses the document's
+**The catalogue is `docs/design/lld/logging-catalogue.md` and it is the authority**, the
+same discipline `test_events.py` holds `events.md` to. One test here parses the documents'
 `### \`event.name\`` headings and asserts the set equals `log_events.ALL`, so a name
 added in code without a paragraph, or a paragraph without a name, fails the suite.
 
@@ -29,6 +29,8 @@ from deltapayoff.logging_setup import (
 
 REPO = Path(__file__).resolve().parents[2]
 LOGGING_DOC = REPO / "docs" / "design" / "lld" / "logging.md"
+LOGGING_CATALOGUE = REPO / "docs" / "design" / "lld" / "logging-catalogue.md"
+LOGGING_DOCS = (LOGGING_DOC, LOGGING_CATALOGUE)
 
 
 def documented_event_names() -> set[str]:
@@ -38,8 +40,15 @@ def documented_event_names() -> set[str]:
     sections or rewriting the prose after them does not move the goalposts — the same
     convention `test_events.py.documented_event_types` uses for `events.md`.
     """
-    text = LOGGING_DOC.read_text(encoding="utf-8")
-    return set(re.findall(r"^###\s+`([^`]+)`", text, flags=re.MULTILINE))
+    return {
+        name
+        for document in LOGGING_DOCS
+        for name in re.findall(
+            r"^###\s+`([^`]+)`",
+            document.read_text(encoding="utf-8"),
+            flags=re.MULTILINE,
+        )
+    }
 
 
 def make_record(
@@ -68,6 +77,11 @@ def test_log_event_refuses_an_unregistered_name() -> None:
     logger = logging.getLogger("deltapayoff.test.refuses")
     with pytest.raises(ValueError, match="not a registered log event"):
         log_event(logger, logging.INFO, "made.up.name", "hello")
+
+
+def test_store_replay_log_names_are_registered() -> None:
+    assert log_events.STORE_REPLAY_GAP in log_events.ALL
+    assert log_events.STORE_CHECKPOINT in log_events.ALL
 
 
 def test_log_event_accepts_every_registered_name(

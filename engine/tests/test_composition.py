@@ -129,13 +129,14 @@ def test_redis_bus_is_a_consumer_only_composition(monkeypatch, tmp_path) -> None
             "chain-stream",
             "chain-recompute",
             "chain-minute-pass",
-            "bar-writer",
             "feed-state",
+            "store-state-cache",
+            "computed-chain-publisher",
         }
         stats = main.app.state.events.stats()
-        assert set(stats) == {"chain-stream", "bar-writer", "feed-state"}
-        assert stats["bar-writer"]["lossless"] is True
+        assert set(stats) == {"chain-stream", "feed-state", "store-state"}
         assert stats["feed-state"]["lossless"] is False
+        assert stats["store-state"]["lossless"] is False
         assert _StubRedisBus.instances[-1].started is True
 
     assert _StubRedisBus.instances[-1].closed is True

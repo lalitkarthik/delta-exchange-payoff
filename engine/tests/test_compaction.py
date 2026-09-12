@@ -44,10 +44,13 @@ from deltapayoff.store import (
     SPOT_SCHEMA,
     TMP_SUFFIX,
     BarStore,
+    CompactionBlocked,
     CompactionInterrupted,
     CompactionUnsound,
+    Intent,
     all_stores,
     compact_all,
+    write_intent,
 )
 
 DAY = "2026-09-03"
@@ -639,6 +642,25 @@ def test_a_full_day_of_all_four_tables_compacts_and_reads_back_with_no_invented_
             value.hour for value in frame.get_column("minute").to_list()
         }
         assert stored_hours.isdisjoint(silent), store.dataset
+
+
+def test_compact_all_is_blocked_by_a_root_flush_intent(tmp_path: Path) -> None:
+    store = BarStore(tmp_path)
+    write_hours(store, hours=2)
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*.parquet")
+    }
+    write_intent(tmp_path, Intent(generation=18, files=("quote-bars/missing.parquet",)))
+
+    with pytest.raises(CompactionBlocked, match="generation 18"):
+        compact_all(tmp_path, before=NEXT_DAY)
+
+    after = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*.parquet")
+    }
+    assert after == before
 
 
 def test_all_four_tables_are_compacted_together_and_none_is_forgotten(

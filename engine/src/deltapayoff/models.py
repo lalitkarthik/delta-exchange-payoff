@@ -247,6 +247,8 @@ class RecordingState(BaseModel):
     buffered_rows: int
     #: Rows this process has written to Parquet, across all four tables.
     rows_written: int
+    #: Age of the cached split-mode store state; `null` for the local writer.
+    state_age_seconds: float | None = None
 
 
 class RecordingRequest(BaseModel):

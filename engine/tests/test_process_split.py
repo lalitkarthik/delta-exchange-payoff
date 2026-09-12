@@ -157,6 +157,39 @@ async def _redis_market_counts(client: Any, keys: tuple[str, ...]) -> Counter[st
     return counts
 
 
+def test_split_consumer_stack_has_no_writer_or_lossless_store_reader(monkeypatch) -> None:
+    monkeypatch.setenv("DELTA_BUS", "redis")
+    consumer = main.build_consumer_stack()
+
+    assert consumer.writer is None
+    assert "bar-writer" not in consumer.events._subscriptions
+    assert all(
+        not subscription.lossless
+        for subscription in consumer.events._subscriptions.values()
+    )
+
+
+def test_split_lifespan_exposes_no_local_writer(monkeypatch) -> None:
+    monkeypatch.setenv("DELTA_BUS", "redis")
+    stack = main.build_consumer_stack()
+    monkeypatch.setattr(main, "build_consumer_stack", lambda: stack)
+
+    async def no_start(_stack) -> None:
+        return None
+
+    async def no_stop(_stack) -> None:
+        return None
+
+    monkeypatch.setattr(main, "start_consumer_stack", no_start)
+    monkeypatch.setattr(main, "stop_consumer_stack", no_stop)
+
+    async def scenario() -> None:
+        async with main.lifespan(main.app):
+            assert main.app.state.writer is None
+
+    asyncio.run(scenario())
+
+
 def test_feed_restart_delivers_captured_events_to_the_live_consumer(
     monkeypatch,
     tmp_path,
@@ -228,8 +261,6 @@ def test_feed_restart_delivers_captured_events_to_the_live_consumer(
 
             await _wait_until(
                 lambda: consumer.stream.applied >= len(first_events)
-                and consumer.writer.stats()["reference"]["ticks"]
-                >= expected_market_counts["md.option_reference"] // 2
             )
             boundary = {
                 key: await client.xlen(key) for key in first_touched
@@ -272,10 +303,6 @@ def test_feed_restart_delivers_captured_events_to_the_live_consumer(
             )
             await _wait_until(
                 lambda: consumer.stream.applied >= len(first_events) + len(second_events)
-                and consumer.writer.stats()["reference"]["ticks"]
-                == expected_market_counts["md.option_reference"]
-                and consumer.writer.stats()["spot"]["ticks"]
-                == expected_market_counts["md.index_quote"]
             )
 
             actual_keys = {
@@ -291,17 +318,10 @@ def test_feed_restart_delivers_captured_events_to_the_live_consumer(
                 await _redis_market_counts(client, expected_streams)
                 == expected_market_counts
             )
-            stats = consumer.writer.stats()
-            fallback_quotes = expected_market_counts["md.option_reference"]
-            assert (
-                stats["ticks"]
-                == expected_market_counts["md.option_quote"] + fallback_quotes
-            )
-            assert (
-                stats["reference"]["ticks"]
-                == expected_market_counts["md.option_reference"]
-            )
-            assert stats["spot"]["ticks"] == expected_market_counts["md.index_quote"]
+            # The API process intentionally has no writer in split mode. Store/table
+            # assertions belong to test_store_process.py, where the standalone store
+            # owns the four roots; this test now proves only live-consumer delivery.
+            assert consumer.writer is None
         finally:
             if second_feed is not None:
                 await second_feed.supervisor.aclose()

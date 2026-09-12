@@ -1,19 +1,20 @@
 # High-level design: the feed, end to end
 
 **What the platform is:** in split mode, `feed` owns the venue connection, turns venue frames
-into canonical events, and publishes them to Redis; the engine consumes those events into the
-newest ladder, our implied volatility and Greeks, and sealed one-minute Parquet bars.
+into canonical events, and publishes them to Redis; `store` folds the lossless events into
+sealed one-minute Parquet bars while the engine consumes its screen events into the newest
+ladder, our implied volatility and Greeks.
 `docs/chain-contract.md` stays the authority on the page.
 
 This document says **what the parts are and how they talk**, never how one is built inside —
 that is a low-level design, written when the part lands ([lld/index.md](lld/index.md)). What
 crosses between parts is [events.md](events.md); where the two disagree the catalogue wins.
 
-**Modes.** `DELTA_BUS=redis` selects the two-process composition: `deltapayoff.feed_main:app`
-is the feed and `deltapayoff.main:app` is the engine. With `DELTA_BUS` unset — the default —
-the engine remains the existing in-process FanOut monolith, exactly as before. No service calls
-the other over HTTP. This supersedes `docs/architecture.md`, whose per-module detail is still
-accurate where this document is silent.
+**Modes.** `DELTA_BUS=redis` selects the split composition of three apps:
+`deltapayoff.feed_main:app`, `deltapayoff.store_main:app` and `deltapayoff.main:app`.
+With `DELTA_BUS` unset — the default — the engine remains the existing in-process FanOut
+monolith, exactly as before. No service calls the other over HTTP. This supersedes
+`docs/architecture.md`, whose per-module detail is still accurate where this document is silent.
 
 ---
 
@@ -33,13 +34,14 @@ accurate where this document is silent.
                         +--+--------+--+
                         | Redis Streams |
                         +--+--------+--+
-                  canonical |        | canonical
-              +--------------v+      +-v--------------+
-              | ChainStream    |      | BarWriter       |
-              | chain-stream   |      | bar-writer      |
-              | drop-oldest    |      | lossless        |
-              +-------+--------+      +--------+--------+
-                      +----------+-----------+
+                  canonical |        | canonical (lossless)
+              +--------------v+      +-v----------------+
+              | ChainStream    |      | store            |
+              | chain-stream   |      | store_main:app   |
+              | drop-oldest    |      | BarWriter        |
+              +-------+--------+      | -> Parquet       |
+                      |               +------------------+
+                      +-----------------------+
                                  |
               +------------------v------------------+
               | engine: deltapayoff.main:app        |
@@ -81,11 +83,16 @@ the feed opens the venue.
 
 ### 2.3 The engine process
 
-`deltapayoff.main:app` owns `ChainStream`, `BarWriter`, Parquet access, the REST routes and
-`/ws/chain`. In split mode it opens no Delta socket: `ChainStream` consumes `chain-stream`,
-`BarWriter` consumes `bar-writer` losslessly, and `FeedConnectionCache` consumes `feed-state`
-with drop-oldest semantics. `/chain` and `/expiries` answer from `ChainStream` in that mode.
-The two engine consumers receive the canonical events that feed published to Redis.
+`deltapayoff.main:app` owns `ChainStream`, Parquet reads, the REST routes and `/ws/chain`. In
+split mode it opens no Delta socket, owns no writer and performs no Parquet writes:
+`ChainStream` consumes `chain-stream` and `FeedConnectionCache` consumes `feed-state` with
+drop-oldest semantics. `/chain` and `/expiries` answer from `ChainStream` in that mode.
+
+#### The store process
+
+`deltapayoff.store_main:app` owns the lossless `store` consumer group, its checkpoint and
+replay from the last flush, and is the only writer of the four tables. It exposes one route,
+`GET /health`, and publishes `store.state`; the protocol is [store-replay.md](lld/store-replay.md).
 
 ### 2.4 The bus
 
@@ -101,10 +108,10 @@ Every drop is counted.
 
 **Two implementations behind that seam since #61.** `fanout.py` remains the default when
 `DELTA_BUS` is unset: the unchanged in-process monolith. `redis_bus.py` is selected by
-`DELTA_BUS=redis`; feed publishes in pipelined batches and trims by age, while the engine owns
-the `chain-stream`, `bar-writer` and `feed-state` subscriptions. Lossless remains acked and
-replayed from a recorded id; drop-oldest still jumps to the newest entries and **counts what it
-skipped**. Details are [lld/redis-bus.md](lld/redis-bus.md); names and encoding are
+`DELTA_BUS=redis`; feed publishes in pipelined batches and trims by age, while the consumers
+own their independent subscriptions. Lossless remains acked and replayed from a recorded id;
+drop-oldest still jumps to the newest entries and **counts what it skipped**. Details are
+[lld/redis-bus.md](lld/redis-bus.md); names and encoding are
 [cloud/nomenclature.md](cloud/nomenclature.md); ack, trim and persistence are
 [cloud/redis-hosting.md](cloud/redis-hosting.md).
 
@@ -113,14 +120,16 @@ skipped**. Details are [lld/redis-bus.md](lld/redis-bus.md); names and encoding 
 **ChainStream** (`stream.py`) is the live chain cache: newest event per contract, rebuilt into a
 ladder on demand, with the recompute loop solving our IV and Greeks. In split mode it receives
 canonical market events only from Redis and drives `/chain`, `/expiries` and `/ws/chain`.
-**BarWriter** (`bars.py`, `store.py`) folds the lossless stream into four Parquet tables; a minute
-with no arrivals produces no row. The pricing core remains pure, and venue IV and Greeks remain
-reference columns, never inputs.
+**BarWriter** (`bars.py`, `store.py`) lives in `store` in split mode and folds the lossless
+stream into four Parquet tables; a minute with no arrivals produces no row. In that mode it
+folds `computed.chain` published by the api rather than sampling a cache. The pricing core
+remains pure, and venue IV and Greeks remain reference columns, never inputs.
 
 ### 2.6 The public surface and the screens
 
 In split mode, feed has `GET /health`, which is its local `FeedSupervisor.report`. The engine
-serves `/expiries`, `/chain`, `/smile`, `/iv-vs-rv`, `/recording`, `/health` and `/ws/chain`.
+serves `/expiries`, `/chain`, `/smile`, `/iv-vs-rv`, `/recording`, `/health` and `/ws/chain`,
+while store has `GET /health`.
 Its `/health` is authoritative about remote feed state from the `feed.connection` and
 `heartbeat` observations in `FeedConnectionCache`, while retaining process liveness and
 watched pairs. The websocket badge is derived from that same projection, including its
@@ -166,10 +175,12 @@ Every transition emits one `feed.connection` event and one log record; nothing e
 | From | To | Event |
 |---|---|---|
 | Feed adapter | Redis publisher | `md.option_quote`, `md.option_reference`, `md.index_quote` |
-| Redis | ChainStream, BarWriter | the three canonical market events |
+| Redis | ChainStream, store/BarWriter | the three canonical market events |
 | Redis | FeedConnectionCache | `feed.connection`, `heartbeat` |
+| api | Redis -> store | `computed.chain` (split composition only) |
+| store | Redis -> api | `store.state` |
 | ChainStream | REST and websocket handlers | ladders from the live cache |
-| BarWriter | Parquet store | sealed `md.option_bar` data |
+| store/BarWriter | Parquet store | sealed `md.option_bar` data |
 | Store | the REST routes | Parquet reads, carrying no event |
 
 Fields, emitters, consumers and timing are in [events.md](events.md).

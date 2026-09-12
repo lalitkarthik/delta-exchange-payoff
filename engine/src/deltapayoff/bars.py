@@ -125,7 +125,7 @@ from typing import Any
 
 from .chain import expiry_from_symbol
 from .compute import MODEL_VERSION
-from .events import IndexQuote, OptionQuote, OptionReference
+from .events import ComputedChain, IndexQuote, OptionQuote, OptionReference
 
 #: One bar's width. Not configurable: every count and estimate in #5 is against minutes,
 #: and a second width would make two populations of rows indistinguishable in one table.
@@ -434,11 +434,14 @@ class _Watermarked:
         self._meta: dict[str, tuple[str, str, float, str]] = {}
         #: The newest minute boundary already sealed. A tick for it or earlier is late.
         self._sealed_through_us: int | None = None
+        self._restored_through_us: int | None = None
 
         self.ticks = 0
         #: Ticks that arrived after their bar was sealed. **Counted, never silent** — a
         #: discarded observation with no counter is the same lie as a silent drop.
         self.late = 0
+        #: Ticks replayed at or below a watermark restored from the store checkpoint.
+        self.already_flushed = 0
         #: Ticks whose symbol could not be parsed into underlying, expiry, strike, type.
         self.unparseable = 0
         #: Ticks carrying nothing to fold in. Not an observation; advances no series.
@@ -465,9 +468,24 @@ class _Watermarked:
         """
         minute_us = exchange_us - exchange_us % BUCKET_US
         if self._sealed_through_us is not None and minute_us <= self._sealed_through_us:
-            self.late += 1
+            if (
+                self._restored_through_us is not None
+                and minute_us <= self._restored_through_us
+            ):
+                self.already_flushed += 1
+            else:
+                self.late += 1
             return None
         return minute_us
+
+    def restore(self, sealed_through_us: int) -> None:
+        """Restore the exact checkpoint watermark before any bucket is opened."""
+        if self._open or self._restored_through_us is not None:
+            raise RuntimeError(
+                f"{type(self).__name__} cannot restore after it has started"
+            )
+        self._sealed_through_us = sealed_through_us
+        self._restored_through_us = sealed_through_us
 
     def seal(self, now: float) -> list[Any]:
         """Emit every bar whose minute closed at least `grace_seconds` ago by `now`.
@@ -520,6 +538,7 @@ class _Watermarked:
         return {
             "ticks": self.ticks,
             "late": self.late,
+            "already_flushed": self.already_flushed,
             "unparseable": self.unparseable,
             "empty": self.empty,
             "bars_emitted": self.bars_emitted,
@@ -1052,6 +1071,10 @@ def spot_from_index(event: Any) -> SpotTick | None:
 #: precisely the venue defect this project documented.
 COMPUTED_GRACE_SECONDS = 0.0
 
+#: `derived`, `1.45 x measured max transit 1,156.8 ms = 1.68 s, rounded up; 1.45 is
+#: the same factor table A/B/D's 8.0 s used`.
+COMPUTED_SPLIT_GRACE_SECONDS = 2.0
+
 #: The format `chain.build_chain` writes `fetched_at` in. Second resolution, which is
 #: ample for a minute bucket and is why nothing here has to reason about microseconds.
 FETCHED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -1158,6 +1181,43 @@ def _stamp_us(fetched_at: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return int(taken.replace(tzinfo=timezone.utc).timestamp()) * 1_000_000
+
+
+def computed_ticks_from_event(event: Any) -> list[ComputedTick]:
+    """Flatten a v2 ``ComputedChain`` event into one tick per present leg."""
+    if not isinstance(event, ComputedChain):
+        return []
+    fetched_at = event.fetched_at
+    if not isinstance(fetched_at, datetime):
+        return []
+    if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:
+        return []
+    stamp = _micros(fetched_at.replace(microsecond=0))
+    ticks: list[ComputedTick] = []
+    for strike in event.strikes:
+        for leg in (strike.call, strike.put):
+            if leg is None:
+                continue
+            ticks.append(
+                ComputedTick(
+                    symbol=leg.symbol,
+                    exchange_us=stamp,
+                    iv=leg.iv,
+                    iv_leg=leg.iv_leg,
+                    iv_reason=leg.iv_reason or None,
+                    delta=leg.delta,
+                    gamma=leg.gamma,
+                    vega=leg.vega,
+                    theta=leg.theta,
+                    rho=leg.rho,
+                    forward=event.forward,
+                    discount=event.discount,
+                    years_to_expiry=event.years_to_expiry,
+                    forward_method=event.forward_method,
+                    model_version=event.model_version,
+                )
+            )
+    return ticks
 
 
 def computed_ticks_from_chain(chain: Any) -> list[ComputedTick]:

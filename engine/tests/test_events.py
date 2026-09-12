@@ -1,7 +1,7 @@
 """The envelope, the registry, the instrument, and the bus interface.
 
 **The catalogue is `docs/design/events.md` and it is the authority.** One test here parses
-that document's section headings and asserts the registry holds exactly the same nine
+that document's section headings and asserts the registry holds exactly the same ten
 names, so a type added in code without a paragraph, or a paragraph without a type, fails
 the suite rather than drifting quietly.
 
@@ -24,6 +24,7 @@ from deltapayoff.events import (
     Alert,
     BarTable,
     Bus,
+    ChainLeg,
     ChainStrike,
     ComputedChain,
     ConnectionState,
@@ -38,6 +39,7 @@ from deltapayoff.events import (
     OptionQuote,
     OptionReference,
     Right,
+    StoreState,
     UnknownEventType,
     UnknownSchemaVersion,
     known_schema_version,
@@ -120,6 +122,7 @@ SAMPLES: dict[str, Event] = {
         source="chain-cache",
         underlying="BTC",
         expiry=date(2026, 6, 27),
+        fetched_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
         forward=77_612.4,
         discount=0.9987,
         forward_method="fitted",
@@ -129,15 +132,23 @@ SAMPLES: dict[str, Event] = {
         strikes=(
             ChainStrike(
                 strike=Decimal("60000"),
-                iv=0.5217,
-                iv_leg="put",
-                delta=0.4812,
-                gamma=0.000031,
-                vega=61.2,
-                theta=-18.4,
-                rho=7.1,
+                call=ChainLeg(
+                    symbol="C-BTC-60000-270626",
+                    iv=0.5217,
+                    iv_leg="put",
+                    delta=0.4812,
+                    gamma=0.000031,
+                    vega=61.2,
+                    theta=-18.4,
+                    rho=7.1,
+                ),
             ),
-            ChainStrike(strike=Decimal("62000"), iv=None, iv_reason="vega too small"),
+            ChainStrike(
+                strike=Decimal("62000"),
+                put=ChainLeg(
+                    symbol="P-BTC-62000-270626", iv=None, iv_reason="vega too small"
+                ),
+            ),
         ),
     ),
     "feed.connection": FeedConnection(
@@ -165,6 +176,17 @@ SAMPLES: dict[str, Event] = {
     ),
     "control.command": ControlCommand(
         **ENVELOPE, source="operator", adapter="delta", command="pause"
+    ),
+    "store.state": StoreState(
+        **ENVELOPE,
+        source="store",
+        recording=True,
+        buffered_rows=12,
+        rows_written=345,
+        replay_gap_entries=2,
+        already_flushed=3,
+        flush_errors=1,
+        generation=17,
     ),
 }
 
@@ -342,7 +364,7 @@ def test_every_event_round_trips_through_json(type_name: str) -> None:
 def test_every_event_carries_the_envelope(type_name: str) -> None:
     event = SAMPLES[type_name]
     assert event.type == type_name
-    assert event.schema_version == 1
+    assert event.schema_version == (2 if type_name == "computed.chain" else 1)
     assert event.ts_venue == TS_VENUE
     assert event.ts_received == TS_RECEIVED
     assert registry()[type_name] is type(event)
@@ -420,11 +442,42 @@ def test_a_payload_omitting_the_version_takes_the_class_default() -> None:
     assert parse_event(payload).schema_version == 1
 
 
+def test_computed_chain_version_one_is_unknown_to_the_v2_reader() -> None:
+    payload = SAMPLES["computed.chain"].model_dump(mode="json")
+    payload["schema_version"] = 1
+
+    with pytest.raises(UnknownSchemaVersion, match="computed.chain.*2"):
+        parse_event(payload)
+
+
+def test_computed_chain_fetched_at_must_be_aware() -> None:
+    payload = SAMPLES["computed.chain"].model_dump()
+    payload["fetched_at"] = datetime(2026, 6, 1, 12, 0, 0)
+
+    with pytest.raises(ValidationError, match="fetched_at.*timezone"):
+        ComputedChain.model_validate(payload)
+
+
+def test_control_command_defaults_to_feed_and_store_reconnect_is_invalid() -> None:
+    command = ControlCommand(
+        **ENVELOPE, source="operator", adapter="delta", command="pause"
+    )
+    assert command.target == "feed"
+    with pytest.raises(ValidationError, match="store.*reconnect|reconnect.*store"):
+        ControlCommand(
+            **ENVELOPE,
+            source="operator",
+            adapter="delta",
+            command="reconnect",
+            target="store",
+        )
+
+
 @pytest.mark.parametrize("type_name", sorted(SAMPLES))
-def test_every_type_is_still_at_version_one(type_name: str) -> None:
-    """The nine fields #37 added to two events are all optional with defaults, which
-    `docs/design/events.md` calls a compatible change. Nothing was bumped."""
-    assert known_schema_version(registry()[type_name]) == 1
+def test_every_type_has_the_catalogued_schema_version(type_name: str) -> None:
+    """Only `computed.chain` has left version 1; the other types remain compatible."""
+    expected = 2 if type_name == "computed.chain" else 1
+    assert known_schema_version(registry()[type_name]) == expected
 
 
 def test_parse_accepts_the_bytes_a_transport_would_hand_it() -> None:
@@ -449,7 +502,7 @@ def test_registering_a_type_twice_raises() -> None:
 def test_the_registry_holds_exactly_the_types_the_catalogue_names() -> None:
     """One test, so the document and the code cannot drift apart silently."""
     documented = documented_event_types()
-    assert len(documented) == 9, (
+    assert len(documented) == 10, (
         f"parsed {len(documented)} type headings out of {EVENTS_DOC}; "
         "the heading shape this test keys off has changed"
     )
@@ -501,20 +554,26 @@ def test_every_field_the_catalogue_names_exists_on_the_class(type_name: str) -> 
     is this one: a field renamed or dropped in code while the document still names it.
     """
     cls = registry()[type_name]
-    available = set(cls.model_fields)
-    for field in cls.model_fields.values():
-        # `computed.chain` lists its per-strike fields in its own Payload bullet; they
-        # live on the nested `ChainStrike`, so a nested model's fields count as present.
-        annotation = field.annotation
-        for candidate in getattr(annotation, "__args__", ()) or ():
-            if isinstance(candidate, type) and issubclass(candidate, BaseModel):
-                available |= set(candidate.model_fields)
+    available = _nested_model_fields(cls)
     documented = documented_payload_fields(type_name)
     assert documented, f"parsed no payload fields for {type_name}"
     assert documented <= available, (
         f"{type_name}: {sorted(documented - available)} named in {EVENTS_DOC.name} "
         f"but absent from {cls.__name__}"
     )
+
+
+def _nested_model_fields(model: type[BaseModel]) -> set[str]:
+    available = set(model.model_fields)
+    for field in model.model_fields.values():
+        annotation = field.annotation
+        candidates = getattr(annotation, "__args__", ()) or ()
+        if isinstance(annotation, type):
+            candidates += (annotation,)
+        for candidate in candidates:
+            if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                available |= _nested_model_fields(candidate)
+    return available
 
 
 # ------------------------------------------------------------------- the wire is numbers
@@ -586,6 +645,12 @@ def test_an_implied_volatility_of_zero_is_refused() -> None:
     unsolved strike carries `None` and an `iv_reason`."""
     with pytest.raises(ValidationError):
         ChainStrike(strike=Decimal("60000"), iv=0.0)
+
+
+def test_a_chain_leg_carries_its_venue_symbol_and_greeks() -> None:
+    leg = ChainLeg(symbol="C-BTC-60000-270626", iv=0.5217, delta=0.4812)
+    assert leg.symbol == "C-BTC-60000-270626"
+    assert leg.delta == 0.4812
 
 
 def test_a_hyphen_in_a_venue_or_underlying_is_refused_at_construction() -> None:

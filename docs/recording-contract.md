@@ -14,7 +14,7 @@ already past this project's 200-line bound when `/smile` was split out of it, an
 same argument applies again: two documents are only two authorities when they describe
 the same thing. This describes one pair of routes and is the sole authority for them.
 
-## Why the route exists
+## Default monolith: why the route exists
 
 The store began writing when the process started and stopped when it died. Anyone who
 wanted to stop accumulating market data — to work on the machine, to keep a day's
@@ -28,7 +28,8 @@ stopping was meant to protect.
 {
   "recording": true,
   "buffered_rows": 0,
-  "rows_written": 41231
+  "rows_written": 41231,
+  "state_age_seconds": null
 }
 ```
 
@@ -37,12 +38,13 @@ stopping was meant to protect.
 | `recording` | whether the writer is aggregating and writing **right now** |
 | `buffered_rows` | sealed bars held in memory, not yet on disk, across all four tables |
 | `rows_written` | rows this process has written to Parquet, across all four tables |
+| `state_age_seconds` | age of the newest split-mode `store.state`; `null` in the monolith |
 
-**The state lives in the engine and is read from it.** Not in the browser, not in
+**In the default monolith, the state lives in the engine and is read from it.** Not in the browser, not in
 `localStorage`. Two tabs must not be able to disagree about whether the store is
 writing, and a reader arriving on a fresh page is told the truth rather than a default.
 
-**`recording` is `true` at start-up, always.** A process that starts without recording
+**In the default monolith, `recording` is `true` at start-up, always.** A process that starts without recording
 silently captures nothing, and forgetting to switch it on is a worse failure than
 forgetting to switch it off. It follows that **a pause does not survive a restart**, and
 the control says so rather than letting the reader assume otherwise.
@@ -51,6 +53,27 @@ The two counters are the sum across the four tables, not a per-table breakdown. 
 exist so a reader can see that recording is a fact and not a label — `rows_written`
 climbing is the engine capturing, and `buffered_rows` returning to zero the moment
 recording is switched off is the flush below having happened.
+
+## In split mode
+
+With `DELTA_BUS=redis`, state lives in `store` and reaches the API as a cached `store.state`
+event, published every ten seconds and on every change. A fresh `GET /recording` returns
+`200` with the three existing fields and nullable `state_age_seconds`. If the newest state is
+older than `STORE_STATE_STALE_SECONDS = 25.0` (`derived`: a ten-second publish interval,
+two missed publishes and five seconds of slack), or none has ever arrived, it returns `503`
+and names the age (`null` when never seen). This reuses #64's feed-state cache rule.
+
+`POST /recording` publishes one `control.command` with `target: "store"` and waits for a
+later `store.state` carrying the requested `recording` value. No acknowledgement within
+`STORE_COMMAND_ACK_TIMEOUT_SECONDS = 10.0` (`assumed`: #64's `2.0 s` bound plus one flush)
+returns `504` and names the requested state. If the store is already in that state, the API
+publishes once and answers immediately. `already_flushed` is present on `store.state` and
+the store's `GET /health`, never in `/recording`'s body.
+
+The monolith is unchanged in every other respect, including `recording: true` at start-up
+and a recording pause not surviving restart. The one restart difference is deliberate:
+the store checkpoint records `recording` and the open pause span, so a restarted split store
+comes back paused where the monolith comes back recording.
 
 ## `POST /recording`
 
@@ -130,7 +153,8 @@ FastAPI default shape, `{"detail": "..."}`.
 | Status | When |
 |---|---|
 | 422 | `recording` is absent from the POST body, or is not a **boolean** — FastAPI's own validation |
-| 503 | the process has no bar writer, so there is no recording state to report or change |
+| 503 | monolith has no writer, or split mode has never seen `store.state` or its newest state is older than `STORE_STATE_STALE_SECONDS` (the response names `state_age_seconds`) |
+| 504 | split mode published the store command but no later matching `store.state` arrived within `STORE_COMMAND_ACK_TIMEOUT_SECONDS`; the response names the requested state |
 
 **A strict boolean.** `"off"`, `"no"` and `"0"` are 422, not false. Pydantic's lax
 mode would read all three as false, and guessing at a string is the wrong disposition for

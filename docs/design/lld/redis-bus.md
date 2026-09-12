@@ -3,10 +3,10 @@
 **The seam does not move.** `events/bus.py` names `publish(event)` and
 `subscribe(name, maxsize, lossless)`; `fanout.py` still fills it by default. `redis_bus.py` is
 the second implementation behind the same methods, selected by `DELTA_BUS=redis`, landed by
-#61 (I2). In split mode, `feed` is publisher-only; the engine owns `chain-stream`, `bar-writer`
-and `feed-state` subscriptions, and `ChainStream.attach` and `BarWriter.attach` still read the
-same `Subscription`. With `DELTA_BUS` unset — the default — FanOut is the unchanged in-process
-monolith. The Redis subscription **subclasses** that class rather than imitating it.
+#61 (I2). In split mode, `feed` is publisher-only; `store` owns its lossless subscription and
+the engine owns `chain-stream` and `feed-state`. With `DELTA_BUS` unset — the default — FanOut
+is the unchanged in-process monolith. The Redis subscription **subclasses** that class rather
+than imitating it.
 
 Names and encoding are [../cloud/nomenclature.md](../cloud/nomenclature.md), decided in #58.
 The ack, trim and persistence policy is [../cloud/redis-hosting.md](../cloud/redis-hosting.md)
@@ -30,8 +30,9 @@ tell the two implementations apart from outside, which is why it exists: a proce
 at the wrong Redis is otherwise a silent misconfiguration.
 
 **The stream list comes from configuration and is never discovered.** `BusConfig.streams()`
-is `stream_names(venues, underlyings)` — fourteen keys for one venue and two
-underlyings, built from the same `--underlyings` set the feed is given. `XREAD` has no
+is `stream_names(venues, underlyings)` — fifteen keys (`derived`) for one venue and two underlyings,
+including venue-scoped `store.state:DELTA`, built from the same `--underlyings` set the feed is
+given. `XREAD` has no
 wildcard, so a stream found late is a stream that was silently not read: that is #51
 restaged, and #51 cost three days of history.
 
@@ -39,34 +40,32 @@ Stream keys are `{event_type}:{VENUE}[:{UNDERLYING}]`; issue #74 removed the env
 section. Streams under old `dev:` and `prod:` names may still exist locally; they are not
 migrated, because the pipe holds thirty minutes and they age out on their own.
 
-## 2. Lossless — a consumer group, acked on receipt
+## 2. Lossless — per-stream positions and a consumer group
 
-`subscribe(..., lossless=True)` creates `XGROUP CREATE <stream> <name> 0 MKSTREAM` on every
-configured stream and reads `XREADGROUP <name> <name>-<instance> ... >`. **The group name is
-the subscription's name**, which is the service name — no environment and no venue in it,
-because the key already carries the venue.
+The built signature is `subscribe(..., start_ids: Mapping[str, Position] | None,
+group_start: "0" | "$" = "0", skip: Sequence[Span] = ())`. Each `Position` carries an id
+and logical index. `group_start` is resolved once to a concrete id when a group is created;
+it is never repeatedly passed as the literal `$`. `skip` contains pause spans that a replaying
+reader drops and counts. `behind` is per stream: it tells the store's log clock that replay
+or a full read batch is still catching up; the clock is described in
+[store-replay.md](store-replay.md), not repeated here.
 
-Every batch read is **acked before the work**, in one pipelined `XACK` per stream. This is
-not the textbook pattern and the reason is `redis-hosting.md` §5: the durability boundary is
-the store's five-minute *flush*, not the read, so a per-message ack after the work would
-report something true about neither. `XACK` frees no memory in any case — `measured` (#69),
-5,000 entries acked and `MEMORY USAGE` unchanged. Only the trim deletes.
+Lossless subscriptions create `XGROUP CREATE <stream> <name> <group_start> MKSTREAM`, read
+`XREADGROUP`, and ack each batch before the work. The group name is the service name. The
+durability boundary is the store flush, not the ack; `XACK` frees no stream memory (`measured`,
+#69).
 
-**Replay is from a recorded id, not from the pending list.** `subscribe(..., start_id=...)`
-reads forward with a plain `XREAD` from that id up to the group's own `last-delivered-id`,
-then switches to `>`. The two halves meet exactly — `(start_id, last-delivered]` and
-`(last-delivered, ∞)` — so nothing is skipped and nothing arrives twice. The pending list
-would carry only what was never acked, and everything is acked on receipt.
+`last_ids` is the last entry put on the queue per stream. A store checkpoint supplies the
+per-stream `start_ids`, so replay covers the recorded suffix and then live `>` delivery.
+`feed-state` still hydrates the API cache from `feed.connection` and `heartbeat`.
 
-`last_ids` on the subscription is the id of the last entry **put on the queue** per stream.
-A consumer records it at the moment it flushes, having drained the queue, and hands it back
-as `start_id` after a restart. I3 is what will do that in `store.py`; this ticket provides
-it and pins it.
+### 2.1 Gap check
 
-**The feed-state subscription closes the cold-start gap.** An engine started after `feed` is
-already connected observes `feed.connection` and `heartbeat` on its filtered subscription and
-reports the last observation and its age. The first heartbeat after API start carries the
-controller's state and hydrates the cache; no feed-side startup change is needed.
+At start-up, one `XINFO STREAM` per stream runs in one pipeline. For a saved position,
+`trimmed = entries-added - length` and `lost = max(0, trimmed - index)`. The
+`max-deleted-entry-id` is `measured` to remain `0-0` after `XTRIM`, so it is unusable.
+A trimmed position replays the retained suffix, reports both bounds and the exact loss, and
+never refuses start-up.
 
 ## 3. Drop-oldest — a reader outside every group, and it jumps
 
@@ -136,8 +135,8 @@ buffering into an outbox nobody is draining.
 ## 6. What it counts
 
 `stats()` keeps the fan-out's six per subscription — `offered`, `dropped`, `queued`,
-`lossless`, `over_capacity`, `backlog_peak` — and adds three only a broker can produce:
-`skipped` (§3), `resyncs`, and `undecodable`, an entry that would not decode, logged at
+`lossless`, `over_capacity`, `backlog_peak` — and adds broker counters `skipped` (§3),
+`span_dropped`, `resyncs`, and `undecodable`, an entry that would not decode, logged at
 error and never fatal to the reader. `publisher()` carries the write side: `published`,
 `written`, `batches`, `trims`, `failures`, `unroutable`, `outbox`, `outbox_dropped`, and the
 flush timings §7 is read off.
@@ -186,9 +185,10 @@ because prod is Linux beside the Redis; `DEFAULT_READ_BLOCK_MS` carries the same
 ## 8. What is not here
 
 **The default remains in-process.** With `DELTA_BUS` unset, FanOut keeps the engine and feed
-composition unchanged. With `DELTA_BUS=redis`, this bus is the process boundary: `feed` publishes
-and the engine owns the three subscriptions. Store replay from its recorded id is I4 (#63); engine
-I5 (#64) adds the engine's feed-state health projection to that consumer composition.
+composition unchanged. With `DELTA_BUS=redis`, `feed` publishes, `store` owns its lossless
+group, and the engine owns the screen subscriptions. Store replay from per-stream recorded
+`Position`s is landed in I4 (#63): it replays the retained suffix, preserves the log clock,
+and reports trimmed loss rather than refusing start-up. Engine I5 (#64) adds feed-state health.
 
 **No `XAUTOCLAIM`, no pending-list recovery, no dead-letter.** §2 says why: the flush is the
 durability boundary and the recorded id is the recovery. A consumer that needed per-message

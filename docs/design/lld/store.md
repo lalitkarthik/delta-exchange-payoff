@@ -17,11 +17,13 @@ Underlying comes first because all readers select one underlying while `/smile` 
 without a date predicate; the first directory therefore prunes the other asset before dates are
 scanned.
 
-**Process boundary.** In split mode (`DELTA_BUS=redis`), the engine owns `BarWriter` and its
-lossless `bar-writer` subscription; the store receives that lossless market-data stream only
-through Redis. Once an entry is written to Redis, a feed outage creates no additional store loss
-for that entry, but an event still in a dead publisher's memory is not durable. With
-`DELTA_BUS` unset — the default — FanOut keeps the existing in-process monolith unchanged.
+**Process boundary.** In split mode (`DELTA_BUS=redis`), `deltapayoff.store_main:app` owns
+`BarWriter` in its own `store` consumer group; the api has no writer at all. It receives the
+lossless market-data stream through Redis, folds the same four tables as the monolith, and is
+their only writer. With `DELTA_BUS` unset — the default — FanOut keeps the existing in-process
+monolith unchanged.
+The crash protocol is [store-replay.md](store-replay.md); this design records its ownership
+and read-path consequences rather than repeating that protocol.
 
 ---
 
@@ -31,16 +33,18 @@ for that entry, but an event still in a dead publisher's memory is not durable. 
 |---|---|---|---|
 | A `quote-bars` | contract × minute | `md.option_quote`, with `md.option_reference`'s own quote as fallback | 8.0 s |
 | B `reference-bars` | contract × minute | `md.option_reference` | 8.0 s |
-| C `computed-bars` | contract × minute | **sampled** from the chain cache, not from the bus | 0.0 s |
+| C `computed-bars` | contract × minute | monolith: sampled from its chain cache; split store: folded from `computed.chain`, published by the api on the writer's own sampling schedule | 0.0 s monolith (`derived`); 2.0 s split (`derived` from `measured` maximum transit 1,156.8 ms) |
 | D `spot-bars` | underlying × minute | `md.index_quote` | 8.0 s |
 
-**Table C is the odd one out and stays so.** Our implied volatility and Greeks are produced
-by the recompute loop, so the writer samples `ChainStream.computed_chains` through a
-callable — a callable rather than the stream, so this module never learns a chain cache
-exists. Its grace is zero on purpose: a sample has no stragglers to wait for, and sealing
-minute M the instant M ends is what makes a chain still stamped inside M when M+1 closes
-**late**, and therefore refused. Without that, a dead feed would re-sample its last ladder
-every minute and the store would fill with identical fabricated rows.
+**Table C differs by composition.** The monolith samples its own `ChainStream` cache and keeps
+grace `0.0 s`; only the split composition publishes `computed.chain`. The split `BarWriter`
+folds those per-leg events, with `2.0 s` grace (`derived`: 1.45 × the `measured` 1,156.8 ms
+maximum transit, rounded above 1.68 s). The event schedule is the writer's schedule, not a
+store-side resampling of a cache.
+The split event is `schema_version` 2 with separate per-leg `call` and `put` blocks.
+Table C validation requires exact, bit-identical numeric values for rows common to both compositions;
+coverage uses the orchestrator's `measured` tolerance only for rows admitted by split grace that
+the monolith's zero-grace rule refuses. The tolerance is measured, not chosen to pass.
 
 ### `index-bars` — outside the four
 
@@ -116,7 +120,8 @@ counted late, the fallback would be dead code and the flag would be a constant `
 ## 4. Bucketing, and the one clock that decides
 
 `DELTA_STORE_ROOT` configures the store root and defaults to `<repo>/data`. Two engine processes
-must never share a store root: both would flush into the same directories.
+(including two stores) must never share a root: both would flush into the same directories and
+corrupt the root-level `_store-checkpoint.json` and `_store-flush-intent.json` as well.
 
 `ts_venue` alone decides which minute a tick belongs to, converted to microseconds by
 integer arithmetic in `bars._micros` — never through `timestamp()`, which returns a float
@@ -127,9 +132,19 @@ since #37 that stamp is what the writer buckets on.
 **An event with no `ts_venue` is refused whole and counted in `skipped`.** Bucketing it on
 our arrival time is the one thing this design exists not to do.
 
+### Graceful stop in split mode
+
 **Never forward-fill.** A minute with no arrivals produces no row — not nulls, never the
-previous close — in every table, and a partial bar at process stop is written with its true
-tick counts and no flag.
+previous close — in every table. The monolith writes a partial stop bar with true tick counts;
+the store process checkpoints the partial open minute, so a restart inside the `derived`
+thirty-minute Redis retention completes it rather than sealing a truncated bar. A stop longer
+than that `derived` retention loses the minutes trimmed from Redis, and the gap signal reports them.
+
+**Current split-mode read-path lag.** Without a writer in the api, `/smile`, `/chain/at`,
+`/chain/minutes` and `/bars` cannot use `BarStore.pending()` and read only disk, so their right
+edge is up to one flush interval plus the open minute behind the monolith's live edge. Follow-up
+[#81](https://github.com/lalitkarthik/delta-exchange-payoff/issues/81) ends this; its named option
+is feeding the api the catalogue's `md.option_bar` events. #63 does not fix it.
 
 ## 5. Failure modes
 

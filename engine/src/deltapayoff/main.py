@@ -53,6 +53,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date as Date
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Annotated, Any
 
 from fastapi import (
@@ -65,9 +66,11 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import log_events
+from . import compute, log_events
 from .adapters import Adapter, DeltaAdapter, DeltaFeed
+from .bars import BUCKET_US
 from .chain import (
+    EXPIRY_FORMAT,
     UNDERLYINGS,
     ValidationError,
     normalise_underlying,
@@ -76,7 +79,18 @@ from .chain import (
 from .compute import enrich
 from .contract_bars import ContractBarsResponse, read_contract_bars
 from .delta_client import DeltaClient, DeltaUnavailable
-from .events import Bus, ConnectionState, ControlCommand, Event, FeedConnection, Heartbeat
+from .events import (
+    Bus,
+    ChainStrike,
+    ComputedChain,
+    ConnectionState,
+    ControlCommand,
+    Event,
+    FeedConnection,
+    Heartbeat,
+    StoreState,
+)
+from .events import ChainLeg as EventChainLeg
 from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
 from .feed_runtime import relist_forever, relist_instruments
@@ -98,6 +112,7 @@ from .redis_bus import REDIS_BUS, BusConfig, RedisBus, selected_bus
 from .smile import read_smile
 from .store import (
     COMPUTED_DATASET,
+    COMPUTED_SAMPLE_SECONDS,
     COMPUTED_SCHEMA,
     INDEX_DATASET,
     INDEX_SCHEMA,
@@ -107,6 +122,7 @@ from .store import (
     SPOT_SCHEMA,
     BarStore,
     BarWriter,
+    computed_sample_due,
     read_contract_ivs,
     read_index_bars,
     read_spot_bars,
@@ -199,6 +215,14 @@ LIVE_FEED_ENV = "DELTA_LIVE_FEED"
 #: tolerates two missed heartbeats plus 5 s of batching and scheduling slack while a dead
 #: `feed` turns the badge in under half a minute.
 FEED_HEARTBEAT_STALE_SECONDS = 25.0
+
+#: `derived`: the store publishes every ten seconds, so 25 s tolerates two missed
+#: publishes plus five seconds of batching and scheduling slack.
+STORE_STATE_STALE_SECONDS = 25.0
+
+#: `assumed`: #64's 2.0 s feed bound plus one flush of <= 8 files; flush duration is
+#: logged (store.flush, duration_seconds) and is to be read off the live run.
+STORE_COMMAND_ACK_TIMEOUT_SECONDS = 10.0
 
 
 def live_feed_enabled() -> bool:
@@ -548,6 +572,159 @@ def _rounded_age(value: float) -> float:
     return round(max(0.0, value), 3)
 
 
+def computed_chain_event(
+    chain: ChainResponse,
+    *,
+    source: str = "chain-cache",
+    ts_received: datetime,
+) -> ComputedChain:
+    """Translate one enriched chain into the v2 event the split store consumes."""
+    from .bars import FETCHED_AT_FORMAT
+
+    fetched_at = datetime.strptime(chain.fetched_at, FETCHED_AT_FORMAT).replace(
+        tzinfo=timezone.utc
+    )
+    strikes: list[ChainStrike] = []
+    for row in chain.rows:
+        legs: dict[str, EventChainLeg | None] = {}
+        for side in ("call", "put"):
+            leg = getattr(row, side)
+            if leg is None or leg.computed is None:
+                legs[side] = None
+                continue
+            computed = leg.computed
+            legs[side] = EventChainLeg(
+                symbol=leg.symbol,
+                iv=computed.iv,
+                iv_leg=computed.iv_leg,
+                iv_reason=computed.iv_reason,
+                delta=computed.delta,
+                gamma=computed.gamma,
+                vega=computed.vega,
+                theta=computed.theta,
+                rho=computed.rho,
+            )
+        strikes.append(
+            ChainStrike(
+                strike=Decimal(str(row.strike)),
+                call=legs["call"],
+                put=legs["put"],
+            )
+        )
+    return ComputedChain(
+        source=source,
+        ts_received=ts_received,
+        underlying=chain.underlying,
+        expiry=datetime.strptime(chain.expiry, EXPIRY_FORMAT).date(),
+        fetched_at=fetched_at,
+        forward=chain.forward,
+        discount=chain.discount,
+        years_to_expiry=chain.years_to_expiry,
+        forward_method=chain.forward_method,
+        model_version=compute.MODEL_VERSION,
+        solver="S1-newton",
+        strikes=tuple(strikes),
+    )
+
+
+def publish_computed_chains(
+    chains: list[ChainResponse],
+    publish: Callable[[Event], None],
+    *,
+    ts_received: datetime | None = None,
+    source: str = "chain-cache",
+    on_error: Callable[[], None] | None = None,
+) -> int:
+    """Publish computed chains, returning the number of chains that failed."""
+    received = _utc_now() if ts_received is None else ts_received
+    errors = 0
+    for chain in chains:
+        try:
+            publish(
+                computed_chain_event(
+                    chain,
+                    source=source,
+                    ts_received=received,
+                )
+            )
+        except Exception:
+            errors += 1
+            if on_error is not None:
+                on_error()
+            log_event(
+                logger,
+                logging.ERROR,
+                log_events.ENGINE_ERROR,
+                "a computed chain could not be published",
+                exc_info=True,
+            )
+    return errors
+
+
+@dataclass
+class StoreStateCache:
+    """The newest venue-scoped `store.state`, plus when this process observed it."""
+
+    monotonic_clock: Callable[[], float] = field(
+        default=time.monotonic, repr=False
+    )
+    event: StoreState | None = None
+    observed_mono: float | None = None
+    _generation: int = field(default=0, init=False, repr=False)
+    _update_event: asyncio.Event = field(
+        default_factory=asyncio.Event, init=False, repr=False
+    )
+    _subscription: Any = field(default=None, init=False, repr=False)
+
+    def attach(self, bus, maxsize: int = 100, name: str = "store-state"):
+        """Attach one drop-oldest reader restricted to `store.state` on Redis."""
+        if isinstance(bus, RedisBus):
+            self._subscription = bus.subscribe(
+                name,
+                maxsize=maxsize,
+                event_types=("store.state",),
+            )
+        else:
+            self._subscription = bus.subscribe(name, maxsize=maxsize)
+        return self._subscription
+
+    def apply(self, event: Event) -> None:
+        if not isinstance(event, StoreState):
+            return
+        if self.event is not None and event.ts_received <= self.event.ts_received:
+            return
+        self.event = event
+        self.observed_mono = self.monotonic_clock()
+        self._generation += 1
+        self._update_event.set()
+
+    def latest(self) -> tuple[StoreState, float] | None:
+        if self.event is None or self.observed_mono is None:
+            return None
+        return self.event, _rounded_age(self.monotonic_clock() - self.observed_mono)
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    async def wait_for_generation(self, after: int) -> int:
+        while self._generation <= after:
+            await self._update_event.wait()
+            self._update_event.clear()
+        return self._generation
+
+    async def run(self) -> None:
+        if self._subscription is None:
+            raise RuntimeError("attach() the store state cache before running it")
+        while True:
+            self.apply(await self._subscription.queue.get())
+
+    def clear(self) -> None:
+        self.event = None
+        self.observed_mono = None
+        self._subscription = None
+
+
 @dataclass
 class FeedStack:
     """Every moving part of the live feed, wired to the bus and to each other.
@@ -571,7 +748,7 @@ class FeedStack:
     #: whole of what `events/bus.py` was written for.
     events: Bus
     stream: ChainStream
-    writer: BarWriter
+    writer: BarWriter | None
     #: The venue, behind `adapters.base.Adapter`. Everything venue-specific is inside it,
     #: including the two REST reads `/expiries` and `/chain` are answered from.
     adapter: Any
@@ -583,6 +760,8 @@ class FeedStack:
     #: **#40's badge reads this.** The latest `feed.connection` per adapter, kept in step
     #: with the supervisor's own `publish` — see `FeedConnectionCache`.
     feed_cache: FeedConnectionCache
+    #: The split composition's cached store state. The monolith does not need it.
+    store_cache: StoreStateCache | None = None
     #: The background tasks, empty until `start_feed_stack` runs. Cancelled on shutdown.
     #: **The feed is no longer among them** — the supervisor owns that task.
     tasks: list[asyncio.Task] = field(default_factory=list)
@@ -594,11 +773,26 @@ class FeedStack:
     #: subtracts to find what is new, and it only ever grows — see `relist_instruments`
     #: for why a settled contract is not taken back out.
     listed: dict[str, set[str]] = field(default_factory=dict)
+    computed_publish_errors: int = 0
 
     @property
     def feed(self) -> Any:
         """The socket owner inside the adapter, for the counters #39's `/health` reads."""
         return None if self.adapter is None else self.adapter.feed
+
+    def publish_computed_chains(self, chains: list[ChainResponse]) -> int:
+        """Publish split-mode computed chains on the bus that owns their cadence."""
+        if selected_bus() != REDIS_BUS:
+            return 0
+        errors = publish_computed_chains(
+            chains,
+            self.events.publish,
+            ts_received=_utc_now(),
+            on_error=lambda: setattr(
+                self, "computed_publish_errors", self.computed_publish_errors + 1
+            ),
+        )
+        return errors
 
 
 def build_bus() -> Bus:
@@ -712,6 +906,7 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
         # thing that would have to be undone to add it.
         supervisor=FeedSupervisor([adapter], publish),
         feed_cache=feed_cache,
+        store_cache=None,
     )
 
 
@@ -721,54 +916,80 @@ def build_consumer_stack() -> FeedStack:
     events = RedisBus(config)
     stream = ChainStream()
     stream.attach(events)
-    writer = BarWriter(BarStore(), chains=stream.live_computed_chains)
-    writer.attach(events)
     feed_cache = FeedConnectionCache(venue=config.venue)
     feed_cache.attach(events)
+    store_cache = StoreStateCache()
+    store_cache.attach(events)
     return FeedStack(
         events=events,
         stream=stream,
-        writer=writer,
+        writer=None,
         adapter=None,
         supervisor=None,
         feed_cache=feed_cache,
+        store_cache=store_cache,
     )
 
 
+async def publish_computed_forever(
+    stack: FeedStack,
+    *,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], Any] = asyncio.sleep,
+) -> None:
+    """Sample the live chain cache on the writer's timer-plus-edge schedule."""
+    wall = stack.stream.wall if clock is None else clock
+    sampled_at: float | None = None
+    sampled_minute_us: int | None = None
+    while True:
+        now = wall()
+        minute_us = int(now * 1e6) - int(now * 1e6) % BUCKET_US
+        if computed_sample_due(now, sampled_at, sampled_minute_us):
+            stack.publish_computed_chains(stack.stream.live_computed_chains())
+            sampled_at = now
+            sampled_minute_us = minute_us
+        next_timer = (
+            COMPUTED_SAMPLE_SECONDS
+            if sampled_at is None
+            else max(0.001, COMPUTED_SAMPLE_SECONDS - (now - sampled_at))
+        )
+        next_edge = max(0.001, 60.0 - (now % 60.0))
+        await sleep(min(next_timer, next_edge))
+
+
 async def start_consumer_stack(stack: FeedStack) -> None:
-    """Start Redis before the five consumer tasks."""
+    """Start Redis before the split composition's consumer tasks."""
     await start_bus(stack.events)
+    assert stack.writer is None
+    assert stack.store_cache is not None
     stack.tasks = [
         asyncio.create_task(stack.stream.run(), name="chain-stream"),
         asyncio.create_task(recompute_forever(stack.stream), name="chain-recompute"),
         asyncio.create_task(
-            recompute_every_minute(stack.stream, stack.writer.sample_chains),
+            recompute_every_minute(stack.stream, stack.publish_computed_chains),
             name="chain-minute-pass",
         ),
-        asyncio.create_task(stack.writer.run(), name="bar-writer"),
         asyncio.create_task(stack.feed_cache.run(), name="feed-state"),
+        asyncio.create_task(
+            stack.store_cache.run(), name="store-state-cache"
+        ),
+        asyncio.create_task(
+            publish_computed_forever(stack), name="computed-chain-publisher"
+        ),
     ]
     for task in stack.tasks:
         task.add_done_callback(_report_finished_task)
 
 
 async def stop_consumer_stack(stack: FeedStack) -> None:
-    """Cancel consumers, flush bars, then close Redis."""
+    """Cancel split consumers and close Redis; the store owns all four tables."""
     for task in stack.tasks:
         task.cancel()
     if stack.tasks:
         await asyncio.gather(*stack.tasks, return_exceptions=True)
     stack.tasks = []
-    try:
-        await stack.writer.aclose()
-    except Exception:
-        log_event(
-            logger,
-            logging.ERROR,
-            log_events.ENGINE_ERROR,
-            "the final bar flush failed",
-            exc_info=True,
-        )
+    if stack.store_cache is not None:
+        stack.store_cache.clear()
     await stop_bus(stack.events)
 
 
@@ -880,6 +1101,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.feed = None
         app.state.supervisor = None
         app.state.feed_cache = stack.feed_cache
+        app.state.store_cache = stack.store_cache
         app.state.tasks = stack.tasks
         try:
             yield
@@ -895,6 +1117,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "feed",
                 "supervisor",
                 "feed_cache",
+                "store_cache",
                 "tasks",
             ):
                 setattr(app.state, name, None)
@@ -921,6 +1144,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.feed = stack.feed
     app.state.supervisor = stack.supervisor
     app.state.feed_cache = stack.feed_cache
+    app.state.store_cache = None
     app.state.tasks = stack.tasks
 
     if live_feed_enabled():
@@ -962,6 +1186,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "feed",
             "supervisor",
             "feed_cache",
+            "store_cache",
             "tasks",
         ):
             setattr(app.state, name, None)
@@ -1044,7 +1269,7 @@ def get_computed_store() -> BarStore:
     return BarStore(dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
 
 
-def get_bar_writer() -> BarWriter:
+def get_bar_writer() -> Any:
     """The writer `/recording` reports on and switches. Sibling of the store seam above.
 
     **503 rather than a default when there is none.** A process without a writer is not
@@ -1055,11 +1280,6 @@ def get_bar_writer() -> BarWriter:
     ran, which is every test that does not enter `TestClient` as a context manager.
     """
     writer = getattr(app.state, "writer", None)
-    if writer is None:
-        raise HTTPException(
-            status_code=503,
-            detail="the engine has no bar writer; recording state is unknown",
-        )
     return writer
 
 
@@ -1201,6 +1421,16 @@ def get_feed_cache() -> FeedConnectionCache | None:
     a process whose lifespan never ran has no cache to read, and `/ws/chain` simply
     sends no `feed` message rather than raising — see `live_chain`."""
     return getattr(app.state, "feed_cache", None)
+
+
+def get_store_cache() -> StoreStateCache | None:
+    """The split process's cached `store.state`, or none in the monolith."""
+    return getattr(app.state, "store_cache", None)
+
+
+def get_event_bus() -> Any:
+    """The process bus used by the split recording command route."""
+    return getattr(app.state, "events", None)
 
 
 @app.get("/health", response_model=HealthReport)
@@ -1774,12 +2004,47 @@ def _recording_state(writer: BarWriter) -> RecordingState:
         recording=writer.recording,
         buffered_rows=sum(store.buffered for store in writer.stores),
         rows_written=sum(store.rows_written for store in writer.stores),
+        state_age_seconds=None,
     )
+
+
+def _store_recording_state(event: StoreState, age: float) -> RecordingState:
+    return RecordingState(
+        recording=event.recording,
+        buffered_rows=event.buffered_rows,
+        rows_written=event.rows_written,
+        state_age_seconds=age,
+    )
+
+
+def _split_recording_state(cache: StoreStateCache | None) -> RecordingState:
+    if cache is None:
+        raise HTTPException(
+            status_code=503,
+            detail="the engine has no bar writer; recording state is unknown",
+        )
+    latest = cache.latest()
+    if latest is None:
+        raise HTTPException(
+            status_code=503,
+            detail="the store has not reported its recording state",
+        )
+    event, age = latest
+    if age > STORE_STATE_STALE_SECONDS:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"the store state is {age:.3f} seconds old, older than the "
+                f"{STORE_STATE_STALE_SECONDS:.3f}-second freshness bound"
+            ),
+        )
+    return _store_recording_state(event, age)
 
 
 @app.get("/recording", response_model=RecordingState)
 def recording_state(
-    writer: Annotated[BarWriter, Depends(get_bar_writer)],
+    writer: Annotated[Any, Depends(get_bar_writer)],
+    store_cache: Annotated[StoreStateCache | None, Depends(get_store_cache)],
 ) -> RecordingState:
     """Whether the store is writing, read from the engine. `docs/recording-contract.md`.
 
@@ -1788,13 +2053,22 @@ def recording_state(
     writing, and a reader arriving on a fresh page is told the truth rather than a
     default.
     """
-    return _recording_state(writer)
+    if writer is not None:
+        return _recording_state(writer)
+    if selected_bus() == REDIS_BUS:
+        return _split_recording_state(store_cache)
+    raise HTTPException(
+        status_code=503,
+        detail="the engine has no bar writer; recording state is unknown",
+    )
 
 
 @app.post("/recording", response_model=RecordingState)
 async def set_recording(
     body: RecordingRequest,
-    writer: Annotated[BarWriter, Depends(get_bar_writer)],
+    writer: Annotated[Any, Depends(get_bar_writer)],
+    store_cache: Annotated[StoreStateCache | None, Depends(get_store_cache)],
+    events: Annotated[Any, Depends(get_event_bus)],
 ) -> RecordingState:
     """Stop or start the store. **The engine's only mutating route.**
 
@@ -1811,8 +2085,55 @@ async def set_recording(
     left unexamined: anything that can reach the port, and the port is loopback.
     Authentication is named there and not built.
     """
-    await writer.set_recording(body.recording)
-    return _recording_state(writer)
+    if writer is not None:
+        await writer.set_recording(body.recording)
+        return _recording_state(writer)
+    if selected_bus() != REDIS_BUS or store_cache is None or events is None:
+        raise HTTPException(
+            status_code=503,
+            detail="the engine has no bar writer; recording state is unknown",
+        )
+
+    requested = body.recording
+    adapter = getattr(getattr(events, "config", None), "venue", "DELTA")
+    command = ControlCommand(
+        source="operator",
+        ts_received=_utc_now(),
+        adapter=adapter,
+        command="resume" if requested else "pause",
+        target="store",
+    )
+    after = store_cache.generation
+    cached = store_cache.latest()
+    events.publish(command)
+
+    latest = store_cache.latest()
+    if cached is not None and cached[0].recording is requested:
+        return _store_recording_state(*cached)
+    if latest is not None and latest[0].recording is requested:
+        return _store_recording_state(*latest)
+
+    async def wait_for_ack() -> RecordingState:
+        nonlocal after
+        while True:
+            await store_cache.wait_for_generation(after)
+            latest = store_cache.latest()
+            if latest is not None and latest[0].recording is requested:
+                return _store_recording_state(*latest)
+            after = store_cache.generation
+
+    try:
+        return await asyncio.wait_for(
+            wait_for_ack(), timeout=STORE_COMMAND_ACK_TIMEOUT_SECONDS
+        )
+    except TimeoutError as error:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"the store did not acknowledge recording={str(requested).lower()} "
+                f"within {STORE_COMMAND_ACK_TIMEOUT_SECONDS:.1f} seconds"
+            ),
+        ) from error
 
 
 #: Second precision, `Z`-suffixed — `chain.py`'s `fetched_at` spelling, and now `feed`'s

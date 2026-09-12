@@ -30,12 +30,21 @@ from deltapayoff.bars import (
     _parse_symbol,
     _to_utc,
     computed_ticks_from_chain,
+    computed_ticks_from_event,
     samples_from_reference,
     spot_from_index,
     tick_from_option_quote,
 )
 from deltapayoff.compute import MODEL_VERSION, NO_QUOTE
-from deltapayoff.events import IndexQuote, Instrument, OptionQuote, OptionReference
+from deltapayoff.events import (
+    ChainLeg,
+    ChainStrike,
+    ComputedChain,
+    IndexQuote,
+    Instrument,
+    OptionQuote,
+    OptionReference,
+)
 from deltapayoff.models import ChainResponse, ChainRow, ComputedLeg, Leg
 from fakes.decoder import events_from_frame
 
@@ -253,6 +262,35 @@ def test_a_tick_arriving_after_its_bar_was_sealed_is_counted_and_discarded() -> 
     assert aggregator.stats()["late"] == 1
     assert aggregator.seal(wall_after(2)) == [], "the sealed minute reopened"
     assert aggregator.flush() == [], "the late tick was kept somewhere"
+
+
+def test_a_restored_watermark_counts_replayed_ticks_separately_from_late_ticks() -> None:
+    aggregator = BarAggregator()
+    restored = MINUTE_US + 30 * SECOND_US
+
+    aggregator.restore(restored)
+    aggregator.add(at(10.0, 70.0, 72.0))
+    aggregator.add(at(10.0, 71.0, 73.0, minute=1))
+
+    stats = aggregator.stats()
+    assert stats["already_flushed"] == 1
+    assert stats["late"] == 0
+    assert stats["ticks"] == 1
+    assert aggregator._sealed_through_us == restored
+    assert aggregator.seal((MINUTE_US + 1) / 1e6) == []
+    assert aggregator._sealed_through_us == restored
+
+
+def test_restore_refuses_an_open_or_already_restored_aggregator() -> None:
+    open_aggregator = BarAggregator()
+    open_aggregator.add(at(1.0, 70.0, 72.0))
+    with pytest.raises(RuntimeError, match="BarAggregator"):
+        open_aggregator.restore(MINUTE_US)
+
+    restored = BarAggregator()
+    restored.restore(MINUTE_US)
+    with pytest.raises(RuntimeError, match="BarAggregator"):
+        restored.restore(MINUTE_US + MINUTE)
 
 
 def test_the_watermark_advances_over_a_minute_that_was_never_open() -> None:
@@ -1147,6 +1185,44 @@ def enriched_chain(
         years_to_expiry=0.00114155,
         forward_method="F1+assumed-rate",
     )
+
+
+def test_a_computed_chain_event_flattens_each_present_leg_without_using_local_model(
+) -> None:
+    fetched_at = datetime.fromtimestamp(
+        (MINUTE_US + 30 * SECOND_US) / 1e6, tz=timezone.utc
+    ).replace(microsecond=999999)
+    event = ComputedChain(
+        source="chain-cache",
+        ts_received=fetched_at,
+        underlying="BTC",
+        expiry=datetime(2026, 9, 4, tzinfo=timezone.utc).date(),
+        fetched_at=fetched_at,
+        forward=None,
+        discount=None,
+        years_to_expiry=None,
+        forward_method=None,
+        model_version="api-model",
+        solver="S1-newton",
+        strikes=(
+            ChainStrike(
+                strike=77600,
+                call=ChainLeg(
+                    symbol="C-BTC-77600-040926",
+                    iv=None,
+                    iv_leg="call",
+                    iv_reason="no quote",
+                )
+            ),
+        ),
+    )
+
+    [tick] = computed_ticks_from_event(event)
+    assert tick.symbol == "C-BTC-77600-040926"
+    assert tick.exchange_us == MINUTE_US + 30 * SECOND_US
+    assert tick.iv is None
+    assert tick.iv_reason == "no quote"
+    assert tick.model_version == "api-model"
 
 
 def test_an_enriched_chain_flattens_to_one_tick_per_listed_leg() -> None:

@@ -151,6 +151,8 @@ class FeedSupervisor:
 
     def dispatch_command(self, event: ControlCommand) -> bool:
         """Apply a command that has already been published to every controller."""
+        if event.target != "feed":
+            return False
         accepted = False
         for controller in self._controllers:
             accepted = controller.command(event) or accepted

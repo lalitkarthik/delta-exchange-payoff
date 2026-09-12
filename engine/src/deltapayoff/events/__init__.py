@@ -16,6 +16,7 @@ from .bus import Bus
 from .catalogue import (
     Alert,
     BarTable,
+    ChainLeg,
     ChainStrike,
     ComputedChain,
     ConnectionState,
@@ -26,6 +27,7 @@ from .catalogue import (
     OptionBar,
     OptionQuote,
     OptionReference,
+    StoreState,
 )
 from .envelope import (
     Event,
@@ -42,6 +44,7 @@ __all__ = [
     "Alert",
     "BarTable",
     "Bus",
+    "ChainLeg",
     "ChainStrike",
     "ComputedChain",
     "ConnectionState",
@@ -56,6 +59,7 @@ __all__ = [
     "OptionQuote",
     "OptionReference",
     "Right",
+    "StoreState",
     "UnknownEventType",
     "UnknownSchemaVersion",
     "format_strike",

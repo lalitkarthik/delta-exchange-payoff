@@ -38,8 +38,9 @@ from deltapayoff.events.redis_wire import (
     stream_type,
 )
 
-# The nine built samples, one per catalogued type, live beside the catalogue's own tests.
-# Imported rather than restated so a tenth event type has exactly one place to be sampled.
+# The ten built samples, one per catalogued type, live beside the catalogue's own tests.
+# Imported rather than restated so an eleventh event type has exactly one place to be
+# sampled.
 from test_events import SAMPLES
 
 TS_RECEIVED = datetime(2026, 6, 1, 12, 0, 0, 212600, tzinfo=timezone.utc)
@@ -142,7 +143,7 @@ def test_stream_type_reads_the_event_type_from_the_first_section(
 def test_stream_names_do_not_include_an_environment_section() -> None:
     keys = stream_names(venues=("DELTA",), underlyings=("BTC", "ETH"))
 
-    assert len(keys) == 14
+    assert len(keys) == 15
     assert not any(key.startswith(("dev:", "prod:")) for key in keys)
     assert all(key.count(":") <= 2 for key in keys)
 
@@ -166,6 +167,7 @@ def test_stream_mismatch_reads_the_type_from_the_first_stream_section() -> None:
         ("heartbeat", "heartbeat:DELTA"),
         ("alert", "alert"),
         ("control.command", "control.command:DELTA"),
+        ("store.state", "store.state:DELTA"),
     ],
 )
 def test_each_event_lands_on_the_key_the_nomenclature_names(
@@ -199,7 +201,7 @@ def test_the_configured_key_list_is_the_fourteen_and_is_never_discovered() -> No
     """
     keys = stream_names(venues=("DELTA",), underlyings=("BTC", "ETH"))
 
-    assert len(keys) == 14
+    assert len(keys) == 15
     assert "md.option_quote:DELTA:ETH" in keys
     assert "alert" in keys
     assert "control.command:DELTA" in keys

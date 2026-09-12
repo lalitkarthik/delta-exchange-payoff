@@ -1,7 +1,8 @@
 """Every `event` name any part of the engine logs. One place, so a name cannot drift.
 
-`docs/design/lld/logging.md` documents each one in prose; `tests/test_logging.py`
-asserts the two lists are the same set. Add a name here and to that document together,
+`docs/design/lld/logging-catalogue.md` documents each one in prose;
+`tests/test_logging.py` asserts the two lists are the same set. Add a name here and to
+that document together,
 or the test fails — that is the whole mechanism that keeps the document true.
 
 `logging_setup.log_event` refuses an event not in `ALL`, so a call site cannot reach a
@@ -30,6 +31,11 @@ FEED_INSTRUMENTS = "feed.instruments"
 #: A `store.BarStore.flush()` wrote a file. Info, with the table, the rows, the file and
 #: the time it took — the numbers an operator wants after the three-day hole.
 STORE_FLUSH = "store.flush"
+#: A saved stream position had entries trimmed before it. Error, with both positions
+#: and the exact number of entries that cannot be replayed.
+STORE_REPLAY_GAP = "store.replay_gap"
+#: A generation's files and checkpoint became durable. Info, once per committed flush.
+STORE_CHECKPOINT = "store.checkpoint"
 #: A record was dropped off a **lossless** subscription. Error: `fanout.py` documents
 #: this as impossible by construction, and a guard that never fires is cheap insurance
 #: against the day the construction changes.
@@ -57,7 +63,8 @@ BUS_SELECTED = "bus.selected"
 #: Always error or worse; never on a path this project expects to take.
 ENGINE_ERROR = "engine.error"
 
-#: Every name above, and the thing `docs/design/lld/logging.md` is checked against.
+#: Every name above, and the thing `docs/design/lld/logging-catalogue.md` is checked
+#: against.
 ALL = frozenset(
     {
         FEED_TRANSITION,
@@ -65,6 +72,8 @@ ALL = frozenset(
         FEED_RECONNECT,
         FEED_INSTRUMENTS,
         STORE_FLUSH,
+        STORE_REPLAY_GAP,
+        STORE_CHECKPOINT,
         QUEUE_DROP,
         COMPUTE_RECOMPUTE_SET,
         WS_CLIENT_ATTACH,

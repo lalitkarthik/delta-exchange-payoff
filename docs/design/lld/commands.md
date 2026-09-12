@@ -38,6 +38,31 @@ and a spent reconnect budget — the loudest failure this engine has. So `reason
 `models.AdapterHealth` gains a `reason` field so `/health` carries it too. Adding an
 optional field with a default is compatible, so no `schema_version` moves.
 
+## 2.1 A fourth thing an operator can tell, and a second target
+
+`ControlCommand` gains `target: "feed" | "store"`, defaulting to `"feed"`; the wire, stream
+and grammar remain unchanged and `schema_version` stays `1`.
+
+| Target | Command | Result |
+|---|---|---|
+| `feed` | `pause` | the existing venue pause |
+| `feed` | `resume` | the existing venue resume |
+| `feed` | `reconnect` | the existing commanded reconnect |
+| `store` | `pause` / `resume` | the recording toggle |
+| `store` | `reconnect` | refused by the model at construction |
+
+A separate `store.command` event type on its own stream would make the misroute impossible by
+construction rather than merely tested, and it was not taken because #63 settles that the
+toggle becomes a `control.command`.
+
+The API publishes the store command; `store-control` receives it, the store applies it at its
+next drained point, checkpoints and publishes `store.state`; the API cache observes that
+state to complete the request. `FeedSupervisor.dispatch_command` drops anything not targeted
+at the feed. Without this guard, a recording pause addressed to `DELTA` would pause the venue
+connection. The filter belongs there because it is the single path to a controller.
+`tests/test_commands.py` pins that a store pause moves no controller and produces no
+`feed.connection`.
+
 ## 3. Delivery depends on the bus mode
 
 The route answers only after the command has an acknowledged state. The path that gets to
@@ -151,27 +176,9 @@ anything that can reach the port, and the port is loopback.
 
 ## 7. What was observed live
 
-**`measured`, run `2026-09-08T05:09Z`**, engine on port 8010 against
-`api.india.delta.exchange` with `DELTA_LIVE_FEED=1`, the web app on port 3000 pointed at
-it with `NEXT_PUBLIC_ENGINE_URL`, one browser on the BTC ladder. `feed` messages off
-`/ws/chain`, and the two commands sent with `curl`:
-
-| t | `feed` message | |
-|---|---|---|
-| +0.03 s | `connected` / `open` | no badge |
-| +3.55 s | `stopped` / `paused` | **badge appears**, `feed stopped`, hover `paused` |
-| +33.40 s | `connecting` / `resume` | badge follows |
-| +34.43 s | `connected` / `open` | **badge clears**, ladder moves again |
-
-Across the thirty seconds paused, `/health` held `stopped` / `paused` with
-`budget_remaining` **10 of 10**, `reconnects` unmoved and `transitions` frozen — no
-flapping, no alert, nothing spent. The resume dialled and was `connected` in **1.03 s**.
-
-**This closes #40's one unticked acceptance line.** That ticket could not disable the
-engine's outbound leg without touching firewall settings and said so; `pause` is the lever
-it was waiting for. The browser's own connection chip read `live` throughout, beside a
-badge saying the venue feed was not — the two-independent-indicators case the badge exists
-for, observed a second time.
+`measured`, run `2026-09-08T05:09Z`: a commanded pause held `stopped` / `paused` with
+`budget_remaining` 10 of 10, and resume reached `connected` in 1.03 s. The badge and
+controller remained independent, as required by #40.
 
 ## 8. The seam the tests drive
 

@@ -46,7 +46,7 @@ from deltapayoff.events import (
 )
 from deltapayoff.events.redis_wire import stream_name
 from deltapayoff.fanout import FanOut
-from deltapayoff.redis_bus import BusConfig, BusUnavailable, RedisBus
+from deltapayoff.redis_bus import BusConfig, BusUnavailable, Position, RedisBus, Span
 
 TS = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 INSTRUMENT = Instrument(
@@ -56,6 +56,9 @@ INSTRUMENT = Instrument(
     strike=Decimal("60000"),
     right=Right.CALL,
     venue_symbol="C-BTC-60000-270626",
+)
+ETH_INSTRUMENT = INSTRUMENT.model_copy(
+    update={"underlying": "ETH", "venue_symbol": "C-ETH-60000-270626"}
 )
 
 #: A fixed instant, so the trim floor a test asserts against is arithmetic rather than
@@ -68,6 +71,11 @@ def quote(bid: float) -> OptionQuote:
     """One `md.option_quote`, distinguishable by its bid. The hot event type, so the
     contract is proven on the stream that actually carries 1,537 messages a second."""
     return OptionQuote(source="delta", ts_received=TS, instrument=INSTRUMENT, bid=bid)
+
+
+def quote_on(underlying: str, bid: float) -> OptionQuote:
+    instrument = INSTRUMENT if underlying == "BTC" else ETH_INSTRUMENT
+    return OptionQuote(source="delta", ts_received=TS, instrument=instrument, bid=bid)
 
 
 def run(coro):
@@ -147,7 +155,13 @@ async def until(predicate, timeout: float = 10.0, what: str = "") -> None:
 
 
 @asynccontextmanager
-async def open_bus(kind: str, url: str | None, clock=lambda: NOW):
+async def open_bus(
+    kind: str,
+    url: str | None,
+    clock=lambda: NOW,
+    *,
+    read_count: int = 500,
+):
     """A started bus of the kind under test, and its keys removed afterwards.
 
     Every Redis run deletes its configured streams before closing, so two tests on one
@@ -164,6 +178,7 @@ async def open_bus(kind: str, url: str | None, clock=lambda: NOW):
         # assertion still goes through an explicit `flush()`.
         batch_ms=5,
         read_block_ms=20,
+        read_count=read_count,
     )
     factory = _fake_client if kind == "redis-fake" else None
     bus = RedisBus(config, client_factory=factory, clock=clock)
@@ -460,6 +475,60 @@ def test_two_consumers_in_two_groups_each_receive_every_entry(redis_kind) -> Non
     assert api_bids == [float(n) for n in range(20)]
 
 
+def test_subscribe_rejects_removed_scalar_start_id(redis_kind) -> None:
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            with pytest.raises(TypeError):
+                bus.subscribe("store", maxsize=10, lossless=True, start_id="1-0")
+
+    run(scenario())
+
+
+def test_lossless_replay_uses_a_saved_position_per_stream(redis_kind) -> None:
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            first = bus.subscribe("store", maxsize=500, lossless=True)
+            await live(bus)
+            for n in range(3):
+                bus.publish(quote_on("BTC", float(n)))
+            for n in range(2):
+                bus.publish(quote_on("ETH", float(10 + n)))
+            await settle(bus)
+            await take(first, 5)
+            keys = {
+                "BTC": stream_name(quote_on("BTC", 0)),
+                "ETH": stream_name(quote_on("ETH", 0)),
+            }
+            saved = {underlying: first.positions[key] for underlying, key in keys.items()}
+
+            for n in range(3, 5):
+                bus.publish(quote_on("BTC", float(n)))
+            for n in range(12, 15):
+                bus.publish(quote_on("ETH", float(n)))
+            await settle(bus)
+            await take(first, 5)
+            bus.unsubscribe(first)
+
+            restarted = bus.subscribe(
+                "store",
+                maxsize=500,
+                lossless=True,
+                start_ids={key: saved[underlying] for underlying, key in keys.items()},
+            )
+            await live(bus)
+            replayed = await take(restarted, 5)
+            return keys, saved, restarted, replayed
+
+    keys, saved, restarted, replayed = run(scenario())
+    assert sorted(event.bid for event in replayed) == [3.0, 4.0, 12.0, 13.0, 14.0]
+    assert restarted.positions[keys["BTC"]].index == saved["BTC"].index + 2
+    assert restarted.positions[keys["ETH"]].index == saved["ETH"].index + 3
+
+
 def test_a_restarted_reader_replays_from_the_id_it_last_flushed(redis_kind) -> None:
     """The five-minute loss window #57 names, closed.
 
@@ -500,7 +569,10 @@ def test_a_restarted_reader_replays_from_the_id_it_last_flushed(redis_kind) -> N
             await settle(bus)
 
             restarted = bus.subscribe(
-                "store", maxsize=500, lossless=True, start_id=flushed_id
+                "store",
+                maxsize=500,
+                lossless=True,
+                start_ids={key: Position(flushed_id, writer.positions[key].index)},
             )
             await live(bus)
             return [event.bid for event in await take(restarted, 10)]
@@ -509,6 +581,331 @@ def test_a_restarted_reader_replays_from_the_id_it_last_flushed(redis_kind) -> N
     # Five replayed — 5..9, the ones acked but not flushed — then the five that arrived
     # while nothing was reading. Nothing lost and nothing before the flush repeated.
     assert bids == [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]
+
+
+def test_a_configured_stream_missing_from_saved_positions_starts_at_the_group_start(
+    redis_kind,
+) -> None:
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            key = stream_name(quote_on("ETH", 0.0))
+            for n in range(3):
+                bus.publish(quote_on("ETH", float(n)))
+            await settle(bus)
+            restarted = bus.subscribe(
+                "new-store",
+                maxsize=100,
+                lossless=True,
+                start_ids={
+                    stream_name(quote_on("BTC", 0.0)): Position("0-0", 0)
+                },
+                group_start="0",
+            )
+            await live(bus)
+            return key, [event.bid for event in await take(restarted, 3)]
+
+    key, bids = run(scenario())
+    assert key.endswith(":ETH")
+    assert bids == [0.0, 1.0, 2.0]
+
+
+def test_replay_positions_keep_the_saved_index_and_count_every_stream_entry(redis_kind):
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            first = bus.subscribe("store", maxsize=100, lossless=True)
+            await live(bus)
+            key = stream_name(quote_on("BTC", 0.0))
+            for n in range(5):
+                bus.publish(quote_on("BTC", float(n)))
+            await settle(bus)
+            await take(first, 5)
+            saved = first.positions[key]
+            bus.unsubscribe(first)
+            for n in range(5, 8):
+                bus.publish(quote_on("BTC", float(n)))
+            await settle(bus)
+            restarted = bus.subscribe(
+                "store",
+                maxsize=100,
+                lossless=True,
+                start_ids={key: saved},
+            )
+            await live(bus)
+            await take(restarted, 3)
+            return saved.index, restarted.positions[key].index
+
+    saved_index, current_index = run(scenario())
+    assert current_index == saved_index + 3
+
+
+def test_a_pause_span_withholds_its_replay_range_but_not_the_entries_outside_it(
+    redis_kind,
+):
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            first = bus.subscribe("store", maxsize=100, lossless=True)
+            await live(bus)
+            key = stream_name(quote(0.0))
+            bus.publish(quote(0.0))
+            await settle(bus)
+            await take(first, 1)
+            saved = first.positions[key]
+            for n in range(1, 5):
+                bus.publish(quote(float(n)))
+            await settle(bus)
+            await take(first, 4)
+            end = first.last_ids[key]
+            bus.unsubscribe(first)
+            restarted = bus.subscribe(
+                "store",
+                maxsize=100,
+                lossless=True,
+                start_ids={key: saved},
+                skip=(Span({key: saved.id}, {key: end}),),
+            )
+            await live(bus)
+            await until(lambda: not restarted.behind[key], what="replay completed")
+            bus.publish(quote(5.0))
+            await settle(bus)
+            replayed = await take(restarted, 1)
+            return replayed[0].bid, restarted.span_dropped, restarted.positions[key]
+
+    bid, dropped, position = run(scenario())
+    assert bid == 5.0
+    assert dropped == 4
+    assert position.index == 6
+
+
+def test_a_pause_span_on_one_stream_does_not_withhold_the_other(redis_kind):
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            first = bus.subscribe("store", maxsize=100, lossless=True)
+            await live(bus)
+            btc_key = stream_name(quote_on("BTC", 0.0))
+            eth_key = stream_name(quote_on("ETH", 0.0))
+            bus.publish(quote_on("BTC", 0.0))
+            bus.publish(quote_on("ETH", 0.0))
+            await settle(bus)
+            await take(first, 2)
+            saved = {btc_key: first.positions[btc_key], eth_key: first.positions[eth_key]}
+            bus.publish(quote_on("BTC", 1.0))
+            bus.publish(quote_on("ETH", 1.0))
+            await settle(bus)
+            await take(first, 2)
+            bus.unsubscribe(first)
+            restarted = bus.subscribe(
+                "store",
+                maxsize=100,
+                lossless=True,
+                start_ids=saved,
+                skip=(Span({btc_key: saved[btc_key].id}, None),),
+            )
+            await live(bus)
+            await until(
+                lambda: not restarted.behind[btc_key], what="BTC replay completed"
+            )
+            return (
+                [event.bid for event in await take(restarted, 1)],
+                restarted.span_dropped,
+            )
+
+    bids, dropped = run(scenario())
+    assert bids == [1.0]
+    assert dropped == 1
+
+
+def test_replay_gaps_reports_exact_trimmed_loss(redis_kind):
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            first = bus.subscribe("store", maxsize=100, lossless=True)
+            await live(bus)
+            key = stream_name(quote(0.0))
+            for n in range(10):
+                bus.publish(quote(float(n)))
+            await settle(bus)
+            await take(first, 10)
+            saved = first.positions[key]
+            await bus.client.xtrim(key, maxlen=5, approximate=False)
+            bus.unsubscribe(first)
+            restarted = bus.subscribe(
+                "store", maxsize=100, lossless=True, start_ids={key: saved}
+            )
+            await live(bus)
+            gaps = await bus.replay_gaps(restarted, {key: saved})
+            return gaps[key]
+
+    gap = run(scenario())
+    assert gap.lost == 0
+    assert gap.trimmed == 5
+
+
+def test_replay_gaps_reports_loss_past_a_saved_index(redis_kind):
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            first = bus.subscribe("store", maxsize=100, lossless=True)
+            await live(bus)
+            key = stream_name(quote(0.0))
+            for n in range(10):
+                bus.publish(quote(float(n)))
+            await settle(bus)
+            entries = await bus.client.xrange(key)
+            saved = Position(entries[0][0].decode(), 1)
+            await take(first, 10)
+            await bus.client.xtrim(key, maxlen=5, approximate=False)
+            bus.unsubscribe(first)
+            restarted = bus.subscribe(
+                "store", maxsize=100, lossless=True, start_ids={key: saved}
+            )
+            await live(bus)
+            gaps = await bus.replay_gaps(restarted, {key: saved})
+            return gaps[key]
+
+    gap = run(scenario())
+    assert gap.lost == 4
+    assert gap.trimmed == 5
+    assert gap.first_retained_id is not None
+
+
+def test_replay_gaps_distinguishes_a_missing_group_and_an_empty_stream(redis_kind):
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            key = stream_name(quote(0.0))
+            bus.publish(quote(1.0))
+            await settle(bus)
+            saved = Position("0-0", 0)
+            missing = bus.subscribe(
+                "missing-group", maxsize=100, lossless=True, start_ids={key: saved}
+            )
+            await live(bus)
+            missing_gap = (await bus.replay_gaps(missing, {key: saved}))[key]
+
+            empty_key = stream_name(quote_on("ETH", 0.0))
+            existing_empty = bus.subscribe("empty-group", maxsize=100, lossless=True)
+            await live(bus)
+            bus.unsubscribe(existing_empty)
+            empty = bus.subscribe(
+                "empty-group",
+                maxsize=100,
+                lossless=True,
+                start_ids={empty_key: Position("0-0", 0)},
+            )
+            await live(bus)
+            empty_gap = (
+                await bus.replay_gaps(empty, {empty_key: Position("0-0", 0)})
+            )[empty_key]
+            missing_empty = bus.subscribe(
+                "missing-empty",
+                maxsize=100,
+                lossless=True,
+                start_ids={empty_key: Position("0-0", 0)},
+            )
+            await live(bus)
+            missing_empty_gap = (
+                await bus.replay_gaps(
+                    missing_empty, {empty_key: Position("0-0", 0)}
+                )
+            )[empty_key]
+            return missing_gap, empty_gap, missing_empty_gap
+
+    missing, empty, missing_empty = run(scenario())
+    assert missing.lost is None
+    assert empty.first_retained_id is None
+    assert empty.lost == 0
+    assert missing_empty.first_retained_id is None
+    assert missing_empty.lost is None
+
+
+def test_lossless_behind_clears_after_a_short_read(redis_kind):
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url, read_count=2) as bus:
+            subscription = bus.subscribe("behind", maxsize=100, lossless=True)
+            await live(bus)
+            key = stream_name(quote(0.0))
+            gate = asyncio.Event()
+            client = bus.client
+            assert client is not None
+            original = client.xreadgroup
+            calls = 0
+
+            async def blocked_second_read(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    await gate.wait()
+                return await original(*args, **kwargs)
+
+            client.xreadgroup = blocked_second_read
+            for n in range(3):
+                bus.publish(quote(float(n)))
+            await settle(bus)
+            await until(lambda: subscription.behind[key], what="full read marks behind")
+            assert subscription.behind_streams() == (key,)
+            await take(subscription, 2)
+            gate.set()
+            await take(subscription, 1)
+            await until(
+                lambda: not subscription.behind[key], what="short read clears behind"
+            )
+            return subscription.behind_streams()
+
+    assert run(scenario()) == ()
+
+
+def test_lossless_replay_is_behind_until_its_saved_range_is_drained(redis_kind):
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url, read_count=2) as bus:
+            first = bus.subscribe("store", maxsize=100, lossless=True)
+            await live(bus)
+            key = stream_name(quote(0.0))
+            for n in range(4):
+                bus.publish(quote(float(n)))
+            await settle(bus)
+            await take(first, 1)
+            saved = first.positions[key]
+            await take(first, 3)
+            bus.unsubscribe(first)
+            for n in range(4, 7):
+                bus.publish(quote(float(n)))
+            await settle(bus)
+            gate = asyncio.Event()
+            client = bus.client
+            assert client is not None
+            original = client.xread
+
+            async def blocked_xread(*args, **kwargs):
+                result = await original(*args, **kwargs)
+                await gate.wait()
+                return result
+
+            client.xread = blocked_xread
+            restarted = bus.subscribe(
+                "store", maxsize=100, lossless=True, start_ids={key: saved}
+            )
+            await until(lambda: restarted.behind[key], what="replay marks behind")
+            gate.set()
+            await live(bus)
+            await take(restarted, 3)
+            await until(lambda: not restarted.behind[key], what="replay clears behind")
+
+    run(scenario())
 
 
 def test_every_batch_write_trims_by_age_and_nothing_younger_goes(redis_kind) -> None:

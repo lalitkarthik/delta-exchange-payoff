@@ -1,4 +1,4 @@
-"""The nine events. Eight outbound from a producer to the bus, one inbound.
+"""The ten events. Nine outbound from a producer to the bus, one inbound.
 
 **This module is `docs/design/events.md` in code, field for field.** That document is the
 authority on the names and the directions; `tests/test_events.py` parses its section
@@ -26,7 +26,13 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from .envelope import Event, register
 from .instrument import strike_as_json_number
@@ -163,25 +169,14 @@ class OptionBar(Event):
     columns: dict[str, Any]
 
 
-class ChainStrike(BaseModel):
-    """Our numbers for one strike of one expiry.
-
-    `iv` is a property of the **strike** and not of a leg — put-call parity gives both
-    sides one volatility — so `iv_leg` names the side it was solved on. **`iv` is `null`
-    and never `0`**, and the greeks are null with it, because greeks at some default
-    volatility would be five plausible numbers describing nothing.
-    """
+class ChainLeg(BaseModel):
+    """Our numbers for one venue option leg at a strike."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    strike: Decimal
-    #: **`null` and never `0`.** A zero here would be a solved volatility of zero, which
-    #: is not a thing; unsolved is `None` with `iv_reason` saying why. Enforced rather
-    #: than asserted, because this is the catalogue's most repeated sentence.
+    symbol: str
     iv: float | None = None
-    #: `"call"` or `"put"` — the out-of-the-money side this strike's `iv` came from.
     iv_leg: str | None = None
-    #: Empty when solved. Otherwise the solver's own account of why it stopped.
     iv_reason: str = ""
     delta: float | None = None
     gamma: float | None = None
@@ -195,6 +190,22 @@ class ChainStrike(BaseModel):
         if value == 0:
             raise ValueError("iv is null and never 0; an unsolved strike carries None")
         return value
+
+
+class ChainStrike(BaseModel):
+    """Our numbers for one strike of one expiry.
+
+    `iv` is a property of the **strike** and not of a leg — put-call parity gives both
+    sides one volatility — so `iv_leg` names the side it was solved on. **`iv` is `null`
+    and never `0`**, and the greeks are null with it, because greeks at some default
+    volatility would be five plausible numbers describing nothing.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    strike: Decimal
+    call: ChainLeg | None = None
+    put: ChainLeg | None = None
 
     @field_serializer("strike", when_used="json")
     def _serialise_strike(self, strike: Decimal) -> int | float:
@@ -210,19 +221,45 @@ class ComputedChain(Event):
     """
 
     type: Literal["computed.chain"] = "computed.chain"
+    schema_version: int = 2
     instrument: None = None
     underlying: str
     expiry: date
     forward: float | None = None
     discount: float | None = None
     #: How the forward was arrived at — fitted, or a borrowed constant saying so.
-    forward_method: str
-    years_to_expiry: float
+    forward_method: str | None = None
+    years_to_expiry: float | None = None
+    fetched_at: datetime
     #: The whole model stamp, as `compute.MODEL_VERSION` writes it into table C.
     model_version: str
     #: The solver inside that stamp, named on its own so a consumer need not split it.
     solver: str
     strikes: tuple[ChainStrike, ...] = ()
+
+    @field_validator("fetched_at")
+    @classmethod
+    def _refuse_a_naive_fetched_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "fetched_at carries no timezone; a stamp is aware or it is not a stamp"
+            )
+        return value
+
+
+@register
+class StoreState(Event):
+    """`store.state` â€” the venue-scoped state published by the store process."""
+
+    type: Literal["store.state"] = "store.state"
+    instrument: None = None
+    recording: bool
+    buffered_rows: int
+    rows_written: int
+    replay_gap_entries: int = 0
+    already_flushed: int = 0
+    flush_errors: int = 0
+    generation: int = 0
 
 
 @register
@@ -285,3 +322,10 @@ class ControlCommand(Event):
     type: Literal["control.command"] = "control.command"
     adapter: str
     command: Literal["pause", "resume", "reconnect"]
+    target: Literal["feed", "store"] = "feed"
+
+    @model_validator(mode="after")
+    def _refuse_store_reconnect(self) -> ControlCommand:
+        if self.target == "store" and self.command == "reconnect":
+            raise ValueError("reconnect is feed-only; target='store' is invalid")
+        return self

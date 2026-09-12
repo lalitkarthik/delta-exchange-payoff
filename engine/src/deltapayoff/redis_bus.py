@@ -45,7 +45,7 @@ import contextlib
 import logging
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -106,6 +106,37 @@ DEFAULT_MAX_OUTBOX = 200_000
 
 class BusUnavailable(RuntimeError):
     """Configured for Redis, and Redis did not answer. Fatal at start-up, by design."""
+
+
+@dataclass(frozen=True, slots=True)
+class Position:
+    """A stream id together with the ordinal at which the id was observed."""
+
+    id: str
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise ValueError(f"position index must not be negative: {self.index}")
+
+
+@dataclass(frozen=True, slots=True)
+class Span:
+    """A recorded pause boundary, exclusive at the start and inclusive at the end."""
+
+    frm: Mapping[str, str]
+    to: Mapping[str, str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayGap:
+    """Facts about entries trimmed before a saved stream position."""
+
+    stream: str
+    saved_id: str
+    first_retained_id: str | None
+    lost: int | None
+    trimmed: int
 
 
 @dataclass(frozen=True)
@@ -194,14 +225,21 @@ class RedisSubscription(Subscription):
         "streams",
         "group",
         "consumer",
-        "start_id",
+        "start_ids",
+        "group_start",
+        "skip",
         "last_ids",
+        "positions",
+        "behind",
+        "span_dropped",
         "skipped",
         "resyncs",
         "undecodable",
         "positioned",
         "_delivered",
         "_baseline",
+        "_group_missing",
+        "_replaying",
     )
 
     def __init__(
@@ -212,7 +250,9 @@ class RedisSubscription(Subscription):
         *,
         streams: tuple[str, ...],
         consumer: str,
-        start_id: str | None,
+        start_ids: Mapping[str, Position] | None,
+        group_start: str,
+        skip: Sequence[Span],
     ) -> None:
         super().__init__(name, maxsize, lossless=lossless)
         self.streams = streams
@@ -220,10 +260,17 @@ class RedisSubscription(Subscription):
         #: in it: the key already carries both. Nomenclature §5.
         self.group = name
         self.consumer = consumer
-        self.start_id = start_id
+        self.start_ids = dict(start_ids or {})
+        self.group_start = group_start
+        self.skip = tuple(skip)
         #: The id of the last entry taken off each stream. What a consumer records at its
         #: flush and hands back as `start_id` after a restart.
         self.last_ids: dict[str, str] = {}
+        self.positions: dict[str, Position] = {
+            key: self.start_ids.get(key, Position("0-0", 0)) for key in streams
+        }
+        self.behind: dict[str, bool] = dict.fromkeys(streams, False)
+        self.span_dropped = 0
         #: Entries this reader never received, counted at the jump. **Redis trims
         #: silently and ours never has.** Always zero on a lossless subscription.
         self.skipped = 0
@@ -239,6 +286,12 @@ class RedisSubscription(Subscription):
         self.positioned = asyncio.Event()
         self._delivered: dict[str, int] = dict.fromkeys(streams, 0)
         self._baseline: dict[str, int] = dict.fromkeys(streams, 0)
+        self._group_missing: set[str] = set()
+        self._replaying: set[str] = set()
+
+    def behind_streams(self) -> tuple[str, ...]:
+        """Return configured streams whose reader still trails its log."""
+        return tuple(sorted(key for key, behind in self.behind.items() if behind))
 
 
 class RedisBus:
@@ -259,6 +312,7 @@ class RedisBus:
         self._client: Any = None
         self._subscriptions: dict[str, RedisSubscription] = {}
         self._readers: dict[str, asyncio.Task] = {}
+        self._prepared_groups: dict[str, set[str]] = {}
         self._outbox: list[tuple[str, dict[str, bytes]]] = []
         self._flusher: asyncio.Task | None = None
         self._flushing = asyncio.Lock()
@@ -392,7 +446,9 @@ class RedisBus:
         maxsize: int,
         lossless: bool = False,
         *,
-        start_id: str | None = None,
+        start_ids: Mapping[str, Position] | None = None,
+        group_start: str = "0",
+        skip: Sequence[Span] = (),
         event_types: Iterable[str] | None = None,
     ) -> RedisSubscription:
         """Register a consumer, exactly as the fan-out does, plus one keyword.
@@ -409,6 +465,10 @@ class RedisBus:
             raise ValueError(f"maxsize must be at least 1; got {maxsize}")
         if name in self._subscriptions:
             raise ValueError(f"a subscriber named {name!r} already exists")
+        if group_start not in {"0", "$"}:
+            raise ValueError(f"group_start for {name!r} must be '0' or '$'")
+        if not lossless and (start_ids is not None or skip):
+            raise ValueError(f"{name!r} is not lossless; replay options are invalid")
         streams = self.config.streams()
         if event_types is not None:
             selected_types = tuple(event_types)
@@ -423,13 +483,28 @@ class RedisBus:
             streams = tuple(
                 stream for stream in streams if stream_type(stream) in selected_types
             )
+        selected_start_ids = {
+            key: position for key, position in (start_ids or {}).items() if key in streams
+        }
+        ignored = sorted(set(start_ids or {}) - set(selected_start_ids))
+        if ignored:
+            log_event(
+                logger,
+                logging.WARNING,
+                log_events.BUS_SELECTED,
+                "%r ignored saved positions for unconfigured streams: %s",
+                name,
+                ", ".join(ignored),
+            )
         subscription = RedisSubscription(
             name,
             maxsize,
             lossless,
             streams=streams,
             consumer=f"{name}-{self.config.instance}",
-            start_id=start_id,
+            start_ids=selected_start_ids,
+            group_start=group_start,
+            skip=skip,
         )
         self._subscriptions[name] = subscription
         if self._client is not None:
@@ -477,7 +552,7 @@ class RedisBus:
         """The connection, or `None` before `start()`. For tests and the measure tool."""
         return self._client
 
-    async def start(self) -> None:
+    async def start(self, *, start_readers: bool = True) -> None:
         """Dial, prove the connection, then start the flusher and every reader.
 
         **A publisher that cannot reach Redis fails here**, loudly and within the connect
@@ -505,11 +580,35 @@ class RedisBus:
 
         self._client = client
         self._flusher = asyncio.create_task(self._flush_forever(), name="bus-flush")
+        if start_readers:
+            await self.start_readers()
+
+    async def start_readers(self) -> None:
+        """Start subscriptions after a caller has prepared their replay cursors.
+
+        The store needs one small window between group creation and reader start: it asks
+        Redis how much of a saved position was trimmed, then adjusts the replay base index
+        before any entry can be delivered. Ordinary callers keep the original `start()`
+        behaviour, which calls this method immediately.
+        """
+        if self._client is None:
+            raise RuntimeError("start the Redis bus before starting its readers")
         for name, subscription in self._subscriptions.items():
-            self._readers[name] = asyncio.create_task(
-                self._read(subscription), name=f"bus-read-{name}"
-            )
+            if name not in self._readers:
+                self._readers[name] = asyncio.create_task(
+                    self._read(subscription), name=f"bus-read-{name}"
+                )
         await self.ready()
+
+    async def ensure_groups(self, subscription: RedisSubscription) -> None:
+        """Create or join a lossless subscription's groups without starting its reader."""
+        if self._client is None:
+            raise RuntimeError("start the Redis bus before ensuring consumer groups")
+        if not subscription.lossless:
+            raise ValueError(f"{subscription.name!r} is not lossless")
+        self._prepared_groups[subscription.name] = await self._ensure_group(
+            subscription
+        )
 
     async def ready(self) -> None:
         """Wait until every subscriber's reader has taken its starting position.
@@ -586,11 +685,12 @@ class RedisBus:
         """
         try:
             try:
-                existing = (
-                    await self._ensure_group(sub)
-                    if sub.lossless
-                    else await self._position_at_head(sub)
-                )
+                if sub.lossless:
+                    existing = self._prepared_groups.pop(sub.name, None)
+                    if existing is None:
+                        existing = await self._ensure_group(sub)
+                else:
+                    existing = await self._position_at_head(sub)
             finally:
                 # Set even on a failure: a reader that could not position is a logged
                 # error, and `ready()` must not hang the process waiting for one.
@@ -614,8 +714,7 @@ class RedisBus:
 
     async def _read_group(self, sub: RedisSubscription, existing: set[str]) -> None:
         """Lossless: a consumer group, acked on receipt, replayed from a recorded id."""
-        if sub.start_id:
-            await self._replay(sub, existing)
+        await self._replay(sub, existing)
 
         streams = dict.fromkeys(sub.streams, ">")
         while True:
@@ -627,17 +726,28 @@ class RedisBus:
                 block=self.config.read_block_ms or None,
             )
             if not got:
+                for key in sub.streams:
+                    sub.behind[key] = False
                 await asyncio.sleep(self.config.idle_sleep_seconds)
                 continue
             # **Acked on receipt, before the work.** The flush is the durability boundary,
             # not the read, so a per-message ack after the work would say nothing true.
             pipe = self._client.pipeline(transaction=False)
+            full_reads: dict[str, bool] = {}
+            returned = {_text(key) for key, entries in got if entries}
+            for key in sub.streams:
+                if key not in returned:
+                    sub.behind[key] = False
             for key, entries in got:
                 if entries:
                     pipe.xack(key, sub.group, *[entry_id for entry_id, _ in entries])
             await pipe.execute()
             for key, entries in got:
-                self._deliver(sub, _text(key), entries)
+                name = _text(key)
+                full_reads[name] = len(entries) >= self.config.read_count
+                self._deliver(sub, name, entries)
+            for key, is_full in full_reads.items():
+                sub.behind[key] = is_full
 
     async def _read_head(self, sub: RedisSubscription) -> None:
         """Drop-oldest: no group, everything a read gives, and a jump when far behind.
@@ -673,9 +783,15 @@ class RedisBus:
         """
         delivered = 0
         for entry_id, fields in entries:
-            sub.last_ids[key] = _text(entry_id)
+            entry_id = _text(entry_id)
+            sub.last_ids[key] = entry_id
+            previous = sub.positions.get(key, Position("0-0", 0))
+            sub.positions[key] = Position(entry_id, previous.index + 1)
             sub._delivered[key] = sub._delivered.get(key, 0) + 1
             delivered += 1
+            if _in_skip_span(sub, key, entry_id):
+                sub.span_dropped += 1
+                continue
             try:
                 sub.offer(decode(fields, stream=key))
             except Exception:
@@ -702,15 +818,29 @@ class RedisBus:
         import redis.exceptions
 
         existing: set[str] = set()
+        heads = (
+            await self._stream_heads(sub.streams) if sub.group_start == "$" else {}
+        )
         for key in sub.streams:
+            if key in sub.start_ids:
+                group_id = sub.start_ids[key].id
+            elif sub.group_start == "$":
+                group_id, added = heads.get(key, ("0-0", 0))
+                sub.positions[key] = Position(group_id, added)
+                sub.last_ids[key] = group_id
+            else:
+                group_id = "0"
             try:
                 await self._client.xgroup_create(
-                    key, sub.group, id="0", mkstream=True
+                    key, sub.group, id=group_id, mkstream=True
                 )
             except redis.exceptions.ResponseError as exc:
                 if "BUSYGROUP" not in str(exc):
                     raise
                 existing.add(key)
+            else:
+                if key in sub.start_ids:
+                    sub._group_missing.add(key)
         return existing
 
     async def _replay(self, sub: RedisSubscription, existing: set[str]) -> None:
@@ -720,15 +850,24 @@ class RedisBus:
         group's `>` covers everything after `last-delivered`. No gap, and no entry twice.
         """
         targets = await self._group_positions(sub, existing)
-        cursor = {key: sub.start_id or "0-0" for key in targets}
+        cursor = {key: sub.start_ids[key].id for key in targets if key in sub.start_ids}
+        sub._replaying.update(cursor)
+        for key in cursor:
+            sub.behind[key] = True
         while cursor:
             pending = {
                 key: at for key, at in cursor.items() if _id_before(at, targets[key])
             }
             if not pending:
+                for key in cursor:
+                    sub.behind[key] = False
+                    sub._replaying.discard(key)
                 return
             got = await self._client.xread(pending, count=self.config.read_count)
             if not got:
+                for key in cursor:
+                    sub.behind[key] = False
+                    sub._replaying.discard(key)
                 return
             for key, entries in got:
                 name = _text(key)
@@ -752,6 +891,39 @@ class RedisBus:
                 if _text(group.get("name")) == sub.group:
                     positions[key] = _text(group.get("last-delivered-id", "0-0"))
         return positions
+
+    async def replay_gaps(
+        self,
+        subscription: RedisSubscription,
+        start_ids: Mapping[str, Position],
+    ) -> dict[str, ReplayGap]:
+        """Report trimming facts for saved positions with one stream-info pipeline."""
+        keys = [key for key in subscription.streams if key in start_ids]
+        if not keys:
+            return {}
+        pipe = self._client.pipeline(transaction=False)
+        for key in keys:
+            pipe.xinfo_stream(key)
+        results = await pipe.execute(raise_on_error=False)
+        gaps: dict[str, ReplayGap] = {}
+        for key, info in zip(keys, results, strict=True):
+            saved = start_ids[key]
+            if not isinstance(info, dict):
+                gaps[key] = ReplayGap(key, saved.id, None, None, 0)
+                continue
+            added = int(_info_value(info, "entries-added", 0))
+            length = int(_info_value(info, "length", 0))
+            trimmed = max(0, added - length)
+            first = _info_value(info, "first-entry")
+            first_id = _text(first[0]) if first else None
+            if key in subscription._group_missing:
+                lost: int | None = None
+            elif first_id is None:
+                lost = 0
+            else:
+                lost = max(0, trimmed - saved.index)
+            gaps[key] = ReplayGap(key, saved.id, first_id, lost, trimmed)
+        return gaps
 
     async def _position_at_head(self, sub: RedisSubscription) -> set[str]:
         """Start at `$` — but as a **concrete id**, taken once.
@@ -826,8 +998,8 @@ class RedisBus:
                 heads[key] = ("0-0", 0)
                 continue
             heads[key] = (
-                _text(info.get("last-generated-id", "0-0")),
-                int(info.get("entries-added", 0)),
+                _text(_info_value(info, "last-generated-id", "0-0")),
+                int(_info_value(info, "entries-added", 0)),
             )
         return heads
 
@@ -843,10 +1015,29 @@ def _text(value: Any) -> str:
     return value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
 
 
+def _info_value(info: Mapping[Any, Any], key: str, default: Any = None) -> Any:
+    return info.get(key, info.get(key.encode(), default))
+
+
 def _id_before(left: str, right: str) -> bool:
     """Stream id ordering. `ms-seq`, both integers, and neither is a string comparison —
     `"9-0"` sorts after `"10-0"` as text and before it as an id."""
     return _id_parts(left) < _id_parts(right)
+
+
+def _in_skip_span(sub: RedisSubscription, key: str, entry_id: str) -> bool:
+    for span in sub.skip:
+        frm = span.frm.get(key)
+        if frm is None or not _id_before(frm, entry_id):
+            continue
+        if span.to is None:
+            if key in sub._replaying:
+                return True
+            continue
+        to = span.to.get(key)
+        if to is not None and not _id_before(to, entry_id):
+            return True
+    return False
 
 
 def _id_parts(entry_id: str) -> tuple[int, int]:
@@ -859,9 +1050,12 @@ __all__ = [
     "BusConfig",
     "BusUnavailable",
     "FANOUT_BUS",
+    "Position",
     "REDIS_BUS",
+    "ReplayGap",
     "RedisBus",
     "RedisSubscription",
+    "Span",
     "selected_bus",
     "trim_floor_ms",
 ]
