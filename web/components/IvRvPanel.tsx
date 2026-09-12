@@ -146,6 +146,26 @@ export default function IvRvPanel({ underlying }: { underlying: Underlying }) {
 
   const offered = series?.valid_intervals ?? bounds?.intervals ?? ["1m"];
 
+  /** MT54-06: the history-source caption, rendered only once a series has loaded.
+   * The engine supplies the counts; nothing here recounts a point. */
+  const sourceCaption = (() => {
+    if (!series) return null;
+    if (series.realised_source === "index-bars") {
+      return (
+        `RV: ${series.realised_points} plotted points from Delta’s .DEXBTUSD index ` +
+        `candles. IV: ${series.implied_points} plotted points from locally recorded ` +
+        `order books; Delta’s candle history has no IV or bid/ask, so IV cannot be ` +
+        `backfilled.`
+      );
+    }
+    return (
+      `RV: ${series.realised_points} plotted points from locally recorded spot-bars ` +
+      `because no index backfill is present. IV: ${series.implied_points} plotted ` +
+      `points from locally recorded order books; Delta’s candle history has no IV ` +
+      `or bid/ask, so IV cannot be backfilled.`
+    );
+  })();
+
   /** The one line of text that turns an invisible decision into a visible one. */
   const provenance = (() => {
     if (!series || series.points.length === 0) return null;
@@ -272,6 +292,9 @@ export default function IvRvPanel({ underlying }: { underlying: Underlying }) {
               <IvRvChart series={series} visible={visible} />
             </div>
             {provenance ? <p className="note ivr-provenance">{provenance}</p> : null}
+            {sourceCaption ? (
+              <p className="note ivr-provenance">{sourceCaption}</p>
+            ) : null}
           </>
         ) : null}
 

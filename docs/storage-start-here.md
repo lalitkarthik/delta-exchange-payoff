@@ -33,7 +33,7 @@ The folder names carry the date and the asset. A reader skips a day without open
 
 ---
 
-## The four tables
+## The five tables
 
 | Table | Holds | Columns |
 |---|---|---|
@@ -41,6 +41,7 @@ The folder names carry the date and the asset. A reader skips a day without open
 | **reference-bars** | mark, LTP, open interest, **Delta's** IV and Greeks | 28 |
 | **computed-bars** | **our** IV and **our** Greeks, plus the model stamp | 20 |
 | **spot-bars** | Spot, once a minute for the whole asset | 8 |
+| **index-bars** | Delta's own index candles, written only by a backfill job — never the engine | 6 |
 
 **Ours and theirs sit side by side. Ours are added, never substituted.** That is what makes any agreement between them evidence rather than construction.
 

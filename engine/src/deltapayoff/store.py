@@ -140,6 +140,16 @@ REFERENCE_DATASET = "reference-bars"
 SPOT_DATASET = "spot-bars"
 COMPUTED_DATASET = "computed-bars"
 
+#: `index-bars`, R1: **not** a fifth entry in `all_stores()`. The four tables above are
+#: what nightly compaction and `tools/migrate_store.py` keep in sync; this one is filled
+#: only by `tools/backfill_index_bars.py`, is born directly in the
+#: `underlying=.../date=.../` layout those tools migrated *to* rather than *from*, and is
+#: written in large backfill pages rather than five-minute flushes — so it has few files
+#: and nothing here to compact. Its `BarStore` is constructed where it is used (the
+#: backfill tool, and `main.StoreVolatilitySource`) rather than threaded through the
+#: four-store helpers.
+INDEX_DATASET = "index-bars"
+
 #: Every five minutes. This number **is** the crash-loss budget: the engine has no
 #: graceful stop, so whatever sits in the buffer when the process dies is gone. Five
 #: minutes rather than sixty because that loss has been paid three times in one day —
@@ -322,6 +332,20 @@ COMPUTED_SCHEMA: dict[str, Any] = {
     "years_to_expiry": pl.Float64,
     "forward_method": pl.Categorical,
     "model_version": pl.Categorical,
+}
+
+#: `index-bars`. **`symbol` is `String`, not `Categorical`** — unlike every other table's
+#: symbol column — because this store holds one backfilled index series at a time and a
+#: dictionary encoding earns nothing over a handful of distinct values repeated across a
+#: whole backfill; the schema is fixed here as the plain type the ticket specifies rather
+#: than copied from a table this one otherwise resembles.
+INDEX_SCHEMA: dict[str, Any] = {
+    "minute": pl.Datetime("us", "UTC"),
+    "symbol": pl.String,
+    "index_open": pl.Float64,
+    "index_high": pl.Float64,
+    "index_low": pl.Float64,
+    "index_close": pl.Float64,
 }
 
 #: The partition columns. They live in the directory names, not in the files, which is
@@ -1438,6 +1462,53 @@ def read_spot_bars(
             high=row["spot_high"],
             low=row["spot_low"],
             close=row["spot_close"],
+        )
+        for row in rows.iter_rows(named=True)
+    ]
+
+
+def read_index_bars(
+    store: BarStore,
+    underlying: str,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    symbol: str | None = None,
+) -> list[RvBar]:
+    """`index-bars` as the estimators' own bar type, ascending, gaps left as gaps.
+
+    The read side of R4: a row with any of the four prices null is **dropped, not
+    defaulted** — the same rule `read_spot_bars` applies to a null spot price, and for the
+    same reason. A bucket the venue did not return has no row at all, so there is nothing
+    here to drop *from*; dropping only guards against a partially-null row somehow
+    reaching this store, which nothing in `tools/backfill_index_bars.py` writes but which
+    this reader refuses to trust rather than to check.
+
+    `symbol` narrows to one series when the store ever holds more than one; omitted, every
+    symbol under `underlying` is returned, which is only ever sensible while exactly one
+    is backfilled.
+    """
+    frame = store.scan().filter(pl.col("underlying") == underlying)
+    if symbol is not None:
+        frame = frame.filter(pl.col("symbol") == symbol)
+    if start is not None:
+        frame = frame.filter(pl.col("minute") >= start)
+    if end is not None:
+        frame = frame.filter(pl.col("minute") <= end)
+
+    rows = (
+        frame.select("minute", "index_open", "index_high", "index_low", "index_close")
+        .drop_nulls()
+        .sort("minute")
+        .collect()
+    )
+    return [
+        RvBar(
+            at=row["minute"],
+            open=row["index_open"],
+            high=row["index_high"],
+            low=row["index_low"],
+            close=row["index_close"],
         )
         for row in rows.iter_rows(named=True)
     ]

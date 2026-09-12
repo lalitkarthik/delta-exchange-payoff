@@ -94,6 +94,14 @@ export interface VolatilitySeries {
   valid_intervals: string[];
   bounds: LookbackBounds;
   points: VolPoint[];
+  /** Which table the realised series in `points` was computed from. The engine
+   * chooses; this file never infers it from the rest of the payload. */
+  realised_source: "index-bars" | "spot-bars";
+  /** How many of `points` carry a usable realised figure — at least one requested
+   * estimator is non-null. Supplied by the engine; never recounted here. */
+  realised_points: number;
+  /** How many of `points` carry a non-null `iv`. Supplied by the engine. */
+  implied_points: number;
 }
 
 export interface BoundsResponse extends LookbackBounds {

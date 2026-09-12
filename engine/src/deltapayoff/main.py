@@ -93,12 +93,14 @@ from .models import (
     SmileResponse,
     WatchedPair,
 )
-from .realised_vol import ESTIMATORS
+from .realised_vol import ESTIMATORS, Bar
 from .redis_bus import REDIS_BUS, BusConfig, RedisBus, selected_bus
 from .smile import read_smile
 from .store import (
     COMPUTED_DATASET,
     COMPUTED_SCHEMA,
+    INDEX_DATASET,
+    INDEX_SCHEMA,
     REFERENCE_DATASET,
     REFERENCE_SCHEMA,
     SPOT_DATASET,
@@ -106,6 +108,7 @@ from .store import (
     BarStore,
     BarWriter,
     read_contract_ivs,
+    read_index_bars,
     read_spot_bars,
 )
 from .stream import ChainStream, recompute_every_minute, recompute_forever
@@ -1078,13 +1081,25 @@ def get_chain_stream() -> ChainStream:
     return app.state.stream
 
 
-class StoreVolatilitySource:
-    """The volatility screen's read path: two tables, read lazily, converted once.
+#: The venue symbol `StoreVolatilitySource.index_bars` is fixed to. #54 backfills one
+#: BTC index series; a second underlying's index bars are a later ticket's problem, not
+#: a parameter this route already has a use for.
+INDEX_SYMBOL = ".DEXBTUSD"
 
-    A named object rather than two loose calls so the whole of it can be replaced in a
-    test with something that holds bars in a list — `/volatility` must be exercised
-    without a Parquet tree, and the suite must not learn to build one to test a
-    query string.
+#: The two names `/volatility` and `/volatility/bounds` report in `realised_source`
+#: (MT54-04). Defined once, here, because `_select_realised_series` is the one place
+#: that chooses between them; `volatility_series` accepts whichever string it is given
+#: and does not choose one itself.
+INDEX_BARS_SOURCE = "index-bars"
+SPOT_BARS_SOURCE = "spot-bars"
+
+
+class StoreVolatilitySource:
+    """The volatility screen's read path: three tables, read lazily, converted once.
+
+    A named object rather than loose calls so the whole of it can be replaced in a test
+    with something that holds bars in a list — `/volatility` must be exercised without a
+    Parquet tree, and the suite must not learn to build one to test a query string.
     """
 
     def __init__(self, root: Any = None) -> None:
@@ -1092,9 +1107,16 @@ class StoreVolatilitySource:
         self.computed = BarStore(
             root, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA
         )
+        # R1: `index-bars` is not part of `all_stores()`, so its `BarStore` is built
+        # here, where it is read, rather than threaded through the four-store helpers
+        # every live table shares.
+        self.index = BarStore(root, dataset=INDEX_DATASET, schema=INDEX_SCHEMA)
 
     def spot_bars(self, underlying: str, **kwargs: Any) -> Any:
         return read_spot_bars(self.spot, underlying, **kwargs)
+
+    def index_bars(self, underlying: str, **kwargs: Any) -> Any:
+        return read_index_bars(self.index, underlying, symbol=INDEX_SYMBOL, **kwargs)
 
     def contract_ivs(self, underlying: str, **kwargs: Any) -> Any:
         return read_contract_ivs(self.computed, underlying, **kwargs)
@@ -1103,6 +1125,26 @@ class StoreVolatilitySource:
 def get_volatility_source() -> StoreVolatilitySource:
     """Overridden in tests, which hand the route bars instead of a directory tree."""
     return StoreVolatilitySource()
+
+
+def _select_realised_series(
+    source: StoreVolatilitySource, underlying: str
+) -> tuple[list[Bar], str]:
+    """MT54-03: the realised series for one underlying, and which table answered.
+
+    `.DEXBTUSD` index bars win whenever at least one exists for this underlying;
+    an empty index store falls back **wholly** to `spot-bars`. Never a concatenation of
+    the two, and never a switch between them partway through a range — every point in a
+    response rests on exactly one series, so a reader is never shown a line whose left
+    half came from one table and whose right half came from another.
+
+    Shared by both `/volatility/bounds` and `/volatility` so the bounds a lookback is
+    checked against and the series it is computed from are always the same choice.
+    """
+    index_bars = source.index_bars(underlying)
+    if index_bars:
+        return index_bars, INDEX_BARS_SOURCE
+    return source.spot_bars(underlying), SPOT_BARS_SOURCE
 
 
 class HistoricalSource:
@@ -1406,8 +1448,9 @@ async def volatility_bounds(
             status_code=400,
             detail=f"interval must be one of {', '.join(INTERVALS)}, not {interval!r}",
         )
+    bars, _realised_source = _select_realised_series(source, symbol)
     bounds = lookback_bounds(
-        spot_bars=source.spot_bars(symbol),
+        spot_bars=bars,
         iv_rows=source.contract_ivs(symbol),
         interval=INTERVALS[interval],
     )
@@ -1469,7 +1512,7 @@ async def volatility(
         )
 
     step_interval = INTERVALS[interval]
-    bars = source.spot_bars(symbol)
+    bars, realised_source = _select_realised_series(source, symbol)
     iv_rows = source.contract_ivs(symbol)
     bounds = lookback_bounds(
         spot_bars=bars, iv_rows=iv_rows, interval=step_interval
@@ -1530,6 +1573,7 @@ async def volatility(
         step=stride * step_interval,
         underlying=symbol,
         bounds=bounds,
+        realised_source=realised_source,
     )
 
 

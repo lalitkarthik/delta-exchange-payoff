@@ -24,15 +24,25 @@ START = datetime(2026, 9, 4, 0, 0, tzinfo=timezone.utc)
 
 
 class StubSource:
-    """Twenty days of minute bars and a flat 8/60-day term structure. No store."""
+    """Twenty days of minute bars and a flat 8/60-day term structure. No store.
 
-    def __init__(self, days: int = 20, *, skip: set[int] | None = None) -> None:
+    `index_days` is separate from `days` and defaults to zero — an empty index series,
+    so a test that never asks about MT54-03's selection gets exactly the old behaviour:
+    `spot_bars` alone answers every route. `calls` records `("index" | "spot",
+    underlying)` for each read, which is how the selection tests below prove which
+    source a route actually consulted rather than inferring it from arithmetic alone.
+    """
+
+    def __init__(
+        self, days: int = 20, *, skip: set[int] | None = None, index_days: int = 0
+    ) -> None:
         self.days = days
         self.skip = skip or set()
-        self.calls: list[str] = []
+        self.index_days = index_days
+        self.calls: list[tuple[str, str]] = []
 
     def spot_bars(self, underlying: str, **_: object) -> list[Bar]:
-        self.calls.append(underlying)
+        self.calls.append(("spot", underlying))
         return [
             Bar(
                 at=START + n * MINUTE,
@@ -43,6 +53,19 @@ class StubSource:
             )
             for n in range(self.days * 1440)
             if n not in self.skip
+        ]
+
+    def index_bars(self, underlying: str, **_: object) -> list[Bar]:
+        self.calls.append(("index", underlying))
+        return [
+            Bar(
+                at=START + n * MINUTE,
+                open=80_000.0 + (5.0 if n % 2 else 0.0),
+                high=80_012.0,
+                low=79_998.0,
+                close=80_000.0 + (5.0 if n % 2 else 0.0),
+            )
+            for n in range(self.index_days * 1440)
         ]
 
     def contract_ivs(
@@ -305,3 +328,143 @@ def test_the_bounds_endpoint_says_so_when_nothing_is_usable() -> None:
     assert body["usable"] is False
     assert body["binding"] == "history"
     assert "history" in body["detail"]
+
+
+# --- MT54-03: `.DEXBTUSD` index bars preferred over spot-bars -----------------------
+
+
+def test_populated_index_bars_are_preferred_and_spot_is_never_consulted() -> None:
+    """Twenty days of index history against three of spot: only correct if the index
+    series actually drove the answer, because three days alone cannot clear the
+    eight-day floor set by the shortest listed expiry."""
+    source = StubSource(days=3, index_days=20)
+    app.dependency_overrides[get_volatility_source] = lambda: source
+    try:
+        client = TestClient(app)
+        bounds = client.get(
+            "/volatility/bounds", params={"underlying": "BTC", "interval": "1h"}
+        ).json()
+        series = client.get(
+            "/volatility",
+            params={"underlying": "BTC", "lookback_days": 10, "interval": "1h"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert bounds["usable"] is True, "three days of spot alone could not answer this"
+    assert bounds["binding"] == "history"
+    assert bounds["max_days"] < 20.0
+    assert series.status_code == 200
+    assert ("index", "BTC") in source.calls
+    assert ("spot", "BTC") not in source.calls, "spot must not be read once index hits"
+
+
+def test_an_empty_index_store_falls_back_wholly_to_spot_bars() -> None:
+    source = StubSource(days=20, index_days=0)
+    app.dependency_overrides[get_volatility_source] = lambda: source
+    try:
+        body = TestClient(app).get(
+            "/volatility/bounds", params={"underlying": "BTC", "interval": "1h"}
+        ).json()
+    finally:
+        app.dependency_overrides.clear()
+
+    assert body["usable"] is True
+    assert body["binding"] == "history"
+    assert body["max_days"] < 20.0
+    assert ("index", "BTC") in source.calls
+    assert ("spot", "BTC") in source.calls, "empty index must fall back to spot"
+
+
+def test_bounds_and_series_are_computed_from_the_same_selected_source() -> None:
+    """Both routes share one selection helper, so a request for either must bound
+    itself against exactly the series the other reports."""
+    source = StubSource(days=3, index_days=20)
+    app.dependency_overrides[get_volatility_source] = lambda: source
+    try:
+        client = TestClient(app)
+        bounds_body = client.get(
+            "/volatility/bounds", params={"underlying": "BTC", "interval": "1h"}
+        ).json()
+        series_body = client.get(
+            "/volatility",
+            params={"underlying": "BTC", "lookback_days": 10, "interval": "1h"},
+        ).json()
+    finally:
+        app.dependency_overrides.clear()
+
+    assert series_body["bounds"]["max_days"] == bounds_body["max_days"]
+    assert series_body["bounds"]["binding"] == bounds_body["binding"]
+
+
+# --- MT54-04: provenance on the response ---------------------------------------------
+
+
+def test_the_response_names_index_bars_when_the_index_series_answered() -> None:
+    source = StubSource(days=3, index_days=20)
+    app.dependency_overrides[get_volatility_source] = lambda: source
+    try:
+        body = TestClient(app).get(
+            "/volatility",
+            params={"underlying": "BTC", "lookback_days": 10, "interval": "1h"},
+        ).json()
+    finally:
+        app.dependency_overrides.clear()
+
+    assert body["realised_source"] == "index-bars"
+
+
+def test_the_response_names_spot_bars_on_a_fallback() -> None:
+    source = StubSource(days=20, index_days=0)
+    app.dependency_overrides[get_volatility_source] = lambda: source
+    try:
+        body = TestClient(app).get(
+            "/volatility",
+            params={"underlying": "BTC", "lookback_days": 10, "interval": "1h"},
+        ).json()
+    finally:
+        app.dependency_overrides.clear()
+
+    assert body["realised_source"] == "spot-bars"
+
+
+# --- MT54-05: plotted-point counts on the response ------------------------------------
+
+
+def test_realised_and_implied_points_are_reported_and_bounded(
+    client: TestClient,
+) -> None:
+    body = client.get(
+        "/volatility",
+        params={
+            "underlying": "BTC", "lookback_days": 10,
+            "interval": "1h", "estimators": "log,parkinson",
+        },
+    ).json()
+
+    assert 0 <= body["realised_points"] <= len(body["points"])
+    assert 0 <= body["implied_points"] <= len(body["points"])
+    # Every point in this fixture has both a full-coverage RV and an IV.
+    assert body["realised_points"] == len(body["points"])
+    assert body["implied_points"] == len(body["points"])
+
+
+def test_trailing_lag_points_with_no_realisation_are_not_counted(
+    client: TestClient,
+) -> None:
+    """The last N days of a lag-aligned series have `rv[name] is None` for every
+    estimator — `test_the_trailing_window_has_implied_present_and_realised_null` pins
+    the same fact in `test_volatility.py`. Those points must not count toward
+    `realised_points`, only toward `implied_points`."""
+    body = client.get(
+        "/volatility",
+        params={
+            "underlying": "BTC", "lookback_days": 10,
+            "interval": "1h", "estimators": "log", "alignment": "lag",
+        },
+    ).json()
+
+    trailing = body["points"][-1]
+    assert trailing["rv"]["log"] is None
+    assert body["realised_points"] < len(body["points"])
+    assert body["implied_points"] == len(body["points"])

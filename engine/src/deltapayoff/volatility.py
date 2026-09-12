@@ -125,6 +125,13 @@ class BoundsResponse(BaseModel):
     intervals: list[str]
 
 
+#: The two names a response's `realised_source` may carry. Chosen by
+#: `main._select_realised_series`, which is the one place that decides between the two
+#: tables; this module accepts whichever it is given rather than choosing one itself.
+INDEX_BARS_SOURCE = "index-bars"
+SPOT_BARS_SOURCE = "spot-bars"
+
+
 class VolatilitySeries(BaseModel):
     """The whole response: both series, the controls that produced them, the bounds."""
 
@@ -140,6 +147,18 @@ class VolatilitySeries(BaseModel):
     valid_intervals: list[str]
     bounds: LookbackBounds
     points: list[VolPoint]
+    #: Which table the realised series in `points` was computed from — `"index-bars"`
+    #: or `"spot-bars"`. The route chooses (R... #54); this field reports the choice
+    #: rather than leaving a reader to infer it from arithmetic elsewhere on the
+    #: payload. Defaults to `"spot-bars"` so a caller of `volatility_series` from
+    #: before this field existed keeps getting the answer it always got.
+    realised_source: str = SPOT_BARS_SOURCE
+    #: How many of `points` carry a usable realised figure — at least one requested
+    #: estimator is non-null — and how many carry an implied one. Neither has to equal
+    #: the other or `len(points)`: a point is emitted for every step in the range
+    #: whatever it could compute, and the two series go stale on independent schedules.
+    realised_points: int = 0
+    implied_points: int = 0
 
 
 def _listed_tenors(iv_rows: dict[datetime, list[ContractIv]]) -> list[float]:
@@ -348,8 +367,14 @@ def volatility_series(
     step: timedelta,
     underlying: str = "BTC",
     bounds: LookbackBounds | None = None,
+    realised_source: str = SPOT_BARS_SOURCE,
 ) -> VolatilitySeries:
-    """Both series over `[start, end]`, one point every `step`."""
+    """Both series over `[start, end]`, one point every `step`.
+
+    `realised_source` is reported on the response unchanged — it names which table
+    `spot_bars` actually came from, and the caller (`main._select_realised_series`)
+    is the one place that decides that, not this function.
+    """
     if alignment not in ALIGNMENTS:
         raise ValueError(f"alignment must be one of {ALIGNMENTS}, not {alignment!r}")
     for name in estimators:
@@ -405,6 +430,14 @@ def volatility_series(
             )
         )
 
+    # MT54-05: counted from the final `points` array, after stepping and alignment —
+    # never from raw stored minutes, returns or coverage entries, which would count
+    # work done rather than answers actually plotted.
+    realised_points = sum(
+        1 for point in points if any(value is not None for value in point.rv.values())
+    )
+    implied_points = sum(1 for point in points if point.iv is not None)
+
     return VolatilitySeries(
         underlying=underlying,
         lookback_days=tenor_days,
@@ -419,4 +452,7 @@ def volatility_series(
             binding="none", detail="bounds not computed",
         ),
         points=points,
+        realised_source=realised_source,
+        realised_points=realised_points,
+        implied_points=implied_points,
     )

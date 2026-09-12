@@ -275,11 +275,11 @@ than rendering an empty chart.
   nothing about coverage.** The payload carries it per point per estimator; the screen does
   not yet draw it. A window computed from 60% coverage currently looks identical to one from
   100%.
-- **The index price history is verified, and argues these estimators read the wrong source.**
-  [`index-history.md`](index-history.md) — `.DEXBTUSD` does not pad and reaches back ~2.7
-  years, but its per-minute range is wider than ours on **16 of 16** overlapping minutes.
-  Feeding the range estimators the venue's bars instead of `spot-bars` is the cheapest test
-  of the discretisation hypothesis in §4.
+- **Realised volatility reads `index-bars` when it has rows for the underlying, `spot-bars`
+  otherwise — never both in one window.** [`index-history.md`](index-history.md): the
+  venue's range is wider than ours on **16 of 16** overlapping minutes, so the two must not
+  share a rolling window. `GET /volatility` names the source as `realised_source`, with
+  `realised_points`/`implied_points` behind the caption — implied cannot be backfilled.
 - **`spot_price` versus `settlement_index_price` is unconfirmed.** If they differ, realised
   volatility measures a slightly different asset than implied volatility implies, and the
   wedge sits inside the premium unlabelled.

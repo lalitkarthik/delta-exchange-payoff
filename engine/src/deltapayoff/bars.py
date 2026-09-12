@@ -1262,3 +1262,32 @@ class ComputedAggregator(_Watermarked):
             forward_method=last.forward_method,
             model_version=last.model_version,
         )
+
+
+# --- `index-bars`: backfilled venue index candles, no live source at all ---------
+
+
+@dataclass(frozen=True, slots=True)
+class IndexBar:
+    """One minute of a venue index series, e.g. `.DEXBTUSD`, backfilled from
+    `/v2/history/candles` rather than aggregated from a tick on the bus.
+
+    **Not produced by an aggregator.** Tables A, B and D are folded from ticks this
+    module drains off the live feed; this row type has no tick and no `_Watermarked`
+    behind it at all — `tools/backfill_index_bars.py` builds it straight from a decoded
+    candle and hands it to `store.BarStore.add()` the same way a sealed bar is handed
+    over, so the write path — layout, file naming, uniqueness — is identical to every
+    other table's without a second implementation of it.
+
+    `minute` is timezone-aware UTC, matching every other table's bucket start. The four
+    prices are nullable because a bucket the venue did not return is never invented: see
+    `store.read_index_bars`, which drops rather than fills a row with any of them absent.
+    """
+
+    underlying: str
+    minute: datetime
+    symbol: str
+    index_open: float | None
+    index_high: float | None
+    index_low: float | None
+    index_close: float | None

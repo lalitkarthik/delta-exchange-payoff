@@ -42,6 +42,31 @@ minute M the instant M ends is what makes a chain still stamped inside M when M+
 **late**, and therefore refused. Without that, a dead feed would re-sample its last ladder
 every minute and the store would fill with identical fabricated rows.
 
+### `index-bars` — outside the four
+
+A fifth table, and not one of the four above. `tools/backfill_index_bars.py` writes it by
+walking Delta's `.DEXBTUSD` 1-minute index candles backwards from now, in pages of up to
+4,000 bars; nothing else ever does, and the engine's `BarWriter` does not know it exists.
+
+| Column | Type | Note |
+|---|---|---|
+| `minute` | timestamp | the venue's own minute, not ours |
+| `symbol` | string | `.DEXBTUSD` — carried, not assumed |
+| `index_open` / `index_high` / `index_low` / `index_close` | float | the venue's own OHLC |
+
+No `spot_ticks` and no tick count of any kind: a venue candle carries no observation count
+to report, unlike table D's. A minute the venue did not return produces no row, the same
+rule as everywhere else in this store.
+
+Same layout as the four above: `index-bars/underlying=<asset>/date=<YYYY-MM-DD>/*.parquet`.
+
+**It sits outside `all_stores()`, so `compact_all` and `tools/migrate_store.py` never touch
+it.** Compaction exists to fold many small five-minute flush files into one; this table is
+never flushed in that shape — a backfill run writes it once, in large pages, not on the
+five-minute timer the other four share. It is born straight into the current layout, so
+`migrate_store.py`, which moves older tables into that layout, has nothing to do here
+either.
+
 ## 2. The translation, in one place
 
 The catalogue follows `docs/chain-contract.md` and `models.Leg`. This store does not. The

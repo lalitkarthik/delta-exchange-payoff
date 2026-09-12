@@ -426,3 +426,95 @@ def test_a_year_is_365_days_here_and_not_252() -> None:
     assert implied is not None
     with_252 = 0.40 * (10 / 252) ** 0.5
     assert abs(implied - with_252) > 0.01
+
+
+# --- MT54-04: provenance -------------------------------------------------------------
+
+
+def test_realised_source_defaults_to_spot_bars_when_not_supplied() -> None:
+    """Existing callers that do not pass provenance must keep the old default, so
+    nothing that called `volatility_series` before MT54-04 changes behaviour."""
+    series = volatility_series(
+        spot_bars=walking_bars(480),
+        iv_rows=iv_by_bucket(480),
+        lookback=LOOKBACK,
+        interval=INTERVAL,
+        estimators=["log"],
+        alignment="contemporaneous",
+        start=START + 15 * DAY,
+        end=START + 15 * DAY,
+        step=DAY,
+    )
+
+    assert series.realised_source == "spot-bars"
+
+
+def test_realised_source_is_reported_exactly_as_the_caller_supplied_it() -> None:
+    series = volatility_series(
+        spot_bars=walking_bars(480),
+        iv_rows=iv_by_bucket(480),
+        lookback=LOOKBACK,
+        interval=INTERVAL,
+        estimators=["log"],
+        alignment="contemporaneous",
+        start=START + 15 * DAY,
+        end=START + 15 * DAY,
+        step=DAY,
+        realised_source="index-bars",
+    )
+
+    assert series.realised_source == "index-bars"
+
+
+# --- MT54-05: plotted-point counts ----------------------------------------------------
+
+
+def test_realised_and_implied_point_counts_match_full_coverage() -> None:
+    """Every point in this fixture has a full-coverage RV and an IV, so both counts
+    equal the number of points."""
+    series = volatility_series(
+        spot_bars=walking_bars(480),
+        iv_rows=iv_by_bucket(480),
+        lookback=LOOKBACK,
+        interval=INTERVAL,
+        estimators=["log", "parkinson"],
+        alignment="contemporaneous",
+        start=START + 15 * DAY,
+        end=START + 19 * DAY,
+        step=12 * HOUR,
+    )
+
+    assert 0 <= series.realised_points <= len(series.points)
+    assert 0 <= series.implied_points <= len(series.points)
+    assert series.realised_points == len(series.points)
+    assert series.implied_points == len(series.points)
+
+
+def test_trailing_lag_points_with_every_estimator_null_are_not_counted_as_realised() -> (
+    None
+):
+    """The last N days of a lag-aligned series have no realisation for *any* requested
+    estimator — `test_the_trailing_window_has_implied_present_and_realised_null` pins
+    the null itself; this pins that those points do not count toward `realised_points`
+    while IV, present throughout, still counts toward `implied_points`.
+    """
+    bars = walking_bars(480)  # twenty days, so the last ten cannot look forward
+
+    series = volatility_series(
+        spot_bars=bars,
+        iv_rows=iv_by_bucket(480),
+        lookback=LOOKBACK,
+        interval=INTERVAL,
+        estimators=["log", "parkinson"],
+        alignment="lag",
+        start=START + 12 * DAY,
+        end=START + 19 * DAY,
+        step=DAY,
+    )
+
+    trailing = [point for point in series.points if point.at > START + 9 * DAY]
+    assert trailing, "the fixture must reach into the window that has not finished"
+    assert all(all(value is None for value in point.rv.values()) for point in trailing)
+
+    assert series.realised_points == len(series.points) - len(trailing)
+    assert series.implied_points == len(series.points)
