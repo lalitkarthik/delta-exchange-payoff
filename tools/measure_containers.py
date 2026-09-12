@@ -26,8 +26,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine" / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
-# Derived, not measured: five seconds catches a short CPU spike while keeping a day's
-# file and this tool's Docker-daemon calls below the noise floor of a 4-vCPU host.
+# `--interval` is the sampling PERIOD, sweep start to sweep start. Five seconds is
+# `assumed`: short enough to catch a CPU spike lasting a few seconds, long enough that
+# one sweep fits inside it.
+#
+# This tool's Docker-daemon calls are NOT below any noise floor, and the sentence that
+# stood here claiming they were was wrong from the day it was written (#100). The
+# `measured` figures, 2026-09-12, quiet host, six `dxp` containers:
+#
+#   one `docker stats --no-stream`, one container ......  1.88 s   (n=96)
+#   one `docker stats --no-stream`, all six at once ....  1.84 s   (n=16, concurrent)
+#   `docker ps` discovery ..............................  0.21 s   (n=32)
+#
+# Reading the six serially cost 11.79 s, so the real cadence was 16.84 s against this
+# configured 5 s -- a 3.37x overrun, and **70.0% of every period spent in `docker`**.
+# The same 3.32x shows in the I13 collection's own timestamps. Batching the six reads
+# into one call cuts a sweep to 2.33 s, and a 5 s period is now actually achieved.
+#
+# The share is still material: `measured` 46-47% of each period is spent in `docker`
+# subprocesses, and it is spent during the window whose CPU is being measured. It is
+# smaller in absolute terms -- 2.33 s per period rather than 11.79 s -- but it has not
+# become negligible, and a run that needs it smaller should raise `--interval` rather
+# than assume this line away.
 SAMPLE_INTERVAL_SECONDS = 5.0
 
 # R6's reference figures, transcribed from research/0007-load-profile.md sections 4 and 5.
@@ -246,6 +266,84 @@ def _write_record(handle: IO[str], record: dict[str, Any]) -> None:
     handle.flush()
 
 
+def _stats_rows(stdout: str) -> dict[str, dict[str, int | float]]:
+    """Parse one `docker stats` invocation, which may carry one line per container."""
+    rows: dict[str, dict[str, int | float]] = {}
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            payload = json.loads(stripped)
+            identifier = str(payload.get("ID") or payload.get("Container") or "")
+            if not identifier:
+                continue
+            rows[identifier] = parse_stats(stripped)
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return rows
+
+
+def _match_ids(
+    requested: Sequence[str], rows: dict[str, dict[str, int | float]]
+) -> dict[str, dict[str, int | float]]:
+    """Key Docker's rows back onto the ids we asked for, tolerating id truncation."""
+    matched: dict[str, dict[str, int | float]] = {}
+    for container_id in requested:
+        if container_id in rows:
+            matched[container_id] = rows[container_id]
+            continue
+        for key, value in rows.items():
+            if key.startswith(container_id) or container_id.startswith(key):
+                matched[container_id] = value
+                break
+    return matched
+
+
+def _read_stats(
+    docker_cmd: Sequence[str],
+    container_ids: Sequence[str],
+    clock: Callable[[], datetime] | None,
+) -> dict[str, tuple[dict[str, int | float], str, float]]:
+    """Read every container's stats, and stamp each read with its own clock.
+
+    `docker stats --no-stream` accepts several ids in one invocation and reads them
+    concurrently, so one batched call costs about what one serial call costs. Every
+    container's percentage is still computed from that container's own two consecutive
+    daemon reads, so batching changes the cost and not the arithmetic -- see #100 for
+    the paired run that checked it. A daemon that refuses the batched form, or answers
+    it short, falls back to one call per container; those reads are genuinely at
+    different times and each row then carries its own.
+    """
+    readings: dict[str, tuple[dict[str, int | float], str, float]] = {}
+    arguments = ("stats", "--no-stream", "--format", r"{{json .}}")
+
+    if len(container_ids) > 1:
+        started = _isoformat(_utc_now(clock))
+        begin = time.monotonic()
+        result = _run_docker(docker_cmd, *arguments, *container_ids)
+        read_seconds = round(time.monotonic() - begin, 6)
+        if result.returncode == 0:
+            for container_id, parsed in _match_ids(
+                container_ids, _stats_rows(result.stdout)
+            ).items():
+                readings[container_id] = (parsed, started, read_seconds)
+
+    for container_id in container_ids:
+        if container_id in readings:
+            continue
+        started = _isoformat(_utc_now(clock))
+        begin = time.monotonic()
+        result = _run_docker(docker_cmd, *arguments, container_id)
+        read_seconds = round(time.monotonic() - begin, 6)
+        if result.returncode != 0:
+            continue
+        matched = _match_ids([container_id], _stats_rows(result.stdout))
+        if container_id in matched:
+            readings[container_id] = (matched[container_id], started, read_seconds)
+    return readings
+
+
 def sample_tick(
     docker_cmd: Sequence[str],
     project: str,
@@ -253,11 +351,20 @@ def sample_tick(
     states: dict[str, ContainerState],
     *,
     clock: Callable[[], datetime] | None = None,
+    sweep: int = 0,
 ) -> None:
-    """Collect and append one sample for every container visible on this tick."""
-    sampled_at = _utc_now(clock)
-    sampled_at_text = _isoformat(sampled_at)
+    """Collect and append one sample for every container visible on this sweep.
+
+    Every sample row carries the timestamp of **its own** read, never the sweep's.
+    Before #100 one `sampled_at` was computed ahead of the reads and stamped across
+    all of them, so rows up to 6.9 s apart looked simultaneous (`measured` 2026-09-12).
+    A `sweep` field keeps the rows groupable, and `read_seconds` carries the residual
+    uncertainty on the row's own stamp rather than hiding it.
+    """
+    sweep_began = time.monotonic()
+    sweep_started_text = _isoformat(_utc_now(clock))
     containers = discover_containers(docker_cmd, project)
+    names = dict(containers)
 
     handle: IO[str]
     close_handle = False
@@ -270,44 +377,41 @@ def sample_tick(
         handle = output
 
     try:
-        for container_id, container_name in containers:
-            state = states.get(container_id)
-            if state is None:
-                state = ContainerState(_started_at(docker_cmd, container_id))
-                states[container_id] = state
+        for container_id, _ in containers:
+            if container_id not in states:
+                states[container_id] = ContainerState(
+                    _started_at(docker_cmd, container_id)
+                )
 
-            stats = _run_docker(
-                docker_cmd,
-                "stats",
-                "--no-stream",
-                "--format",
-                r"{{json .}}",
-                container_id,
-            )
-            if stats.returncode != 0:
+        readings = _read_stats(docker_cmd, [cid for cid, _ in containers], clock)
+
+        for container_id, container_name in containers:
+            reading = readings.get(container_id)
+            if reading is None:
                 continue
-            try:
-                parsed = parse_stats(stats.stdout.strip())
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                continue
+            parsed, read_at_text, read_seconds = reading
 
             _write_record(
                 handle,
                 {
                     "type": "sample",
-                    "sampled_at": sampled_at_text,
+                    "sweep": sweep,
+                    "sampled_at": read_at_text,
+                    "read_seconds": read_seconds,
                     "container_id": container_id,
                     "container_name": container_name,
                     **parsed,
                 },
             )
 
+            state = states[container_id]
             if state.healthy:
                 continue
             healthy, method = _health_signal(docker_cmd, container_id)
             if not healthy:
                 continue
             state.healthy = True
+            read_at = _parse_timestamp(read_at_text) or _utc_now(clock)
             _write_record(
                 handle,
                 {
@@ -315,11 +419,24 @@ def sample_tick(
                     "container_id": container_id,
                     "container_name": container_name,
                     "started_at": state.started_at,
-                    "healthy_at": sampled_at_text,
-                    "seconds": _elapsed_seconds(state.started_at, sampled_at),
+                    "healthy_at": read_at_text,
+                    "seconds": _elapsed_seconds(state.started_at, read_at),
                     "method": method,
                 },
             )
+
+        _write_record(
+            handle,
+            {
+                "type": "sweep",
+                "sweep": sweep,
+                "started_at": sweep_started_text,
+                "elapsed_seconds": round(time.monotonic() - sweep_began, 6),
+                "containers_seen": len(containers),
+                "container_names": [names[cid] for cid, _ in containers],
+                "containers_read": len(readings),
+            },
+        )
     finally:
         if close_handle:
             handle.close()
@@ -377,15 +494,78 @@ def _collect(args: argparse.Namespace) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     states: dict[str, ContainerState] = {}
     limit = args.samples
+    duration = args.duration
+    interval = args.interval
+
+    cadences: list[float] = []
+    sweep_costs: list[float] = []
+    overruns = 0
 
     with output.open("a", encoding="utf-8") as handle:
-        tick = 0
-        while limit is None or tick < limit:
-            sample_tick(docker_cmd, args.project, handle, states)
-            tick += 1
-            if limit is not None and tick >= limit:
+        run_began = time.monotonic()
+        sweep = 0
+        while True:
+            if limit is not None and sweep >= limit:
                 break
-            time.sleep(args.interval)
+            if duration is not None and time.monotonic() - run_began >= duration:
+                break
+
+            sweep_began = time.monotonic()
+            sample_tick(docker_cmd, args.project, handle, states, sweep=sweep)
+            elapsed = time.monotonic() - sweep_began
+            sweep_costs.append(elapsed)
+            sweep += 1
+
+            # The interval is the period, not the gap. Sleep only what is left of it,
+            # and never a negative amount. #100: the loop used to sleep the whole
+            # interval on top of the sweep, so a configured 5 s produced a `measured`
+            # 16.4 s cadence and drifted in silence.
+            remaining = interval - elapsed
+            if remaining < 0:
+                overruns += 1
+                print(
+                    f"measure_containers: OVERRUN on sweep {sweep - 1} -- the sweep "
+                    f"took {elapsed:.3f} s against a {interval:.3f} s interval, over "
+                    f"by {-remaining:.3f} s. This sweep's real cadence is "
+                    f"{elapsed:.3f} s, not {interval:.3f} s. Every rate derived from "
+                    "the configured interval is wrong by that ratio.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _write_record(
+                    handle,
+                    {
+                        "type": "overrun",
+                        "sweep": sweep - 1,
+                        "interval_seconds": interval,
+                        "elapsed_seconds": round(elapsed, 6),
+                        "over_by_seconds": round(-remaining, 6),
+                    },
+                )
+                remaining = 0.0
+            cadences.append(elapsed + remaining)
+
+            if limit is not None and sweep >= limit:
+                break
+            if (
+                duration is not None
+                and (time.monotonic() - run_began) + remaining >= duration
+            ):
+                break
+            time.sleep(remaining)
+
+    if cadences:
+        mean_cadence = statistics.fmean(cadences)
+        mean_cost = statistics.fmean(sweep_costs)
+        share = mean_cost / mean_cadence * 100 if mean_cadence else 0.0
+        print(
+            f"measure_containers: {len(cadences)} sweeps, cadence mean "
+            f"{mean_cadence:.3f} s against a configured {interval:.3f} s, "
+            f"max {max(cadences):.3f} s, {overruns} overrun(s). Sweeps spent "
+            f"{mean_cost:.3f} s in docker, {share:.1f}% of the period.",
+            file=sys.stderr,
+            flush=True,
+        )
     return 0
 
 
@@ -640,9 +820,30 @@ def _build_parser() -> argparse.ArgumentParser:
     collect = commands.add_parser("collect", help="append live container samples")
     collect.add_argument("--project", default="dxp")
     collect.add_argument(
-        "--interval", type=_non_negative_float, default=SAMPLE_INTERVAL_SECONDS
+        "--interval",
+        type=_non_negative_float,
+        default=SAMPLE_INTERVAL_SECONDS,
+        help="the sampling PERIOD in seconds, measured sweep start to sweep start",
     )
-    collect.add_argument("--samples", type=_non_negative_int, default=None)
+    collect.add_argument(
+        "--samples",
+        type=_non_negative_int,
+        default=None,
+        help=(
+            "stop after this many sweeps. At the real cadence that is "
+            "(samples - 1) * interval seconds, so 17280 sweeps at 5 s is 24 hours. "
+            "Prefer --duration when what you mean is a length of time"
+        ),
+    )
+    collect.add_argument(
+        "--duration",
+        type=_non_negative_float,
+        default=None,
+        help=(
+            "stop after this many seconds of wall clock. A hard bound that holds "
+            "even when sweeps overrun the interval"
+        ),
+    )
     collect.add_argument("--out", default=None)
     collect.add_argument("--docker-cmd", default="docker")
 

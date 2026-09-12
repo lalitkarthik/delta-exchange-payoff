@@ -54,7 +54,9 @@ def main() -> int:
         return 0
 
     if command == "stats":
-        container_id = argv[-1]
+        # Since #100 the tool asks for every container in one invocation, the way
+        # `docker stats --no-stream` allows. Answer one JSON line per id requested.
+        requested = [value for value in argv if value in CONTAINERS]
         values = {
             "feed-id": {
                 "Container": "feed-id",
@@ -79,7 +81,10 @@ def main() -> int:
                 "PIDs": "1",
             },
         }
-        print(json.dumps(values[container_id]))
+        if not requested:
+            return 1
+        for container_id in requested:
+            print(json.dumps(values[container_id]))
         return 0
 
     if command == "inspect":
