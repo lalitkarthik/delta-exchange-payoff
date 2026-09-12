@@ -43,12 +43,12 @@ migrated, because the pipe holds thirty minutes and they age out on their own.
 ## 2. Lossless — per-stream positions and a consumer group
 
 The built signature is `subscribe(..., start_ids: Mapping[str, Position] | None,
-group_start: "0" | "$" = "0", skip: Sequence[Span] = ())`. Each `Position` carries an id
-and logical index. `group_start` is resolved once to a concrete id when a group is created;
-it is never repeatedly passed as the literal `$`. `skip` contains pause spans that a replaying
-reader drops and counts. `behind` is per stream: it tells the store's log clock that replay
-or a full read batch is still catching up; the clock is described in
-[store-replay.md](store-replay.md), not repeated here.
+group_start: "0" | "$" = "$", skip: Sequence[Span] = ())`. Each `Position` carries an id and
+logical index. **The unstated `group_start` is `"$"`; `"0"` is deliberate** (#97). It resolves
+once to a concrete id when a group is created, is never repeatedly passed as the literal `$`,
+and positions a group only at creation (#86). `skip` contains pause spans that a replaying
+reader drops and counts. `behind` is per stream: it tells the store's log clock that replay or
+a full read batch is still catching up; see [store-replay.md](store-replay.md).
 
 Lossless subscriptions create `XGROUP CREATE <stream> <name> <group_start> MKSTREAM`, read
 `XREADGROUP`, and ack each batch before the work. The group name is the service name. The

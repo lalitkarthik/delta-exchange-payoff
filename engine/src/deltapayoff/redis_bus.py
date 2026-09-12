@@ -447,7 +447,7 @@ class RedisBus:
         lossless: bool = False,
         *,
         start_ids: Mapping[str, Position] | None = None,
-        group_start: str = "0",
+        group_start: str = "$",
         skip: Sequence[Span] = (),
         event_types: Iterable[str] | None = None,
     ) -> RedisSubscription:
@@ -460,6 +460,34 @@ class RedisBus:
 
         `maxsize` keeps both meanings: a ceiling under drop-oldest, a watermark under
         lossless.
+
+        **`group_start` defaults to `"$"`, and `"0"` has to be typed (#97).** It picks the
+        id a consumer group is *created* at, so it is read once per group and only under
+        `lossless=True`. The two values are not symmetric in what they cost when they are
+        the wrong one. `"$"` creates the group at the head: a caller that wanted history
+        gets none, and finds out immediately, because it asked for something and received
+        nothing. `"0"` creates the group at the bottom and hands the reader everything
+        Redis still holds — a whole retention window — as if it had just arrived; for the
+        one lossless reader that writes anything down that is thirty minutes refolded into
+        bars that already exist. That is #84 (five entries folded twice at a restart seam)
+        at the scale of the window, and #94 is the same value sitting in a document rather
+        than running. One default fails loudly and reversibly, the other silently and
+        destructively, so the default is the loud one. `"0"` is not removed: still
+        validated below, still reachable, now deliberate.
+
+        **Required-instead-of-defaulted was weighed and rejected (#97).** Two reasons,
+        neither about what is easier to type. First, `group_start` is meaningless to a
+        drop-oldest subscriber, which creates no consumer group at all: `main.py`'s two
+        feed-state readers, `stream.py`'s ladder reader and `store_main.py`'s control
+        reader correctly state no opinion, and a required argument would make every caller
+        answer a question only lossless callers are asking. Second, `subscribe` is one
+        half of the `events/bus.py` seam, whose signature is `(name, maxsize,
+        lossless=False)` and whose other implementation, `FanOut`, has no such parameter;
+        a required keyword on one of two implementations of a shared seam is not a
+        stronger contract, it is a broken one. And explicitness at the call site is not
+        the protection it looks like — in #86 all three service callers *had* typed
+        `group_start="$"` and the consumer still posted its own downtime, because `$`
+        positions a group only when that group is created. See `_ensure_group`.
         """
         if maxsize < 1:
             raise ValueError(f"maxsize must be at least 1; got {maxsize}")
@@ -808,12 +836,28 @@ class RedisBus:
         return delivered
 
     async def _ensure_group(self, sub: RedisSubscription) -> set[str]:
-        """`XGROUP CREATE ... MKSTREAM` on every configured stream, at id `0`.
+        """`XGROUP CREATE ... MKSTREAM` on every configured stream, at a resolved id.
+
+        The id is chosen per stream, in this order: the caller's saved position for that
+        stream if it passed one; else the stream's head, taken here once as a concrete id,
+        if `group_start` is `"$"`; else `"0"`. **`"$"` is what a caller that said nothing
+        gets**, since #97 — `subscribe` records why, and why `"0"` was kept reachable
+        rather than deleted.
 
         Returns the streams whose group **already existed**, which is what tells a replay
-        where the previous instance of this consumer had got to. A group created here for
-        the first time starts at `0` and already carries everything Redis holds, so there
-        is nothing to replay in front of it.
+        where the previous instance of this consumer had got to.
+
+        Whether a newly created group has anything in front of it depends on which of the
+        three ids it was created at. At a saved position it starts where the reader left
+        off and `_replay` covers the suffix ahead of it. At the head it starts from now
+        and there is nothing to replay, deliberately — everything older is being declined.
+        At `0` it starts at the bottom and already carries everything Redis still holds,
+        so again nothing is replayed in front of it, for the opposite reason.
+
+        **`$` positions a group only when that group is created.** A `BUSYGROUP` answer
+        means it already exists and is rejoined wherever its last-delivered id sits;
+        `group_start` has no say over that, which is #86 and why the Discord consumer
+        drops stale alerts in its own loop rather than here.
         """
         import redis.exceptions
 
@@ -1003,6 +1047,18 @@ class RedisBus:
 
         `raise_on_error=False` because a stream nobody has written to yet does not exist,
         and "no such key" is an answer — an empty stream — rather than a failure.
+
+        **A stream that exists and holds nothing is the other half of that answer**, and
+        it does not report the same way. Real Redis gives `last-generated-id` as `0-0`;
+        `fakeredis` gives `None` (`measured` 2026-09-12, `fakeredis.aioredis` in the main
+        checkout's venv: `xinfo_stream` on a stream created by `XGROUP CREATE` with
+        `MKSTREAM` answers `'last-generated-id': None`). A present-but-`None` field
+        defeats a `dict.get` default, and `_text(None)` is the string `"None"`, which is
+        not a stream id — every command taking it fails with `Invalid stream ID
+        specified as stream command argument`. `0-0` is the true last-generated id of a
+        stream with no entries, which is real Redis's answer, so both normalise to it.
+        Reached by every `$` subscriber and, before #97 made `$` the default, already by
+        every drop-oldest one through `_position_at_head`.
         """
         keys = list(streams)
         pipe = self._client.pipeline(transaction=False)
@@ -1014,9 +1070,10 @@ class RedisBus:
             if not isinstance(info, dict):
                 heads[key] = ("0-0", 0)
                 continue
+            last_id = _info_value(info, "last-generated-id", "0-0")
             heads[key] = (
-                _text(_info_value(info, "last-generated-id", "0-0")),
-                int(_info_value(info, "entries-added", 0)),
+                "0-0" if last_id is None else _text(last_id),
+                int(_info_value(info, "entries-added", 0) or 0),
             )
         return heads
 
