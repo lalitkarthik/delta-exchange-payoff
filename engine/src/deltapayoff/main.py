@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from datetime import date as Date
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from functools import partial
 from typing import Annotated, Any
 
 from fastapi import (
@@ -68,6 +69,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import compute, log_events
 from .adapters import Adapter, DeltaAdapter, DeltaFeed
+from .bar_buffer import BUFFER_HORIZON_SECONDS, BarBuffer
 from .bars import BUCKET_US
 from .chain import (
     EXPIRY_FORMAT,
@@ -80,6 +82,7 @@ from .compute import enrich
 from .contract_bars import ContractBarsResponse, read_contract_bars
 from .delta_client import DeltaClient, DeltaUnavailable
 from .events import (
+    BarTable,
     Bus,
     ChainStrike,
     ComputedChain,
@@ -98,6 +101,7 @@ from .historical import list_minutes, read_ladder_at
 from .logging_setup import configure_logging, log_event
 from .models import (
     AdapterHealth,
+    BarBufferReport,
     ChainResponse,
     ExpiriesResponse,
     HealthReport,
@@ -109,6 +113,7 @@ from .models import (
 )
 from .realised_vol import ESTIMATORS, Bar
 from .redis_bus import REDIS_BUS, BusConfig, RedisBus, selected_bus
+from .smile import MINUTE_FORMAT as SMILE_MINUTE_FORMAT
 from .smile import read_smile
 from .store import (
     COMPUTED_DATASET,
@@ -762,6 +767,8 @@ class FeedStack:
     feed_cache: FeedConnectionCache
     #: The split composition's cached store state. The monolith does not need it.
     store_cache: StoreStateCache | None = None
+    #: The split composition's stand-in for the bar writer's own pending buffer.
+    bar_buffer: BarBuffer | None = None
     #: The background tasks, empty until `start_feed_stack` runs. Cancelled on shutdown.
     #: **The feed is no longer among them** — the supervisor owns that task.
     tasks: list[asyncio.Task] = field(default_factory=list)
@@ -920,6 +927,8 @@ def build_consumer_stack() -> FeedStack:
     feed_cache.attach(events)
     store_cache = StoreStateCache()
     store_cache.attach(events)
+    bar_buffer = BarBuffer()
+    bar_buffer.attach(events)
     return FeedStack(
         events=events,
         stream=stream,
@@ -928,6 +937,7 @@ def build_consumer_stack() -> FeedStack:
         supervisor=None,
         feed_cache=feed_cache,
         store_cache=store_cache,
+        bar_buffer=bar_buffer,
     )
 
 
@@ -962,6 +972,7 @@ async def start_consumer_stack(stack: FeedStack) -> None:
     await start_bus(stack.events)
     assert stack.writer is None
     assert stack.store_cache is not None
+    assert stack.bar_buffer is not None
     stack.tasks = [
         asyncio.create_task(stack.stream.run(), name="chain-stream"),
         asyncio.create_task(recompute_forever(stack.stream), name="chain-recompute"),
@@ -976,6 +987,7 @@ async def start_consumer_stack(stack: FeedStack) -> None:
         asyncio.create_task(
             publish_computed_forever(stack), name="computed-chain-publisher"
         ),
+        asyncio.create_task(stack.bar_buffer.run(), name="bar-buffer"),
     ]
     for task in stack.tasks:
         task.add_done_callback(_report_finished_task)
@@ -1102,6 +1114,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.supervisor = None
         app.state.feed_cache = stack.feed_cache
         app.state.store_cache = stack.store_cache
+        app.state.bar_buffer = stack.bar_buffer
         app.state.tasks = stack.tasks
         try:
             yield
@@ -1118,6 +1131,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "supervisor",
                 "feed_cache",
                 "store_cache",
+                "bar_buffer",
                 "tasks",
             ):
                 setattr(app.state, name, None)
@@ -1145,6 +1159,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.supervisor = stack.supervisor
     app.state.feed_cache = stack.feed_cache
     app.state.store_cache = None
+    app.state.bar_buffer = None
     app.state.tasks = stack.tasks
 
     if live_feed_enabled():
@@ -1187,6 +1202,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "supervisor",
             "feed_cache",
             "store_cache",
+            "bar_buffer",
             "tasks",
         ):
             setattr(app.state, name, None)
@@ -1262,10 +1278,22 @@ def get_computed_store() -> BarStore:
     A process with no writer — the lifespan has not run, which is every test that does
     not override this — still gets a reader over whatever is on disk, because "the
     engine is not collecting" and "the endpoint is broken" are different facts.
+
+    In split mode, the api has no writer but does have `BarBuffer`, so its pending source
+    is table C's buffer rows. With neither object present, the disk-only reader remains a
+    valid empty-or-historical answer rather than turning a non-collecting engine into a
+    broken endpoint.
     """
     writer = getattr(app.state, "writer", None)
     if writer is not None:
         return writer.computed_store
+    buffer = getattr(app.state, "bar_buffer", None)
+    if buffer is not None:
+        return BarStore(
+            dataset=COMPUTED_DATASET,
+            schema=COMPUTED_SCHEMA,
+            pending_source=partial(buffer.rows, BarTable.COMPUTED),
+        )
     return BarStore(dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
 
 
@@ -1389,11 +1417,36 @@ def get_historical_source() -> HistoricalSource:
     exactly as `/smile` includes it for table C — a parquet-only read would hand the
     slider's right edge a hole up to a flush interval wide. A process with no writer
     still gets readers over whatever is on disk; see `get_computed_store`.
+
+    In split mode, the api has no writer and each of the four stores takes its matching
+    table from `BarBuffer` through `pending_source`. With neither writer nor buffer, the
+    same four disk-only stores answer empty or historical data: the engine is not
+    collecting and the endpoint is not therefore broken.
     """
     writer = getattr(app.state, "writer", None)
     if writer is not None:
         return HistoricalSource(
             writer.store, writer.reference_store, writer.computed_store, writer.spot_store
+        )
+    buffer = getattr(app.state, "bar_buffer", None)
+    if buffer is not None:
+        return HistoricalSource(
+            BarStore(pending_source=partial(buffer.rows, BarTable.QUOTE)),
+            BarStore(
+                dataset=REFERENCE_DATASET,
+                schema=REFERENCE_SCHEMA,
+                pending_source=partial(buffer.rows, BarTable.REFERENCE),
+            ),
+            BarStore(
+                dataset=COMPUTED_DATASET,
+                schema=COMPUTED_SCHEMA,
+                pending_source=partial(buffer.rows, BarTable.COMPUTED),
+            ),
+            BarStore(
+                dataset=SPOT_DATASET,
+                schema=SPOT_SCHEMA,
+                pending_source=partial(buffer.rows, BarTable.SPOT),
+            ),
         )
     return HistoricalSource(
         BarStore(),
@@ -1428,6 +1481,11 @@ def get_store_cache() -> StoreStateCache | None:
     return getattr(app.state, "store_cache", None)
 
 
+def get_bar_buffer() -> BarBuffer | None:
+    """The split api's sealed-bar buffer, or `None` without a split lifespan."""
+    return getattr(app.state, "bar_buffer", None)
+
+
 def get_event_bus() -> Any:
     """The process bus used by the split recording command route."""
     return getattr(app.state, "events", None)
@@ -1438,6 +1496,7 @@ async def health(
     supervisor: Annotated[FeedSupervisor | None, Depends(get_supervisor)],
     feed_cache: Annotated[FeedConnectionCache | None, Depends(get_feed_cache)],
     stream: Annotated[ChainStream | None, Depends(get_watched_stream)],
+    bar_buffer: Annotated[BarBuffer | None, Depends(get_bar_buffer)],
 ) -> HealthReport:
     """Liveness **and** readiness, and the difference between them.
 
@@ -1467,6 +1526,27 @@ async def health(
             )
             for underlying, expiry, viewers, grace in stream.watching()
         ]
+    if bar_buffer is not None:
+        stats = bar_buffer.stats()
+        report.bar_buffer = BarBufferReport(
+            bars=stats["bars"],
+            per_table=stats["per_table"],
+            minutes=stats["minutes"],
+            oldest_minute=(
+                None
+                if stats["oldest_minute"] is None
+                else stats["oldest_minute"].strftime(SMILE_MINUTE_FORMAT)
+            ),
+            newest_minute=(
+                None
+                if stats["newest_minute"] is None
+                else stats["newest_minute"].strftime(SMILE_MINUTE_FORMAT)
+            ),
+            skipped=stats["skipped"],
+            malformed=stats["malformed"],
+            evicted=stats["evicted"],
+            horizon_seconds=BUFFER_HORIZON_SECONDS,
+        )
     return report
 
 

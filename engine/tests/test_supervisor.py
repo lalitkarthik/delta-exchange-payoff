@@ -255,6 +255,10 @@ def test_a_process_with_no_feed_still_answers(monkeypatch) -> None:
         "feed": "stopped",
         "adapters": [],
         "watched": [],
+        # P81-10 made this field required but nullable. A process with no feed holds
+        # no buffer, so it reports null rather than an empty buffer -- the two mean
+        # different things and a web client types against the difference.
+        "bar_buffer": None,
     }
 
 

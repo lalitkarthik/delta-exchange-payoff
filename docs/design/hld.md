@@ -179,6 +179,8 @@ Every transition emits one `feed.connection` event and one log record; nothing e
 | Redis | FeedConnectionCache | `feed.connection`, `heartbeat` |
 | api | Redis -> store | `computed.chain` (split composition only) |
 | store | Redis -> api | `store.state` |
+| BarWriter | Redis | `md.option_bar` (store process only) |
+| Redis | BarBuffer | `md.option_bar` (api process only) |
 | ChainStream | REST and websocket handlers | ladders from the live cache |
 | store/BarWriter | Parquet store | sealed `md.option_bar` data |
 | Store | the REST routes | Parquet reads, carrying no event |

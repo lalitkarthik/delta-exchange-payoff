@@ -43,9 +43,11 @@ from deltapayoff.bars import (
 from deltapayoff.chain import EXPIRY_FORMAT, nearest_strike
 from deltapayoff.compute import MODEL_VERSION, enrich
 from deltapayoff.events import (
+    BarTable,
     ConnectionState,
     Heartbeat,
     Instrument,
+    OptionBar,
     OptionQuote,
     Right,
 )
@@ -539,6 +541,44 @@ def test_the_writer_subscribes_losslessly(tmp_path: Path) -> None:
 
     assert subscription.lossless is True
     assert bus.stats()[subscription.name]["lossless"] is True
+
+
+def test_the_writer_publishes_one_typed_bar_for_each_table(tmp_path: Path) -> None:
+    published: list[OptionBar] = []
+    writer = BarWriter(BarStore(tmp_path), publish=published.append)
+    lts = datetime(2026, 9, 4, 9, 0, 8, 123456, tzinfo=timezone.utc)
+
+    writer._hand_to_store(
+        writer.store, [bar(last_lts=lts)], BarTable.QUOTE
+    )
+    writer._hand_to_store(
+        writer.reference_store, [reference()], BarTable.REFERENCE
+    )
+    writer._hand_to_store(writer.spot_store, [spot()], BarTable.SPOT)
+    writer._hand_to_store(
+        writer.computed_store, [computed_bar()], BarTable.COMPUTED
+    )
+
+    assert [event.table for event in published] == list(BarTable)
+    assert all(event.instrument is None for event in published)
+    assert all(event.underlying == "BTC" for event in published)
+    assert [set(event.columns) for event in published] == [
+        set(store.schema)
+        for store in writer.stores
+    ]
+    assert published[0].columns["last_lts"] == lts.isoformat()
+    assert published[0].columns["bid_ticks"] == 118
+
+
+def test_a_publisher_error_does_not_lose_the_bar(tmp_path: Path) -> None:
+    def fail(_event: OptionBar) -> None:
+        raise RuntimeError("publisher is down")
+
+    writer = BarWriter(BarStore(tmp_path), publish=fail)
+    writer._hand_to_store(writer.store, [bar()], BarTable.QUOTE)
+
+    assert writer.store.buffered == 1
+    assert writer.stats()["publish_errors"] == 1
 
 
 def test_the_writer_turns_bus_quotes_into_parquet_bars(tmp_path: Path) -> None:
@@ -1919,6 +1959,123 @@ def test_an_empty_buffer_still_reports_the_full_schema(tmp_path: Path) -> None:
 
     assert empty.height == 0
     assert set(empty.collect_schema()) == set(COMPUTED_SCHEMA) | {"date", "underlying"}
+
+
+def test_a_pending_source_frames_the_same_rows_as_the_local_buffer(
+    tmp_path: Path,
+) -> None:
+    bars = [
+        computed_bar(minute=datetime(2026, 9, 4, 9, minute, tzinfo=timezone.utc))
+        for minute in (0, 1)
+    ]
+    local = BarStore(tmp_path / "local", dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    local.add(bars)
+    remote = BarStore(
+        tmp_path / "remote",
+        dataset=COMPUTED_DATASET,
+        schema=COMPUTED_SCHEMA,
+        pending_source=lambda: list(bars),
+    )
+
+    assert remote.pending().collect().equals(local.pending().collect())
+    assert remote.buffered == 0
+
+
+def test_a_buffer_fed_store_is_typed_even_when_its_source_is_empty(
+    tmp_path: Path,
+) -> None:
+    store = BarStore(
+        tmp_path,
+        dataset=COMPUTED_DATASET,
+        schema=COMPUTED_SCHEMA,
+        pending_source=lambda: [],
+    )
+
+    empty = store.pending().collect()
+
+    assert empty.height == 0
+    assert dict(empty.collect_schema()) == {
+        **COMPUTED_SCHEMA,
+        "underlying": pl.Categorical,
+        "date": pl.Date,
+    }
+
+
+def test_a_buffer_fed_store_cannot_write(tmp_path: Path) -> None:
+    store = BarStore(
+        tmp_path,
+        dataset=COMPUTED_DATASET,
+        schema=COMPUTED_SCHEMA,
+        pending_source=lambda: [],
+    )
+
+    message = "computed-bars.*buffer-fed store does not write"
+    with pytest.raises(RuntimeError, match=message):
+        store.add([computed_bar()])
+    with pytest.raises(RuntimeError, match=message):
+        store.flush()
+    assert store.buffered == 0
+
+
+def test_scan_and_pending_prefers_the_committed_disk_row(
+    tmp_path: Path,
+) -> None:
+    disk = bar()
+    buffer = bar()
+    object.__setattr__(disk, "bid_close", 701.0)
+    object.__setattr__(buffer, "bid_close", 999.0)
+    writable = BarStore(tmp_path)
+    writable.add([disk])
+    writable.flush()
+    readable = BarStore(
+        tmp_path,
+        pending_source=lambda: [buffer],
+    )
+
+    rows = store_module.scan_and_pending(
+        readable, pl.lit(True)
+    ).collect()
+
+    assert rows.height == 1
+    assert rows.row(0, named=True)["bid_close"] == 701.0
+
+
+def test_scan_and_pending_deduplicates_a_spot_row_without_a_symbol(
+    tmp_path: Path,
+) -> None:
+    disk = spot(close=701.0)
+    buffer = spot(close=999.0)
+    writable = spot_store(tmp_path)
+    writable.add([disk])
+    writable.flush()
+    readable = BarStore(
+        tmp_path,
+        dataset=SPOT_DATASET,
+        schema=SPOT_SCHEMA,
+        pending_source=lambda: [buffer],
+    )
+
+    rows = store_module.scan_and_pending(readable, pl.lit(True)).collect()
+
+    assert rows.height == 1
+    assert rows.row(0, named=True)["spot_close"] == 701.0
+
+
+def test_scan_and_pending_keeps_disjoint_disk_and_buffer_rows(tmp_path: Path) -> None:
+    disk = bar(minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc))
+    buffer = bar(minute=datetime(2026, 9, 4, 9, 1, tzinfo=timezone.utc))
+    writable = BarStore(tmp_path)
+    writable.add([disk])
+    writable.flush()
+    readable = BarStore(tmp_path, pending_source=lambda: [buffer])
+
+    rows = store_module.scan_and_pending(readable, pl.lit(True)).collect()
+
+    assert rows.height == 2
+    assert rows.sort("minute")["minute"].to_list() == [
+        disk.minute,
+        buffer.minute,
+    ]
 
 
 def test_a_computed_bar_round_trips_through_parquet_with_its_values_and_its_types(

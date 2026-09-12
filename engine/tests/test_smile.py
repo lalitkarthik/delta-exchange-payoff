@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import deltapayoff.smile as smile_module
 from deltapayoff.bars import ComputedBar
 from deltapayoff.compute import MODEL_VERSION
 from deltapayoff.main import app, get_computed_store
@@ -201,6 +202,80 @@ def test_the_series_is_the_union_of_disk_and_buffer_in_one_ascending_run(
         "2026-09-04T09:03:00Z",
         "2026-09-04T09:04:00Z",
     ]
+
+
+def test_the_committed_row_wins_when_disk_and_buffer_hold_the_same_strike(
+    make_client, monkeypatch, store
+) -> None:
+    store.add([computed_bar(iv=0.41)])
+    assert store.flush() == 1
+    buffered = computed_bar(iv=0.99)
+    read_store = BarStore(
+        store.root,
+        dataset=COMPUTED_DATASET,
+        schema=COMPUTED_SCHEMA,
+        pending_source=lambda: [buffered],
+    )
+    concat = smile_module.pl.concat
+
+    def reverse_sources(frames, **kwargs):
+        return concat(list(reversed(frames)), **kwargs)
+
+    monkeypatch.setattr(smile_module.pl, "concat", reverse_sources)
+
+    body = smile(make_client(read_store))
+
+    assert body["minutes"][0]["points"] == [
+        {
+            "strike": 77600.0,
+            "iv": 0.41,
+            "iv_leg": "call",
+            "iv_reason": None,
+        }
+    ]
+
+
+def test_disjoint_disk_and_buffer_minutes_both_reach_the_smile(
+    make_client, store
+) -> None:
+    store.add([computed_bar(minute=MINUTE, iv=0.41)])
+    assert store.flush() == 1
+    buffered = computed_bar(
+        minute=datetime(2026, 9, 4, 9, 1, 0, 123456, tzinfo=timezone.utc), iv=0.99
+    )
+    read_store = BarStore(
+        store.root,
+        dataset=COMPUTED_DATASET,
+        schema=COMPUTED_SCHEMA,
+        pending_source=lambda: [buffered],
+    )
+
+    body = smile(make_client(read_store))
+
+    assert [entry["minute"] for entry in body["minutes"]] == [
+        "2026-09-04T09:00:00Z",
+        "2026-09-04T09:01:00Z",
+    ]
+
+
+def test_model_versions_cover_disk_and_buffer_minutes(make_client, store) -> None:
+    disk_version = "disk-model"
+    buffer_version = "buffer-model"
+    store.add([computed_bar(model_version=disk_version)])
+    assert store.flush() == 1
+    buffered = computed_bar(
+        minute=MINUTE.replace(minute=1), model_version=buffer_version
+    )
+    read_store = BarStore(
+        store.root,
+        dataset=COMPUTED_DATASET,
+        schema=COMPUTED_SCHEMA,
+        pending_source=lambda: [buffered],
+    )
+
+    body = smile(make_client(read_store))
+
+    assert body["model_versions"] == sorted([disk_version, buffer_version])
 
 
 def test_a_buffered_row_carries_the_same_fields_as_a_flushed_one(

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -21,11 +22,14 @@ from fastapi.testclient import TestClient
 from deltapayoff import main
 from deltapayoff.adapters import DeltaAdapter
 from deltapayoff.adapters.delta import instrument_from_symbol
+from deltapayoff.bar_buffer import BUFFER_HORIZON_SECONDS, BarBuffer
 from deltapayoff.delta_client import DeltaUnavailable, parse_envelope
 from deltapayoff.events import (
+    BarTable,
     ConnectionState,
     ControlCommand,
     FeedConnection,
+    OptionBar,
     OptionReference,
 )
 from deltapayoff.main import (
@@ -36,7 +40,21 @@ from deltapayoff.main import (
     get_supervisor,
     get_watched_stream,
 )
+from deltapayoff.smile import MINUTE_FORMAT
+from deltapayoff.store import (
+    COMPUTED_DATASET,
+    COMPUTED_SCHEMA,
+    REFERENCE_DATASET,
+    REFERENCE_SCHEMA,
+    SPOT_DATASET,
+    SPOT_SCHEMA,
+    BarStore,
+    translate_bar_columns,
+)
+from deltapayoff.store import SCHEMA as QUOTE_SCHEMA
 from deltapayoff.stream import ChainStream
+from test_store import bar as quote_bar
+from test_store import computed_bar, reference, spot
 
 
 class StubDelta:
@@ -93,6 +111,189 @@ def make_client() -> Iterator[Callable[[StubDelta], TestClient]]:
 
     yield factory
     app.dependency_overrides.clear()
+
+
+def _bar_event(bar, table: BarTable, schema) -> OptionBar:
+    return OptionBar(
+        source="bar-writer",
+        instrument=None,
+        table=table,
+        underlying=bar.underlying,
+        minute=bar.minute,
+        columns=translate_bar_columns(
+            {name: getattr(bar, name) for name in schema}, schema, to_wire=True
+        ),
+        ts_received=bar.minute,
+    )
+
+
+def test_store_providers_keep_the_writer_stores_when_a_writer_exists(tmp_path) -> None:
+    writer_stores = SimpleNamespace(
+        store=BarStore(tmp_path),
+        reference_store=BarStore(
+            tmp_path, dataset=REFERENCE_DATASET, schema=REFERENCE_SCHEMA
+        ),
+        computed_store=BarStore(
+            tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA
+        ),
+        spot_store=BarStore(tmp_path, dataset=SPOT_DATASET, schema=SPOT_SCHEMA),
+    )
+    app.state.writer = writer_stores
+    app.state.bar_buffer = BarBuffer()
+    try:
+        assert main.get_computed_store() is writer_stores.computed_store
+        source = main.get_historical_source()
+        assert source.quote is writer_stores.store
+        assert source.reference is writer_stores.reference_store
+        assert source.computed is writer_stores.computed_store
+        assert source.spot is writer_stores.spot_store
+    finally:
+        app.state.writer = None
+        app.state.bar_buffer = None
+
+
+def test_store_providers_use_only_the_matching_table_from_the_bar_buffer(
+    tmp_path,
+) -> None:
+    minute = datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    buffer = BarBuffer()
+    buffer.apply(
+        _bar_event(computed_bar(minute=minute), BarTable.COMPUTED, COMPUTED_SCHEMA)
+    )
+    buffer.apply(_bar_event(quote_bar(minute=minute), BarTable.QUOTE, QUOTE_SCHEMA))
+    app.state.writer = None
+    app.state.bar_buffer = buffer
+    try:
+        computed = main.get_computed_store()
+        source = main.get_historical_source()
+        assert computed.pending().collect()["symbol"].to_list() == [
+            "C-BTC-77600-040926"
+        ]
+        assert source.quote.pending().collect()["symbol"].to_list() == [
+            "C-BTC-77600-040926"
+        ]
+        assert source.reference.pending().collect().height == 0
+        assert source.spot.pending().collect().height == 0
+    finally:
+        app.state.writer = None
+        app.state.bar_buffer = None
+
+
+def test_store_providers_are_disk_only_without_a_writer_or_bar_buffer(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("DELTA_STORE_ROOT", str(tmp_path))
+    app.state.writer = None
+    app.state.bar_buffer = None
+
+    computed = main.get_computed_store()
+    source = main.get_historical_source()
+
+    assert computed.pending().collect().height == 0
+    assert source.quote.pending().collect().height == 0
+    assert source.reference.pending().collect().height == 0
+    assert source.computed.pending().collect().height == 0
+    assert source.spot.pending().collect().height == 0
+
+
+def test_read_routes_answer_from_the_split_bar_buffer(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("DELTA_STORE_ROOT", str(tmp_path))
+    minute = datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    buffer = BarBuffer()
+    buffer.apply(
+        _bar_event(computed_bar(minute=minute), BarTable.COMPUTED, COMPUTED_SCHEMA)
+    )
+    buffer.apply(_bar_event(quote_bar(minute=minute), BarTable.QUOTE, QUOTE_SCHEMA))
+    buffer.apply(
+        _bar_event(reference(minute=minute), BarTable.REFERENCE, REFERENCE_SCHEMA)
+    )
+    buffer.apply(_bar_event(spot(minute=minute), BarTable.SPOT, SPOT_SCHEMA))
+    app.state.writer = None
+    app.state.bar_buffer = buffer
+    try:
+        client = TestClient(app)
+        smile = client.get(
+            "/smile", params={"underlying": "BTC", "expiry": "04-09-2026"}
+        )
+        minutes = client.get(
+            "/chain/minutes",
+            params={
+                "underlying": "BTC",
+                "expiry": "04-09-2026",
+                "date": "2026-09-04",
+            },
+        )
+        ladder = client.get(
+            "/chain/at",
+            params={
+                "underlying": "BTC",
+                "expiry": "04-09-2026",
+                "minute": "2026-09-04T09:00:00Z",
+            },
+        )
+        bars = client.get(
+            "/bars",
+            params={
+                "instrument": "DELTA-BTC-20260904-77600-C-USD",
+                "date": "2026-09-04",
+            },
+        )
+    finally:
+        app.state.writer = None
+        app.state.bar_buffer = None
+
+    assert smile.status_code == 200
+    assert smile.json()["minutes"][0]["minute"] == "2026-09-04T09:00:00Z"
+    assert minutes.status_code == 200
+    assert minutes.json()["minutes"] == ["2026-09-04T09:00:00Z"]
+    assert ladder.status_code == 200
+    assert ladder.json()["data"]["minute"] == "2026-09-04T09:00:00Z"
+    assert bars.status_code == 200
+    assert bars.json()["bars"][0]["minute"] == "2026-09-04T09:00:00Z"
+
+
+def _health_without_lifespan() -> TestClient:
+    app.dependency_overrides[main.get_supervisor] = lambda: None
+    app.dependency_overrides[main.get_feed_cache] = lambda: None
+    app.dependency_overrides[main.get_watched_stream] = lambda: None
+    return TestClient(app)
+
+
+def test_health_reports_a_null_bar_buffer_without_one() -> None:
+    app.state.bar_buffer = None
+    try:
+        response = _health_without_lifespan().get("/health")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["bar_buffer"] is None
+    assert response.json()["status"] == "ok"
+    assert response.json()["feed"] == "stopped"
+
+
+def test_health_reports_bar_buffer_stats_and_shared_minute_stamps() -> None:
+    buffer = BarBuffer()
+    first = datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    second = datetime(2026, 9, 4, 9, 1, tzinfo=timezone.utc)
+    buffer.apply(_bar_event(quote_bar(minute=first), BarTable.QUOTE, QUOTE_SCHEMA))
+    buffer.apply(_bar_event(spot(minute=second), BarTable.SPOT, SPOT_SCHEMA))
+    app.state.bar_buffer = buffer
+    try:
+        response = _health_without_lifespan().get("/health")
+    finally:
+        app.dependency_overrides.clear()
+        app.state.bar_buffer = None
+
+    report = response.json()["bar_buffer"]
+    assert report["bars"] == buffer.stats()["bars"]
+    assert report["per_table"] == buffer.stats()["per_table"]
+    assert report["minutes"] == buffer.stats()["minutes"]
+    assert report["oldest_minute"] == first.strftime(MINUTE_FORMAT)
+    assert report["newest_minute"] == second.strftime(MINUTE_FORMAT)
+    assert report["horizon_seconds"] == BUFFER_HORIZON_SECONDS
+    assert datetime.strptime(report["oldest_minute"], MINUTE_FORMAT)
+    assert datetime.strptime(report["newest_minute"], MINUTE_FORMAT)
 
 
 # --- happy paths ----------------------------------------------------------------

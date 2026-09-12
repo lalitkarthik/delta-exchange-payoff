@@ -80,9 +80,9 @@ steps backwards under an NTP correction; elapsed time is monotonic, as `timing.t
 
 `md.index_quote`, `computed.chain` and `feed.connection` narrow the inherited field to
 `instrument: None`, so passing one fails validation — the catalogue's own sentence made
-checkable. `heartbeat`, `alert`, `control.command` and `md.option_bar` keep the nullable
-field, because the catalogue does not pin them: a spot bar has no contract identity, and an
-alert may one day be about one contract.
+checkable. `heartbeat`, `alert` and `control.command` keep the nullable field because the
+catalogue does not pin them. `md.option_bar` keeps it too, and names its underlying in the
+payload, because a spot bar has no contract to name.
 
 ### `md.option_bar` carries a discriminator, not four event types
 

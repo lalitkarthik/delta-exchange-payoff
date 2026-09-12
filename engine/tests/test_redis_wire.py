@@ -23,7 +23,9 @@ from decimal import Decimal
 import pytest
 
 from deltapayoff.events import (
+    BarTable,
     Instrument,
+    OptionBar,
     OptionQuote,
     Right,
     registry,
@@ -181,6 +183,20 @@ def test_each_event_lands_on_the_key_the_nomenclature_names(
     `computed.chain`, which name no venue of their own.
     """
     assert stream_name(SAMPLES[type_name], venue="DELTA") == expected
+
+
+def test_a_spot_bar_without_an_instrument_uses_its_payload_underlying() -> None:
+    event = OptionBar(
+        source="bar-writer",
+        instrument=None,
+        underlying="BTC",
+        table=BarTable.SPOT,
+        minute=TS_RECEIVED,
+        ts_received=TS_RECEIVED,
+        columns={},
+    )
+
+    assert stream_name(event, venue="DELTA") == "md.option_bar:DELTA:BTC"
 
 
 def test_an_event_naming_no_venue_is_refused_rather_than_keyed_by_its_source() -> None:

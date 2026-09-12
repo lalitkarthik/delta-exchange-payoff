@@ -155,7 +155,8 @@ class OptionBar(Event):
     **A minute with no arrivals produces no event**, as it produces no row. Nothing is
     forward-filled and no bar is invented.
 
-    `columns` carries that table's own columns as the store already shapes them. The four
+    `underlying` is a property of the asset, not of the messenger. `columns` carries that
+    table's own columns as the store already shapes them. The four
     schemas are **not** re-declared here: `store.py`'s `SCHEMA`, `REFERENCE_SCHEMA`,
     `SPOT_SCHEMA` and `COMPUTED_SCHEMA` are their authority, and a second copy is exactly
     the drift this catalogue exists to prevent. Values must be JSON scalars for the event
@@ -164,9 +165,21 @@ class OptionBar(Event):
 
     type: Literal["md.option_bar"] = "md.option_bar"
     table: BarTable
+    underlying: str
     #: The minute the bar covers, at its open.
     minute: datetime
     columns: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _underlying_matches_instrument(self) -> OptionBar:
+        if (
+            self.instrument is not None
+            and self.instrument.underlying.upper() != self.underlying.upper()
+        ):
+            raise ValueError(
+                "instrument underlying and option-bar underlying must agree"
+            )
+        return self
 
 
 class ChainLeg(BaseModel):

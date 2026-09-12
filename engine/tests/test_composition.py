@@ -121,6 +121,21 @@ def test_redis_bus_is_a_consumer_only_composition(monkeypatch, tmp_path) -> None
                 }
             ],
             "watched": [],
+            # P81-10 added this block: the split api holds sealed bars in memory, and its
+            # size has to be readable off a running api for criterion 2. Empty at
+            # start-up,
+            # which is exactly what a consumer-only composition should report.
+            "bar_buffer": {
+                "bars": 0,
+                "per_table": {"quote": 0, "reference": 0, "spot": 0, "computed": 0},
+                "minutes": 0,
+                "oldest_minute": None,
+                "newest_minute": None,
+                "skipped": 0,
+                "malformed": 0,
+                "evicted": 0,
+                "horizon_seconds": 360.0,
+            },
         }
         assert main.app.state.adapter is None
         assert main.app.state.feed is None
@@ -132,11 +147,28 @@ def test_redis_bus_is_a_consumer_only_composition(monkeypatch, tmp_path) -> None
             "feed-state",
             "store-state-cache",
             "computed-chain-publisher",
+            # P81-07: the split api drains md.option_bar into its own buffer, on the bus
+            # it
+            # already holds. This is the task that gives the split read paths a right
+            # edge.
+            "bar-buffer",
         }
         stats = main.app.state.events.stats()
-        assert set(stats) == {"chain-stream", "feed-state", "store-state"}
+        assert set(stats) == {
+            "chain-stream",
+            "feed-state",
+            "store-state",
+            "bar-buffer",
+        }
         assert stats["feed-state"]["lossless"] is False
         assert stats["store-state"]["lossless"] is False
+        # The two state caches above hold the latest value and nothing else, so dropping
+        # an
+        # older one costs nothing. A sealed bar is not a state: drop one and the split
+        # read
+        # paths carry a hole at the right edge that no later event refills. Hence
+        # lossless.
+        assert stats["bar-buffer"]["lossless"] is True
         assert _StubRedisBus.instances[-1].started is True
 
     assert _StubRedisBus.instances[-1].closed is True

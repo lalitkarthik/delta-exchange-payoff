@@ -92,16 +92,28 @@ def _rows(store: BarStore, underlying: str, expiry: str) -> list[dict[str, Any]]
     came from. The de-duplication is therefore not a choice between two values. It sorts
     on `option_type` first so the survivor is the same row on every run rather than
     whichever one the file happened to hold first.
+
+    The disk row is the store's committed output and the buffer row is a reconstruction
+    from a JSON round trip, so the file wins when both sources carry one minute.
     """
-    sources = (store.scan(), store.pending())
+    rank = "_source_rank"
+    sources = (
+        (store.scan(), 0),
+        (store.pending(), 1),
+    )
     frame = pl.concat(
-        [_filtered(source, underlying, expiry) for source in sources],
+        [
+            _filtered(source, underlying, expiry).with_columns(
+                pl.lit(source_rank).alias(rank)
+            )
+            for source, source_rank in sources
+        ],
         how="vertical_relaxed",
     )
-    ordered = frame.sort("minute", "strike", "option_type").unique(
+    ordered = frame.sort("minute", "strike", "option_type", rank).unique(
         subset=("minute", "strike"), keep="first", maintain_order=True
     )
-    return ordered.collect().to_dicts()
+    return ordered.drop(rank).collect().to_dicts()
 
 
 def _filtered(source: pl.LazyFrame, underlying: str, expiry: str) -> pl.LazyFrame:

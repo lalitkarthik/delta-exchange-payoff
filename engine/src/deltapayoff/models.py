@@ -354,6 +354,20 @@ class WatchedPair(BaseModel):
     grace_remaining_seconds: float | None = None
 
 
+class BarBufferReport(BaseModel):
+    """The split api's in-memory sealed-bar buffer, as reported by `/health`."""
+
+    bars: int
+    per_table: dict[str, int]
+    minutes: int
+    oldest_minute: str | None
+    newest_minute: str | None
+    skipped: int
+    malformed: int
+    evicted: int
+    horizon_seconds: float
+
+
 class HealthReport(BaseModel):
     """`GET /health`. **Liveness and readiness, side by side and not confused.**
 
@@ -382,3 +396,5 @@ class HealthReport(BaseModel):
     #: **not** a fault: the minute pass still covers every listed expiry. Empty by
     #: default so a process with no chain cache still answers the same shape.
     watched: list[WatchedPair] = []
+    #: The split api's sealed-bar buffer, or `null` when this process has no one.
+    bar_buffer: BarBufferReport | None = None

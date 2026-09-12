@@ -14,6 +14,7 @@ file, and change the row's status to a link. Do not write one ahead of the code.
 | The broker adapter — the protocol, the Delta implementation, the fake | [adapter.md](adapter.md) | #36, #37 |
 | The chain cache — invalidation, the recompute passes, watched pairs | [chain-cache.md](chain-cache.md) | #37, #44 |
 | The store — the four tables, sealing, flushing, ETH | [store.md](store.md) | #37, #43 |
+| The store — the numbers behind that design | [store-numbers.md](store-numbers.md) | #81 |
 | The store's replay — the checkpoint, the flush commit, the log clock | [store-replay.md](store-replay.md) | #63 |
 | The connection controller — the state machine, staleness, the events | [controller.md](controller.md) | #38, #39, #41 |
 | The three commands — pause, resume, reconnect, and the route that sends them | [commands.md](commands.md) | #41 |

@@ -114,6 +114,7 @@ SAMPLES: dict[str, Event] = {
         source="bar-writer",
         instrument=INSTRUMENT,
         table=BarTable.QUOTE,
+        underlying="BTC",
         minute=TS_VENUE,
         columns={"mid_open": 1250.0, "mid_close": 1262.5, "mid_ticks": 61},
     ),
@@ -507,6 +508,19 @@ def test_the_registry_holds_exactly_the_types_the_catalogue_names() -> None:
         "the heading shape this test keys off has changed"
     )
     assert set(registry()) == documented
+
+
+def test_option_bar_rejects_an_underlying_that_disagrees_with_its_instrument() -> None:
+    with pytest.raises(ValidationError, match="underlying"):
+        OptionBar(
+            **ENVELOPE,
+            source="bar-writer",
+            instrument=INSTRUMENT,
+            underlying="ETH",
+            table=BarTable.QUOTE,
+            minute=TS_VENUE,
+            columns={},
+        )
 
 
 def test_the_events_low_level_design_exists_and_the_index_links_it() -> None:

@@ -122,7 +122,7 @@ from .bars import (
     spot_from_index,
     tick_from_option_quote,
 )
-from .events import Alert, ComputedChain
+from .events import Alert, BarTable, ComputedChain, OptionBar
 from .iv_index import ContractIv
 from .logging_setup import log_event
 from .realised_vol import Bar as RvBar
@@ -356,6 +356,30 @@ COMPUTED_SCHEMA: dict[str, Any] = {
     "forward_method": pl.Categorical,
     "model_version": pl.Categorical,
 }
+
+
+def translate_bar_columns(
+    values: Mapping[str, Any], schema: Mapping[str, Any], *, to_wire: bool
+) -> dict[str, Any]:
+    """Translate the schema's timestamp and count dtypes in either direction.
+
+    The producer and consumer are separated by a JSON round trip, so the two dtypes
+    that JSON cannot preserve need an explicit spelling. Keeping the schema as the
+    authority means a new column gets the same translation on both sides automatically.
+    """
+    translated: dict[str, Any] = {}
+    for name, dtype in schema.items():
+        value = values[name]
+        base_type = dtype.base_type() if hasattr(dtype, "base_type") else dtype
+        if value is not None and base_type == pl.Datetime:
+            translated[name] = (
+                value.isoformat() if to_wire else datetime.fromisoformat(value)
+            )
+        elif value is not None and base_type == pl.UInt32:
+            translated[name] = int(value)
+        else:
+            translated[name] = value
+    return translated
 
 #: `index-bars`. **`symbol` is `String`, not `Categorical`** — unlike every other table's
 #: symbol column — because this store holds one backfilled index series at a time and a
@@ -719,10 +743,13 @@ class BarStore:
         root: Path | str | None = None,
         dataset: str = DATASET,
         schema: dict[str, Any] | None = None,
+        *,
+        pending_source: Callable[[], list[Any]] | None = None,
     ) -> None:
         self.root = Path(root) if root is not None else default_root()
         self.dataset = dataset
         self.schema: dict[str, Any] = dict(SCHEMA if schema is None else schema)
+        self.pending_source = pending_source
         self._buffer: list[Any] = []
         self.flushes = 0
         self.rows_written = 0
@@ -743,6 +770,10 @@ class BarStore:
         quotes under a day they did not happen in, which is the kind of error that reads
         as data rather than as a bug.
         """
+        if self.pending_source is not None:
+            raise RuntimeError(
+                f"{self.dataset} is a buffer-fed store; buffer-fed store does not write"
+            )
         for bar in bars:
             if not bar.underlying:
                 raise ValueError(f"{bar.symbol!r} has no underlying to partition on")
@@ -761,6 +792,10 @@ class BarStore:
 
     def flush(self, *, generation: int | None = None) -> int:
         """Write the buffer, optionally publishing a generation atomically."""
+        if self.pending_source is not None:
+            raise RuntimeError(
+                f"{self.dataset} is a buffer-fed store; buffer-fed store does not write"
+            )
         if generation is None:
             return self._flush_legacy()
         return self._flush_generation(generation)
@@ -930,6 +965,10 @@ class BarStore:
         and a reader that skipped them would report a right edge behind the live data with
         nothing to signal it. `/smile` is the first such reader — see `smile.read_smile`.
 
+        The buffer is either this writer's own unflushed bars or bars handed in from
+        elsewhere; either way it is one flush interval of sealed minutes and never the
+        open minute, which lives in the aggregators.
+
         The partition columns are rebuilt from the bars, because `_frame` deliberately
         omits them: on disk they are the directory names, and here they have to be
         materialised so the two halves of a union have one schema. They are derived from
@@ -942,7 +981,11 @@ class BarStore:
         `flush` empties by rebinding, so a flush that lands mid-read costs this reader
         nothing: those rows are on disk by then and the next read finds them there.
         """
-        buffered = list(self._buffer)
+        buffered = (
+            list(self._buffer)
+            if self.pending_source is None
+            else list(self.pending_source())
+        )
         if not buffered:
             return pl.LazyFrame(schema={**self.schema, **HIVE_SCHEMA})
         return (
@@ -1318,6 +1361,7 @@ class BarWriter:
         group: str = "store",
         checkpoint_root: Path | None = None,
         computed: ComputedAggregator | None = None,
+        *,
         publish: Callable[[Any], None] | None = None,
         interrupt_at: str | None = None,
         on_state_change: Callable[[], None] | None = None,
@@ -1363,7 +1407,7 @@ class BarWriter:
         self._subscription = subscription
         self.group = group
         self.checkpoint_root = None if checkpoint_root is None else Path(checkpoint_root)
-        self.publish = publish
+        self._publish = publish
         self.on_state_change = on_state_change
         self.committed_generation = 0
         self.interrupt_at = interrupt_at
@@ -1381,6 +1425,7 @@ class BarWriter:
         #: writer ignored most of the bus" should be a number and not a discovery.
         self.skipped = 0
         self.flush_errors = 0
+        self.publish_errors = 0
         #: Bus records drained and dropped because recording was off. Distinct from
         #: `skipped`, which counts records the writer could make nothing of at all.
         self.discarded = 0
@@ -1768,10 +1813,48 @@ class BarWriter:
         grace is zero, so it is the one most easily moved by a second reading.
         """
         now = self.clock() if now is None else now
-        self.store.add(self.aggregator.seal(now))
-        self.reference_store.add(self.reference.seal(now))
-        self.spot_store.add(self.spot.seal(now))
-        self.computed_store.add(self.computed.seal(now))
+        self._hand_to_store(self.store, self.aggregator.seal(now), BarTable.QUOTE)
+        self._hand_to_store(
+            self.reference_store, self.reference.seal(now), BarTable.REFERENCE
+        )
+        self._hand_to_store(self.spot_store, self.spot.seal(now), BarTable.SPOT)
+        self._hand_to_store(
+            self.computed_store, self.computed.seal(now), BarTable.COMPUTED
+        )
+
+    def _hand_to_store(
+        self, store: BarStore, bars: list[Any], table: BarTable
+    ) -> None:
+        """Hand sealed bars to storage, then announce each one when configured."""
+        store.add(bars)
+        if self._publish is None:
+            return
+        for bar in bars:
+            event = OptionBar(
+                source="bar-writer",
+                instrument=None,
+                table=table,
+                underlying=bar.underlying,
+                minute=bar.minute,
+                columns=translate_bar_columns(
+                    {name: getattr(bar, name) for name in store.schema},
+                    store.schema,
+                    to_wire=True,
+                ),
+                ts_received=datetime.fromtimestamp(self.clock(), tz=timezone.utc),
+            )
+            try:
+                self._publish(event)
+            except Exception:
+                self.publish_errors += 1
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    log_events.ENGINE_ERROR,
+                    "sealed %s bar could not be published",
+                    table.value,
+                    exc_info=True,
+                )
 
     async def _maybe_flush(self) -> None:
         """Write if the flush interval has elapsed. **Off the event loop.**
@@ -1908,10 +1991,10 @@ class BarWriter:
         return sum(store.flush(generation=generation) for store in self.stores)
 
     def _publish_flush_failure(self, error: Exception) -> None:
-        if self.publish is None:
+        if self._publish is None:
             return
         try:
-            self.publish(
+            self._publish(
                 Alert(
                     source="store",
                     ts_received=datetime.fromtimestamp(self.clock(), tz=timezone.utc),
@@ -1997,10 +2080,16 @@ class BarWriter:
         # being recomputed some minutes ago yields a sample that is late and refused, so
         # a stopped feed still contributes nothing on the way out.
         self._sample_computed(self.clock(), force=True)
-        self.store.add(self.aggregator.flush())
-        self.reference_store.add(self.reference.flush())
-        self.spot_store.add(self.spot.flush())
-        self.computed_store.add(self.computed.flush())
+        self._hand_to_store(
+            self.store, self.aggregator.flush(), BarTable.QUOTE
+        )
+        self._hand_to_store(
+            self.reference_store, self.reference.flush(), BarTable.REFERENCE
+        )
+        self._hand_to_store(self.spot_store, self.spot.flush(), BarTable.SPOT)
+        self._hand_to_store(
+            self.computed_store, self.computed.flush(), BarTable.COMPUTED
+        )
         await asyncio.to_thread(self._flush_all)
 
     def stats(self) -> dict[str, Any]:
@@ -2017,6 +2106,7 @@ class BarWriter:
             "skipped": self.skipped,
             "discarded": self.discarded,
             "flush_errors": self.flush_errors,
+            "publish_errors": self.publish_errors,
             "flushes": self.store.flushes,
             "rows_written": self.store.rows_written,
             "buffered": self.store.buffered,
@@ -2064,16 +2154,42 @@ def scan_and_pending(store: BarStore, clause: pl.Expr) -> pl.LazyFrame:
     happening in a fourth one some ticket writes without noticing the first three had a
     pattern.
 
+    The disk row is the store's committed output, written through `add()` and `flush()`
+    with the table's real dtypes, while the buffer row is a reconstruction from a JSON
+    round trip; the file is authoritative when both carry one minute.
+
     `smile._rows`'s own version additionally widens categorical columns to strings
     before concatenating; that extra step is not folded in here; `vertical_relaxed`
     already tolerates the dtype mismatch it existed to smooth over on every path that
     does not need the widening for some other reason, and `smile.py` is left reading as
     it always has rather than being touched by a ticket that does not own it.
     """
-    return pl.concat(
-        [source.filter(clause) for source in (store.scan(), store.pending())],
+    return prefer_disk(
+        store.scan().filter(clause),
+        store.pending().filter(clause),
+        schema=store.schema,
+    )
+
+
+def prefer_disk(
+    disk: pl.LazyFrame,
+    buffer: pl.LazyFrame,
+    *,
+    schema: Mapping[str, Any],
+) -> pl.LazyFrame:
+    """Union two sources once per stored identity, with the committed file winning."""
+    rank = "_source_rank"
+    identity = ("underlying", "date", "minute")
+    if "symbol" in schema:
+        identity += ("symbol",)
+    ranked = pl.concat(
+        [
+            disk.with_columns(pl.lit(0).alias(rank)),
+            buffer.with_columns(pl.lit(1).alias(rank)),
+        ],
         how="vertical_relaxed",
     )
+    return ranked.sort(rank).unique(subset=identity, keep="first").drop(rank)
 
 
 # --- the read path for the volatility screen ----------------------------------------

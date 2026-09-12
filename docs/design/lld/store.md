@@ -18,12 +18,17 @@ without a date predicate; the first directory therefore prunes the other asset b
 scanned.
 
 **Process boundary.** In split mode (`DELTA_BUS=redis`), `deltapayoff.store_main:app` owns
-`BarWriter` in its own `store` consumer group; the api has no writer at all. It receives the
-lossless market-data stream through Redis, folds the same four tables as the monolith, and is
-their only writer. With `DELTA_BUS` unset — the default — FanOut keeps the existing in-process
-monolith unchanged.
-The crash protocol is [store-replay.md](store-replay.md); this design records its ownership
-and read-path consequences rather than repeating that protocol.
+`BarWriter` and is the only Parquet writer; the api has no `BarWriter` or `BarStore` buffer.
+A lossless `bar-buffer` subscription folds `md.option_bar` into `BarBuffer`, whose
+table-specific rows are injected as `BarStore.pending_source`; `/smile` (`smile.read_smile`),
+`/chain/minutes` (`historical.list_minutes`), `/chain/at` (`historical.read_ladder_at`) and
+`/bars` (`contract_bars.read_contract_bars`) union disk with that source. Both modes expose
+the newest sealed minute; overlap is one row and disk wins. `BUFFER_HORIZON_SECONDS` bounds
+the buffer; `measured` 4.43 MiB was retained for 12,390 six-minute bars in a `tracemalloc`
+run on 2026-09-12. See [0010-store-replay.md](../decisions/0010-store-replay.md),
+[#81](https://github.com/lalitkarthik/delta-exchange-payoff/issues/81) and the crash
+protocol [store-replay.md](store-replay.md). With `DELTA_BUS` unset, FanOut keeps the
+existing in-process monolith unchanged.
 
 ---
 
@@ -186,14 +191,7 @@ HTTP, and `tests/test_composition.py` a scripted socket into the writer's counte
 
 ## 8. Numbers
 
-| Number | Tag | Run |
-|---|---|---|
-| Table A/B/D grace 8.0 s | `derived` | 1.45x the 5,511 ms ceiling from `tools/measure_arrival_lag.py`, 2026-09-04 |
-| Table C grace 0.0 s | `derived` | a sample has no stragglers; see §1 |
-| Arrival lag: book p50 212.6 ms, max 510.3 ms; reference median 3,176 ms, max 5,298.8 ms | `measured` | `tools/measure_arrival_lag.py`, 2026-09-04 |
-| Flush every 5 minutes, 288 files per table per day before compaction | `derived` | #16, from the measured hourly file sizes |
-| ~7,056 spot observations a minute against ~118 for one contract's book | `measured` | `tools/measure_feed.py`, 2026-09-03 |
-| 2,460 quote-bar rows, all carrying `last_lts`, over 410 s | `measured` | #36's live run, 2026-09-07T13:24:41Z |
-| One production-interval (300 s) flush, BTC alone: 7,535 rows, 8 files, 877,975 bytes across the four tables | `measured` | #37's live run |
-| The same flush shape, BTC+ETH: scheduled flush 11,740 rows/8 files/699,591 bytes; plus the trailing open-minute flush, 14,088 rows/16 files/909,237 bytes total. File count doubles cleanly — one `underlying=` partition per table per flush, per underlying; rows and bytes do not, because the two runs cover different minutes and market activity, not only a different recorded set | `measured` | `tools/measure_store.py`'s `capture()`, generalised to two underlyings, scratch root, 2026-09-08 — full breakdown in `docs/storage.md` |
-| Every one of the four tables holds an ETH partition with rows after two flush intervals | `measured` | same run |
+Every measured and derived number behind this design, with the run that produced it, is in
+[store-numbers.md](store-numbers.md). It is split out rather than kept here because this file
+reached the 200-line bound and evidence grows while a design does not -- the same move #62
+made for the HLD and #63 made for the logging catalogue.

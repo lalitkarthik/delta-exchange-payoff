@@ -94,12 +94,9 @@ Nine travel outbound from a producer to the bus. One travels inbound.
 
 ### `md.option_bar` — a sealed minute bar
 
-- **Direction** outbound. **Emitted by** the bar writer at seal.
-- **Consumed by** nothing today; published so a later consumer needs no second aggregation. Not
-  yet emitted either: the writer's four aggregators still hand their bars straight to the store.
-- **When** a minute closes and its grace elapses. **A minute with no arrivals produces no
-  event**, as it produces no row.
-- **Payload** `table` (quote, reference, spot or computed), `minute`, and that table's columns.
+- **Direction** outbound. **Emitted by** the bar writer at seal, in the store process only; the monolith's writer has no publisher and publishes none. **Consumed by** the api's `BarBuffer`, which folds it into the in-memory buffer the four historical read paths union with disk.
+- **When** a minute closes and its grace elapses. **A minute with no arrivals produces no event**, as it produces no row.
+- **Payload** `table` (quote, reference, spot or computed), `underlying`, `minute`, and that table's columns.
 
 ### `computed.chain` — our IV and Greeks for one expiry
 
