@@ -17,17 +17,21 @@ import asyncio
 import importlib
 import json
 import logging
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import polars as pl
 import pytest
 from fastapi.testclient import TestClient
 
 from deltapayoff import main
-from deltapayoff.adapters import DeltaAdapter, DeltaFeed
-from deltapayoff.events import Event
+from deltapayoff.adapters import DeltaAdapter, DeltaFeed, instrument_from_symbol
+from deltapayoff.events import Alert, Event, IndexQuote, OptionQuote, OptionReference
 from deltapayoff.fanout import FanOut
 from deltapayoff.store import BarStore, BarWriter
 from deltapayoff.stream import ChainStream
+from wait_helpers import wait_until
 
 CALL = "C-BTC-77600-040926"
 PUT = "P-BTC-77600-040926"
@@ -534,3 +538,149 @@ def test_a_configuration_naming_nothing_valid_still_records_the_default(
         assert main.live_underlyings() == ("BTC", "ETH")
 
     assert caplog.records, "it fell back silently"
+
+
+# --- what the monolith's bar writer may put on its bus -------------------------------
+
+
+#: The failure the ticket names. `store.py`'s own tests use the same string, so a reader
+#: comparing the two compositions is reading one error and not two.
+DISK_FULL = "no space left on device"
+
+#: A fixed venue stamp, never `now()`. The bar it seals is the same bar in November.
+MONOLITH_BAR_US = datetime(2026, 9, 4, 9, 0, 0, 123456, tzinfo=timezone.utc)
+
+
+def _monolith_market_events() -> tuple:
+    """One quote, one reference and one index tick — enough to seal three tables."""
+    instrument = instrument_from_symbol(CALL)
+    assert instrument is not None
+    return (
+        OptionQuote(
+            source="feed",
+            ts_venue=MONOLITH_BAR_US,
+            ts_received=MONOLITH_BAR_US,
+            instrument=instrument,
+            bid=100.0,
+            ask=101.0,
+        ),
+        OptionReference(
+            source="feed",
+            ts_venue=MONOLITH_BAR_US,
+            ts_received=MONOLITH_BAR_US,
+            instrument=instrument,
+            mark=100.5,
+        ),
+        IndexQuote(
+            source="feed",
+            ts_venue=MONOLITH_BAR_US,
+            ts_received=MONOLITH_BAR_US,
+            underlying="BTC",
+            spot=77600.0,
+        ),
+    )
+
+
+def test_a_failed_flush_in_the_monolith_reaches_the_bus_as_an_alert(
+    monkeypatch, tmp_path
+) -> None:
+    """#107 criterion 2, against **the writer `build_feed_stack` actually builds**.
+
+    `test_store_flush_failure.py` already proves `BarWriter` alerts on a failed flush,
+    and it proved it against a writer the test itself handed a `publish`. `main.py`
+    handed its writer none, so that test was true of an object no running process
+    constructs and `:8000` built the alert and dropped it. This test takes the stack from
+    the composition root instead, which is the only place the question can be settled.
+
+    The three assertions are one decision each, and the seam exists for all three:
+
+    * a sealed bar reaches the store and **not** the bus — the writer subscribes to that
+      fanout (`writer.attach(events)`), so a bar published onto it would come straight
+      back as `skipped`, thousands a minute;
+    * the `alert` does reach it, because that is what an operator has to see;
+    * and it arrives on the **event loop thread**, because `_flush_all` raises on an
+      `asyncio.to_thread` worker and `asyncio.Queue.put_nowait` is not thread-safe. The
+      thread identities are recorded rather than reasoned about.
+    """
+
+    async def scenario() -> None:
+        monkeypatch.delenv("DELTA_BUS", raising=False)
+        monkeypatch.setenv("DELTA_STORE_ROOT", str(tmp_path))
+        stack = main.build_feed_stack(object())
+        writer = stack.writer
+        probe = stack.events.subscribe("probe", maxsize=32)
+        loop_thread = threading.get_ident()
+
+        published: list[tuple[int, object]] = []
+        fanout_publish = stack.events.publish
+
+        def recording_publish(event) -> None:
+            published.append((threading.get_ident(), event))
+            fanout_publish(event)
+
+        monkeypatch.setattr(stack.events, "publish", recording_publish)
+
+        # Half one: four tables seal, and nothing at all goes on the bus.
+        for event in _monolith_market_events():
+            writer.ingest(event)
+        writer._seal((MONOLITH_BAR_US + timedelta(minutes=1, seconds=15)).timestamp())
+        assert writer.store.buffered == 1, "no quote bar was sealed to fail a flush with"
+        assert published == [], "the monolith put a sealed bar on its own bus"
+        assert probe.queue.empty()
+
+        # Half two: the flush raises where the ticket says it raises.
+        flushed_on: list[int] = []
+
+        def write_parquet(self, file, *args, **kwargs):
+            flushed_on.append(threading.get_ident())
+            raise OSError(DISK_FULL)
+
+        monkeypatch.setattr(pl.DataFrame, "write_parquet", write_parquet)
+        await writer._maybe_flush()
+
+        await wait_until(
+            lambda: not probe.queue.empty(),
+            message="the monolith's flush-failure alert never reached the bus",
+        )
+        alert = probe.queue.get_nowait()
+        assert isinstance(alert, Alert)
+        assert alert.code == "store.flush_failed"
+        assert alert.source == "store"
+        assert alert.severity == "error"
+        assert DISK_FULL in alert.detail, "the alert does not name what went wrong"
+        assert writer.flush_errors == 1, "a failed flush was not counted exactly once"
+        assert probe.queue.empty(), "the seam forwarded something besides the alert"
+
+        assert flushed_on, "the flush never reached write_parquet"
+        assert loop_thread not in flushed_on, "the flush ran on the event loop"
+        assert [thread for thread, _ in published] == [loop_thread], (
+            "the alert was published from the worker thread that raised it; "
+            "asyncio.Queue.put_nowait is not thread-safe"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_the_monolith_seam_refuses_everything_that_is_not_an_alert(
+    monkeypatch, tmp_path
+) -> None:
+    """The refusal is counted, so "the monolith puts no bar on its bus" is a number
+    rather than a claim — and a later change that starts forwarding bars moves it."""
+
+    async def scenario() -> None:
+        monkeypatch.delenv("DELTA_BUS", raising=False)
+        monkeypatch.setenv("DELTA_STORE_ROOT", str(tmp_path))
+        stack = main.build_feed_stack(object())
+        seam = stack.writer._publish
+        assert isinstance(seam, main.StoreAlertSeam)
+
+        for event in _monolith_market_events():
+            stack.writer.ingest(event)
+        stack.writer._seal(
+            (MONOLITH_BAR_US + timedelta(minutes=1, seconds=15)).timestamp()
+        )
+
+        assert seam.refused == 3, "three sealed bars, three refusals"
+        assert stack.events.published == 0
+
+    asyncio.run(scenario())

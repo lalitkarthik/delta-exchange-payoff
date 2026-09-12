@@ -82,6 +82,7 @@ from .compute import enrich
 from .contract_bars import ContractBarsResponse, read_contract_bars
 from .delta_client import DeltaClient, DeltaUnavailable
 from .events import (
+    Alert,
     BarTable,
     Bus,
     ChainStrike,
@@ -851,6 +852,123 @@ async def stop_bus(bus: Bus) -> None:
         await bus.aclose()
 
 
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    """The loop running on this thread, or `None` on a thread with none."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+class StoreAlertSeam:
+    """The monolith's `publish` for the bar writer: an `alert`, on the loop thread.
+
+    **What it is for.** `BarWriter` announces a failed store flush by calling the
+    `publish` it was built with -- `_flush_failed`, then `_publish_flush_failure`. The
+    split composition hands it `bus.publish` in `store_main.py`; the monolith handed it
+    nothing at all, so on the composition serving `:8000` the alert was built and
+    dropped. `flush_errors` moved on `/health` (#103) and nothing anywhere said why. #107.
+
+    **Why the fanout is not simply handed over**, which is the question this class exists
+    to answer rather than route around:
+
+    1. **The writer reads that fanout.** `build_feed_stack` calls `writer.attach(events)`,
+       so the writer subscribes to the bus it would publish to. Its other use of `publish`
+       is one `OptionBar` per sealed bar (`_hand_to_store`), and those would return to the
+       writer's own lossless queue to be counted in `skipped` -- thousands a minute, read
+       by nobody, because the monolith has no second process to read them. That is the
+       whole difference between it and the split. So this seam forwards an `Alert` and
+       **refuses everything else**, and counts the refusals so that is a number.
+    2. **The publish happens off the event loop.** `_flush_all` runs inside
+       `asyncio.to_thread`, and `FanOut.publish` ends in `asyncio.Queue.put_nowait`, which
+       resolves a waiting getter's future. That is not thread-safe, and what it produces
+       is a lost wakeup rather than an exception -- a consumer that stops receiving with
+       nothing raised anywhere, which is this repository's worst failure shape.
+       `RedisBus.publish` only appends to a list, which is why the split path was always
+       safe without any of this. So delivery is scheduled with `loop.call_soon_threadsafe`
+       -- the one loop method asyncio documents as safe to call from another thread -- and
+       `FanOut.publish` then runs on the loop thread, exactly as it does for the socket
+       handler and every other publisher in this process. **What that costs is one
+       scheduling hop**: an alert raised by the final flush in `stop_feed_stack` is
+       delivered only if the loop turns again, which it does -- `stop_bus` and
+       `client.aclose()` are both awaited after it -- but it is a promise about the
+       shutdown order and not about the alert. The ERROR record from `_flush_failed` is
+       written inline on the worker and does not depend on any of this.
+
+    **Why the filter lives here and not as a second seam on `BarWriter`.** An alert is not
+    a market-data event, and an `on_alert` argument beside `publish` would say so in the
+    type system. But what makes this bus unsafe to hand over whole is not a fact about
+    storage: it is a fact about *this composition* -- that the writer reads this bus, and
+    that the flush is dispatched to a worker thread. The composition root is the only
+    place both are known, and `store.py` keeps one `publish` seam that the two
+    compositions fill differently. A seam in the store would move the decision to the
+    module that cannot make it.
+    """
+
+    def __init__(self, bus: Bus) -> None:
+        self._bus = bus
+        #: The loop to deliver on, captured wherever one is running. `build_feed_stack`
+        #: is called from `lifespan`, so in every real process this is the loop the
+        #: writer's flush is dispatched from. A test that builds the stack outside a loop
+        #: gets `None` here, and the lookup in `__call__` finds the running one instead.
+        self._loop = _running_loop()
+        #: Events the writer offered that are not alerts -- one per sealed bar. Counted
+        #: rather than dropped quietly, so "the monolith puts no bar on its own bus" is a
+        #: number a test reads, and a change that starts forwarding them moves it.
+        self.refused = 0
+        #: Alerts that reached no loop to be delivered on, or that the bus refused.
+        #: Expected to stay at zero; an error record accompanies every one of them.
+        self.undeliverable = 0
+
+    def __call__(self, event: Any) -> None:
+        """Called from an `asyncio.to_thread` worker. **Nothing here touches the loop's
+        own structures except through `call_soon_threadsafe`.**"""
+        if not isinstance(event, Alert):
+            self.refused += 1
+            return
+        loop = _running_loop() or self._loop
+        try:
+            if loop is None:
+                raise RuntimeError("no event loop to publish the alert on")
+            loop.call_soon_threadsafe(self._deliver, event)
+        except RuntimeError:
+            # A closed loop, or a stack built outside one. The flush failure still has
+            # its error record from `_flush_failed`; this says the alert did not follow.
+            self.undeliverable += 1
+            log_event(
+                logger,
+                logging.ERROR,
+                log_events.ENGINE_ERROR,
+                "the store alert %s reached no event loop and was not published",
+                event.code,
+                exc_info=True,
+            )
+
+    def _deliver(self, event: Alert) -> None:
+        """Publish, on the loop thread.
+
+        `self._bus` is read here rather than bound at construction, so a test replacing
+        the bus's `publish` replaces the one this delivers through.
+
+        **The guard is this class's own** and not a duplicate of the one in
+        `_publish_flush_failure`: by the time this runs, the caller that had a `try`
+        around `publish` has long returned, and an exception raised here would reach the
+        loop's default handler instead of a record naming the store.
+        """
+        try:
+            self._bus.publish(event)
+        except Exception:
+            self.undeliverable += 1
+            log_event(
+                logger,
+                logging.ERROR,
+                log_events.ENGINE_ERROR,
+                "the store alert %s was not published",
+                event.code,
+                exc_info=True,
+            )
+
+
 def build_feed_stack(client: DeltaClient) -> FeedStack:
     """Wire the bus, the chain cache, the bar writer and the adapter together.
 
@@ -876,6 +994,11 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     `BarStore()` names the quote table only; the writer derives the other two roots from
     it, so there is exactly one place that decides where market data lands.
 
+    **The writer's `publish` is `StoreAlertSeam` and not the bus.** It carries a failed
+    flush's `alert` onto the fanout and refuses every other event, because the writer is
+    itself a subscriber here -- see that class for why the two facts deciding this are
+    known at the composition root and nowhere else. #107.
+
     Every collaborator is looked up in this module's globals **at call time**, which is
     what lets a test replace `DeltaClient`, `DeltaFeed`, `BarStore` or `BarWriter` with a
     stub and get a stack that never opens a socket. `DeltaFeed` reaches the adapter as a
@@ -885,7 +1008,13 @@ def build_feed_stack(client: DeltaClient) -> FeedStack:
     events = build_bus()
     stream = ChainStream()
     stream.attach(events)
-    writer = BarWriter(BarStore(), chains=stream.live_computed_chains)
+    writer = BarWriter(
+        BarStore(),
+        chains=stream.live_computed_chains,
+        # An `alert` and nothing else, delivered on the loop thread. `StoreAlertSeam`
+        # carries the argument for why the bus is not handed over whole. #107.
+        publish=StoreAlertSeam(events),
+    )
     writer.attach(events)
     adapter = DeltaAdapter(
         client=client,

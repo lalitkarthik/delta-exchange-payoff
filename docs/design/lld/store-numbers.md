@@ -63,3 +63,9 @@ conservation law for a point sample the way there is for a running count of tick
 `theta`'s envelope has been measured; the rest of table C's Greeks are reported by the
 tool for visibility but do not gate its exit code until their own envelope is measured
 from a live run.
+
+## Why table A seals on the larger of the two watermarks
+
+Moved here from [store.md](store.md) by #107, which needed the line back. A bar sealed at the
+book's 2.0 s closes four seconds before its fallback could arrive, so every fallback quote
+would be counted late, the fallback would be dead code and the flag would be a constant `True`.

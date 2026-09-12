@@ -27,8 +27,7 @@ the newest sealed minute; overlap is one row and disk wins. `BUFFER_HORIZON_SECO
 the buffer, and [store-numbers.md](store-numbers.md) says what it held. See
 [0010-store-replay.md](../decisions/0010-store-replay.md),
 [#81](https://github.com/lalitkarthik/delta-exchange-payoff/issues/81) and the crash protocol
-[store-replay.md](store-replay.md). With `DELTA_BUS` unset, FanOut keeps the existing
-in-process monolith unchanged.
+[store-replay.md](store-replay.md). With `DELTA_BUS` unset, one in-process FanOut serves both.
 
 ---
 
@@ -114,9 +113,8 @@ takes the book's if it saw anything at all, the fallback's otherwise. **They are
 merged**: a book bar with two stale fallback samples folded into its high and low would be a
 bar whose provenance is unanswerable, which is the whole point of the column.
 
-This is why table A seals on the **larger** of the two watermarks. A bar sealed at the book's
-2.0 s closes four seconds before its fallback could arrive, so every fallback quote would be
-counted late, the fallback would be dead code and the flag would be a constant `True`.
+This is why table A seals on the **larger** of the two watermarks: the smaller leaves every
+fallback quote late and the flag a constant `True` -- [store-numbers.md](store-numbers.md) counts.
 
 ## 4. Bucketing, and the one clock that decides
 
@@ -159,11 +157,11 @@ the minutes trimmed from Redis, and the gap signal reports them.
 | A symbol that will not parse into underlying/expiry/strike/type | `unparseable` grows; never filed under a guess |
 | A reference event quoting neither side | No fallback tick; a pair of absent prices is not a quote |
 | Recording switched off | The subscription is still **drained** and `discarded` grows; a lossless queue nobody empties backs up the socket reader |
-| A flush raises | All or nothing (#101): the files that flush published are removed, the buffer and the flush ordinal are left as they were, and the next interval flushes the same bars — one `BarStore._flush_buffer` implements it and `_flush_legacy` and `_flush_generation` differ only in how they name a file. **Both compositions then say the same thing** (#107): `flush_errors` grows by exactly one, an error record carries the exception with `exc_info`, and an `alert` `store.flush_failed` is published (see below for where that lands). One `BarWriter._flush_failed` does all three, reached from `_flush_all` in the monolith and `_commit` in the split, so there is no second copy to drift; the message names a table in the monolith, where the four flush independently, and a generation in the split, where they commit as one |
+| A flush raises | All or nothing (#101): the files that flush published are removed, the buffer and the flush ordinal are left as they were, and the next interval flushes the same bars — one `BarStore._flush_buffer` implements it and `_flush_legacy` and `_flush_generation` differ only in how they name a file. **Both compositions then say the same thing** (#107): `flush_errors` grows by exactly one, an error record carries the exception with `exc_info`, and an `alert` `store.flush_failed` is published. One `BarWriter._flush_failed` does all three, reached from `_flush_all` in the monolith and `_commit` in the split, so there is no second copy to drift; the message names a table in the monolith, where the four flush independently, and a generation in the split, where they commit as one. **The alert lands only where the writer was given a `publish`.** `store_main.py` hands the split `bus.publish`; `main.py` hands the monolith `StoreAlertSeam`, which forwards the `alert`, refuses every other event because the writer subscribes to that same fanout, and delivers through `loop.call_soon_threadsafe` because `_flush_all` raises on an `asyncio.to_thread` worker and `asyncio.Queue.put_nowait` is not thread-safe |
 
 **A count is not a diagnosis.** `flush_errors` has been on `/health` since #103, so a failing flush
-was already a number; until #107 the monolith wrote nothing saying *why*. The alert needs somewhere
-to go too: `store_main.py` hands the writer the bus, `main.py`'s monolith hands it no `publish`.
+was already a number; until #107 the monolith wrote nothing saying *why*. The alert needed somewhere
+to go too, and both compositions now hand the writer a `publish`; the row above says which and why.
 
 ## 6. What still speaks the venue's shape
 
@@ -185,6 +183,9 @@ instrument to parse in the first place.
 
 ## 7. The seam the tests drive
 
+**A composition test drives the writer `build_feed_stack` builds, never one it assembles.**
+#107's first test gave its `BarWriter` a `publish` `main.py` did not: true of no live process.
+
 `BarWriter.attach(bus)` and `ingest(event)`, with `BarStore` on a `tmp_path` and an injected
 clock, so sealing and flushing are test parameters rather than races. Events come from the
 real adapter through `tests/fakes/decoder.py`. `tests/test_bars.py` drives the aggregators,
@@ -194,6 +195,5 @@ HTTP, and `tests/test_composition.py` a scripted socket into the writer's counte
 ## 8. Numbers
 
 Every measured and derived number behind this design, with the run that produced it, is in
-[store-numbers.md](store-numbers.md). It is split out rather than kept here because this file
-reached the 200-line bound and evidence grows while a design does not -- the same move #62
-made for the HLD and #63 made for the logging catalogue.
+[store-numbers.md](store-numbers.md). Evidence grows and a design does not -- the same move
+#62 made for the HLD and #63 made for the logging catalogue.
