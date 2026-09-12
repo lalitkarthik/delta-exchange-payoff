@@ -129,6 +129,10 @@ you conclude your change broke something.
   a design note filling up has been fixed the same way — the design stays and the evidence
   moves to a sibling — as `hld-evidence.md` (#62), `logging-catalogue.md` (#63) and
   `store-numbers.md` (#81) each did.
+- **A table row can be true and still render outside its table.** `engine/tests/
+  test_doc_render.py` parses every Markdown file under `docs/` and fails on a row a stray
+  blank line and block element ejected (#95), or one whose column count disagrees with its
+  own header.
 - **Stay inside the ticket's allowed scope.** Note anything else you spot in
   `out_of_scope_noticed`; do not fix it.
 - Numbers are tagged `measured`, `assumed` or `derived`, with the run that produced them.
