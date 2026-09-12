@@ -332,20 +332,72 @@ async def _prepare_process(
     if checkpoint is None:
         checkpoint = _first_checkpoint(process)
         write_checkpoint(root, checkpoint)
-        log_event(
-            logger,
-            logging.INFO,
-            log_events.STORE_CHECKPOINT,
-            "store checkpoint generation %d initialized",
-            checkpoint.generation,
-            generation=checkpoint.generation,
-            streams=len(checkpoint.streams),
-            quote_sealed_through_us=checkpoint.sealed_through_us[DATASET],
-            reference_sealed_through_us=checkpoint.sealed_through_us[REFERENCE_DATASET],
-            spot_sealed_through_us=checkpoint.sealed_through_us[SPOT_DATASET],
-            computed_sealed_through_us=checkpoint.sealed_through_us[COMPUTED_DATASET],
-        )
+        _log_start_up(process, checkpoint, "initialized")
+    else:
+        _log_start_up(process, checkpoint, "restored")
     return process
+
+
+def _replayed_from(checkpoint: Checkpoint) -> str:
+    """Every stream and the position this start-up is reading forward from, in one field.
+
+    One string rather than four, because the point of the record is that it is **one
+    line an operator reads after a restart**: four fields whose names are stream keys
+    would be four columns that appear and disappear with the configuration.
+    """
+    return " ".join(
+        f"{stream}@{position.id}(index {position.index})"
+        for stream, position in sorted(checkpoint.streams.items())
+    )
+
+
+def _log_start_up(
+    process: StoreProcess, checkpoint: Checkpoint, disposition: str
+) -> None:
+    """**One record on every start-up, whether or not anything was wrong.** #110.
+
+    Before this, `store` said nothing at all on a clean replay: the gap check logs when
+    it finds a gap and is silent when it does not, and the generation-zero record fired
+    only on a first start. So the restart at `measured` 2026-09-12T15:56:57Z left
+    `.stack-logs/store/2026-09-12.log` empty between 15:56:57.1Z and 16:01:59.3Z, and
+    the only evidence that a minute had been dropped from one of four tables was a
+    **file name**. #110 had to establish its own mechanism from Parquet because of that
+    silence, and this is the line that would have answered it: what was replayed, from
+    where, and what each of the four tables had already sealed through.
+
+    **It is the same `store.checkpoint` event, not a new one.** A start-up record is a
+    statement about a checkpoint -- the one being adopted -- and a second event name for
+    it would split every "what did this generation do" query in two. `disposition` is
+    what distinguishes the two cases in the message: *initialized* is a root with no
+    checkpoint in it, *restored* is every other start.
+
+    Exactly one record per start-up, so
+    `test_store_process_first_start_positions_readers_and_writes_generation_zero`'s count
+    still means what it says.
+    """
+    sealed = checkpoint.sealed_through_us
+    log_event(
+        logger,
+        logging.INFO,
+        log_events.STORE_CHECKPOINT,
+        "store checkpoint generation %d %s: replaying %d streams from %s; "
+        "recording=%s, replay gap %d entries",
+        checkpoint.generation,
+        disposition,
+        len(checkpoint.streams),
+        _replayed_from(checkpoint) or "nothing saved",
+        checkpoint.recording,
+        process.writer.replay_gap_entries,
+        generation=checkpoint.generation,
+        streams=len(checkpoint.streams),
+        replayed_from=_replayed_from(checkpoint),
+        recording=checkpoint.recording,
+        replay_gap_entries=process.writer.replay_gap_entries,
+        quote_sealed_through_us=sealed[DATASET],
+        reference_sealed_through_us=sealed[REFERENCE_DATASET],
+        spot_sealed_through_us=sealed[SPOT_DATASET],
+        computed_sealed_through_us=sealed[COMPUTED_DATASET],
+    )
 
 
 def _state_signature(process: StoreProcess) -> tuple[bool, int, int]:

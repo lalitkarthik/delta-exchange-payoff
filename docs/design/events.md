@@ -148,7 +148,8 @@ Nine travel outbound from a producer to the bus. One travels inbound.
 - **Payload** `severity`, `code` (a short stable name), `detail`, and `adapter` where one applies.
 - **Codes emitted so far.** The controller (#38): `connection_silent`, silence past
   `reconnect_after`; `poll_failing`, its watchdog's polls raising. The store (#103):
-  `store.flush_failed`, `store.replay_gap`, `store.consumer_lag`. The bus (#103):
+  `store.flush_failed`, `store.replay_gap`, `store.consumer_lag`, and `store.empty_generation`
+  (#110) for a generation with zero rows in all four tables while recording. The bus (#103):
   `bus.reader_stopped`. **`degraded` does not alert, and nor does a `pause`** — fifteen quiet
   seconds is already a badge and a heartbeat, a pause is something a person just did, and an alert on either is the flood an alert exists to stand out from.
 

@@ -877,3 +877,145 @@ def test_a_split_writer_cannot_also_sample_a_chain_cache(tmp_path: Path) -> None
             computed=ComputedAggregator(),
             checkpoint_root=tmp_path,
         )
+
+
+def test_a_restart_writes_one_start_up_record_saying_what_it_replayed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#110 criterion 3. **A clean replay used to be completely silent.**
+
+    `store` logged only when the gap check found a gap, and the generation-zero record
+    fired only on a first start, so the restart at `measured` 2026-09-12T15:56:57Z left
+    nothing at all in `.stack-logs/store/2026-09-12.log` between 15:56:57.1Z and
+    16:01:59.3Z. A minute was dropped from one of four tables inside that window and the
+    only evidence it left was a **file name**. #110 had to reconstruct its mechanism from
+    Parquet because of that silence.
+
+    One record, on every start-up, naming the generation adopted, every stream and the
+    position it is reading forward from, and what each of the four tables had already
+    sealed through.
+    """
+
+    async def scenario() -> None:
+        import fakeredis.aioredis
+
+        server = fakeredis.aioredis.FakeServer()
+        clock = Clock((BASE + timedelta(minutes=2, seconds=10)).timestamp())
+        first = await _make_process(tmp_path, server, clock)
+        try:
+            # No drain loop: the queue is emptied by hand. This test is about what the
+            # **next** process says at start-up, so a writer task racing the reader would
+            # be a second moving part it does not need -- and under the concurrent runs
+            # #96 and #99 describe, the one that times out.
+            first.bus.publish(_quote_event(0))
+            await first.bus.flush()
+            await _wait_until(
+                lambda: first.subscription.offered == 1,
+                message="the quote never reached the subscription",
+            )
+            while not first.subscription.queue.empty():
+                first.writer.ingest(first.subscription.queue.get_nowait())
+            assert first.writer.aggregator.ticks == 1
+            first.writer._seal(clock())
+            assert first.writer._commit() == 1
+        finally:
+            await _kill_process(first)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="deltapayoff.store_main"):
+            second = await _make_process(tmp_path, server, clock)
+            await _kill_process(second)
+
+        records = [
+            record
+            for record in caplog.records
+            if record.event == log_events.STORE_CHECKPOINT
+        ]
+        assert len(records) == 1, (
+            f"a restart wrote {len(records)} start-up records; it must write exactly "
+            f"one, and before #110 it wrote none"
+        )
+        record = records[0]
+        assert record.generation == 1
+        assert record.streams == 4
+        assert record.recording is True
+        assert record.replay_gap_entries == 0
+        # What was replayed: every stream, with the position read forward from.
+        for stream in (
+            "computed.chain:DELTA:BTC",
+            "md.index_quote:DELTA:BTC",
+            "md.option_quote:DELTA:BTC",
+            "md.option_reference:DELTA:BTC",
+        ):
+            assert stream in record.replayed_from
+        # And what was sealed, per table, which is the field #110 needed and did not have.
+        assert record.quote_sealed_through_us > 0
+        assert record.reference_sealed_through_us > 0
+        assert record.spot_sealed_through_us > 0
+        assert record.computed_sealed_through_us > 0
+
+    asyncio.run(scenario())
+
+
+def test_a_generation_with_no_rows_in_any_table_says_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """**The check #110 says is worth more than its own fix**, and #103, #104 and #108.
+
+    All three of this week's losses arrived as minutes sealed empty, never as a missing
+    file and never as a duplicate. A generation committed with four tables and zero rows
+    is *correct* -- sealed empty, nothing invented, no forward-fill -- and it is also
+    exactly what a dead system writes. Nothing anywhere watched for it: generation 126 was
+    committed at `measured` 2026-09-12T16:17:00Z with four tables, zero rows and no
+    `store.flush` record at all, while `feed` was down, and nobody knew for hours.
+
+    Warning and an `alert` while recording; info and no alert while paused, where an empty
+    generation every five minutes is the design.
+    """
+
+    async def scenario() -> None:
+        import fakeredis.aioredis
+
+        server = fakeredis.aioredis.FakeServer()
+        clock = Clock((BASE + timedelta(minutes=2, seconds=10)).timestamp())
+        process = await _make_process(tmp_path, server, clock)
+        published: list[object] = []
+        process.writer._publish = published.append
+        try:
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="deltapayoff.store"):
+                # Nothing was ever folded, so this commit publishes four empty tables.
+                assert process.writer._commit() == 0
+                recording_records = [
+                    record
+                    for record in caplog.records
+                    if record.event == log_events.STORE_CHECKPOINT
+                    and getattr(record, "rows", None) == 0
+                ]
+                assert len(recording_records) == 1, (
+                    "a generation with zero rows in all four tables said nothing"
+                )
+                assert recording_records[0].levelno == logging.WARNING
+                assert recording_records[0].tables == 4
+                assert recording_records[0].recording is True
+                codes = [getattr(event, "code", None) for event in published]
+                assert "store.empty_generation" in codes
+
+                # Paused: the same shape, reported quietly and without an alert.
+                caplog.clear()
+                published.clear()
+                process.writer.recording = False
+                assert process.writer._commit() == 0
+                paused_records = [
+                    record
+                    for record in caplog.records
+                    if record.event == log_events.STORE_CHECKPOINT
+                    and getattr(record, "rows", None) == 0
+                ]
+                assert len(paused_records) == 1
+                assert paused_records[0].levelno == logging.INFO
+                assert [getattr(event, "code", None) for event in published] == []
+        finally:
+            await _kill_process(process)
+
+    asyncio.run(scenario())

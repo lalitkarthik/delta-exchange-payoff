@@ -1664,8 +1664,7 @@ class BarWriter:
             if command.command == "pause":
                 self.recording = False
                 self.pause_spans.append(Span(ids, None))
-                self._seal(self.seal_clock())
-                await asyncio.to_thread(self._commit)
+                await self._seal_and_write()
             elif command.command == "resume":
                 self.recording = True
                 for index in range(len(self.pause_spans) - 1, -1, -1):
@@ -1676,8 +1675,7 @@ class BarWriter:
                             {key: position.id for key, position in positions.items()},
                         )
                         break
-                self._seal(self.seal_clock())
-                await asyncio.to_thread(self._commit)
+                await self._seal_and_write()
 
     def attach(self, fanout, maxsize: int = QUEUE_WATERMARK, name: str = "bar-writer"):
         """Take a lossless queue on the bus. `run` drains it."""
@@ -2059,6 +2057,8 @@ class BarWriter:
             trip("after-checkpoint")
             clear_intent(root)
             trip("after-intent-delete")
+            if written == 0:
+                self._note_empty_generation(generation, sealed)
             self._prune_origins()
             self._notify_state_change()
             return written
@@ -2080,6 +2080,75 @@ class BarWriter:
                 generation=generation,
             )
             raise
+
+    def _note_empty_generation(self, generation: int, sealed: dict[str, int]) -> None:
+        """A generation committed with **zero rows in every one of the four tables**.
+
+        **The one line that would have named all three of this week's losses inside five
+        minutes**, and nothing anywhere was watching for it. Every one of them arrived as
+        minutes sealed empty, never as a missing file and never as a duplicate: 97
+        minutes trimmed unread while `store` had stopped consuming (#103), one minute
+        dropped at a replay seam (#110), ten minutes with the venue socket down (#108).
+        The tests and `tools/measure_computed_gaps.py` both look for the duplicate, and
+        the duplicate has not happened once in 348 recorded minutes.
+
+        **What it says is not "something is broken".** A generation with four tables and
+        no rows is *correct* behaviour -- sealed empty, nothing invented, no forward-fill,
+        which is the rule this whole store exists to keep. `measured` at
+        2026-09-12T16:17:00Z,
+        generation 126 was exactly this, with `feed` down. The point is that correct
+        and dead produce the identical file on disk, so the difference has to be said out
+        loud by the only process that knows it committed nothing.
+
+        **Warning while recording, info while paused.** A paused `store` commits empty
+        generations by design and every five minutes; warning on those would be the flood
+        an alert exists to stand out from. `CONTEXT.md` section 7 refuses `0` for absent,
+        and this is the other side of that rule: zero rows is a real observation and is
+        reported as one.
+        """
+        empty = "recording" if self.recording else "paused"
+        log_event(
+            logger,
+            logging.WARNING if self.recording else logging.INFO,
+            log_events.STORE_CHECKPOINT,
+            "store generation %d committed %d rows across all four tables while %s: "
+            "every minute in it was sealed empty",
+            generation,
+            0,
+            empty,
+            generation=generation,
+            rows=0,
+            tables=len(self.stores),
+            recording=self.recording,
+            quote_sealed_through_us=sealed[DATASET],
+            reference_sealed_through_us=sealed[REFERENCE_DATASET],
+            spot_sealed_through_us=sealed[SPOT_DATASET],
+            computed_sealed_through_us=sealed[COMPUTED_DATASET],
+        )
+        if not self.recording or self._publish is None:
+            return
+        try:
+            self._publish(
+                Alert(
+                    source="store",
+                    ts_received=datetime.fromtimestamp(self.clock(), tz=timezone.utc),
+                    severity="warning",
+                    code="store.empty_generation",
+                    detail=(
+                        f"generation {generation} committed with zero rows in all "
+                        f"{len(self.stores)} tables while recording; every minute in it "
+                        f"was sealed empty"
+                    ),
+                )
+            )
+        except Exception:
+            log_event(
+                logger,
+                logging.ERROR,
+                log_events.ENGINE_ERROR,
+                "the store empty-generation alert could not be published",
+                exc_info=True,
+            )
 
     def _notify_state_change(self) -> None:
         if self.on_state_change is None:
@@ -2173,9 +2242,9 @@ class BarWriter:
         A failing table stops the pass -- the tables that already landed keep their
         files, the failing one and the ones behind it keep their buffers, and the next
         interval flushes exactly what is still owed. Every caller is told: the loop in
-        `_maybe_flush` swallows it to stay alive, `set_recording` and `aclose` let it
-        reach the caller that asked for the flush, and all of them now leave a record
-        behind them.
+        `_maybe_flush` swallows it to stay alive, `_seal_and_write` lets it reach
+        whichever of `set_recording`, a `control.command` or `aclose` asked for the
+        flush, and all of them now leave a record behind them.
         """
         written = 0
         for store in self.stores:
@@ -2223,39 +2292,82 @@ class BarWriter:
             return self.recording
 
         self.recording = False
-        self._seal()
-        # The interval restarts from the pause rather than from the last flush before
-        # it, so a resume does not write again immediately for no reason.
-        self._last_flush = self.clock()
-        await asyncio.to_thread(self._flush_all)
+        await self._seal_and_write()
         return self.recording
+
+    async def _seal_and_write(self, *, drain_open_minutes: bool = False) -> int:
+        """Seal, then write, **through whichever transaction this composition has.**
+
+        The one place a non-periodic flush happens, and the only place the choice
+        between the two compositions' transactions is made. Three callers reach it —
+        `set_recording(False)`, `_apply_pending_commands` for a `control.command` pause
+        or resume, and `aclose` — and #109 is what happened while they were three
+        separate copies of it.
+
+        **They had already drifted, and in the direction that costs data.** `aclose`
+        branched on `checkpoint_root` and reached `_commit`; `set_recording` did not and
+        reached `_flush_all` unconditionally; the command path branched but was written
+        out a third time. So a pause on a split `store` wrote Parquet with **no
+        generation in the file name, no flush intent and no checkpoint** — the bars
+        landed in a checkpoint root beside generation-named files, and the watermark
+        stayed behind them, so the next restart replayed the entries they came from and
+        wrote the same minutes a second time. `test_store_restart_seam.py` reproduces
+        that duplicate against the code as it was.
+
+        **This is the third time the same argument has been made here.** #101 merged the
+        two flush implementations into `BarStore._flush_buffer`, #107 merged the two
+        error handlers into `_flush_failed`, and both were merged because two copies is
+        how the compositions came to disagree in the first place. Accepted a third time
+        rather than argued down: every one of these callers wants exactly *"seal what is
+        eligible, then make it durable the way this composition makes things durable"*,
+        and that is one sentence.
+
+        `drain_open_minutes` is the only thing a caller still chooses, and only the
+        **monolith** honours it: `aclose` there must empty the aggregators, because a
+        monolith that stops has no replay to re-fold the open minute from and the
+        partial bar is a real observation. The split ignores it deliberately — the open
+        minute is re-folded from the bus on the next start, and flushing it here would
+        write a partial bar that the replay then writes again whole.
+
+        **The seal clock, not the wall clock, in the split.** `run` already seals on
+        `seal_clock()` there and on `self.clock()` in the monolith, for record 0010 R4's
+        reason: while a lossless reader is behind, the wall clock is ahead of the data
+        and sealing on it closes minutes the replay has not reached yet. A pause used to
+        seal on the wall clock in both compositions, which is that defect on the one
+        path most likely to be taken during a replay.
+        """
+        # The interval restarts from here rather than from the last flush before it, so
+        # a resume does not write again immediately for no reason.
+        self._last_flush = self.clock()
+        if self.checkpoint_root is not None:
+            self._seal(self.seal_clock())
+            return await asyncio.to_thread(self._commit)
+        if drain_open_minutes:
+            # The open minute's computed state is a real observation too, so the cache
+            # is sampled once more before the aggregators are drained. A cache that
+            # stopped being recomputed some minutes ago yields a sample that is late and
+            # refused, so a stopped feed still contributes nothing on the way out.
+            self._sample_computed(self.clock(), force=True)
+            self._hand_to_store(self.store, self.aggregator.flush(), BarTable.QUOTE)
+            self._hand_to_store(
+                self.reference_store, self.reference.flush(), BarTable.REFERENCE
+            )
+            self._hand_to_store(self.spot_store, self.spot.flush(), BarTable.SPOT)
+            self._hand_to_store(
+                self.computed_store, self.computed.flush(), BarTable.COMPUTED
+            )
+        else:
+            self._seal()
+        return await asyncio.to_thread(self._flush_all)
 
     async def aclose(self) -> None:
         """Flush the partial bars from all three tables and write them out. For stop.
 
         The partial bars this produces carry their **true** tick counts and no flag —
-        the counts already say they are short.
+        the counts already say they are short. In the split there are none to produce:
+        see `_seal_and_write`, which owns the difference.
         """
-        if self.checkpoint_root is not None:
-            self._seal(self.seal_clock())
-            await asyncio.to_thread(self._commit)
-            return
-        # The open minute's computed state is a real observation too, so the cache is
-        # sampled once more before the aggregators are drained. A cache that stopped
-        # being recomputed some minutes ago yields a sample that is late and refused, so
-        # a stopped feed still contributes nothing on the way out.
-        self._sample_computed(self.clock(), force=True)
-        self._hand_to_store(
-            self.store, self.aggregator.flush(), BarTable.QUOTE
-        )
-        self._hand_to_store(
-            self.reference_store, self.reference.flush(), BarTable.REFERENCE
-        )
-        self._hand_to_store(self.spot_store, self.spot.flush(), BarTable.SPOT)
-        self._hand_to_store(
-            self.computed_store, self.computed.flush(), BarTable.COMPUTED
-        )
-        await asyncio.to_thread(self._flush_all)
+        await self._seal_and_write(drain_open_minutes=True)
 
     def stats(self) -> dict[str, Any]:
         """The writer's own view, beside each aggregator's and the bus's.

@@ -94,7 +94,7 @@ you conclude your change broke something.
   ```
   200  docs/design/research/0001-stream-naming-and-payload-format.md  grown  #95
   200  docs/design/research/0009-compaction-cadence.md   created  #76 (f7df53c)
-  236  docs/design/events.md                              grown    #81 (f2fd905)
+  237  docs/design/events.md                              grown    #81, #110
   248  docs/design/cloud/epic.md                          grown    #74 (ceb9911)
   295  docs/iv-vs-rv.md                                   grown    #54 (4209ec2)
   640  docs/architecture.md                               grown    #77 (01710dd)
