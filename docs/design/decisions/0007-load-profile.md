@@ -127,3 +127,51 @@ binary quantity and is corrected in 0061 by #95. The 12 GiB ceiling is unaffecte
 `measured` 40.77%, from I2's run of 2026-09-09. Both it and the 5.88% it replaces trace to real
 runs, and the tag was no help in telling them apart — what separated them was the batch interval.
 `../cloud/compute-numbers.md` §2 sets out the two conditions side by side.
+
+## I13 (#79) determination — the threshold is crossed, and the doubt was aimed at the wrong service
+
+**Appended, not rewritten.** Every figure above stands as the `derived` belief it was; what
+follows is the `measured` reading against it. Evidence:
+[../research/0007a-container-measurement.md](../research/0007a-container-measurement.md), with
+the per-cell ledger in
+[../research/0007b-container-measurement-numbers.md](../research/0007b-container-measurement-numbers.md).
+`measured` 2026-09-12T05:50:07Z–11:02:38Z, **5h12m and not one day** — the collection ends
+because the stack stopped storing (#103), not because the day ended.
+
+**R6's re-cost threshold — "I13 (#79) moving any cell by more than 25%" — is crossed.
+Thirteen cells moved.** The four that matter: `feed` CPU `measured` **0.3592** against
+`derived` 0.52–0.71, **−30.9%** on the lower bound and **−49.4%** on the 0.71 this record's
+sizing actually used; `web` memory **110.6 MiB** against 240.8, −54.1%; Redis memory
+**761.8 MiB** against 1,056.4, −27.9%; and `api`'s per-viewer network **10.4 KB/s** for the
+first viewer and **8.6 KB/s** for each of the next two against `derived` 38.9 KB/s a viewer,
+−73% and −78%. The remaining nine, with their attributions, are 0007b §1. **No decision is
+reopened here**: the profile's shape — every Python service CPU-bound on one core, Redis and
+`web` memory-bound, nothing disk- or network-bound — is confirmed in every row.
+
+**§9 named `api` as the share it least believed. It was right to doubt it, and wrong about
+which half.** `api`'s CPU is `measured` 0.3045 and sits inside this record's 0.25–0.49 band;
+at 0 viewers it is 0.2701, 8.0% above the lower bound. The base §9 feared was under-measured
+because "what drives it was zero when it was measured" is in fact right. What is wrong is the
+**marginal** term: `+0.05–0.14 a watched expiry` prices every viewer alike, and `measured` the
+first viewer costs **0.0466 core** and the next two **0.0168 core each** — 66% below the
+band's lower bound, because the ladder is solved once and fanned out. **The doubt was
+justified; the cell it should have fallen on was the increment, not the base.**
+
+**§9's runner-up, `feed`, is the larger error.** It recorded that `derived` 0.52 disagreed
+with I2's `measured` 0.71, called the disagreement unexplained, and **sized on 0.71**.
+`measured` 0.3592 is below both, so the disagreement was resolved in the wrong direction and
+`feed` is over-provisioned by `derived` 1.98x against the figure the sizing used. **Of the two
+services this record doubted, the one it ranked second is the one that moved.**
+
+**Two cells this record should be read with.** `proxy` has no row here and #65 made it a real
+container: it is `measured` 0.0109 core and 17.1 MiB, with no `derived` counterpart to move
+against. And the `Redis | 1,056.4 MiB` cell in the decision table above is tagged `measured`
+while `../research/0007-load-profile.md` §4 tags the same figure `derived` M4. **They cannot
+both be right.** The research file's `derived` is the one the arithmetic supports; the
+disagreement is recorded here rather than corrected in place, and it is not this ticket's to
+settle.
+
+**The run sat at `derived` 0.86x of this record's 1x**, by `feed` ingress bytes — 724.8 KB/s
+`measured` against 843.4 — on one underlying rather than two. Every CPU cell above is
+`measured` at that intensity, and nothing here scales it back to 1x, because the relationship
+between ingress and CPU is exactly what this record estimates.

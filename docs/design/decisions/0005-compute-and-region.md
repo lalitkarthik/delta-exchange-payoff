@@ -179,3 +179,21 @@ at $78.07. **So #95 crosses no new threshold.** What it corrects is a document t
 sizing from the route this record's successor had already abandoned — the same route
 [0007-load-profile.md](0007-load-profile.md) rejects as option B, of which it says: "It is how
 0005 reached 6 vCPU at 10×."
+
+## I13 (#79) determination — the antecedent is met, the consequence is not
+
+**Appended, not rewritten.** Evidence
+[../research/0007a-container-measurement.md](../research/0007a-container-measurement.md) and its
+[numbers](../research/0007b-container-measurement-numbers.md), `measured`
+2026-09-12T05:50:07Z–11:02:38Z, **5h12m and not one day**. **R4's threshold — "if the split
+costs materially more than the monolith's `measured` 30.89% of a core, `m7g.large` is the first
+thing that stops fitting and the 1× row moves to `m7g.xlarge` at $94.24" — answers differently
+in its two halves.** The antecedent is met: the split costs `measured` **1.0888 cores** over six
+containers, `derived` **1.1351** with `discord-alerts` from its own later run, which is `derived`
+**3.52×** the monolith and within 1.0% of the lower bound of R6's `derived` 1.10–1.75 —
+confirming that prediction at its bound. **The consequence does not follow**: 1.0888 cores fits
+`m7g.large`'s 2 vCPU with `derived` 0.91 core spare, so nothing has stopped fitting and **$94.24
+is not triggered**. The class is in any case already *Superseded in part* by
+[0008](0008-topology.md), whose own threshold the same measurement crosses back toward
+`m7g.large`; that is 0008's determination, not this record's. **Platform, region, network mode
+and subnet are untouched.** What this retires is the estimate the threshold was written against.

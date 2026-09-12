@@ -178,17 +178,17 @@ the unit behind the Redis working set. **Quote it from there, never from a sente
 
 ## 8. The load profile, per service
 
-`derived` by R6 (#75): arithmetic in [../research/0007-load-profile.md](../research/0007-load-profile.md),
-belief in [../decisions/0007-load-profile.md](../decisions/0007-load-profile.md). I13 (#79) measures it; its day-long run has not happened yet, and [../research/0007a-container-measurement.md](../research/0007a-container-measurement.md) holds the pending table meanwhile.
+**`measured` by I13 (#79)**, 2026-09-12T05:50:07Z–11:02:38Z, **5h12m and not one day**, at `derived` 0.86× of 1×: [../research/0007a-container-measurement.md](../research/0007a-container-measurement.md), ledger in [0007b](../research/0007b-container-measurement-numbers.md). The `derived` column is R6's belief, [../decisions/0007-load-profile.md](../decisions/0007-load-profile.md). **Thirteen cells moved more than 25%**; 10× is not measured and stays R6's.
 
-| Service | Bound by | 1× | 10× |
-|---|---|---|---|
-| `feed` | CPU, one core | 0.52–0.71 core | 5.2–7.1 cores: 8–11 processes, one Python process is one core |
-| `store` | CPU (decode), not disk | 0.28–0.51 core; 2.33 KB/s to disk | 2.8–5.1 cores |
-| `api` | CPU, set by viewers | 0.25–0.49, + 0.05–0.14 a watched expiry | 2.5–4.9, + viewers |
-| `web` / Redis | memory | 240.8 MiB / 1,056.4 MiB `measured` | unchanged / 10.269 GiB |
+| Service | Bound by | 1× `measured` | 1× `derived` | 10× `derived` |
+|---|---|---|---|---|
+| `feed` | CPU, one core | **0.3592 core**, 97.1 MiB | 0.52–0.71 core | 5.2–7.1 cores: 8–11 processes, one Python process is one core |
+| `store` | CPU (decode), not disk | **0.3048 core**; 1.49 KB/s to disk | 0.28–0.51 core; 2.33 KB/s | 2.8–5.1 cores |
+| `api` | CPU, set by viewers | **0.3045 core**; +0.0466 the first viewer, +0.0168 each of the next two | 0.25–0.49, + 0.05–0.14 a watched expiry | 2.5–4.9, + viewers |
+| `web` / Redis | memory | **110.6 MiB idle / 761.8 MiB** | 240.8 MiB / 1,056.4 MiB | unchanged / 10.269 GiB |
+| `proxy` / `discord-alerts` | — | **0.0109 / 0.0463 core**, 17.1 / 46.9 MiB | no R6 row for either | — |
 
-**The split costs 1.10–1.75 cores against the monolith's 0.31**: §4 under-counts CPU and over-counts memory.
+**The split costs `measured` 1.0888 cores against the monolith's 0.31** — 3.52×, and within 1.0% of R6's lower bound. Start-to-healthy is `measured` **0.250–1.632 s** a service; the rest of `compose up`'s 11–16 s is the healthcheck, not the service.
 
 ## 9. One instance or several
 

@@ -143,3 +143,35 @@ take `feed`'s core at the upper bound, and it holds `feed`'s vCPU with 1,024 CPU
 of what else is on the box. `../cloud/compute.md` §4 now reserves that whole vCPU for `feed` in
 its own table too, which it did not before #95 — it reserved 0.5, sized on a 100 ms publisher
 figure — so the two documents now say the same thing.
+
+## I13 (#79) determination — crossed, and it points back at `m7g.large`
+
+**Appended, not rewritten.** Evidence:
+[../research/0007a-container-measurement.md](../research/0007a-container-measurement.md) and
+[../research/0007b-container-measurement-numbers.md](../research/0007b-container-measurement-numbers.md),
+`measured` 2026-09-12T05:50:07Z–11:02:38Z, **5h12m and not one day**.
+
+**R7's re-cost threshold reads: "I13 (#79) measuring the 1× total at 1.4 cores or less brings
+back `m7g.large` at $48.94. Past 2.8 cores, the threshold above applies." The 1× total is
+`measured` 1.0888 cores** across the six containers of the I13 collection, or `derived`
+**1.1351** with `discord-alerts` added from its own later run — two runs in one sum, and a
+quotation of it has to say so. **The lower threshold is crossed and the 2.8-core split
+threshold is not approached**, at `derived` 41% of it.
+
+**This does not by itself move the class, and three things stand between the number and
+`m7g.large`.** First, the run sat at `derived` **0.86x** of 1× by `feed` ingress bytes, on one
+underlying rather than two. Second, criterion 1 of this record rejects `m7g.large` on
+*headroom*, not on the total: it holds `feed`'s whole vCPU with 1,024 CPU units so that
+`api`'s viewers cannot take it, and 1.0888 cores on 2 vCPU leaves `derived` 0.91 core for
+every other container plus every spike — `measured` p95s sum to 1.767 cores, which is 88% of
+an `m7g.large`. Third, the seventh service's cell is `measured` over ten minutes, not over the
+window. **The threshold is crossed; the decision it points at needs its own ticket, and this
+one does not reopen it.**
+
+**Start-to-healthy, which this record's rolling-deploy wait depends on, is now `measured`.**
+Every service is ready in **0.250–1.632 s** (container `StartedAt` to its own ready line). The
+10.99–15.72 s that `docker compose up` reports is the stack, not the service: Compose
+serialises on `depends_on` and the healthcheck — `interval` 3 s and `start_period` 10 s on six
+of seven — adds a further 4.4–9.3 s of detection lag. **A rolling deploy here waits on
+healthcheck configuration, not on service boot**, and that is the lever if the wait ever
+matters.

@@ -627,6 +627,30 @@ def _throughput(samples: list[dict[str, Any]]) -> dict[str, dict[str, float | st
     return {name: _mean_max(values) for name, values in rates.items()}
 
 
+def _flat_counters(samples: list[dict[str, Any]]) -> list[str]:
+    """Name every counter whose first and last readings are identical.
+
+    A counter that never advanced is not a `measured` zero. `docker stats` BlockIO
+    does not observe a bind mount on this host: the I13 collection reported
+    `block_read` 0.0 B/s for all six containers over 5h12m while the store was
+    writing Parquet into one the whole time. The tool cannot know the true figure,
+    so it names the counter instead of letting a reader quote 0.0 as evidence. #79.
+    """
+    ordered = _sorted_samples(samples)
+    if len(ordered) < 2:
+        return []
+    flat: list[str] = []
+    for name, field in THROUGHPUT_FIELDS.items():
+        readings = [
+            record[field]
+            for record in ordered
+            if isinstance(record.get(field), (int, float))
+        ]
+        if len(readings) >= 2 and readings[0] == readings[-1]:
+            flat.append(name)
+    return flat
+
+
 def _metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
     cpu_values = [
         float(record["cpu_percent"])
@@ -655,6 +679,7 @@ def _metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
             else PENDING
         },
         "throughput_bytes_per_second": _throughput(samples),
+        "counters_flat": _flat_counters(samples),
     }
 
 
@@ -781,6 +806,13 @@ def render_summary(report: dict[str, Any]) -> str:
             lines.append(
                 f"  {name_key} B/s mean/max: {_display(rate['mean'])} / "
                 f"{_display(rate['max'])}"
+            )
+        if facts["counters_flat"]:
+            lines.append(
+                "  counters that never advanced: "
+                + ", ".join(facts["counters_flat"])
+                + " -- a flat counter is not a measured zero; check the metric at its"
+                " source before quoting it"
             )
         health = facts["health"]
         lines.append(
