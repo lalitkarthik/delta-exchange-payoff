@@ -181,13 +181,13 @@ cd engine && ./.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.sto
 3. No lock stops two compactors running at once. Documented, not defended against.
 4. The aggregator is not yet checked against a raw frame capture.
 5. `lts`'s meaning is unverified. It is stored and decides nothing.
-6. In the default monolith, Table C loses a row when the cache is stale for a whole minute. `measured` on 2026-09-04,
-   expiry 25-09-2026: sampling once a minute lost **217 of 904 minutes — 24%** — every gap
-   exactly one minute long, while quotes for those minutes were captured. [#23](https://github.com/lalitkarthik/delta-exchange-payoff/issues/23)
-   samples every ten seconds instead. That **narrows** the window from one instant to ten
-   seconds; it does not close it, and the 217 stay lost. A day-long `tools/measure_computed_gaps.py`
-   run scheduled by #63 fills in the surviving rate; leave that number blank until the run.
-   Always a **missing** row, never an invented one.
+6. In the default monolith, Table C loses a row when the cache is stale for a whole minute.
+   `measured` 2026-09-12 over 2026-09-04's whole recorded day, expiry 25-09-2026: **214 of
+   1,118 quoted minutes — 19.1%**, every gap one minute long. The older **217 of 904 — 24%**
+   was a run truncated at 15:03 of a day that ran to 19:40 ([#104](https://github.com/lalitkarthik/delta-exchange-payoff/issues/104)).
+   [#23](https://github.com/lalitkarthik/delta-exchange-payoff/issues/23) samples every ten
+   seconds: it narrows the window and does not close it. The rate surviving that change is
+   still unmeasured — leave it blank until a day the new sampling recorded. Never invented.
 7. I8 (#70)'s seam is done; S3 is unreachable from this build — no AWS account here, no
    `boto3`/`fsspec` dependency (`measured` 0, `docs/design/lld/store-numbers.md`). With
    access: wire a backend behind `BarStore.path`'s S3 branch, run
