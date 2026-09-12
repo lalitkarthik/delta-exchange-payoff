@@ -93,6 +93,7 @@ above them describe a restart; those two describe what the code does and does no
 | A4 | `api` joins at `$` and **never replays**. Its cache refills from the events that arrive next. |
 | A5 | A **trimmed position** is a **replay gap**: `store` replays the retained suffix, reports both bounds and an exact count, alerts, and never refuses start-up ([0010](../decisions/0010-store-replay.md) R5). **The check is continuous, on the `store.state` cadence, not a start-up step** ([0010](../decisions/0010-store-replay.md) R5a, #103). |
 | A6 | While any stream is behind, the **seal clock** is `min(wall clock, the time inside the last stream id of any stream still behind)` ([0010](../decisions/0010-store-replay.md) R4). |
+| A7 | A pass that fails **after** `XREADGROUP` returned leaves its batch in the **pending list**, and the next pass reads it back with `XREADGROUP ... 0` before it reads `>` (#111). |
 
 **A3 is what [0010](../decisions/0010-store-replay.md) changed, and it supersedes
 [0002](../decisions/0002-redis-hosting.md).** The watermark is per stream and carries an id and a
@@ -118,6 +119,17 @@ anything has restarted since.
 **Acking on receipt is deliberate, and it is not the textbook pattern.** The textbook acks after the
 work and recovers from the pending list with `XAUTOCLAIM`. A per-message ack tells us nothing about
 what reached a file, so the store records the id it last flushed and reads forward from there.
+
+**A7 keeps A1 rather than reversing it, and #111 gives A1 a second reason.** The ticket weighed
+moving the `XACK` after delivery so an undelivered batch stayed claimable, and that repair was
+**not** taken. Alone it repairs nothing, because until #111 nothing here read a pending list at
+all — the batch stays stranded either way. And it would cost what makes A7 exact: acked on
+receipt, the pending list means *handed over and not delivered*, and nothing else, so reading it
+delivers each entry exactly once. Acked after delivery it would hold delivered entries too, and
+the recovery could not tell them apart. **A1 is therefore load-bearing for correctness now, not
+only for the durability argument above**; the reader-side design, including why the inherited
+list is delivered for `bar-buffer` and deferred to the replay for `store`, is
+[../lld/bus-reader.md](../lld/bus-reader.md) §5a.
 
 ### 4.2 Trimming
 

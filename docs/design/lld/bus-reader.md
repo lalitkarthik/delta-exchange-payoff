@@ -103,8 +103,9 @@ repaired.
 ## 5. What it counts
 
 `readers()` per subscription: `alive`, `supervised`, `lossless`, `retries` (consecutive, now),
-`retries_total` (lifetime), `gave_up`, `failure` (the last one, as text), and `behind` (the
-derived list). `reader_exits()` maps a task name to why it ended, including `bus-flush`.
+`retries_total` (lifetime), `gave_up`, `failure` (the last one, as text), `behind` (the derived
+list), and §5a's `recovered`, `stranded` and `deferred` — `retries_total` says a pass failed,
+those three say what it cost. `reader_exits()` maps a task name to why it ended, `bus-flush` too.
 
 `consumer_lag(subscription)` is the other half and keeps no state at all: one pipeline of
 `XINFO STREAM` and `XINFO GROUPS` per stream, returning a `StreamLag` carrying Redis's own
@@ -112,6 +113,71 @@ derived list). `reader_exits()` maps a task name to why it ended, including `bus
 id. `trimmed_past` is the exact replay-gap test — the group's position older than the oldest
 surviving entry — and `lost` is `(entries-added − length) − entries-read`, the same arithmetic
 `replay_gaps` uses at start-up with the group's own counter in place of the saved index.
+
+## 5a. The pending list — the batch a failed pass had already been handed
+
+**#103 made the reader survive a failed pass; it did not make the *batch* survive one.** A pass
+that raises after `XREADGROUP` has returned leaves entries Redis has already moved into the
+group's pending list, and `_read_group` fixes the cursor at `>` once, for the life of the
+process. Nothing in the file read a pending list, so that batch was unreachable. On the running
+stack the api's `bar-buffer` group held **16,502 pending of 63,632 read — 25.9%** of a stream
+`CONTEXT.md` calls lossless, while `/health` said `skipped: 0` and Redis said **`lag 0`** — its
+own field lying, because it counts an entry read the moment it enters the pending list
+(`measured` 2026-09-12T16:44Z, `XINFO GROUPS md.option_bar:DELTA:BTC`; #111).
+
+### Which repair, and why
+
+The ticket named two. **Reading the consumer's own pending list with `XREADGROUP ... 0` is the
+one taken**, at the top of a pass and before the `>` read. Moving the `XACK` after `_deliver` was the other, and alone it repairs nothing — nothing read a
+pending list, so the batch stays stranded either way. It would also cost the property that makes
+this repair exact. **Acked on receipt, the pending list holds entries handed to this consumer
+and not delivered, and nothing else**: `_deliver` is synchronous and the `await` that acks is the
+last suspension point before it. Ack-after-delivery would put delivered entries in it too, and a
+recovery read could not tell the two apart without a second record of its own. `message-bus.md`
+A1 argues the ack order on durability grounds and keeps that argument; this is its second reason,
+recorded there as A7.
+
+**Both halves of #103 survive.** A reader still holds nothing, so the retry is still bounded and
+still gives up loudly: no retry is added and no budget changes. What changes is that giving up no
+longer costs the batch — the flag is armed by the failure and stays armed for a restarted reader.
+
+### Why this is not the hazard that stopped #103 restarting the reader
+
+§3 refuses an automatic restart because re-entering `_read` re-runs `_replay` from `start_ids` —
+the **checkpoint** position, not where the reader has since reached — so everything between is
+re-folded: #84 at the scale of the whole run. **A `0` read is not that.** Redis bounds it to this
+consumer's own undelivered entries, and under the ack order above no delivered entry is in it.
+
+**The two collide at exactly one moment, a restart, and there the answer differs per
+subscription.** A rejoined group carries the pending list the dead process left, and every entry
+in it has an id at or below the group's `last-delivered-id` — so for a stream with a `start_id`
+it lies inside `(start_id, last-delivered]`, precisely what `_replay` re-reads from the raw
+stream. Delivering it here as well would fold it twice.
+
+| Subscription | Inherited pending list | Why |
+|---|---|---|
+| `store`, all four streams | acked, **not delivered**, counted `deferred` | it passes `start_ids`; `_replay` covers exactly that range |
+| `bar-buffer` | **delivered**, counted `recovered` | no `start_ids`, no checkpoint, so no other path ever can |
+
+`_adopt_pending` makes that decision per stream, on whether the subscription passed a `start_id`
+for it, and runs before `_replay`. During a run the list is this process's own and is delivered.
+
+### What it costs, and what it counts
+
+**Off the healthy path.** The read is armed by a failed pass and by nothing else: at `derived`
+1,849.8 events a second an unconditional one per pass would double the reader's round trips.
+**Why those passes fail at all is [bus-reader-stall.md](bus-reader-stall.md), and is not fixed
+here.** Three counters, on both `stats()` and `readers()`:
+
+| Counter | What it is |
+|---|---|
+| `recovered` | entries taken back out of the pending list and delivered. Zero until a pass fails after `XREADGROUP` returned; the exact size of the repair when one has |
+| `stranded` | entries the pending list still named and retention had already trimmed away. `XREADGROUP` returns their ids with no fields. **This is loss** — the residual the repair cannot repair |
+| `deferred` | entries found pending at reader start and left to `_replay`, per the table above. Always zero on a subscription with no `start_ids` |
+
+**`skipped` stayed zero through all of this and was right to** — nothing was skipped. A lossless
+reader's loss does not arrive as a skip, which is why that field's own documentation, *"always
+zero on a lossless subscription"*, stayed true while a quarter of the stream went missing.
 
 ## 6. Log records
 
@@ -122,8 +188,10 @@ subscription and the failure that ended it.
 
 ## 7. What is not here
 
-**No restart, no `XAUTOCLAIM`, no dead-letter.** The first is §3; the other two are
-[redis-bus.md](redis-bus.md) §8 and unchanged by this.
+**No restart, no `XAUTOCLAIM`, no dead-letter.** The first is §3. `XAUTOCLAIM` moves another
+*consumer's* entries and is still refused: one consumer per group per service, so there is none
+to claim from. §5a reads this consumer's **own** list, a different command and a different
+question. Dead-letter is [redis-bus.md](redis-bus.md) §8, unchanged.
 
 **No reader-side alert throttling.** `bus.reader_stopped` is raised once per reader per exit,
 and a reader exits once. The lag alert is throttled, and that one lives in the store —

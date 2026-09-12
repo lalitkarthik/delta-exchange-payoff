@@ -344,6 +344,9 @@ class RedisSubscription(Subscription):
         "skipped",
         "resyncs",
         "undecodable",
+        "recovered",
+        "stranded",
+        "deferred",
         "positioned",
         "alive",
         "supervised",
@@ -358,6 +361,7 @@ class RedisSubscription(Subscription):
         "_baseline",
         "_group_missing",
         "_replaying",
+        "_recover_pending",
     )
 
     def __init__(
@@ -399,6 +403,21 @@ class RedisSubscription(Subscription):
         #: Entries that would not decode. Logged at error, never fatal to the reader — one
         #: unreadable entry must not stop a consumer for the rest of the day.
         self.undecodable = 0
+        #: Entries Redis had already moved into this consumer's pending list when a read
+        #: pass failed, taken back out of it and delivered. **This is the number #111's
+        #: absence hid**: zero on a reader that has never had a pass fail after
+        #: `XREADGROUP` returned, and the exact size of the repair when one has.
+        self.recovered = 0
+        #: Entries that were in the pending list and could not be delivered, because
+        #: retention had trimmed them out of the stream before the recovery read reached
+        #: them. `XREADGROUP` still returns their ids, with no fields. **This is loss**,
+        #: and it is the residual `recovered` does not cover.
+        self.stranded = 0
+        #: Entries found in the pending list at reader start and **deliberately not
+        #: delivered here**, because `_replay` re-reads exactly that range from the raw
+        #: stream. Acked so the list drains; counted so the choice is visible. Always
+        #: zero on a subscription that passes no `start_ids`. See `_adopt_pending`.
+        self.deferred = 0
         #: Set once this reader has taken its starting position — the head of each
         #: stream, or its group. **Nothing published before that point reaches a
         #: drop-oldest reader**, because `$` means "from now" and its "now" is here.
@@ -427,6 +446,11 @@ class RedisSubscription(Subscription):
         self._baseline: dict[str, int] = dict.fromkeys(streams, 0)
         self._group_missing: set[str] = set()
         self._replaying: set[str] = set()
+        #: Whether the next lossless pass must drain this consumer's own pending list
+        #: before it reads `>`. Set by every failed pass and cleared only by a drain
+        #: that ran to the end, so the cost is paid exactly when a pass has failed and
+        #: never on the healthy path. #111.
+        self._recover_pending = False
 
     def reader_lost(self) -> bool:
         """Whether this subscription's reader has stopped keeping its answers fresh.
@@ -733,8 +757,15 @@ class RedisBus:
     def stats(self) -> dict[str, dict[str, int | bool]]:
         """What each consumer received and what it could not keep up with.
 
-        The fan-out's six, plus the three only a broker produces. `skipped` is the one to
+        The fan-out's six, plus the six only a broker produces. `skipped` is the one to
         watch on a screen's subscription and it should be zero on a store's.
+
+        **`skipped` is documented "always zero on a lossless subscription" and that is
+        still true, which is exactly why #111 had no field.** A lossless reader's loss
+        does not arrive as a skip: Redis hands the batch over, moves it into the pending
+        list, and the pass fails before it is delivered. `recovered` and `stranded` are
+        the two halves of that number — what the repair took back, and what retention
+        destroyed before it could. `stranded` is the only one of the six that is loss.
         """
         return {
             name: {
@@ -747,6 +778,9 @@ class RedisBus:
                 "skipped": s.skipped,
                 "resyncs": s.resyncs,
                 "undecodable": s.undecodable,
+                "recovered": s.recovered,
+                "stranded": s.stranded,
+                "deferred": s.deferred,
             }
             for name, s in self._subscriptions.items()
         }
@@ -918,6 +952,11 @@ class RedisBus:
 
         **What `/health` had no way to ask** (#103). The store answered `200 OK` with a
         hardcoded `"status": "ok"` for two hours after its reader had died.
+
+        The three #111 counters are repeated here as well as on `stats()` so that the
+        block a process already publishes carries them without that process changing.
+        `retries_total` says a pass failed; `recovered` and `stranded` say what the
+        failure cost, which is the question `retries_total` on its own cannot answer.
         """
         return {
             name: {
@@ -929,6 +968,9 @@ class RedisBus:
                 "gave_up": s.gave_up,
                 "failure": s.failure,
                 "behind": list(s.behind_streams()),
+                "recovered": s.recovered,
+                "stranded": s.stranded,
+                "deferred": s.deferred,
             }
             for name, s in self._subscriptions.items()
         }
@@ -1084,7 +1126,17 @@ class RedisBus:
                     self._reader_recovered(sub)
 
     async def _reader_failed(self, sub: RedisSubscription, error: Exception) -> None:
-        """Back off and go round again, or give up loudly at the bound."""
+        """Back off and go round again, or give up loudly at the bound.
+
+        **The flag is set before anything else** (#111). A pass that failed may have
+        failed after Redis served its `XREADGROUP` and moved a batch into this
+        consumer's pending list, and from the client's side the two cases are
+        indistinguishable: the reply never arrived. So every failure arms the recovery
+        read, and the read itself is what discovers whether there was anything to
+        recover. It is armed even on the give-up path, so that a reader restarted by an
+        operator picks the batch up rather than inheriting it as loss.
+        """
+        sub._recover_pending = True
         sub.retries += 1
         sub.retries_total += 1
         sub.failure = f"{type(error).__name__}: {error}"
@@ -1142,15 +1194,142 @@ class RedisBus:
 
     async def _read_group(self, sub: RedisSubscription, existing: set[str]) -> None:
         """Lossless: a consumer group, acked on receipt, replayed from a recorded id."""
+        await self._adopt_pending(sub, existing)
         await self._replay(sub, existing)
 
         streams = dict.fromkeys(sub.streams, ">")
         await self._run_reader(sub, lambda: self._read_group_pass(sub, streams))
 
+    async def _adopt_pending(
+        self, sub: RedisSubscription, existing: set[str]
+    ) -> None:
+        """Settle the pending list this reader **inherited**, per stream, before it reads.
+
+        A group that already existed carries whatever the previous incarnation of this
+        consumer was handed and never delivered. Under this file's ack order that list
+        means one exact thing — *handed to us, not delivered* — so it is recoverable.
+        **Whether recovering it is correct is not the same question, and the answer is
+        not the same for every subscription.** That is the trap #103 mapped on the other
+        repair it rejected, and it applies here per stream rather than per bus:
+
+        * A stream this subscription passed a `start_id` for is replayed. `_replay`
+          re-reads `(start_id, last-delivered]` from the raw stream, and **every pending
+          entry has an id at or below `last-delivered`**, so it is inside that range.
+          Delivering it here as well would fold it twice, which is #84. It is acked and
+          counted as `deferred`, and `_replay` is what delivers it.
+        * A stream with no `start_id` is not replayed and has no checkpoint. Nothing
+          else will ever deliver those entries, so this is the only path that can, and
+          it delivers them — once, oldest first, ahead of the group's `>` read.
+
+        `store` is the first case on all four of its streams. The api's `bar-buffer` is
+        the second on its one, which is why it is the subscription that was losing data
+        rather than merely re-reading it.
+        """
+        adopt = [key for key in sub.streams if key in existing]
+        if adopt:
+            await self._drain_pending(sub, adopt, defer_to_replay=True)
+
+    async def _drain_pending(
+        self,
+        sub: RedisSubscription,
+        keys: Sequence[str],
+        *,
+        defer_to_replay: bool = False,
+    ) -> None:
+        """Read this consumer's own pending list to its end, acking and settling it.
+
+        **`XREADGROUP ... STREAMS key 0` is the repair #111 names, and it is the one
+        taken.** The alternative on the ticket — moving the `XACK` after `_deliver` —
+        was weighed and rejected: on its own it changes nothing, because nothing in this
+        file reads a pending list, so the batch stays stranded either way. It would also
+        cost the property that makes *this* repair exact. Acked on receipt, the pending
+        list holds entries that were handed to this consumer and **not delivered**, and
+        nothing else; ack-after-delivery would make it hold delivered entries too, and a
+        recovery read could no longer tell the two apart without a second record of its
+        own. `message-bus.md` §4.1 argues the ack order on durability grounds and it
+        keeps that argument; this adds the second reason.
+
+        Reading `0` is also not the hazard `_replay` carries. `_replay` re-reads from
+        `start_ids`, the **checkpoint** position, which is far behind where the reader
+        has since reached, so everything between is re-folded; that is why #103 rejected
+        automatic reader restart. A `0` read here is bounded by Redis to this consumer's
+        own undelivered entries, and there is no window in which a delivered entry is in
+        it: `_deliver` is synchronous and the `await` that acks is the last suspension
+        point before it.
+
+        Entries retention has already trimmed away come back as an id with no fields.
+        They are counted `stranded` and acked — the list must still drain — and they are
+        the one part of this that is genuinely unrecoverable.
+        """
+        cursor = {key: "0" for key in keys}
+        while cursor:
+            got = await self._client.xreadgroup(
+                sub.group, sub.consumer, cursor, count=self.config.read_count
+            )
+            batches: list[tuple[str, list[Any], list[Any]]] = []
+            for key, entries in got or ():
+                name = _text(key)
+                if not entries:
+                    continue
+                live = [(entry_id, fields) for entry_id, fields in entries if fields]
+                batches.append((name, list(entries), live))
+            if not batches:
+                sub._recover_pending = False
+                return
+            pipe = self._client.pipeline(transaction=False)
+            for name, entries, _live in batches:
+                pipe.xack(name, sub.group, *[entry_id for entry_id, _ in entries])
+            await pipe.execute()
+            cursor = {}
+            for name, entries, live in batches:
+                gone = len(entries) - len(live)
+                if gone:
+                    sub.stranded += gone
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        log_events.QUEUE_DROP,
+                        "%d entries in %r's pending list on %s were trimmed away before "
+                        "they could be recovered and are lost",
+                        gone,
+                        sub.name,
+                        name,
+                    )
+                if defer_to_replay and name in sub.start_ids:
+                    # **Only true before `_replay` has run.** `_replay` covers this
+                    # range once, at reader start. A batch stranded later in the same
+                    # run has nothing else coming for it, so mid-run every stream
+                    # delivers -- deferring one here would be the loss this repairs.
+                    sub.deferred += len(live)
+                elif live:
+                    self._deliver(sub, name, live)
+                    sub.recovered += len(live)
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        log_events.BUS_READER,
+                        "%d entries were recovered from %r's pending list on %s; they "
+                        "had been handed to it by a read pass that then failed",
+                        len(live),
+                        sub.name,
+                        name,
+                    )
+                cursor[name] = _text(entries[-1][0])
+
     async def _read_group_pass(
         self, sub: RedisSubscription, streams: dict[str, str]
     ) -> None:
-        """One `XREADGROUP`, acked and delivered. The whole of what a retry repeats."""
+        """One `XREADGROUP`, acked and delivered. The whole of what a retry repeats.
+
+        **The pending list comes first, and only after a failed pass** (#111). A pass
+        that raised after `XREADGROUP` returned left its batch in this consumer's
+        pending list, where the fixed `>` cursor can never reach it again; that batch is
+        read back here before anything new. The flag is what keeps this off the healthy
+        path: at 1,850 events a second an unconditional extra round trip per pass would
+        double the reader's traffic to buy a case that has not happened.
+        """
+        if sub._recover_pending:
+            await self._drain_pending(sub, sub.streams)
         got = await self._client.xreadgroup(
             sub.group,
             sub.consumer,

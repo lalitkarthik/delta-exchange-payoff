@@ -29,6 +29,7 @@ file, and change the row's status to a link. Do not write one ahead of the code.
 | The Redis Streams bus — the two policies over a broker, batching, trimming, replay | [redis-bus.md](redis-bus.md) | #61 |
 | The store's view of its own consumption — the continuous gap check, `/health` | [store-health.md](store-health.md) | #103 |
 | The bus reader — the retry policy, supervision, and deriving `behind` | [bus-reader.md](bus-reader.md) | #103 |
+| The bus reader — the minute-boundary stall that makes its reads time out | [bus-reader-stall.md](bus-reader-stall.md) | #111 |
 | Discord alerts — the tail consumer, gate, webhook seam, and failure handling | [discord-alerts.md](discord-alerts.md) | #66 |
 
 ## What a low-level design should contain

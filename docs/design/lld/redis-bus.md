@@ -53,7 +53,7 @@ never a cached flag (#103): see [bus-reader.md](bus-reader.md) §4.
 Lossless subscriptions create `XGROUP CREATE <stream> <name> <group_start> MKSTREAM`, read
 `XREADGROUP`, and ack each batch before the work. The group name is the service name. The
 durability boundary is the store flush, not the ack; `XACK` frees no stream memory (`measured`,
-#69).
+#69). Acking first also makes a pending list mean one thing: handed over, not delivered (#111).
 
 `last_ids` is the last entry put on the queue per stream. A store checkpoint supplies the
 per-stream `start_ids`, so replay covers the recorded suffix and then live `>` delivery.
@@ -135,11 +135,11 @@ buffering into an outbox nobody is draining.
 
 `stats()` keeps the fan-out's six per subscription — `offered`, `dropped`, `queued`,
 `lossless`, `over_capacity`, `backlog_peak` — and adds broker counters `skipped` (§3),
-`span_dropped`, `resyncs`, and `undecodable`, an entry that would not decode, logged at
-error and never fatal to the reader. `readers()` and `consumer_lag()` are
-[bus-reader.md](bus-reader.md) §5. `publisher()` carries the write side: `published`,
-`written`, `batches`, `trims`, `failures`, `unroutable`, `outbox`, `outbox_dropped`, and the
-flush timings §7 is read off.
+`span_dropped`, `resyncs`, `undecodable` (an entry that would not decode, logged at error and
+never fatal to the reader), and #111's `recovered`, `stranded` and `deferred`. Those three,
+`readers()` and `consumer_lag()` are [bus-reader.md](bus-reader.md) §5 and §5a.
+`publisher()` carries the write side: `published`, `written`, `batches`, `trims`, `failures`,
+`unroutable`, `outbox`, `outbox_dropped`, and the flush timings §7 is read off.
 
 ## 7. Numbers
 
@@ -190,10 +190,10 @@ group, and the engine owns the screen subscriptions. Store replay from per-strea
 `Position`s is landed in I4 (#63): it replays the retained suffix, preserves the log clock,
 and reports trimmed loss rather than refusing start-up. Engine I5 (#64) adds feed-state health.
 
-**No `XAUTOCLAIM`, no pending-list recovery, no dead-letter.** §2 says why: the flush is the
-durability boundary and the recorded id is the recovery. A consumer needing per-message
-delivery guarantees needs a different acknowledgement policy, a change to `redis-hosting.md`
-§5 first. **No reader restart either**, and [bus-reader.md](bus-reader.md) §3 says why.
+**No `XAUTOCLAIM` and no dead-letter — but a pending list is read now** (#111). A lossless
+pass that fails *after* `XREADGROUP` returned strands its batch where the fixed `>` cursor can
+never reach it, so the next pass reads the consumer's own list with `XREADGROUP ... 0`:
+[bus-reader.md](bus-reader.md) §5a. Acking stays on receipt, and §2 says what that buys.
 
 **No Redis Cluster.** The key grammar would need a hashtag so one venue's streams landed in
 one slot — an addition to the nomenclature, not a rewrite of this.
