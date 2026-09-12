@@ -145,12 +145,6 @@ the store process checkpoints the partial open minute, so a restart inside the `
 thirty-minute Redis retention completes it rather than sealing a truncated bar. A stop longer
 than that `derived` retention loses the minutes trimmed from Redis, and the gap signal reports them.
 
-**Current split-mode read-path lag.** Without a writer in the api, `/smile`, `/chain/at`,
-`/chain/minutes` and `/bars` cannot use `BarStore.pending()` and read only disk, so their right
-edge is up to one flush interval plus the open minute behind the monolith's live edge. Follow-up
-[#81](https://github.com/lalitkarthik/delta-exchange-payoff/issues/81) ends this; its named option
-is feeding the api the catalogue's `md.option_bar` events. #63 does not fix it.
-
 ## 5. Failure modes
 
 | What goes wrong | What happens |

@@ -10,23 +10,25 @@ implied volatility and Greeks from the order book, and pushes the result to a Ne
 a second. A Parquet store folds the same stream into one-minute bars.
 
 **State lives in the GitHub issues, not in files. If an issue and a file disagree, the issue
-wins.** Issue #1 is the whole study; #5–#8 are open.
+wins.** Issue #1 is the whole study; #6–#8 are open, #5 closed (`measured`, `gh issue view 5`,
+2026-09-12) once T5's hive-partitioned Parquet layer landed.
 
 ## Commands
 
 Engine (`engine/`, venv at `engine/.venv`; docs say Python 3.13, the venv here is 3.12):
 
 ```sh
-.venv/bin/python -m uvicorn --app-dir src deltapayoff.main:app --port 8000 --reload
-.venv/bin/python -m pytest                          # whole suite
-.venv/bin/python -m pytest tests/test_bars.py -q    # one file
-.venv/bin/python -m pytest "tests/test_solvers.py::test_every_solver_round_trips_or_declines[70000.0-0.05-S3]"
-.venv/bin/python -m ruff check .
+.venv/Scripts/python.exe -m uvicorn --app-dir src deltapayoff.main:app --port 8000 --reload
+.venv/Scripts/python.exe -m pytest                          # whole suite
+.venv/Scripts/python.exe -m pytest tests/test_bars.py -q    # one file
+.venv/Scripts/python.exe -m pytest "tests/test_solvers.py::test_every_solver_round_trips_or_declines[70000.0-0.05-S3]"
+.venv/Scripts/python.exe -m ruff check .
 ```
 
-`--app-dir src` is what puts the package on the path; there is no install step for it. Paths
-throughout the docs are Windows-flavoured (`.venv/Scripts/`) because that is where this was
-built — use `.venv/bin/` here.
+`--app-dir src` is what puts the package on the path; there is no install step for it. This
+machine is Windows, so the interpreter is `.venv/Scripts/python.exe`, matching
+[AGENTS.md](AGENTS.md) — a POSIX checkout would use `.venv/bin/python`. See `AGENTS.md` for
+the Codex-sandbox pytest flags.
 
 Web (`web/`) — **bun, not npm, not pnpm**:
 
@@ -38,52 +40,52 @@ bun run build
 
 Both processes, engine first. Engine on 8000, web on 3000. **CORS allows only port 3000**
 (`localhost` and `127.0.0.1`), so serving the web side from another port fails in a way that
-looks like the engine being down. The `/ws/chain` route is not covered by CORS — a handshake
-is not subject to it.
+looks like the engine being down. `/ws/chain` is a handshake, not subject to CORS.
 
 `DELTA_LIVE_FEED=0` serves the REST routes and the websocket without opening a socket to
-Delta. `tests/conftest.py` sets it, and also replaces the async client factory with one that
-raises — **no test may touch the network**, and one that tries fails rather than quietly
-succeeding against live data.
+Delta. `tests/conftest.py` sets it and replaces the async client factory with one that
+raises — **no test may touch the network**; one that tries fails loudly, not quietly.
 
-`tools/` holds probes, not engine code: `measure_feed.py`, `measure_arrival_lag.py`,
-`measure_store.py`, `compact_store.py` (the nightly compaction job), `capture_ws.py`,
-`probe_api.py`, `probe_ws.py`. The numbers in the docs came from these; re-run them rather
-than trusting a quoted figure.
+`tools/` holds probes, not engine code — `measure_feed.py`, `measure_arrival_lag.py`,
+`measure_store.py`, `compact_store.py`, `capture_ws.py`, `probe_api.py`, `probe_ws.py`. The
+numbers in the docs came from these; re-run them rather than trusting a quoted figure.
 
-The local stack is documented in [docs/design/cloud/local-stack.md](docs/design/cloud/local-stack.md).
-```sh
-docker compose --project-name dxp --env-file stack.env up -d --wait --wait-timeout 120
-engine/.venv/Scripts/python.exe tools/smoke_stack.py
-docker compose --project-name dxp --env-file stack.env down --remove-orphans
-```
-The stack serves everything on `http://localhost:8080` through the proxy; nothing publishes
-3000 or 8000 because the live `next dev` and live engine own them, and its store root is
-`./.stack-data/`, never `data/`.
+The local Docker stack (seven containers, served at `http://localhost:8080`, store root
+`./.stack-data/`, never `data/`) is documented in full, commands included, in
+[docs/design/cloud/local-stack.md](docs/design/cloud/local-stack.md) — read that, not this
+file, before touching it.
 
 ## Architecture
 
-**One socket, one cache, many browsers.** `DeltaFeed` (`feed.py`) owns the single connection to
-Delta and subscribes every live contract on both channels — `LIVE_UNDERLYINGS` in `main.py` is
-`("BTC",)`, so **ETH is served over REST but is not on the live feed or in the store**. It
-publishes to `FanOut`
-(`fanout.py`), an in-process bus. The socket handler never runs inside a consumer — if it did,
-a slow flush would stop it reading, the receive buffer would fill, and Delta would close the
-connection. Sockets are per browser; the connection to Delta is not. A second tab costs a
-queue, not a connection.
+**One socket, one cache, many browsers.** `DeltaFeed` (`adapters/delta_socket.py`) owns the
+single connection to Delta and subscribes every live contract on both channels —
+`LIVE_UNDERLYINGS` in `main.py` is `("BTC", "ETH")` since `8e11359` (2026-09-08), so **both
+underlyings are on the live feed and in the store by default**; the local Docker stack narrows
+this to BTC alone via `stack.env`'s `DELTA_LIVE_UNDERLYINGS=BTC`, a deployment choice, not a
+code default. It publishes to `FanOut` (`fanout.py`), an in-process bus that Redis Streams
+swaps in when `DELTA_BUS=redis` (see below). The socket handler never runs inside a consumer
+— if it did, a slow flush would stop it reading, the receive buffer would fill, and Delta
+would close the connection. Sockets are per browser; the connection to Delta is not.
 
 **The two channels are not interchangeable.** `ob_l2` carries top-of-book and refreshes every
 **508 ms**; `ticker` carries spot, open interest and Delta's own IV/Greeks and refreshes every
 **5001 ms**. That 9.8x gap is the project's thesis: the venue's implied vol is fitted to prices
-that have already moved. **Delta's IV and Greeks are reference columns only and are never
-consumed as inputs** — `tests/test_no_delta_inputs.py` pins that.
+that have already moved. **Delta's IV and Greeks are reference columns only, never consumed
+as inputs** — `tests/test_no_delta_inputs.py` pins that.
 
-**Two bus consumers, deliberately not one.** `ChainStream` (`stream.py`) keeps only the newest
-frame per `(channel, symbol)` and rebuilds a ladder on demand — it drops on overflow, because a
-four-second-old quote is worthless. `BarWriter` (`store.py`) subscribes **losslessly**, because
-a dropped message there is a permanent hole in the record. Its disk write runs in a worker
-thread. Sharing one structure would make them fight: one wants the latest state, the other
-wants every state.
+**Two bus consumers in the monolith, deliberately not one.** `ChainStream` (`stream.py`) keeps
+only the newest frame per `(channel, symbol)` and rebuilds a ladder on demand — it drops on
+overflow, because a four-second-old quote is worthless. `BarWriter` (`store.py`) subscribes
+**losslessly**, because a dropped message there is a permanent hole in the record. Its disk
+write runs in a worker thread. Sharing one structure would make them fight: one wants the
+latest state, the other wants every state.
+
+**In split mode (`DELTA_BUS=redis`, #62–#66, #81) this is more consumers over two processes,
+not two.** `store_main` alone runs `BarWriter`; the api's `build_consumer_stack` has no
+writer and instead attaches `ChainStream`, `FeedConnectionCache`, `StoreStateCache` and a
+lossless `BarBuffer` so the four read routes can answer from the newest sealed minute without
+a local writer; `alert_consumer` (#66) is a further lossless group in `discord-alerts`. Full
+detail: [docs/design/lld/store.md](docs/design/lld/store.md).
 
 **The pure core.** `chain.py`, `wire.py`, `convert.py`, `compute.py`, `forward.py`,
 `solvers.py`, `black76.py`, `black_scholes.py`, `greeks.py`, `bars.py` take data in and return
@@ -101,14 +103,15 @@ would put five plausible numbers on screen that describe nothing.
 F1–F4 for the forward. They exist to be compared (`agreement.py`, `docs/implied-vol.md`,
 `docs/forward.md`), not because four were needed.
 
-**The store: four tables, four dataset roots**, under a gitignored `<repo>/data/`.
+**The store: five dataset roots**, under a gitignored `<repo>/data/`. The original four —
 `quote-bars` (what the book did), `reference-bars` (what the venue said), `spot-bars`, and
-`computed-bars` (what we made of it). Hive-partitioned `underlying=/date=` — expiry, strike and
-option type are **columns**, because expiry as a partition level explodes into thousands of
-directories of a handful of rows. **Polars is not allowed to lay out the tree**:
-`write_parquet(partition_by=...)` names its output `00000000.parquet` every call, so the 10:00
-flush would silently overwrite the 09:00 one. Directories are built by hand, each flush writes
-a uniquely named file, and a test pins it.
+`computed-bars` (what we made of it) — plus `index-bars`, added in `4209ec2` (#54), written
+only by `tools/backfill_index_bars.py` and read by `/volatility`. Hive-partitioned
+`underlying=/date=` — expiry, strike and option type are **columns**, because expiry as a
+partition level explodes into thousands of directories of a handful of rows. **Polars is not
+allowed to lay out the tree**: `write_parquet(partition_by=...)` names its output
+`00000000.parquet` every call, so the 10:00 flush would silently overwrite the 09:00 one.
+Directories are built by hand, each flush writes a uniquely named file, and a test pins it.
 
 `docs/chain-contract.md` is the engine↔web interface and the authority; `web/lib/contract.ts`
 mirrors it field for field. The websocket sends the identical object `/chain` returns, so
@@ -136,8 +139,7 @@ mirrors it field for field. The websocket sends the identical object `/chain` re
 - **Read source, not READMEs** — including this one. That rule cost a full spec revision to
   learn.
 - Greek conventions are the sibling project's, not textbook: delta/gamma undiscounted, vega/rho
-  discounted and per one percent, theta a one-calendar-day repricing (a 1/252 year overstates
-  it by 1.456x here — crypto trades weekends).
+  discounted and per one percent, theta a one-calendar-day repricing.
 - Delta India's options are **vanilla, linear, USD-settled**. Textbook Black-Scholes and
   put-call parity apply with no correction term. Anything claiming inverse settlement is stale.
 - Public market data only. No API key, no `.env`. Every request needs a `User-Agent` or Delta's
@@ -162,7 +164,11 @@ mirrors it field for field. The websocket sends the identical object `/chain` re
 
 ## Known drift — verify before trusting
 
-The docs are the record, but four of them have fallen behind the code:
+**Historical snapshot, dated 2026-09-04 (before `d163bbc`, #62–#66 and #81) — not re-checked
+against today's `main`.** For the current suite size see [AGENTS.md](AGENTS.md) (**1,347**
+tests with Docker, `measured` 2026-09-12).
+
+Four docs had fallen behind the code as of that snapshot:
 
 - **Root `README.md` says the options are inverse-settled.** They are not.
   `docs/settlement.md` measured it. The README was never updated behind it.
