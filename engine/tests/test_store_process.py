@@ -27,6 +27,7 @@ from deltapayoff.events import (
     OptionReference,
     Right,
 )
+from deltapayoff.events.redis_wire import stream_name
 from deltapayoff.redis_bus import BusConfig, RedisBus
 from deltapayoff.store import BarStore, BarWriter, read_checkpoint
 
@@ -59,6 +60,12 @@ def _factory(server):
         )
 
     return factory
+
+
+def _info(info: dict, field: str) -> str:
+    """One `XINFO STREAM` field as text, whichever way the client decoded its keys."""
+    value = info.get(field, info.get(field.encode()))
+    return value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
 
 
 def _quote_event(minute: int, bid: float = 100.0) -> OptionQuote:
@@ -151,6 +158,11 @@ async def _make_process(
             read_block_ms=0,
             read_count=read_count,
             idle_sleep_seconds=0.001,
+            # **Age trimming off.** Every flush issues `XTRIM MINID` at
+            # `fixture clock - retention`, while Redis stamps entries with its own real
+            # clock: what gets trimmed then depends on the hour the suite is run, and the
+            # trim tests below seed their own. A floor of zero trims nothing.
+            retention_seconds=1_000_000_000.0,
         ),
         client_factory=_factory(server),
     )
@@ -300,6 +312,14 @@ def test_store_restart_replays_only_after_the_saved_positions(tmp_path: Path) ->
 
 
 def test_kill_and_restart_replays_an_uncommitted_minute_once(tmp_path: Path) -> None:
+    """The seam #84 named: a store restarts while the feed keeps publishing.
+
+    The gap publish is the point. Without it the replay has nothing to over-read and the
+    test is green whatever `_replay` does — which is how #63 shipped believing its "none
+    duplicated" criterion held. One entry arrives while nothing is reading, and the
+    restart must fold it once, not once per half of the seam.
+    """
+
     async def scenario() -> None:
         import fakeredis.aioredis
 
@@ -318,28 +338,159 @@ def test_kill_and_restart_replays_an_uncommitted_minute_once(tmp_path: Path) -> 
             assert checkpoint is not None
             assert checkpoint.generation == 1
 
+            # Read and acked, never flushed: what the replay is for.
             first.bus.publish(_quote_event(3, bid=103.0))
             await first.bus.flush()
             await _wait_until(lambda: first.writer.aggregator.ticks == 4)
             await _kill_process(first)
 
+            # **And one published while the store is down.** It lands after the group's
+            # last-delivered id and inside the batch the replay reads, which is exactly
+            # the entry the replay used to hand over and the group's `>` then handed over
+            # again.
+            publisher = RedisBus(
+                first.bus.config, client_factory=_factory(server), clock=clock
+            )
+            try:
+                await publisher.start(start_readers=False)
+                publisher.publish(_quote_event(3, bid=104.0))
+                await publisher.flush()
+            finally:
+                await publisher.aclose()
+
             second = await _make_process(tmp_path, server, clock)
             try:
                 await _start_writer(second, flush_seconds=10_000.0)
-                await _wait_until(lambda: second.writer.aggregator.ticks == 1)
-                clock.value = (BASE + timedelta(minutes=5, seconds=10)).timestamp()
+                # A sentinel in the next minute, published after the restart. The stream
+                # is ordered, so a reader that has reached the sentinel has already
+                # delivered everything the seam could have doubled — no sleeping, and no
+                # patching of the code under test, to know when to look.
+                key = stream_name(_quote_event(4))
+                second.bus.publish(_quote_event(4, bid=105.0))
+                await second.bus.flush()
+                info = await second.bus.client.xinfo_stream(key)
+                head = _info(info, "last-generated-id")
+                await _wait_until(
+                    lambda: second.subscription.last_ids.get(key) == head
+                )
+                await _wait_until(
+                    lambda: second.writer.aggregator.ticks
+                    == second.subscription.offered
+                )
+
+                # 103 from the replay, 104 from the group, 105 the sentinel. Four was the
+                # #84 number: 104 arrived from both halves of the seam.
+                assert second.writer.aggregator.ticks == 3
+                # The index the next checkpoint saves, and what `replay_gaps` subtracts a
+                # trim from. One past the end of the stream under-reports the next loss.
+                assert second.subscription.positions[key].index == int(
+                    _info(info, "entries-added")
+                )
+
+                clock.value = (BASE + timedelta(minutes=6, seconds=10)).timestamp()
                 second.writer._seal(clock())
-                assert second.writer._commit() == 1
+                assert second.writer._commit() == 2
             finally:
                 await _kill_process(second)
 
             rows = BarStore(tmp_path).scan().collect()
             keys = list(zip(rows["symbol"], rows["minute"], strict=True))
-            assert len(keys) == len(set(keys)) == 4
+            assert len(keys) == len(set(keys)) == 5
+            base = BASE.replace(second=0, microsecond=0)
             assert sorted(row["minute"] for row in rows.iter_rows(named=True)) == [
-                BASE.replace(second=0, microsecond=0) + timedelta(minutes=minute)
-                for minute in range(4)
+                base + timedelta(minutes=n) for n in range(5)
             ]
+            # **The tick count, not only key uniqueness.** A doubled tick folds into the
+            # same bar and leaves the key set untouched.
+            ticks = dict(zip(rows["minute"], rows["bid_ticks"], strict=True))
+            assert ticks[base + timedelta(minutes=3)] == 2
+        except Exception:
+            if first.bus.client is not None:
+                await first.bus.aclose()
+            raise
+
+    asyncio.run(scenario())
+
+
+def test_a_trimmed_replay_folds_the_first_retained_entry(tmp_path: Path) -> None:
+    """#85: the entry that survived the trim at the boundary is folded, not skipped.
+
+    Redis trims past the saved position while the store is down. The retained suffix is
+    replayed whole — its first entry included, which a cursor set to `first_retained_id`
+    reads past, because a stream read from an id is exclusive of that id.
+    """
+
+    async def scenario() -> None:
+        import fakeredis.aioredis
+
+        server = fakeredis.aioredis.FakeServer()
+        clock = Clock((BASE + timedelta(minutes=2, seconds=10)).timestamp())
+        first = await _make_process(tmp_path, server, clock)
+        try:
+            await _start_writer(first, flush_seconds=10_000.0)
+            for minute in (0, 1):
+                first.bus.publish(_quote_event(minute, bid=100.0 + minute))
+            await first.bus.flush()
+            await _wait_until(lambda: first.writer.aggregator.ticks == 2)
+            first.writer._seal(clock())
+            assert first.writer._commit() == 2
+            checkpoint = read_checkpoint(tmp_path)
+            assert checkpoint is not None
+            key = stream_name(_quote_event(0))
+            assert checkpoint.streams[key].index == 2
+
+            # Three more, acked and folded but never committed.
+            for minute in (2, 3, 4):
+                first.bus.publish(_quote_event(minute, bid=100.0 + minute))
+            await first.bus.flush()
+            await _wait_until(lambda: first.writer.aggregator.ticks == 5)
+            await _kill_process(first)
+
+            # Redis keeps the newest two while the store is down: minute 2 is gone for
+            # good and minute 3 is the entry that survived at the boundary.
+            trimmer = fakeredis.aioredis.FakeRedis(
+                server=server, decode_responses=False
+            )
+            try:
+                await trimmer.xtrim(key, maxlen=2, approximate=False)
+                info = await trimmer.xinfo_stream(key)
+            finally:
+                await trimmer.aclose()
+            assert int(_info(info, "entries-added")) == 5
+            assert int(_info(info, "length")) == 2
+
+            clock.value = (BASE + timedelta(minutes=6, seconds=10)).timestamp()
+            second = await _make_process(tmp_path, server, clock)
+            try:
+                await _start_writer(second, flush_seconds=10_000.0)
+                # Read through to the head of the stream, then let the writer catch up:
+                # what is folded by then is everything the replay is going to give.
+                head = _info(info, "last-generated-id")
+                await _wait_until(
+                    lambda: second.subscription.last_ids.get(key) == head
+                )
+                await _wait_until(
+                    lambda: second.writer.aggregator.ticks
+                    == second.subscription.offered
+                )
+                # Minute 3 is the entry that survived the trim at the boundary. A cursor
+                # set on it rather than before it reads past it, and one arrives (#85).
+                assert second.writer.aggregator.ticks == 2
+                # One entry not delivered — minute 2 — and `lost` says one.
+                assert second.writer.replay_gap_entries == 1
+                # Rebased onto the trim, so the index is the stream's own ordinal again.
+                assert second.subscription.positions[key].index == 5
+                second.writer._seal(clock())
+                assert second.writer._commit() == 2
+            finally:
+                await _kill_process(second)
+
+            rows = BarStore(tmp_path).scan().collect()
+            minutes = sorted(row["minute"] for row in rows.iter_rows(named=True))
+            base = BASE.replace(second=0, microsecond=0)
+            # Minutes 0 and 1 committed before the kill; 3 and 4 are the retained suffix,
+            # 3 being the first retained entry. Minute 2 is the genuine loss.
+            assert minutes == [base + timedelta(minutes=n) for n in (0, 1, 3, 4)]
         except Exception:
             if first.bus.client is not None:
                 await first.bus.aclose()

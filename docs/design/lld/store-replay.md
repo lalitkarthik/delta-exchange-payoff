@@ -23,8 +23,8 @@ removed at start-up.
   "pauses": [ { "from": { "md.option_quote:DELTA:BTC": "…-0" }, "to": null } ] }
 ```
 
-`streams` is per stream: `id` is the exclusive replay-from position and `index` is its
-logical `entries-added` position. `sealed_through_us` is each aggregator watermark,
+`streams` is per stream: `id` is the **exclusive** replay-from position — a stream read
+from an id never returns that id — and `index` is its logical `entries-added` position. `sealed_through_us` is each aggregator watermark,
 verbatim and not minute-rounded. `pauses` are per-stream spans; `to: null` means the store
 was paused at the checkpoint. An absent file means first start. An unparseable or unknown
 format/version refuses start-up and names the path.
@@ -98,16 +98,49 @@ the span. A null end means through the dead process's replay target.
    per stream in one pipeline. Compute `trimmed = entries-added - length` and
    `lost = max(0, trimmed - index)`. `max-deleted-entry-id` is `measured` to remain `0-0`
    after `XTRIM`, so it is unusable.
-5. If trimmed, replay the retained suffix and signal both bounds and the exact count. If
-   the named group is missing, signal the loss with `lost: null`. Neither condition refuses
-   start-up. Publish `store.state` once, then run.
+5. If trimmed, replay the retained suffix and signal both bounds and the exact count. The
+   rebase **keeps the saved id and moves only the index**. The id is a read cursor and the
+   cursor is exclusive, so setting it to `first_retained_id` reads past the one entry that
+   survived the trim at the boundary — the #85 defect. The saved id is already gone from
+   the stream and a read from a trimmed id returns the whole retained suffix, so it is the
+   correct cursor; the index moves onto `trimmed` so that the first entry delivered carries
+   its true `entries-added` ordinal. If the named group is missing, signal the loss with
+   `lost: null`. Neither condition refuses start-up. Publish `store.state` once, then run.
+
+### 4.1 Where the replay stops, and why it has to
+
+Replay is `XREAD` from the saved id. Live delivery is the group's `>` from its
+`last-delivered-id`. `XREAD` takes a start and no end, so one batch can run past that id —
+by up to `read_count` (500) entries per stream per restart. **The replay drops everything
+past the group's `last-delivered-id`** and leaves it to the `>` read. That bound is what
+makes the two halves meet exactly: `(start_id, last-delivered]` from the replay,
+everything after `last-delivered` from the group.
+
+Without the bound the overlap is delivered twice, which is #84. `measured` 2026-09-12, the
+`test_a_restarted_reader_replays_from_the_id_it_last_flushed` scenario — ten distinct
+entries across the seam, run with the bound removed and with it in place:
+
+| Replay | Bus | Delivered | Distinct | Position index | `entries-added` |
+|---|---|---|---|---|---|
+| unbounded (#84) | fakeredis | 15 | 10 | 20 | 15 |
+| unbounded (#84) | Docker Redis 7 | 14 | 10 | 19 | 15 |
+| bounded (now) | fakeredis | 10 | 10 | 15 | 15 |
+| bounded (now) | Docker Redis 7 | 10 | 10 | 15 | 15 |
+
+The two buses disagree on the surplus because the group's `last-delivered-id` sits one
+entry further along on real Redis; neither number is a property worth pinning, and the
+tests assert that the surplus is empty rather than what it was. The store does not
+deduplicate — `BarWriter.ingest` folds every tick and an unsealed minute accepts any tick —
+so the surplus inflates `bid_ticks` on the restart minute and leaves the saved index past
+the end of the stream, which under-reports the next restart's `lost`.
 
 ## 5. Failure modes and the test seam
 
 | What goes wrong | What happens |
 |---|---|
 | Unparseable checkpoint | `store_main.py` refuses start-up and names the checkpoint path |
-| Checkpoint position was trimmed | retained suffix replays; gap alert, error record and counter carry both bounds and exact `lost` |
+| Checkpoint position was trimmed | the **whole** retained suffix replays, its first entry included; gap alert, error record and counter carry both bounds and exact `lost` |
+| Store restarts while the feed publishes | the replay stops at the group's `last-delivered-id` and the `>` read takes it from there; each entry after the last flush is folded exactly once |
 | Flush fails | generation is cleaned up, bars remain buffered, `flush_errors` increments, and the next interval retries |
 | Group is missing for a checkpoint stream | replay continues with the retained suffix and reports `lost: null`; start-up is not refused |
 | Two stores use one root | unsupported: both can corrupt Parquet and the checkpoint; one store per root is required |
@@ -115,6 +148,18 @@ the span. A null end means through the dead process's replay target.
 The seam is `engine/tests/test_store_process.py`, including the flush-stage parametrisation
 over `FLUSH_STAGES`. It drives the crash boundary, replay, gap arithmetic, restored
 watermark and state publication without a network.
+`test_kill_and_restart_replays_an_uncommitted_minute_once` publishes **between** the kill
+and the restart, so the replay has something to over-read, and asserts the seam minute's
+tick count rather than only key uniqueness — a doubled tick folds into the same bar and
+leaves the key set untouched. `test_a_trimmed_replay_folds_the_first_retained_entry` seeds
+a trim past the saved position and asserts the boundary entry is folded.
+
+The bus half is parametrised over fakeredis and a real `redis:7-alpine`:
+`test_a_restarted_reader_replays_from_the_id_it_last_flushed` drains the subscription to
+empty rather than taking the count it expects, and
+`test_a_replay_from_a_trimmed_id_delivers_the_whole_retained_suffix` pins the exclusive
+cursor both ways — the saved id yields the suffix whole, a cursor on `first_retained_id`
+is one entry short.
 
 ## 6. Numbers
 
@@ -123,3 +168,6 @@ watermark and state publication without a network.
 | Table C grace: 2.0 s | `derived` | 1.45 x `measured` 1,156.8 ms maximum transit (`#61` run) = 1.68 s, rounded up |
 | Recording-command ack timeout: 10.0 s | `assumed` | #64's 2.0 s bound plus one flush of at most 8 files |
 | `STORE_STATE_STALE_SECONDS`: 25.0 s | `derived` | #64's feed-state bound: ten-second publish interval, two missed publishes and five seconds of slack |
+| Replay over-read ceiling: 500 entries per stream per restart | `measured` | `read_count`, the `XREAD` `COUNT` a replay batch uses; it was the whole of the #84 surplus before the bound |
+| That ceiling as time on the live feed: about 0.27 s | `derived` | 500 / `measured` 1,849.8 events/s (#61 run) |
+| Seam surplus before the bound: 5 of 15 on fakeredis, 4 of 14 on Docker Redis 7 | `measured` 2026-09-12 | §4.1, the ten-entry restart scenario run both ways |

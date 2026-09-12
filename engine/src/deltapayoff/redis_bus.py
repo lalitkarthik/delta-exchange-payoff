@@ -846,8 +846,13 @@ class RedisBus:
     async def _replay(self, sub: RedisSubscription, existing: set[str]) -> None:
         """Read forward from the recorded id up to where the group had already got to.
 
-        The two halves meet exactly: this covers `(start_id, last-delivered]` and the
-        group's `>` covers everything after `last-delivered`. No gap, and no entry twice.
+        The two halves meet exactly, and only because this one is bounded at **both**
+        ends. `XREAD` takes a start and no end, so a batch can run past the group's
+        `last-delivered-id`; everything past it is the group's `>` read's to deliver, and
+        handing it to the consumer here as well is how a restart folded the tail of its
+        replay twice (#84). Entries past the target are dropped here and the stream is
+        finished with. This covers `(start_id, last-delivered]`, the group's `>` covers
+        everything after `last-delivered`. No gap, and no entry twice.
         """
         targets = await self._group_positions(sub, existing)
         cursor = {key: sub.start_ids[key].id for key in targets if key in sub.start_ids}
@@ -871,9 +876,21 @@ class RedisBus:
                 return
             for key, entries in got:
                 name = _text(key)
-                self._deliver(sub, name, entries)
-                if entries:
+                target = targets[name]
+                bounded = [
+                    entry
+                    for entry in entries
+                    if not _id_before(target, _text(entry[0]))
+                ]
+                if bounded:
+                    self._deliver(sub, name, bounded)
+                if entries and len(bounded) == len(entries):
                     cursor[name] = _text(entries[-1][0])
+                else:
+                    # The batch reached past the target, so there is nothing before it
+                    # left to read: park the cursor on the target and this stream drops
+                    # out of `pending`. What was dropped arrives from the group's `>`.
+                    cursor[name] = target
 
     async def _group_positions(
         self, sub: RedisSubscription, existing: set[str]

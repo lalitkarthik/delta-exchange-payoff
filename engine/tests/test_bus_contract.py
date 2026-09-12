@@ -137,6 +137,26 @@ async def take(subscription, count: int, timeout: float = 10.0) -> list:
     return got
 
 
+async def drain(subscription, timeout: float = 1.0) -> list:
+    """Everything still queued, read until nothing more arrives. **The surplus.**
+
+    `take` asks for a number and is satisfied by it, so a seam that delivered one record
+    too many stayed green behind it for as long as #84 was open. This is the other half:
+    a test asserts what it took *and* that nothing was left.
+    """
+    got: list = []
+    while True:
+        try:
+            got.append(await asyncio.wait_for(subscription.queue.get(), timeout))
+        except TimeoutError:
+            return got
+
+
+def _entries_added(info) -> int:
+    """`XINFO STREAM`'s lifetime counter, whichever way the client decoded its keys."""
+    return int(info.get("entries-added", info.get(b"entries-added")))
+
+
 async def until(predicate, timeout: float = 10.0, what: str = "") -> None:
     """Wait for something a reader does on its own schedule, or fail saying what.
 
@@ -549,11 +569,12 @@ def test_a_restarted_reader_replays_from_the_id_it_last_flushed(redis_kind) -> N
                 bus.publish(quote(float(n)))
             await settle(bus)
             await take(writer, 5)
-            # **The id is recorded with the queue drained**, which is what makes it the
-            # id of the last message this consumer actually had. `last_ids` names what
-            # the reader has put on the queue, so a consumer records it when it flushes,
-            # having taken everything off.
-            flushed_id = writer.last_ids[key]
+            # **The position is recorded with the queue drained**, which is what makes
+            # it the position of the last message this consumer actually had. It is taken
+            # as one value, id and index together, because that is what a flush writes
+            # into the checkpoint; reading the two at different moments would be a saved
+            # position that never existed.
+            flushed = writer.positions[key]
 
             # Five more, read and acked on receipt — and then the process dies before the
             # next flush. These are exactly what the pending list would not recover.
@@ -572,15 +593,107 @@ def test_a_restarted_reader_replays_from_the_id_it_last_flushed(redis_kind) -> N
                 "store",
                 maxsize=500,
                 lossless=True,
-                start_ids={key: Position(flushed_id, writer.positions[key].index)},
+                start_ids={key: flushed},
             )
             await live(bus)
-            return [event.bid for event in await take(restarted, 10)]
+            replayed = await take(restarted, 10)
+            # **Drained to empty, not counted out.** Taking exactly the ten expected was
+            # green for as long as the seam delivered fifteen (#84): the surplus sat in
+            # the queue behind them and nothing ever looked.
+            extra = await drain(restarted)
+            info = await bus.client.xinfo_stream(key)
+            return (
+                [event.bid for event in replayed],
+                [event.bid for event in extra],
+                restarted.positions[key].index,
+                _entries_added(info),
+            )
 
-    bids = run(scenario())
+    bids, extra, index, entries_added = run(scenario())
     # Five replayed — 5..9, the ones acked but not flushed — then the five that arrived
     # while nothing was reading. Nothing lost and nothing before the flush repeated.
     assert bids == [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]
+    assert extra == [], "the replay and the group's `>` must not both deliver the tail"
+    # The index is the ordinal the next checkpoint saves and `replay_gaps` subtracts a
+    # trim from. One past the end of the stream would under-report the next loss.
+    assert (index, entries_added) == (15, 15)
+
+
+def test_a_replay_from_a_trimmed_id_delivers_the_whole_retained_suffix(
+    redis_kind,
+) -> None:
+    """A replay cursor is exclusive, so it belongs *before* the first retained entry.
+
+    When Redis has trimmed past a saved position the store replays what is left. The
+    saved id is the cursor for that even though Redis no longer holds it — a read from a
+    trimmed id returns the whole retained suffix. `first_retained_id` is the wrong cursor,
+    and #85 is exactly that mistake: both halves are pinned here, because the store's
+    rebase is only safe while Redis keeps behaving this way.
+    """
+    kind, url = redis_kind
+
+    async def scenario():
+        async with open_bus(kind, url) as bus:
+            reader = bus.subscribe("store", maxsize=100, lossless=True)
+            await live(bus)
+            key = stream_name(quote(0.0))
+            # Two, flushed. **Published and drained in two batches**, because the reader
+            # records what it put on the queue and not what the test took off: one batch
+            # of ten would leave the saved position at the head whatever `take` asked for.
+            for n in range(2):
+                bus.publish(quote(float(n)))
+            await settle(bus)
+            await take(reader, 2)
+            saved = reader.positions[key]
+
+            # Eight more, read and acked but never flushed, so the group ends at the head
+            # while the saved position stays two entries in.
+            for n in range(2, 10):
+                bus.publish(quote(float(n)))
+            await settle(bus)
+            await take(reader, 8)
+            bus.unsubscribe(reader)
+
+            # Redis keeps the newest five — bids 5..9. The saved position is three
+            # entries behind the first one that survived.
+            await bus.client.xtrim(key, maxlen=5, approximate=False)
+
+            restarted = bus.subscribe(
+                "store", maxsize=100, lossless=True, start_ids={key: saved}
+            )
+            await live(bus)
+            gap = (await bus.replay_gaps(restarted, {key: saved}))[key]
+            replayed = await take(restarted, 5)
+            extra = await drain(restarted)
+
+            # The same suffix asked for from `first_retained_id`, in a group of its own.
+            # This is what the store did until #85, and it is one entry short.
+            from_boundary = bus.subscribe(
+                "boundary",
+                maxsize=100,
+                lossless=True,
+                start_ids={key: Position(gap.first_retained_id, gap.trimmed)},
+            )
+            await live(bus)
+            short = await drain(from_boundary)
+            return (
+                [event.bid for event in replayed],
+                [event.bid for event in extra],
+                [event.bid for event in short],
+                gap.lost,
+                gap.trimmed,
+                saved.index,
+            )
+
+    bids, extra, short, lost, trimmed, saved_index = run(scenario())
+    assert bids == [5.0, 6.0, 7.0, 8.0, 9.0], "the first retained entry is not optional"
+    assert extra == []
+    # bids 2, 3 and 4 — the three between the saved position and the trim boundary.
+    assert (trimmed, saved_index) == (5, 2)
+    # **The reported loss is the real one**: everything published after the saved
+    # position, less everything the replay handed over.
+    assert lost == (10 - saved_index) - len(bids) == 3
+    assert short == [6.0, 7.0, 8.0, 9.0], "a cursor on the boundary skips the boundary"
 
 
 def test_a_configured_stream_missing_from_saved_positions_starts_at_the_group_start(

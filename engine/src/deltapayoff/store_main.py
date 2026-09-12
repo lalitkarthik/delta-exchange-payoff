@@ -102,7 +102,15 @@ def _first_checkpoint(process: StoreProcess) -> Checkpoint:
 
 
 def _set_replay_base(process: StoreProcess, stream: str, position: Position) -> None:
-    """Make a trimmed suffix start at its true entries-added ordinal."""
+    """Rebase a trimmed stream: the id stays a read cursor, the index moves.
+
+    **The id must sit before the first retained entry, not on it.** A stream read from an
+    id is exclusive of that id, so a cursor set to `first_retained_id` skips the one entry
+    that survived the trim at the boundary (#85). The saved id is the right cursor even
+    though Redis no longer holds it: a read from a trimmed id returns the whole retained
+    suffix. Only the index is wrong, and it is rebased onto the trim count so the first
+    entry delivered carries its true `entries-added` ordinal.
+    """
     process.subscription.start_ids[stream] = position
     process.subscription.positions[stream] = position
     process.writer.prev_positions[stream] = position
@@ -222,10 +230,9 @@ async def _prepare_process(
                     lost=gap.lost,
                 )
                 if gap.lost is not None and gap.lost > 0:
+                    # The saved id, not `first_retained_id`: see `_set_replay_base`.
                     _set_replay_base(
-                        process,
-                        gap.stream,
-                        Position(gap.first_retained_id or gap.saved_id, gap.trimmed),
+                        process, gap.stream, Position(gap.saved_id, gap.trimmed)
                     )
     await bus.start_readers()
 
