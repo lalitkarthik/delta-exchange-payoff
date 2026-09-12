@@ -122,3 +122,30 @@ def test_stack_env_has_non_secret_defaults_and_an_empty_webhook_slot() -> None:
     assert ENV_KEYS <= keys
     assert re.search(r"^DISCORD_WEBHOOK_URL=$", text, re.MULTILINE)
     assert ".stack-data/" in (ROOT / ".gitignore").read_text(encoding="utf-8")
+
+
+#: The four services that run this engine's code and therefore write its log files.
+#: `redis`, `web` and `proxy` are other people's images and log to stdout already.
+ENGINE_SERVICES = {"feed", "store", "api", "discord-alerts"}
+
+
+def test_every_engine_service_mounts_a_volume_over_its_log_directory() -> None:
+    """#103: seven hours of records existed and died with the container.
+
+    `configure_logging` now writes to standard error as well, so `docker logs` is no
+    longer empty -- but standard error is a ring buffer Docker rotates and the daily
+    JSON file is the artefact an incident is actually read out of. In the stalled stack
+    it held 146 KB in `dxp-store`, 18 KB in `dxp-api` and 131 KB in `dxp-feed`
+    (`measured` 2026-09-12) at `/app/logs`, which no volume was mounted on; they were
+    copied out by hand before the containers could be removed. A bind mount is what
+    makes the next incident's evidence survive without anyone remembering to.
+    """
+    blocks = _service_blocks(COMPOSE.read_text(encoding="utf-8"))
+
+    for service in sorted(ENGINE_SERVICES):
+        assert re.search(
+            rf"^\s+- ['\"]?\./\.stack-logs/{re.escape(service)}:/app/logs['\"]?\s*$",
+            blocks[service],
+            re.MULTILINE,
+        ), f"{service} does not mount a volume over /app/logs"
+    assert ".stack-logs/" in (ROOT / ".gitignore").read_text(encoding="utf-8")

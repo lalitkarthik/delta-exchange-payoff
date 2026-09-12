@@ -2234,7 +2234,19 @@ class BarWriter:
 
 
 def _stream_id_seconds(value: str) -> float:
-    milliseconds, _, _sequence = value.split("-", 1)
+    """The wall-clock second inside a Redis stream id, for `seal_clock`.
+
+    `partition`, not `split`. `str.split("-", 1)` yields **two** parts and this unpacks
+    **three**, so from #63 (`83120d6`) until #103 this raised
+    `ValueError: not enough values to unpack` for every stream id there is, `0-0`
+    included. `seal_clock` catches `(TypeError, ValueError)` and continues, so its list
+    of times was always empty and it always fell through to the wall clock — **record
+    0010 R4 had never once run.** `redis_bus._id_parts` had it right all along.
+
+    The same shape as #103 itself: an exception a defensive handler swallowed, and a
+    signal that silently became a default.
+    """
+    milliseconds, _, _sequence = value.partition("-")
     return int(milliseconds) / 1000.0
 
 

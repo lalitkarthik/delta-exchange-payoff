@@ -47,8 +47,8 @@ group_start: "0" | "$" = "$", skip: Sequence[Span] = ())`. Each `Position` carri
 logical index. **The unstated `group_start` is `"$"`; `"0"` is deliberate** (#97). It resolves
 once to a concrete id when a group is created, is never repeatedly passed as the literal `$`,
 and positions a group only at creation (#86). `skip` contains pause spans that a replaying
-reader drops and counts. `behind` is per stream: it tells the store's log clock that replay or
-a full read batch is still catching up; see [store-replay.md](store-replay.md).
+reader drops and counts. **`behind` is derived per stream from the reader's own liveness**,
+never a cached flag (#103): see [bus-reader.md](bus-reader.md) §4.
 
 Lossless subscriptions create `XGROUP CREATE <stream> <name> <group_start> MKSTREAM`, read
 `XREADGROUP`, and ack each batch before the work. The group name is the service name. The
@@ -121,9 +121,8 @@ unbounded buffer is a memory leak with good manners.
 
 `RedisBus.start()` dials, `PING`s inside the connect timeout, creates the groups, positions
 the `$` readers and starts the flusher. It then **waits for every reader to be in position**
-before returning, so "the bus is started" means "nothing published from now on is missed by
-a subscriber that already existed". Both socket timeouts are bounded: an unbounded dial is
-not a failure, it is a process that never reports one.
+before returning. Both socket timeouts are bounded: an unbounded dial is not a failure but a
+process that never reports one. **A started reader is supervised and survives a transient**: its retry policy, its death and its counters are [bus-reader.md](bus-reader.md).
 
 When Redis does not answer, `start()` raises `BusUnavailable` naming the URL, the reason and
 the variable to unset. `main.lifespan` does not catch it — unlike `DeltaUnavailable`, which
@@ -137,7 +136,8 @@ buffering into an outbox nobody is draining.
 `stats()` keeps the fan-out's six per subscription — `offered`, `dropped`, `queued`,
 `lossless`, `over_capacity`, `backlog_peak` — and adds broker counters `skipped` (§3),
 `span_dropped`, `resyncs`, and `undecodable`, an entry that would not decode, logged at
-error and never fatal to the reader. `publisher()` carries the write side: `published`,
+error and never fatal to the reader. `readers()` and `consumer_lag()` are
+[bus-reader.md](bus-reader.md) §5. `publisher()` carries the write side: `published`,
 `written`, `batches`, `trims`, `failures`, `unroutable`, `outbox`, `outbox_dropped`, and the
 flush timings §7 is read off.
 
@@ -191,9 +191,9 @@ group, and the engine owns the screen subscriptions. Store replay from per-strea
 and reports trimmed loss rather than refusing start-up. Engine I5 (#64) adds feed-state health.
 
 **No `XAUTOCLAIM`, no pending-list recovery, no dead-letter.** §2 says why: the flush is the
-durability boundary and the recorded id is the recovery. A consumer that needed per-message
-delivery guarantees would need a different acknowledgement policy, and that is a change to
-`redis-hosting.md` §5 before it is a change here.
+durability boundary and the recorded id is the recovery. A consumer needing per-message
+delivery guarantees needs a different acknowledgement policy, a change to `redis-hosting.md`
+§5 first. **No reader restart either**, and [bus-reader.md](bus-reader.md) §3 says why.
 
 **No Redis Cluster.** The key grammar would need a hashtag so one venue's streams landed in
 one slot — an addition to the nomenclature, not a rewrite of this.
