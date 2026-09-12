@@ -9,7 +9,7 @@ a run behind it does not belong here.
 
 | Number | Tag | Run |
 |---|---|---|
-| Table A/B/D grace 8.0 s | `derived` | 1.45x the 5,511 ms ceiling from `tools/measure_arrival_lag.py`, 2026-09-04 |
+| Table A/B/D grace 8.0 s | `derived` | 1.45x the `derived` 5,511 ms ceiling (storage.md §1.1: the ticker's 5,001 ms republish interval plus `tools/measure_arrival_lag.py`'s measured max `ob_l2` transit), 2026-09-04 |
 | Table C grace 0.0 s, monolith | `derived` | a sample has no stragglers; see [store.md](store.md) §1 |
 | Table C grace 2.0 s, split | `derived` | 1.45x the `measured` 1,156.8 ms maximum `computed.chain` transit, rounded above 1.68 s |
 | `BUFFER_HORIZON_SECONDS`: 4.43 MiB retained for 12,390 six-minute bars | `measured` | a `tracemalloc` run, 2026-09-12, #81 |

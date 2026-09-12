@@ -116,7 +116,7 @@ see the decision record's owner list.
 | Store stream set: 8 keys (4 types × 2 underlyings) | `derived` | `redis_wire.stream_names` with #64's `event_types` filter |
 | One `XREADGROUP` batch ≈ 0.5 s of quotes and ≈ 4 s of index frames | `derived` | `DEFAULT_READ_COUNT` 500 against `measured` 1,000/s and 118/s (#37, `measure_feed.py`) |
 | Table C grace in the split store: **2.0 s** | `derived` | 1.45 × `measured` max transit 1,156.8 ms = 1.68 s, rounded up; 1.45 is the same factor table A/B/D's 8.0 s used |
-| Tables A/B/D grace stays 8.0 s | `derived` | `measured` max arrival lag 5,511 ms + `measured` max transit 1,157 ms = 6.67 s, still inside 8.0 s (1.2× rather than 1.45×) |
+| Tables A/B/D grace stays 8.0 s | `derived` | the `derived` 5,511 ms ceiling (storage.md §1.1: the ticker's 5,001 ms republish interval plus `ob_l2`'s measured max transit) + `measured` max transit 1,157 ms = 6.67 s, still inside 8.0 s (1.2× rather than 1.45×) |
 | Minute-pass ladders at risk without a grace: everything slower than the 500 ms lead | `derived` | `MINUTE_PASS_LEAD_SECONDS` 0.5 s against `measured` p99 transit 847.8 ms |
 | `fakeredis` 2.38.0: after `XTRIM MINID`, `max-deleted-entry-id` stays `0-0`; `entries-added` − `length` = entries trimmed | `measured` | my run, 5 entries added, 3 trimmed → `entries-added` 5, `length` 2, `max-deleted-entry-id` `0-0` |
 | `XGROUP CREATE … <id> MKSTREAM` at an explicit id works on `fakeredis` | `measured` | same run |
