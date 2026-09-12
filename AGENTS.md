@@ -79,6 +79,10 @@ you conclude your change broke something.
   test. Use `tests/wait_helpers.py` — `wait_until` where you can `await`, `wait_until_sync`
   where you cannot — and wait on the thing you actually care about, with a message naming
   it. A sleep that *drives* a fake cadence is fine and is not this. #83, #93.
+- **A load generator is raised and reaped by one script.** The tear-down lives in the file
+  that raises the load, runs on every exit path including force-kill, and prints the count
+  raised against the count it **verified** reaped by re-reading the process table — never
+  by trusting its own kill call. `tools/loadgen.py run`; `check` is the pre-flight. #99.
 - **Documentation notes stay under 200 lines.** Split rather than overflow, unless named
   exempt below with a reason. Scope: every file under `docs/`, plus this file and
   `CLAUDE.md`. Package `README.md` files (root, `engine/`, `web/`) are outside this rule —
@@ -139,6 +143,18 @@ you conclude your change broke something.
   `out_of_scope_noticed`; do not fix it.
 - Numbers are tagged `measured`, `assumed` or `derived`, with the run that produced them.
   Never quote a figure from a doc as if you observed it.
+
+## "Flaky under load" is four mechanisms, not one
+
+Name which one before calling a failure flake — a ticket closed on the wrong mechanism is
+worse than one left open, because the next person stops looking.
+
+1. **The `--basetemp` trap** above: ~315 setup *errors*, a faster run, a clean re-run.
+2. **A shared test Redis** — one container and namespace across worktrees, so a second
+   session deletes the first's keys. #92, fixed.
+3. **Duration bets** — a test sleeping instead of waiting on a condition. #83, #93.
+4. **Load nobody knows is there.** #96 left 112 processes for 73 minutes: 9.5x slower, and
+   21 of 22 "failures" were contention. Run `loadgen.py check` before any gate. #96, #99.
 
 ## Off limits
 
