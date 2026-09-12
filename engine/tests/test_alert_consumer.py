@@ -590,6 +590,9 @@ def test_a_bad_alert_does_not_kill_the_consumer_loop(
         def rollback_post(self) -> None:
             self.rollbacks += 1
 
+        def rollback_collapse_window(self) -> None:
+            self.rollbacks += 1
+
     bus = FanOut()
     consumer = AlertConsumer(
         bus,
@@ -776,10 +779,15 @@ def test_the_live_connect_timeout_loses_its_alert_and_says_which_one(
     """The live failure, reproduced: the seventh alert is acked and never delivered.
 
     `reconnect_budget_spent` was the alert that said the venue connection would not
-    come back without a resume. Its post raised, the occurrence was committed anyway
-    because the HTTP seam *was* attempted, and no replay exists to bring it back. The
-    consumer keeps running, which is the point of the trade -- and the log now names
-    what it cost, which before this test it did not.
+    come back without a resume. Its post raised and no replay exists to bring it back.
+    The consumer keeps running, which is the point of the trade -- and the log names
+    what it cost, which before #66's tests it did not.
+
+    What #115 changed is what happens *afterwards*: the occurrence used to be
+    committed because the HTTP seam had been called, so the signature was suppressed
+    for the next 300 s too. The loss of this post is accepted; the loss of the next
+    one was not. `test_a_failed_post_leaves_the_next_occurrence_free_to_post` below is
+    that half.
     """
     clock = _Clock()
     from deltapayoff.fanout import FanOut
@@ -816,8 +824,163 @@ def test_the_live_connect_timeout_loses_its_alert_and_says_which_one(
     assert "reconnect_budget_spent" in caplog.text
     assert "dropped, not retried" in caplog.text
     assert "https://discord.test/webhook" not in caplog.text
-    # Acked on receipt and committed as spent: nothing is pending and nothing retries.
+    # Acked on receipt and never retried: nothing is pending and nothing comes back.
     assert consumer.gate._pending_post is None
+
+
+# --- #115: the failed post must not also cost the next occurrence its post ----------
+#
+# #66 settled the surrounding decision -- this consumer acks before delivery, because
+# holding entries unacked turns a Discord outage into a stalled consumer with a growing
+# pending list, which is #103 one service over -- and made the loss loud. The other
+# half is that the loss must stop at the message it lost. Until #115 a transport
+# exception committed the occurrence, so the same signature was suppressed for the
+# following `ALERT_COLLAPSE_WINDOW_SECONDS`, and the post that eventually carried it
+# rendered "(collapsed N times since last post)" about a post that never happened.
+
+
+def test_a_failed_post_leaves_the_next_occurrence_free_to_post() -> None:
+    """#115's first criterion, at the seam the defect actually lived at.
+
+    The live shape: `reconnect_budget_spent` raises `ConnectTimeout`, and the venue
+    connection is still down, so the same alert is published again a few seconds
+    later. Before this fix the second one was folded into the failed post's window and
+    a person saw nothing for five minutes.
+
+    The repeat is placed past the 2.0 s global floor and far inside the 300 s collapse
+    window, so the only rule that can suppress it is the one under test.
+    """
+    clock = _Clock(0.0)
+    calls: list[dict[str, Any]] = []
+
+    async def post(_url: str, payload: dict[str, Any]) -> SimpleNamespace:
+        calls.append(payload)
+        if len(calls) == 1:
+            raise ConnectionError("ConnectTimeout")
+        return SimpleNamespace(status=204)
+
+    from deltapayoff.fanout import FanOut
+
+    bus = FanOut()
+    consumer = AlertConsumer(
+        bus,
+        poster=discord_alerts.DiscordPoster(post),
+        gate=discord_alerts.AlertGate(),
+        webhook_url="https://discord.test/webhook",
+        clock=clock,
+        wall_clock=lambda: EARLY_WALL_CLOCK,
+    )
+    consumer.subscribe()
+
+    async def scenario() -> None:
+        bus.publish(_alert("reconnect_budget_spent"))
+        await consumer._run_once()
+
+        clock.value = discord_alerts.ALERT_MIN_POST_INTERVAL_SECONDS + 1.0
+        assert clock.value < discord_alerts.ALERT_COLLAPSE_WINDOW_SECONDS
+        bus.publish(_alert("reconnect_budget_spent"))
+        await consumer._run_once()
+
+    asyncio.run(scenario())
+
+    assert len(calls) == 2, calls
+    assert "reconnect_budget_spent" in calls[1]["content"]
+    # The second post is a first post, not a reveal: the failed one is not a "last
+    # post" to have collapsed anything since.
+    assert "collapsed" not in calls[1]["content"]
+    assert consumer.poster.delivered_count == 1
+    assert consumer.poster.failed_count == 1
+
+
+def test_a_failed_post_still_spends_the_global_post_floor() -> None:
+    """The rollback frees the signature and nothing else.
+
+    The HTTP request was made, so `ALERT_MIN_POST_INTERVAL_SECONDS` has to stay spent.
+    A repeat 0.1 s after a failure is refused by the global floor -- if the rollback
+    refunded that too, this consumer would have no rate limit at all in exactly the
+    conditions that produce alert storms.
+    """
+    clock = _Clock(0.0)
+    calls: list[dict[str, Any]] = []
+
+    async def post(_url: str, payload: dict[str, Any]) -> SimpleNamespace:
+        calls.append(payload)
+        raise ConnectionError("ConnectTimeout")
+
+    from deltapayoff.fanout import FanOut
+
+    bus = FanOut()
+    consumer = AlertConsumer(
+        bus,
+        poster=discord_alerts.DiscordPoster(post),
+        gate=discord_alerts.AlertGate(),
+        webhook_url="https://discord.test/webhook",
+        clock=clock,
+        wall_clock=lambda: EARLY_WALL_CLOCK,
+    )
+    consumer.subscribe()
+
+    async def scenario() -> None:
+        bus.publish(_alert("reconnect_budget_spent"))
+        await consumer._run_once()
+
+        clock.value = discord_alerts.ALERT_MIN_POST_INTERVAL_SECONDS - 0.1
+        bus.publish(_alert("reconnect_budget_spent"))
+        await consumer._run_once()
+
+    asyncio.run(scenario())
+
+    assert len(calls) == 1, calls
+    assert consumer.gate.rate_limited_count == 1
+
+
+def test_a_discord_429_still_spends_the_collapse_window() -> None:
+    """A `429` is the one refusal that must stay committed, and this pins it.
+
+    Discord received the request and named its own backoff; the poster's
+    `_blocked_until` is now set from that answer. Freeing the signature would let the
+    next repeat walk straight into the block, spend a `blocked_count` and be dropped
+    with no HTTP call -- strictly worse than folding it, which at least reveals a
+    count when the window opens.
+    """
+    clock = _Clock(0.0)
+    calls: list[dict[str, Any]] = []
+
+    async def post(_url: str, payload: dict[str, Any]) -> SimpleNamespace:
+        calls.append(payload)
+        return SimpleNamespace(status=429, json_body={"retry_after": 1.0})
+
+    from deltapayoff.fanout import FanOut
+
+    bus = FanOut()
+    consumer = AlertConsumer(
+        bus,
+        poster=discord_alerts.DiscordPoster(post),
+        gate=discord_alerts.AlertGate(),
+        webhook_url="https://discord.test/webhook",
+        clock=clock,
+        wall_clock=lambda: EARLY_WALL_CLOCK,
+    )
+    consumer.subscribe()
+
+    async def scenario() -> None:
+        bus.publish(_alert("reconnect_budget_spent"))
+        await consumer._run_once()
+
+        # Past the global floor and past the 429's own backoff, so the only rule left
+        # holding this repeat back is the collapse window the 429 committed.
+        clock.value = discord_alerts.ALERT_MIN_POST_INTERVAL_SECONDS + 1.0
+        bus.publish(_alert("reconnect_budget_spent"))
+        await consumer._run_once()
+
+    asyncio.run(scenario())
+
+    assert len(calls) == 1, calls
+    assert consumer.poster.ready(clock.value) is True
+    assert consumer.poster.blocked_count == 0
+    assert ("reconnect_budget_spent", "delta", "error") in (
+        consumer.gate._suppressed_count_by_signature
+    )
 
 
 def test_every_test_in_this_module_has_an_assertion() -> None:

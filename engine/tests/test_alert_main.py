@@ -11,10 +11,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
+from fastapi import Response
 from fastapi.testclient import TestClient
 
-from deltapayoff import alert_main
+from deltapayoff import alert_main, discord_alerts
 from deltapayoff.alert_main import WEBHOOK_ENV
 
 
@@ -80,7 +82,16 @@ def test_real_alert_entrypoint_reports_unconfigured_health_without_logging_a_url
 
         assert response == (
             200,
-            {"discord": "unconfigured", "consumer": "alive"},
+            {
+                "status": "ok",
+                "problems": [],
+                "discord": "unconfigured",
+                "consumer": "alive",
+                "delivered": 0,
+                "failed": 0,
+                "blocked": 0,
+                "last_post": "none",
+            },
         )
     finally:
         if process.poll() is None:
@@ -97,17 +108,111 @@ def test_real_alert_entrypoint_reports_unconfigured_health_without_logging_a_url
     assert process.returncode in (0, 1)
 
 
-def test_health_marks_a_finished_consumer_dead(monkeypatch) -> None:
-    process = SimpleNamespace(
-        webhook_url="https://discord.test/webhook",
-        task=SimpleNamespace(done=lambda: True),
+def _fake_process(
+    *,
+    done: bool = False,
+    delivered: int = 0,
+    failed: int = 0,
+    blocked: int = 0,
+    last_outcome: Any = None,
+) -> SimpleNamespace:
+    """A stand-in for `AlertProcess` carrying only what `/health` reads."""
+    poster = SimpleNamespace(
+        delivered_count=delivered,
+        failed_count=failed,
+        blocked_count=blocked,
+        last_outcome=last_outcome,
     )
-    monkeypatch.setattr(alert_main.app.state, "process", process, raising=False)
+    return SimpleNamespace(
+        webhook_url="https://discord.test/webhook",
+        task=SimpleNamespace(done=lambda: done),
+        consumer=SimpleNamespace(poster=poster),
+    )
 
-    assert asyncio.run(alert_main.health()) == {
-        "discord": "configured",
-        "consumer": "dead",
-    }
+
+def _health(monkeypatch, process: SimpleNamespace) -> tuple[int, dict[str, Any]]:
+    monkeypatch.setattr(alert_main.app.state, "process", process, raising=False)
+    response = Response()
+    payload = asyncio.run(alert_main.health(response))
+    return response.status_code, payload
+
+
+def test_health_marks_a_finished_consumer_dead(monkeypatch) -> None:
+    status, payload = _health(monkeypatch, _fake_process(done=True))
+
+    assert payload["consumer"] == "dead"
+    assert payload["discord"] == "configured"
+    assert payload["status"] == "error"
+    assert payload["problems"] == ["the alert consumer task is not running"]
+    # #103: the status code is the contract. Compose's check is `urlopen`, which never
+    # reads a body, so a dead consumer behind a 200 is invisible to it.
+    assert status == 503
+
+
+def test_health_reports_a_failed_delivery_as_a_problem(monkeypatch) -> None:
+    """The question this route could not answer on 2026-09-12.
+
+    At 16:44Z, thirty-one minutes after the only log record in the container was a
+    failed post, `/health` answered `200 {"discord":"configured","consumer":"alive"}`.
+    Both fields were true. Neither was about delivery.
+    """
+    status, payload = _health(
+        monkeypatch,
+        _fake_process(
+            delivered=2,
+            failed=1,
+            last_outcome=discord_alerts.PostOutcome.FAILED,
+        ),
+    )
+
+    assert status == 503
+    assert payload["status"] == "error"
+    assert payload["problems"] == ["the last Discord post did not reach Discord"]
+    assert payload["delivered"] == 2
+    assert payload["failed"] == 1
+    assert payload["last_post"] == "failed"
+    # The two original fields stay, and stay true.
+    assert payload["discord"] == "configured"
+    assert payload["consumer"] == "alive"
+
+
+def test_health_recovers_once_a_later_post_is_delivered(monkeypatch) -> None:
+    """The judgement is the latest attempt, not the running total.
+
+    `failed` never goes back down, so a consumer that failed once and has delivered
+    everything since would read as broken forever if the count were the judgement.
+    """
+    status, payload = _health(
+        monkeypatch,
+        _fake_process(
+            delivered=3,
+            failed=1,
+            last_outcome=discord_alerts.PostOutcome.DELIVERED,
+        ),
+    )
+
+    assert status == 200
+    assert payload["status"] == "ok"
+    assert payload["problems"] == []
+    assert payload["failed"] == 1
+    assert payload["last_post"] == "delivered"
+
+
+def test_health_does_not_call_a_429_a_problem(monkeypatch) -> None:
+    """Discord received that request and named its own backoff; nothing is broken."""
+    status, payload = _health(
+        monkeypatch,
+        _fake_process(
+            failed=1,
+            blocked=2,
+            last_outcome=discord_alerts.PostOutcome.RATE_LIMITED,
+        ),
+    )
+
+    assert status == 200
+    assert payload["status"] == "ok"
+    assert payload["blocked"] == 2
+    assert payload["last_post"] == "rate_limited"
 
 
 def test_configured_health_reports_configured_without_posting(
@@ -120,4 +225,13 @@ def test_configured_health_reports_configured_without_posting(
         response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"discord": "configured", "consumer": "alive"}
+    assert response.json() == {
+        "status": "ok",
+        "problems": [],
+        "discord": "configured",
+        "consumer": "alive",
+        "delivered": 0,
+        "failed": 0,
+        "blocked": 0,
+        "last_post": "none",
+    }
