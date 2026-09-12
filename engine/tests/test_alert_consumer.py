@@ -388,8 +388,19 @@ def test_a_bad_alert_does_not_kill_the_consumer_loop(
     from deltapayoff.fanout import FanOut
 
     class FailingOnceGate:
+        """A gate that raises once, and otherwise satisfies the whole gate interface.
+
+        `commit_post` and `rollback_post` are here because the consumer calls them
+        directly rather than through a `getattr` fallback. That is deliberate: behind a
+        silent fallback an incomplete gate reverts to the defect the #66 review caught --
+        an occurrence spent although Discord never saw the alert -- and this double was
+        incomplete in exactly that way until the fallback was removed.
+        """
+
         def __init__(self) -> None:
             self.calls = 0
+            self.commits = 0
+            self.rollbacks = 0
 
         def decide(self, **_kwargs: Any) -> discord_alerts.GateDecision:
             self.calls += 1
@@ -398,6 +409,12 @@ def test_a_bad_alert_does_not_kill_the_consumer_loop(
             return discord_alerts.GateDecision(
                 post=True, collapsed_count=0, rate_limited=False
             )
+
+        def commit_post(self) -> None:
+            self.commits += 1
+
+        def rollback_post(self) -> None:
+            self.rollbacks += 1
 
     bus = FanOut()
     consumer = AlertConsumer(

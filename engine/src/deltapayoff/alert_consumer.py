@@ -93,19 +93,19 @@ class AlertConsumer:
                     decision.collapsed_count,
                     now=now,
                 )
+                # Called directly, not through `getattr(..., None)`. The gate is typed
+                # `AlertGate` and `decide()` above is already called directly, so a gate
+                # without these methods is a programming error and should say so. Behind a
+                # silent fallback it would instead revert to the exact defect the review
+                # caught -- the occurrence spent although Discord never saw the alert --
+                # and the guarantee this pair exists to install would quietly not hold.
                 if attempted:
-                    commit_post = getattr(self.gate, "commit_post", None)
-                    if commit_post is not None:
-                        commit_post()
+                    self.gate.commit_post()
                 else:
-                    rollback_post = getattr(self.gate, "rollback_post", None)
-                    if rollback_post is not None:
-                        rollback_post()
+                    self.gate.rollback_post()
         except Exception as exc:
             if decision is not None and decision.post:
-                rollback_post = getattr(self.gate, "rollback_post", None)
-                if rollback_post is not None:
-                    rollback_post()
+                self.gate.rollback_post()
             log_event(
                 logger,
                 logging.ERROR,
