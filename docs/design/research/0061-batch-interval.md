@@ -114,6 +114,27 @@ run ended. Every one of the 41,651 trims before that was a no-op, at no measurab
 5. **One socket drop during `control` and one during `50 ms`**, both redialled by the
    controller inside a second and visible in the run log. Neither phase's event rate moved
    outside 1,835–1,854/s, so neither is excluded.
+6. **This run predates the default that keeps the consumer group off the retained window,
+   and the run's own counters are what clear it — not the protocol (#102).** The tool
+   subscribed losslessly while stating no `group_start`, which at this commit resolved to
+   `"0"`: *deliver everything Redis still holds*. Against a non-empty stream that would
+   have drained up to the thirty-minute window at Redis's replay speed before the first
+   live entry. It did not happen here, and three `measured` figures above say so
+   independently of anyone's memory of how the run was launched:
+   - **`unjoined_receipts` is 20.** A replayed entry cannot become a latency sample —
+     `read_stamps` reads the stamps key from `"$"`, so a replayed entry's stamp is behind
+     the cursor and its receipt is never joined. Every sampled entry of a replay therefore
+     lands in this counter. Thirty minutes at 1,850 events a second, sampled 1-in-20, is
+     `derived` **~166,500**. Twenty is end-of-run raggedness.
+   - **`received` 3,330,235 against `written` 3,328,455** — an excess of 1,780, about a
+     second of traffic, where a replay would have shown up to 3.3 million.
+   - **The consumer ran 2,416.9 s against the four phases' 2,402.1 s**, so it was reading
+     14.8 s before the publisher began: a container of its own on 6398, an empty stream,
+     nothing to replay.
+
+   **No figure in this record is compromised.** The tool now states `group_start="$"` at
+   its call site, so figures taken after #97 are comparable with these and no longer
+   depend on which way the default happens to be pointing.
 
 ## What would change the choice
 

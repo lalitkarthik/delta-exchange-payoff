@@ -270,7 +270,18 @@ async def consume_role(args: argparse.Namespace) -> None:
     await bus.start()
     wanted = [name.strip() for name in args.subscriptions.split(",") if name.strip()]
     store = (
-        bus.subscribe("store", maxsize=STORE_WATERMARK, lossless=True)
+        bus.subscribe(
+            "store",
+            maxsize=STORE_WATERMARK,
+            lossless=True,
+            # **An arrival-lag harness must never replay, so it says so (#102).** `"0"`
+            # would create this group at the bottom and hand it the whole retained window
+            # at Redis's replay speed — throughput no venue produces, and entries whose
+            # age is up to thirty minutes. `"$"` has been the default since #97, but a
+            # default is not a measurement protocol: the number this tool writes down has
+            # to depend on what it stated, not on what it inherited.
+            group_start="$",
+        )
         if "store" in wanted
         else None
     )
