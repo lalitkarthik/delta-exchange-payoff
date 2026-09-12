@@ -43,7 +43,7 @@ assertable as twenty seconds. That is what makes staleness detection testable at
 
 **Where this double and the real adapter deliberately part company, since #39.** A real
 `stream` is now *one connection*: it dials, replays, pumps, and returns when that socket
-ends — backoff, the lifetime budget and the decision to redial moved up into
+ends — backoff, the consecutive-failure budget and the decision to redial moved up into
 `controller.ConnectionController`. This double instead walks a whole script in one
 `stream` call, and its `Close` verb reconnects **inside itself**: `closes`, `connections`
 and `replays` all grow without the controller being asked for anything.

@@ -148,3 +148,33 @@ this record, [../lld/controller.md](../lld/controller.md) §4,
 6.6x the worst gap on an unbroken connection; it did not pick it, and a tag says where a
 number came from, not whether a later run agreed with it. The phrasing that briefly made
 this a fourth tag is refused in [../../../CONTEXT.md](../../../CONTEXT.md) §7.
+
+## Appended 2026-09-12 (#114) — "corrected wherever it appears" was not true until now
+
+This record said above, on 2026-09-09, that *the word is corrected wherever it appears*.
+**It was not.** Three days later the refused word was still written of this budget at
+nineteen sites, including the state table's own `reconnecting -> stopped` row
+([../lld/controller.md](../lld/controller.md) §3), the docstring on `RECONNECT_BUDGET`
+itself — which asserted the refusal and its refutation in one sentence — and
+[../lld/reconnect.md](../lld/reconnect.md) line 4, twenty-eight lines above that file's
+own note recording the correction. **A record claiming a completed cleanup that did not
+happen is the same class of defect as the records #106 found**: canon that a later
+document is assembled from, saying something a reader will get wrong.
+
+All nineteen are corrected, and the claim is now held rather than asserted:
+`engine/tests/test_nomenclature.py::test_the_reconnect_budget_is_never_called_a_lifetime_budget`
+scans the normative documents, `engine/src/deltapayoff/` and `engine/tests/`, with six
+uses exempted by naming the sentence that makes each correct — OpenAlgo's bug, the word
+quoted as the one corrected, and a bus reader's `retries_total`, which really is a
+lifetime count.
+
+**The substance was checked before the wording was.** The budget counts consecutive
+failures, as this record says: `_budget_spent` rises by one per drop in
+`_spend_reconnect` and is set back to zero by `message_arrived` and by `resume`, so
+eighteen drops with one delivered frame between them leave a budget of ten intact
+(`measured` 2026-09-12 against `controller.py` in worktree `dxp-114`; the shipped
+assertion is `test_controller.py::test_a_message_restores_the_whole_budget`). **What is
+spent is a drop, not an outage** — the same run stops the connection after eleven
+consecutive drops with no frame between, which is #108's 348 s of name resolution
+failing, exactly. Whether a drop is the right unit is #108's third criterion and is
+**not** decided here; the word is.

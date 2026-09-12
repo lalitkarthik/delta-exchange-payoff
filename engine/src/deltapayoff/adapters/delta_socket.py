@@ -23,8 +23,8 @@ Delta's documented 60 s idle disconnect did not reproduce in a 75 s test on this
 so it is treated as unverified and pings are sent regardless — 30 s, OpenAlgo's interval.
 
 **One connection, and since #39 only one.** `run()` dials once, replays the registry,
-pumps until the socket ends, and returns. **Backoff, the lifetime reconnect budget and
-the decision to redial left this module in #39** and belong to
+pumps until the socket ends, and returns. **Backoff, the consecutive-failure reconnect
+budget and the decision to redial left this module in #39** and belong to
 `controller.ConnectionController`, with every value unchanged — the rules they encode did
 not move, only the code that runs them:
 

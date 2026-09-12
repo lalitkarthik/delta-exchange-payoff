@@ -19,7 +19,7 @@ file, and change the row's status to a link. Do not write one ahead of the code.
 | The connection controller — the state machine, staleness, the events | [controller.md](controller.md) | #38, #39, #41 |
 | The three commands — pause, resume, reconnect, and the route that sends them | [commands.md](commands.md) | #41 |
 | The connection signal — what an adapter reports about its socket, and the register | [connection-signal.md](connection-signal.md) | #38 |
-| Reconnect ownership — backoff, the lifetime budget, the dial loop | [reconnect.md](reconnect.md) | #39 |
+| Reconnect ownership — backoff, the consecutive-failure budget, the dial loop | [reconnect.md](reconnect.md) | #39 |
 | The supervisor — aggregate state, lifespan, the health report | [supervisor.md](supervisor.md) | #39 |
 | Logging — the JSON-lines formatter, the sinks, what is logged and at what level | [logging.md](logging.md) | #42 |
 | The connection badge — the feed-state cache, coalescing, one adapter | [feed-badge.md](feed-badge.md) | #40 |

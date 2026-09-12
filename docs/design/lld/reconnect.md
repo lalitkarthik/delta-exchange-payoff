@@ -1,8 +1,8 @@
 # Low-level design: reconnect ownership
 
 **Who dials, who waits, and who gives up.** Split out of
-[controller.md](controller.md) in #39, when moving backoff and the lifetime budget up out
-of the socket owner would have pushed that design past its 200-line bound. The state
+[controller.md](controller.md) in #39, when moving backoff and the consecutive-failure
+budget up out of the socket owner would have pushed that design past its 200-line bound. The state
 machine those moves feed is still controller.md; the socket they dial is
 [adapter.md](adapter.md).
 

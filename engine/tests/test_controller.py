@@ -968,8 +968,9 @@ def test_an_open_while_already_connected_rebases_rather_than_vanishing() -> None
 
 # --- the reconnect that moved here from the feed (#39) ----------------------------
 #
-# Backoff, the lifetime budget and the decision to redial were inside `DeltaFeed.run`'s
-# `while` loop until #39. They are the controller's now, so their tests are here — and
+# Backoff, the consecutive-failure budget and the decision to redial were inside
+# `DeltaFeed.run`'s `while` loop until #39. They are the controller's now, so their
+# tests are here — and
 # the two that need a socket drive the real `DeltaFeed` through a scripted connection,
 # exactly as `test_feed.py` used to, because a reconnect asserted only against a double
 # that reconnects itself proves nothing about the code that dials.
@@ -1375,7 +1376,7 @@ def test_a_message_arriving_after_a_stop_does_not_restore_the_budget() -> None:
     `message_arrived` restored the budget, the backoff and the age before it looked at
     the state at all, so a frame off a socket winding down — or, from #41, a frame that
     arrives between a stop and the reader noticing — silently handed a `stopped`
-    connection its whole lifetime budget back. The transitions were guarded and the
+    connection its whole budget back. The transitions were guarded and the
     counters were not, which is the more dangerous half: `/health` would report a feed
     that had given up as having a full budget in hand, and #41's resume would start from
     a number nobody spent.
@@ -1403,7 +1404,7 @@ def test_a_message_arriving_after_a_stop_does_not_restore_the_budget() -> None:
 
     assert controller.state is ConnectionState.STOPPED
     assert controller.budget_remaining == 0, (
-        "a stopped connection was handed its lifetime budget back by a stray frame"
+        "a stopped connection was handed its whole budget back by a stray frame"
     )
 
 
