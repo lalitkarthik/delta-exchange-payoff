@@ -188,5 +188,5 @@ is one entry short.
 | Recording-command ack timeout: 10.0 s | `assumed` | #64's 2.0 s bound plus one flush of at most 8 files |
 | `STORE_STATE_STALE_SECONDS`: 25.0 s | `derived` | #64's feed-state bound: ten-second publish interval, two missed publishes and five seconds of slack |
 | Replay over-read ceiling: 500 entries per stream per restart | `measured` | `read_count`, the `XREAD` `COUNT` a replay batch uses; it was the whole of the #84 surplus before the bound |
-| That ceiling as time on the live feed: about 0.27 s | `derived` | 500 / `measured` 1,849.8 events/s (#61 run) |
+| That ceiling as time on the live feed: about 0.27 s | `derived` | 500 / `derived` 1,849.8 events/s ([research/0001](../research/0001-stream-naming-and-payload-format.md) §5, #58) |
 | Seam surplus before the bound: 5 of 15 on fakeredis, 4 of 14 on Docker Redis 7 | `measured` 2026-09-12 | §4.1, the ten-entry restart scenario run both ways |
