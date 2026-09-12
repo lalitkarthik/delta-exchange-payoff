@@ -143,3 +143,7 @@ the real measurement are written out, ready to run, in
   spike.
 - **NSE.** An Indian equities adapter makes ap-south-1 an in-country requirement rather than
   a preference, and closes the region question rather than re-opening it.
+
+## I13 (#79) status
+
+I13 has not run (#65/I6 has not landed as of this writing, so there is no docker-compose.yml and no per-container image); R4's re-cost threshold is: "If the split costs materially more than the monolith's measured 30.89% of a core, m7g.large is the first thing that stops fitting and the 1x row moves to m7g.xlarge at $94.24." crossed: pending; see docs/design/research/0007a-container-measurement.md. This note is appended, not rewritten, per this repository's rule that a decision record is superseded rather than edited in place; the substantive determination (crossed or not) is written here once docs/design/research/0007a-container-measurement.md carries measured values.

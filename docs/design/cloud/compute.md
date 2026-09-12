@@ -179,7 +179,7 @@ cost, becomes the constraint.
 ## 8. The load profile, per service
 
 `derived` by R6 (#75): arithmetic in [../research/0007-load-profile.md](../research/0007-load-profile.md),
-belief in [../decisions/0007-load-profile.md](../decisions/0007-load-profile.md). I13 (#79) measures it.
+belief in [../decisions/0007-load-profile.md](../decisions/0007-load-profile.md). I13 (#79) measures it; its day-long run has not happened yet, and [../research/0007a-container-measurement.md](../research/0007a-container-measurement.md) holds the pending table meanwhile.
 
 | Service | Bound by | 1× | 10× |
 |---|---|---|---|

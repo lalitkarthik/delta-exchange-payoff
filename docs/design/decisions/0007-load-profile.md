@@ -94,3 +94,7 @@ profile controls.
   order path moves `oms` from "small" to "latency-critical" before anything else.
 - **Ten times the rate arriving.** The first question becomes processes per service, not
   instance size.
+
+## I13 (#79) status
+
+I13 has not run (#65/I6 has not landed as of this writing); R6's re-cost threshold is: "I13 (#79) moving any cell by more than 25%, measured per container on the host. api comes first, at 0, 1 and 3 viewers. Then feed, whose derived 0.52 disagrees with I2's measured 0.71." crossed: pending; see docs/design/research/0007a-container-measurement.md. This note is appended, not rewritten, per this repository's rule that a decision record is superseded rather than edited in place; the substantive determination (crossed or not) is written here once docs/design/research/0007a-container-measurement.md carries measured values.

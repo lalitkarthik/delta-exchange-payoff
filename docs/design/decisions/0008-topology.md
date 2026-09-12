@@ -114,3 +114,7 @@ measured hop, and how intents travel. Findings §12.
   each way, and a different decision.
 - **Graviton's per-core speed**, or a compiled codec. Either moves every CPU cell by one factor, and
   with it the class.
+
+## I13 (#79) status
+
+I13 has not run (#65/I6 has not landed as of this writing); R7's re-cost threshold is: "I13 (#79) measuring the 1x total at 1.4 cores or less brings back m7g.large at $48.94. Past 2.8 cores, the threshold above applies." crossed: pending; see docs/design/research/0007a-container-measurement.md. This note is appended, not rewritten, per this repository's rule that a decision record is superseded rather than edited in place; the substantive determination (crossed or not) is written here once docs/design/research/0007a-container-measurement.md carries measured values.
