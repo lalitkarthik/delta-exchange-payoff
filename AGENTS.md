@@ -41,8 +41,10 @@ node node_modules/next/dist/bin/next build
 `next build` rewrites `web/next-env.d.ts`. Leave it dirty and say so in your report; the
 orchestrator restores it. Do not run git yourself.
 
-The suite is 1,101 tests with Docker available, 1,087 plus 14 skipped without. A run that
-collects far fewer than that has failed to collect, whatever it printed.
+The suite is **1,185** tests with Docker available (`measured` 2026-09-12, after #54).
+Without Docker the Redis-backed parametrisations skip rather than run: the collected count
+is the same, the passed count is lower. A run that collects far fewer than 1,185 has failed
+to collect, whatever it printed.
 
 ## Hard rules
 
