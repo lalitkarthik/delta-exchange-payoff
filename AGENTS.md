@@ -23,7 +23,11 @@ Engine, from `engine/`:
 ```
 
 **Inside the Codex sandbox, add `--basetemp=.sandbox-tmp/basetemp -o cache_dir=.sandbox-tmp/cache`
-to the pytest command, and delete `.sandbox-tmp/` as your last command.** The sandbox runs
+to the pytest command, and delete `.sandbox-tmp/` as your last command, with exactly
+`rm -rf .sandbox-tmp`.** Use that literal command and not an equivalent: this machine's Codex
+sandbox policy **rejects** `Remove-Item -Recurse -Force`, and a #81 worker that reached for the
+PowerShell form lost its cleanup to `blocked by policy` (`measured` 2026-09-12). It was the
+only failed command in a 212-command run. The sandbox runs
 as a different Windows user, which cannot write the real user's `%TEMP%\pytest-of-Acer`:
 without the flag every test that uses `tmp_path` errors at setup with `PermissionError:
 [WinError 5]` — 205 of them, `measured` 2026-09-12. Nor can it create anything inside
@@ -41,9 +45,9 @@ node node_modules/next/dist/bin/next build
 `next build` rewrites `web/next-env.d.ts`. Leave it dirty and say so in your report; the
 orchestrator restores it. Do not run git yourself.
 
-The suite is **1,185** tests with Docker available (`measured` 2026-09-12, after #54).
+The suite is **1,347** tests with Docker available (`measured` 2026-09-12, after #81).
 Without Docker the Redis-backed parametrisations skip rather than run: the collected count
-is the same, the passed count is lower. A run that collects far fewer than 1,185 has failed
+is the same, the passed count is lower. A run that collects far fewer than 1,347 has failed
 to collect, whatever it printed.
 
 ## Hard rules
@@ -57,12 +61,17 @@ to collect, whatever it printed.
   replaces the async client factory with one that raises. Do not work around it.
 - **No wall clock in tests.** Expiry dates and windows are fixtures, never `now()`. Tests
   that pass today and fail in November have been written here before.
-- **Documentation notes stay under 200 lines.** Split rather than overflow. Two files are over
-  the bound today (`measured` 2026-09-12): `docs/design/lld/logging.md` at 213 and
-  `docs/design/events.md` at 222. Split `logging.md` if your ticket touches it. Do **not**
-  split `events.md`: `tests/test_events.py` parses it, and the parser does not survive a
-  split — say so in your report instead. `docs/design/hld.md` is **180** lines and fits;
-  it was 219 before #62 moved its evidence into `hld-evidence.md`. Do not split it.
+- **Documentation notes stay under 200 lines.** Split rather than overflow. **One** file is
+  over the bound today (`measured` 2026-09-12, after #81): `docs/design/events.md` at **236**.
+  Do **not** split it: `tests/test_events.py` parses it and the parser does not survive a
+  split — say so in your report instead, and do not make the overflow worse.
+  `docs/design/lld/logging.md` is no longer over: #63 split it, 213 becomes **92** plus a
+  75-line `logging-catalogue.md`, and generalised the parser from one file to a tuple.
+  `docs/design/hld.md` is **193** and fits; it was 219 before #62 moved its evidence into
+  `hld-evidence.md`. `docs/design/lld/store.md` is **197**; it was 204 before #81 moved its
+  evidence into `store-numbers.md`. That is the move to copy when a design file fills up:
+  the design stays, the evidence goes to a sibling, because evidence grows and a design
+  does not.
 - **Stay inside the ticket's allowed scope.** Note anything else you spot in
   `out_of_scope_noticed`; do not fix it.
 - Numbers are tagged `measured`, `assumed` or `derived`, with the run that produced them.
