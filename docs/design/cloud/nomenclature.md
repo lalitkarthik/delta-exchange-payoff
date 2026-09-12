@@ -31,7 +31,7 @@ often used for multi-word fields"
 is the first section — `md.option_quote:DELTA:BTC`, with the dots in `md.option_quote` kept
 inside that section.
 
-### The nine
+### The ten
 
 | Event | Stream | Why that arity |
 |---|---|---|
@@ -40,6 +40,7 @@ inside that section.
 | `md.index_quote` | `md.index_quote:{VENUE}:{UNDERLYING}` | `instrument` is `null`; the underlying comes off the payload |
 | `md.option_bar` | `md.option_bar:{VENUE}:{UNDERLYING}` | the `table` discriminator stays in the payload — four names for one envelope would be four registries |
 | `computed.chain` | `computed.chain:{VENUE}:{UNDERLYING}` | `instrument` is `null`; the expiry stays in the payload, because expiries list and settle daily and a key that appears daily is a key a reader misses |
+| `store.state` | `store.state:{VENUE}` | no underlying; one `store` process per venue reports its own state |
 | `feed.connection` | `feed.connection:{VENUE}` | no underlying; one socket per venue |
 | `heartbeat` | `heartbeat:{VENUE}` | same |
 | `alert` | `alert` | `adapter` is nullable and no reader wants a subset: the logger and the Discord consumer take all of them |
@@ -51,8 +52,9 @@ Examples, in full:
 md.option_quote:DELTA:BTC          md.option_quote:DELTA:ETH
 md.option_reference:DELTA:ETH      md.index_quote:DELTA:BTC
 md.option_bar:DELTA:BTC            computed.chain:DELTA:ETH
-feed.connection:DELTA              heartbeat:DELTA
-alert                              control.command:DELTA
+store.state:DELTA                  feed.connection:DELTA
+heartbeat:DELTA                    alert
+control.command:DELTA
 ```
 
 Longest key today, `md.option_reference:DELTA:BTC`, is 29 bytes — far inside the "very long
@@ -154,7 +156,7 @@ managed Redis, and #57 has not chosen one yet.
 | Group name | the service name, lower case, one word | `store`, `api` |
 | Consumer name | `{service}-{instance}`, the container's short id or `1` | `store-1` |
 | Creation | `XGROUP CREATE <stream> <group> <id> MKSTREAM` | |
-| Start id, `store` | `0` — take everything Redis still holds | |
+| Start id, `store` | checkpoint id in `<root>/_store-checkpoint.json` for that stream; on first start the head (`$`, taken once as a concrete id); never `0` — [0010](../decisions/0010-store-replay.md), which supersedes [0002](../decisions/0002-redis-hosting.md) on this point | |
 | Start id, `api` | `$` — never replay; the cache refills from live frames | |
 
 **No environment and no venue in a group name.** A group lives inside one stream and the stream key
