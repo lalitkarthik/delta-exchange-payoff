@@ -113,11 +113,28 @@ def _command(command: str, *, target: str = "store") -> ControlCommand:
 
 
 async def _wait_until(
-    predicate: Callable[[], bool], *, timeout: float = 3.0
+    predicate: Callable[[], bool], *, timeout: float = 5.0
 ) -> None:
+    """Poll `predicate` until it is true, or fail loudly past `timeout`.
+
+    #93: this used to poll with `await asyncio.sleep(0)`, which yields control but not
+    time — a busy-wait, not a poll. Rescheduled immediately, it spins as fast as the
+    event loop allows and competes for the loop with the very task whose work the
+    predicate is waiting on, which is worse than a fixed sleep under load: a fixed
+    sleep at least gets out of the way. `0.005` gives the writer task real time to run,
+    matching the poll interval every other `_wait_until`/`until` helper in this suite
+    already uses (`test_process_split.py`, `test_bus_contract.py`, `test_commands.py`).
+
+    The bound also moves from 3.0s to 5.0s. #93's own measurement (three concurrent
+    runs of this file, repeated) still timed out occasionally at 3.0s even with the
+    poll fixed — a fixed-duration bet fixed for its interval but still too tight for
+    its bound is the same defect half-fixed. 5.0s matches this suite's least generous
+    sibling (`test_commands.py`'s `until`); the two others allow 10.0s.
+    """
+
     async def wait() -> None:
         while not predicate():
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.005)
 
     await asyncio.wait_for(wait(), timeout)
 

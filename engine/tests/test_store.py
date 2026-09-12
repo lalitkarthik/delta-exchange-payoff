@@ -18,7 +18,6 @@ import logging
 import re
 import time
 from collections import Counter
-from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -77,6 +76,7 @@ from deltapayoff.store import (
 )
 from deltapayoff.wire import chain_from_frames
 from fakes.decoder import events_from_frame
+from wait_helpers import wait_until, wait_until_sync
 
 MINUTE_US = int(datetime(2026, 9, 4, 9, 0, 0, tzinfo=timezone.utc).timestamp() * 1e6)
 MINUTE = 60_000_000
@@ -512,51 +512,6 @@ def test_a_null_last_lts_round_trips_as_null(tmp_path: Path) -> None:
     assert store.scan().collect()["last_lts"].to_list() == [None]
 
 
-async def wait_until(
-    condition: Callable[[], bool], *, timeout: float = 2.0, poll: float = 0.005
-) -> None:
-    """Poll a real-time condition until it is true, or fail loudly past `timeout`.
-
-    For synchronising a test with a `BarWriter` task driven by a **fake** clock: the
-    condition is always something the writer sets after doing the real work (a row
-    count, a buffer length, `writer.loops`), never a guess at how long that work takes.
-    `timeout` is real wall-clock slack for a loaded machine to schedule the writer's
-    task and, where a flush is involved, its worker thread — it does not move the fake
-    clock, which the test alone controls.
-    """
-    deadline = time.monotonic() + timeout
-    while not condition():
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"condition not met within {timeout}s")
-        await asyncio.sleep(poll)
-
-
-def wait_until_sync(
-    condition: Callable[[], bool],
-    *,
-    timeout: float = 5.0,
-    poll: float = 0.01,
-    message: str = "condition not met",
-) -> None:
-    """`wait_until`'s sibling for a test with no event loop of its own to await on.
-
-    `TestClient(main.app)` runs the real application, background tasks included, on its
-    own event loop in another thread; a synchronous test body cannot `await` that loop,
-    only poll it from outside. #83: a fixed `time.sleep` guessing how long two passes of
-    a shortened background loop take is exactly the bet that fails under load -- the
-    loop is real and asyncio-scheduled, so how many passes land inside a fixed sleep
-    depends on how promptly the OS runs that other thread, not on anything the test
-    controls. This polls the condition itself instead, real wall-clock slack behind it
-    (`timeout`) for a loaded machine to schedule that thread, and fails on a timeout
-    with `message` rather than on whatever counter the caller was really asking about.
-    """
-    deadline = time.monotonic() + timeout
-    while not condition():
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"{message} (timed out after {timeout}s)")
-        time.sleep(poll)
-
-
 def test_the_writer_subscribes_losslessly(tmp_path: Path) -> None:
     """Drop-oldest systematically shaves the highs and lows, because drops happen under
     load and load is when price moves fastest. That is a bias, not noise, and it is
@@ -954,6 +909,9 @@ def test_a_slow_flush_cannot_block_the_socket_reader(tmp_path: Path) -> None:
             import time as _time
 
             type(self).calls += 1
+            # #93 triage: fake cadence, not a bet -- this is the injected slow disk the
+            # test exists to expose, a fixed value by design rather than a guess at an
+            # async completion.
             _time.sleep(0.25)  # a blocking write, exactly what must not be on the loop
             return super().flush()
 
@@ -971,6 +929,8 @@ def test_a_slow_flush_cannot_block_the_socket_reader(tmp_path: Path) -> None:
 
         async def socket_reader():
             nonlocal longest
+            # #93 triage: fake cadence -- a bare yield to let other tasks take a turn,
+            # not a wait on a duration; nothing is asserted about how much time passed.
             await asyncio.sleep(0)
             last = loop.time()
             published = 0
@@ -994,6 +954,10 @@ def test_a_slow_flush_cannot_block_the_socket_reader(tmp_path: Path) -> None:
 
         writing = asyncio.create_task(writer.run())
         reading = asyncio.create_task(socket_reader())
+        # #93 triage: fake cadence -- this window only needs to be long enough to
+        # overlap a slow flush so `longest` has a chance to see one; the assertion
+        # below is a latency bound, not a count of passes, so a slower-than-expected
+        # schedule cannot turn this red the way a completion bet would.
         await asyncio.sleep(0.6)  # long enough for two of the slow flushes
         reading.cancel()
         writing.cancel()
@@ -1811,8 +1775,14 @@ def test_the_lifespan_runs_the_writer_and_flushes_the_open_minute_on_shutdown(
                     ask=72.0 + offset,
                 ),
             )
-        # Let the writer's task drain the queue before the lifespan tears it down.
-        time.sleep(0.2)
+        # #93: this used to be a fixed time.sleep(0.2) betting on the writer's own
+        # background thread being scheduled promptly enough to drain the queue -- the
+        # same bet #83 fixed elsewhere. Wait on the drain itself instead.
+        wait_until_sync(
+            lambda: main.app.state.writer.stats()["queued"] == 0,
+            timeout=5.0,
+            message="the writer never drained its queue before shutdown",
+        )
 
     frame = BarStore(tmp_path).scan().collect()
     assert frame.height == 1, "the open minute was discarded at shutdown"
@@ -1852,7 +1822,13 @@ def test_the_running_app_writes_all_three_tables(monkeypatch, tmp_path) -> None:
         publish(
             main.app.state.events, "ticker", ticker_frame(symbol, exchange_us + 1000)
         )
-        time.sleep(0.2)  # let the writer drain before the lifespan tears it down
+        # #93: same bet as above, same fix -- wait on the queue draining rather than
+        # guessing how long the writer's background thread takes to be scheduled.
+        wait_until_sync(
+            lambda: main.app.state.writer.stats()["queued"] == 0,
+            timeout=5.0,
+            message="the writer never drained its queue before shutdown",
+        )
 
     quotes = BarStore(tmp_path).scan().collect()
     references = BarStore(
@@ -1882,6 +1858,9 @@ def test_the_writer_task_reports_a_clean_shutdown_as_cancelled(tmp_path: Path) -
         writer = BarWriter(BarStore(tmp_path), tick_seconds=0.01)
         writer.attach(FanOut())
         task = asyncio.create_task(writer.run())
+        # #93 triage: fake cadence -- gives the task a chance to actually start before
+        # it is cancelled. `task.cancelled()` below holds whether zero loops ran or
+        # many, so no schedule is ever bet on.
         await asyncio.sleep(0.02)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
