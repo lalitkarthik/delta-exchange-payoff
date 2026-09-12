@@ -32,7 +32,9 @@ import polars as pl
 import pytest
 
 from deltapayoff.bars import ComputedBar, QuoteBar, ReferenceBar, SpotBar
+from deltapayoff.redis_bus import Position
 from deltapayoff.store import (
+    CHECKPOINT_NAME,
     COMPACT_PREFIX,
     COMPACTION_STAGES,
     COMPUTED_DATASET,
@@ -44,12 +46,15 @@ from deltapayoff.store import (
     SPOT_SCHEMA,
     TMP_SUFFIX,
     BarStore,
+    Checkpoint,
     CompactionBlocked,
     CompactionInterrupted,
     CompactionUnsound,
     Intent,
     all_stores,
+    clear_intent,
     compact_all,
+    write_checkpoint,
     write_intent,
 )
 
@@ -699,3 +704,122 @@ def test_an_empty_store_has_no_partitions_and_compacts_to_nothing(
 ) -> None:
     assert BarStore(tmp_path).partitions() == []
     assert compact_all(tmp_path, before=NEXT_DAY) == []
+
+
+# -- #63 criterion 6: a day recorded by the split store, holes and all -------------------
+
+
+def _generation_flush(
+    stores: tuple[BarStore, ...], root: Path, generation: int
+) -> int:
+    """One split-mode flush: intent, generation-stamped files, intent cleared.
+
+    The shape `store_main` writes, reproduced here rather than imported, because what
+    this test is about is the **files a real day leaves on disk** - generation-suffixed
+    names under `underlying/date`, and no file at all for an interval that sealed
+    nothing.
+    """
+    planned = [
+        str(path.relative_to(root)).replace("\\", "/")
+        for store in stores
+        for path in store.planned_paths(generation)
+    ]
+    write_intent(root, Intent(generation=generation, files=tuple(planned)))
+    written = sum(store.flush(generation=generation) for store in stores)
+    clear_intent(root)
+    return written
+
+
+def _sorted_rows(store: BarStore) -> pl.DataFrame:
+    """`rows_on_disk` for the four tables together: `spot-bars` carries no symbol."""
+    frame = store.scan().collect()
+    keys = [name for name in ("symbol", "minute") if name in frame.columns]
+    return frame.sort(*keys)
+
+
+def test_a_partition_whose_middle_minutes_sealed_empty_compacts_without_inventing_them(
+    tmp_path: Path,
+) -> None:
+    """#63 criterion 6, in the shape the split store actually recorded on 2026-09-12.
+
+    That day's `.stack-data` partition holds two genuine holes - 11:03-15:51Z and
+    16:07-16:16Z - where `store` went on flushing and sealed every one of those minutes
+    with nothing in it, so **no file was written for the interval and the generation
+    number was consumed anyway** (`measured`: generation 126 committed at 16:17:00Z with
+    four flush records absent and no parquet file bearing g00000126). This builds that
+    shape - `underlying/date` partitions, generation-suffixed names, the flush intent
+    written and cleared around each flush, three generations that seal nothing - and
+    compacts it.
+
+    **The assertion is the minute set, not the row count.** A compaction that
+    forward-filled the hole would keep every real row and still be wrong, and
+    "forward-fill" anywhere near a bar is what `CONTEXT.md` section 7 refuses outright.
+    The checkpoint is asserted byte-identical for the other half of the criterion: the
+    partition cannot record that a minute was sealed empty, `_store-checkpoint.json`
+    is the only thing that can, and compaction must leave it exactly alone.
+    """
+    stores = all_stores(tmp_path)
+    quotes, reference, spot, computed = stores
+    sealed_empty = {4, 5, 6}
+    strikes = [77000.0, 77100.0]
+    expected_minutes: set[datetime] = set()
+
+    for generation in range(1, 9):
+        if generation not in sealed_empty:
+            for index in range(5):
+                when = START + timedelta(minutes=5 * (generation - 1) + index)
+                quotes.add(quote_bar(when, strike) for strike in strikes)
+                reference.add(reference_bar(when, strike) for strike in strikes)
+                computed.add(computed_bar(when, strike) for strike in strikes)
+                spot.add([spot_bar(when)])
+                expected_minutes.add(when)
+        _generation_flush(stores, tmp_path, generation)
+
+    hole = {
+        START + timedelta(minutes=5 * (generation - 1) + index)
+        for generation in sealed_empty
+        for index in range(5)
+    }
+    assert hole and not hole & expected_minutes, "the fixture has no hole in it"
+
+    checkpoint = Checkpoint(
+        generation=8,
+        written_at=datetime(2026, 9, 3, 0, 40, tzinfo=timezone.utc),
+        group="store",
+        recording=True,
+        streams={"md.option_quote:DELTA:BTC": Position("1789210956984-9", 22128894)},
+        # Sealed past the hole: the minutes in it were closed with nothing in them.
+        sealed_through_us={
+            dataset: int((START + timedelta(minutes=39)).timestamp() * 1e6)
+            for dataset in (
+                quotes.dataset,
+                REFERENCE_DATASET,
+                SPOT_DATASET,
+                COMPUTED_DATASET,
+            )
+        },
+    )
+    write_checkpoint(tmp_path, checkpoint)
+    checkpoint_bytes = (tmp_path / CHECKPOINT_NAME).read_bytes()
+
+    before = {}
+    for store in stores:
+        files = parquet_files(partition(store))
+        assert len(files) == 8 - len(sealed_empty), store.dataset
+        assert all("-g0000000" in path.name for path in files), store.dataset
+        before[store.dataset] = _sorted_rows(store)
+
+    results = compact_all(tmp_path, before=NEXT_DAY)
+
+    assert [result.compacted for result in results] == [True] * 4
+    for store in stores:
+        files = parquet_files(partition(store))
+        assert len(files) == 1, store.dataset
+        assert files[0].name.startswith(COMPACT_PREFIX), store.dataset
+        after = _sorted_rows(store)
+        minutes = set(after.get_column("minute").to_list())
+        assert not minutes & hole, f"{store.dataset} invented a sealed-empty minute"
+        assert minutes == expected_minutes, store.dataset
+        assert after.equals(before[store.dataset]), store.dataset
+
+    assert (tmp_path / CHECKPOINT_NAME).read_bytes() == checkpoint_bytes
