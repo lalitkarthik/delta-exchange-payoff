@@ -27,6 +27,22 @@ publisher at the 50 ms interval record 0008 chose. Both are honest numbers and
 a number came from, not whether it still applies. `compute.md`'s reservation table
 rested on the smaller one and would have under-provisioned `feed` five-fold.
 
+**#112: the sweep itself had two structural defects, both making the repository look
+cleaner than it is.** First, `_KNOWN_MULTIPLY_CITED` could only grow: an entry's site
+could stop existing (`1.45` cited `lld/store.md:46`; #107 deleted that line five hours
+after #105 wrote the entry down) and nothing noticed, because the old sweep asked "is
+every disagreement explained" and never "does every explanation still describe a
+disagreement." `test_no_allowlist_entry_has_gone_stale` below asks the second question.
+Second, `_nearest_tag` only ever looked inside a number's own table cell, so it could
+not read this repository's other numbers-table shape — `| Number | Tag | Run |`, the
+one #62, #63 and #81 built by moving evidence out of design notes into siblings —
+where the tag sits in a column of its own. `_column_tag` reads that column. Widening
+the sweep this way surfaced nine further candidates. Eight are the column heuristic
+itself attaching a row's tag to a different, incidentally-cited number in the same
+"Run"/"Basis" cell rather than to the row's own subject — triaged in
+`_KNOWN_MULTIPLY_CITED` below, the same as #105's cell-level false positives. The
+ninth, `1.0888`, is real and open — see its entry.
+
 These parse the documents rather than the code, the way `test_events.py`,
 `test_logging.py` and `test_nomenclature.py` already do.
 """
@@ -223,11 +239,27 @@ _UNITS = (
 _NUM_UNIT_RE = re.compile(rf"(?<![\w#.,])\d{{2,}}(?![\w,.])(?=\s?{_UNITS}\b)")
 _TAG_PROXIMITY = 20
 
-#: Multiply-cited figures the sweep flags that are not #105's defect, each checked by
-#: hand against its sites (full detail in the #105 report). Every one resolves to
-#: either (a) the nearest-tag heuristic attaching a neighbour's tag to the wrong
-#: number in a dense cell or sentence, or (b) a genuine open question this ticket does
-#: not fix -- noted in `out_of_scope_noticed` on the issue rather than corrected here.
+#: This repository's *other* numbers-table shape: `| Number | Tag | Run |` puts the tag
+#: in a column of its own rather than beside the figure -- `hld-evidence.md`,
+#: `store-numbers.md`, `message-bus-numbers.md`, `compute-numbers.md`,
+#: `data-feed-engine-numbers.md` and more are built this way, exactly because #62, #63
+#: and #81 moved evidence out of design notes into siblings in this shape. A cell in
+#: that shape carries nothing but the tag -- matched whole, so a cell that merely
+#: *mentions* a tag among other prose (a "Tag" cell holding two tags for two different
+#: figures side by side, as compute-numbers.md:19 and :21 do) stays ambiguous and is
+#: left alone rather than guessed at.
+_PURE_TAG_RE = re.compile(r"^\s*`(measured|derived|assumed|unmeasured)`\s*$")
+
+#: Multiply-cited figures the sweep flags that are not a real, unresolved tagging
+#: defect, each checked by hand against its sites (full detail in the #105 and #112
+#: reports). Every one resolves to either (a) the nearest-tag or column-tag heuristic
+#: attaching a neighbour's tag to the wrong number in a dense cell, row or sentence, or
+#: (b) a genuine open question outside this ticket's territory -- noted as such below
+#: and in `out_of_scope_noticed` on the issue rather than corrected here.
+#:
+#: `test_no_allowlist_entry_has_gone_stale` keeps this list honest going forward: a key
+#: here that the sweep stops flagging fails by name, so an entry cannot outlive the
+#: disagreement it explains the way `1.45` did (#112) after #107 deleted its cited site.
 _KNOWN_MULTIPLY_CITED = {
     "1,000": "two different quantities collide on a round number: `assumed` ladder "
     "reads/day (durable-store cost model) vs `measured` 1,000/s engine throughput "
@@ -246,8 +278,13 @@ _KNOWN_MULTIPLY_CITED = {
     "1,152": "research/0004a-prices-and-sources.md:164's `measured` tags the flush-file "
     "count basis ('the day'), not the 1,152-a-day multiplier (`derived` everywhere it "
     "is the subject)",
-    "1.45": "the nearest tag in both lld/store-replay.md:187 and lld/store.md:46 "
-    "belongs to the adjacent measured transit figure, not to the 1.45 multiplier",
+    "1.45": "in-cell: lld/store-replay.md:187 and research/0010-store-replay.md:118's "
+    "nearest tag belongs to the adjacent `measured` 1,156.8 ms transit figure, not to "
+    "the 1.45 multiplier. column: research/0010-store-replay.md:118 and :119's "
+    "adjacent `derived` belongs to the row's own subject (2.0 s / 8.0 s grace), not to "
+    "the 1.45 restated in the Basis prose. No site tags 1.45 itself (#112 re-verified "
+    "after #107 deleted the entry's original site, lld/store.md:46, which is why the "
+    "entry went stale and is now re-cited against sites that still exist)",
     "40.77": "compute-numbers.md:19's `derived` tags the adjacent 29.96-point figure "
     "in the same cell, not 40.77 (`measured` everywhere it is the subject)",
     "78.07": "compute-topology.md:32's `assumed` describes the oms/strategy addition "
@@ -257,13 +294,51 @@ _KNOWN_MULTIPLY_CITED = {
     "(`derived` at its direct citation, research/0001:133)",
     "7.25": "docs/superpowers/specs/2026-09-07-engine-feed-management-design.md:297's "
     "`derived` tags the 58 ms product, not 7.25 itself",
-    # Genuine open questions, out of scope for #105 -- see the issue comment.
-    "5,511": "OPEN: storage.md:135 derives 5,511 ms as 5,001 + 510.3 (`derived`); "
-    "research/0010-store-replay.md:119 calls the same 5,511 ms a `measured` max "
-    "arrival lag. Not resolved here; noted out_of_scope_noticed on #105",
-    "240.8": "OPEN: compute.md:189 tags 240.8 MiB `measured` sharing a cell with "
-    "1,056.4 MiB; research/0007-load-profile.md:74 tags it `derived` (M3) directly. "
-    "Not resolved here; noted out_of_scope_noticed on #105",
+    # column-tag false positives, all found widening the sweep for #112: in each, the
+    # adjacent Tag-column cell describes the row's own headline subject, and the
+    # flagged number is only cited incidentally in that row's "Run"/"Basis"/"Source"
+    # cell for a different, unrelated fact -- the same shape as the cell-level false
+    # positives above, one column over.
+    "0.002": "decisions/0007-load-profile.md:78's nearest `derived` belongs to the "
+    "6.9 Mbit/s figure later in the same cell, not to the 0.002% aside; "
+    "research/0003-controller-against-nautilus.md:75's column `measured` correctly "
+    "tags its own row (quiet-gap percentiles, `../quiet-gap.md`)",
+    "0.056": "compute-numbers.md:22's column `derived` belongs to the row's own "
+    "2,216.5 GB/month and $165.00/month, not to the $0.056/GB AWS rate cited in the "
+    "Source cell (`measured` at compute.md:66 and research/0005-compute-and-region.md:71 "
+    "-- AWS's own published NAT price)",
+    "0.321": "controller.md:83's column `measured` belongs to the row's own 44.785 s "
+    "headline, not to the '0.321 s over 35 s' aside in the Where-from cell; "
+    "quiet-gap.md:33's `derived` belongs to the 47x ratio computed from it (15 / "
+    "0.321), not to 0.321 itself",
+    "1,693.6": "redis-hosting.md:133's column `derived` belongs to the row's own "
+    "1,051.5 MiB working-set forecast, not to the 1,693.6 frames/s cited as an input "
+    "in the Source cell (`measured` at twelve other sites, e.g. hld.md §5, "
+    "compute-numbers.md:17)",
+    "200,000": "message-bus-numbers.md:27's column `derived` and redis-bus.md:116's "
+    "in-cell `derived` both belong to the '108 s of traffic' they compute, not to the "
+    "200,000-entry outbox bound reused in that arithmetic (`assumed`, its own subject "
+    "at message-bus-numbers.md:26)",
+    "44.785": "hld-evidence.md:14's column `assumed` belongs to the row's own "
+    "`degraded_after`/grace thresholds (15 s, 30 s), not to the 'longest quiet gap "
+    "44.785 s' cited as supporting evidence (`measured` at controller.md:83 and "
+    "research/0003-controller-against-nautilus.md:77)",
+    "5,001": "message-bus-numbers.md:17's column `derived` belongs to the row's own "
+    "1,849.8 events/s, not to the 5,001 ms ticker refresh interval cited as an input "
+    "in the Run cell (`measured` at six other sites, e.g. events.md:70, "
+    "hld-evidence.md:11)",
+    "724.8": "research/0007b-container-measurement-numbers.md:69's column `derived` "
+    "belongs to the row's own 0.86x run intensity, not to the 724.8 KB/s `feed` "
+    "ingress figure cited in the Arithmetic cell (`measured` at "
+    "research/0007a-container-measurement.md:67)",
+    # Genuine open questions.
+    "1.0888": "OPEN, found widening the sweep for #112, not in that ticket: "
+    "research/0007b-container-measurement-numbers.md:65 tags it `derived` ('sum of "
+    "the six measured means'), while research/0007a-container-measurement.md:132, "
+    "compute.md:191, decisions/0005-compute-and-region.md:191 and "
+    "decisions/0008-topology.md:156 all call the same total `measured`. A real "
+    "disagreement -- fixing it touches two decision records outside this ticket's "
+    "territory, so it is reported, not corrected here; needs its own ticket",
 }
 
 
@@ -295,19 +370,45 @@ def _nearest_tag(cell: str, start: int, end: int) -> str | None:
     return None
 
 
+def _column_tag(cells: list[str], cell_index: int) -> str | None:
+    """The tag for a figure whose own cell carries none, read from the column beside
+    it -- this repository's `| Number | Tag | Run |` shape.
+
+    Only the two immediate neighbours are candidates, matching every site this
+    ticket's evidence names: the tag column sits directly beside the figure's own,
+    never a column further off. A neighbour counts only if it is *exactly* one tag
+    and nothing else -- `_PURE_TAG_RE` -- so a neighbour that itself holds two tags
+    for two different figures (compute-numbers.md's "measured / derived" cells) is
+    not attributed to either one. If the two neighbours disagree, the tag
+    is genuinely ambiguous from this row alone and is left unassigned rather than
+    guessed.
+    """
+    candidates: set[str] = set()
+    for neighbour in (cell_index - 1, cell_index + 1):
+        if 0 <= neighbour < len(cells):
+            match = _PURE_TAG_RE.match(cells[neighbour])
+            if match:
+                candidates.add(match.group(1))
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    return None
+
+
 def _multiply_cited_tag_disagreements() -> dict[str, set[str]]:
     """Every number tagged in 2+ distinct files, mapped to the set of tags it carries.
 
-    A table row is split on `|` and a tag is matched only within a number's own cell
+    A table row is split on `|` and a tag is matched first within a number's own cell
     (or the whole line, for prose), so that a row citing several different tagged
-    quantities side by side does not cross-attribute one's tag to another.
+    quantities side by side does not cross-attribute one's tag to another. Failing
+    that, `_column_tag` checks whether the tag instead sits in a column of its own
+    beside the figure's -- #112's fix for the shape #105's sweep could not read.
     """
     occurrences: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     for path in cloud_documents():
         rel = path.relative_to(REPO).as_posix()
         for line in path.read_text(encoding="utf-8").splitlines():
             cells = line.split("|") if "|" in line else [line]
-            for cell in cells:
+            for cell_index, cell in enumerate(cells):
                 spans = list(_NUM_STRONG_RE.finditer(cell)) + list(
                     _NUM_UNIT_RE.finditer(cell)
                 )
@@ -316,6 +417,8 @@ def _multiply_cited_tag_disagreements() -> dict[str, set[str]]:
                     if not _specific(token):
                         continue
                     tag = _nearest_tag(cell, match.start(), match.end())
+                    if tag is None and len(cells) > 1:
+                        tag = _column_tag(cells, cell_index)
                     if tag is not None:
                         occurrences[token][rel].add(tag)
     return {
@@ -338,4 +441,46 @@ def test_the_multiply_cited_figure_sweep_finds_no_new_disagreement() -> None:
         "new multiply-cited figures disagree on their tag and are not triaged in "
         "_KNOWN_MULTIPLY_CITED: "
         + "; ".join(f"{tok} tags={sorted(disagreements[tok])}" for tok in unexplained)
+    )
+
+
+def test_multiply_cited_numbers_doc_names_every_allowlist_entry() -> None:
+    """Criterion 3 of #112: `docs/design/multiply-cited-numbers.md` is typed by hand,
+    not generated from `_KNOWN_MULTIPLY_CITED` -- but it is pinned rather than left
+    free to drift, the same way `store.md` §1's evidence and `store-numbers.md`'s copy
+    of it are two files that have to agree. This is the pin: every allowlist key must
+    be named somewhere in the doc, so adding, removing or re-keying an entry here
+    without touching the readable record fails here instead of leaving the two silently
+    out of step, which is exactly how #105's own copy of the allowlist (this same file)
+    went stale in the first place.
+    """
+    doc = (REPO / "docs" / "design" / "multiply-cited-numbers.md").read_text(
+        encoding="utf-8"
+    )
+    missing = [token for token in _KNOWN_MULTIPLY_CITED if token not in doc]
+    assert not missing, (
+        "these _KNOWN_MULTIPLY_CITED entries are not named anywhere in "
+        "multiply-cited-numbers.md, which is supposed to be its readable copy: "
+        + ", ".join(missing)
+    )
+
+
+def test_no_allowlist_entry_has_gone_stale() -> None:
+    """#112: an allowlist that can only grow is a list of claims nobody re-checks.
+
+    `1.45` sat in `_KNOWN_MULTIPLY_CITED` citing `lld/store.md:46`, and #107 removed
+    that line five hours after #105 wrote the entry down -- nothing noticed, because
+    the old test only ever asked "is every disagreement explained," never "does every
+    explanation still describe a disagreement." A key the sweep no longer flags is a
+    claim about the documents that the documents no longer support, and it fails here
+    by name instead of rotting silently.
+    """
+    disagreements = _multiply_cited_tag_disagreements()
+    stale = sorted(set(_KNOWN_MULTIPLY_CITED) - set(disagreements))
+    assert not stale, (
+        "these _KNOWN_MULTIPLY_CITED entries no longer correspond to any disagreement "
+        "the sweep finds -- the site(s) they cite have been edited since the entry was "
+        "written, so the entry is now a claim about the documents that is not true. "
+        "Re-verify by hand and either remove the entry or update it to cite where the "
+        "disagreement actually lives now: " + ", ".join(stale)
     )
