@@ -2262,6 +2262,7 @@ button.leg-direction:hover { border-color: currentColor; }
 .structures-features { display: inline-flex; gap: 2px; }
 .structures-features .tab { padding: 4px 11px; font-size: 12px; }
 
+
 /* The grid can be wider than the screen — that is what a COLUMNS control is for — so it
    scrolls inside its own box rather than pushing the page sideways. */
 .structures-scroll { overflow-x: auto; }
