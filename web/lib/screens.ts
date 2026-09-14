@@ -3,15 +3,21 @@
  *
  * One list, so a screen cannot be added to the app and forgotten by the rail. The
  * reference terminal's rail carries seven entries — BKT, PRT, LIB, CHN, STR, VOL, OI —
- * and this list is deliberately not seeded with the five that have no route: a rail
+ * and this list is deliberately not seeded with the ones that have no route: a rail
  * entry that leads nowhere is a promise the app cannot keep. Adding one later is a line
  * in this array and a directory under `app/`, which is what "built to take more" has to
- * mean.
+ * mean — and OI and STR are that promise kept, added exactly that way.
  *
- * Three-letter codes because that is the terminal's alphabet, and the full name is
- * carried beside the code rather than hidden in a tooltip — CHN and VOL are guessable,
- * the other five are not, and a rail that has to be hovered to be read is a rail that
- * gets read once.
+ * **A route is not the same thing as a rail entry.** `/gex` is a real route with a real
+ * screen, and it is deliberately absent from this list: it is the OI screen's second tab,
+ * reached from the strip at the top of that screen rather than from the rail. Two rail
+ * entries for one screen with two views is a rail that claims the app is wider than it
+ * is — so the entry that stays is the one the tab strip opens on, and `covers` below is
+ * what keeps it lit on either tab.
+ *
+ * Short codes because that is the terminal's alphabet, and the full name is carried
+ * beside the code rather than hidden in a tooltip — CHN and VOL are guessable, the rest
+ * are not, and a rail that has to be hovered to be read is a rail that gets read once.
  *
  * **The names are the platform's own labels, spelled the platform's way.** The terminal
  * calls the first screen OPTION CHAIN, so this list does too: the same screen named two
@@ -41,6 +47,14 @@ export interface Screen {
    * current screen — with no second styling path to keep in step with the first.
    */
   readonly icon: string;
+  /**
+   * Other routes this entry stands for, exactly — no prefix matching.
+   *
+   * For a screen that lives at more than one address because it has tabs that are links
+   * rather than state. Without it the rail goes dark on the second tab, which reads as
+   * having navigated out of the app rather than across one screen.
+   */
+  readonly covers?: readonly string[];
 }
 
 export const SCREENS: readonly Screen[] = [
@@ -52,11 +66,28 @@ export const SCREENS: readonly Screen[] = [
     icon: "M8 1.75 L14.25 5 L8 8.25 L1.75 5 Z M1.75 8 L8 11.25 L14.25 8 M1.75 11 L8 14.25 L14.25 11",
   },
   {
+    code: "STR",
+    name: "STRUCTURES",
+    href: "/structures",
+    // Two wings either side of a centre line: a strangle seen head-on, which is the
+    // shape every column of that screen is a wider version of.
+    icon: "M8 2.5 L8 13.5 M4.5 6 L4.5 10 M11.5 6 L11.5 10 M4.5 8 L11.5 8",
+  },
+  {
     code: "VOL",
     name: "VOLATILITY",
     href: "/volatility",
     // A pulse: a flat line that moves and settles, which is what the screen shows.
     icon: "M1.5 9 L4.25 9 L6.25 3.75 L9.5 12.25 L11.5 9 L14.5 9",
+  },
+  {
+    code: "OI",
+    name: "OPEN INTEREST",
+    href: "/oi",
+    // A stack of columns of differing height: how much is held, strike by strike.
+    icon: "M2.5 13.5 L2.5 9 M6.5 13.5 L6.5 5 M10.5 13.5 L10.5 7.5 M14.5 13.5 L14.5 2.5",
+    // The GEX tab is the same screen at a second route, so the entry stays lit there.
+    covers: ["/gex"],
   },
 ];
 
@@ -67,8 +98,13 @@ export const SCREENS: readonly Screen[] = [
  * its rail entry lit without this rule changing. The root is the exception and has to
  * be exact: every path starts with `/`, so a prefix match there would light CHN on
  * every screen in the app.
+ *
+ * `covers` is matched **exactly** and not as a prefix. It names a sibling route that is
+ * the same screen, and a sibling is one address rather than a subtree — treating it as a
+ * prefix would quietly adopt any route that happened to start with the same letters.
  */
 export function isCurrentScreen(screen: Screen, pathname: string): boolean {
+  if (screen.covers?.includes(pathname)) return true;
   if (screen.href === "/") return pathname === "/";
   return pathname === screen.href || pathname.startsWith(`${screen.href}/`);
 }

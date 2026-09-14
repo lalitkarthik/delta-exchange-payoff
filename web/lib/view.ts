@@ -98,6 +98,31 @@ function parseExpiry(value: string | null): string | null {
   return value !== null && EXPIRY.test(value) ? value : null;
 }
 
+/**
+ * A comma-separated list of expiries, for the exposure screens' `?expiry=a,b,c`.
+ *
+ * The same parameter name as the single form on purpose: a link written by the chain
+ * screen names one expiry and one of these screens must open on it, and a link written
+ * here names several and must not need a second parameter to say so. One name, one
+ * meaning — "which expiries is this about" — and the count is the reader's business.
+ *
+ * **A malformed entry is dropped, not fatal**, which is this file's rule throughout: a
+ * mangled link should open the screen on whatever it could make sense of. Duplicates are
+ * collapsed, because a board summed twice over the same expiry would silently double.
+ */
+export function parseExpiries(value: string | null): string[] {
+  if (value === null) return [];
+  return [...new Set(value.split(",").filter((part) => EXPIRY.test(part)))];
+}
+
+function parseMinute(value: string | null): string | null {
+  return value !== null && isMinuteStamp(value) ? value : null;
+}
+
+/**
+ * The query string for a view, including the leading `?`.
+ *
+
 function parseMinute(value: string | null): string | null {
   return value !== null && isMinuteStamp(value) ? value : null;
 }

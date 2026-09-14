@@ -275,3 +275,26 @@ export function unitFactor(perContract: boolean, contractValue: number): number 
 export function unitLabel(perContract: boolean): string {
   return perContract ? "USD/contract" : "USD";
 }
+
+/**
+ * A dollar figure at the scale gamma exposure lives on — thousands to hundreds of
+ * millions — abbreviated so an axis tick and a bar label stay readable.
+ *
+ * **The sign is kept, and it is the whole point of the GEX screen**: a minus here is a
+ * put-heavy strike, not a formatting accident, so it is printed rather than wrapped in
+ * parentheses the way an accountant would. Three significant figures under a thousand
+ * and one decimal above it: `$1.2M` is what a reader compares strikes with, and the
+ * digits after that are noise at the resolution of a bar.
+ *
+ * `null` is nothing at all, as everywhere. A real `0` prints `$0`.
+ */
+
+export function formatUsdCompact(value: number | null): string {
+  if (value === null) return EMPTY;
+  const sign = value < 0 ? "-" : "";
+  const size = Math.abs(value);
+  if (size >= 1e9) return `${sign}$${(size / 1e9).toFixed(1)}B`;
+  if (size >= 1e6) return `${sign}$${(size / 1e6).toFixed(1)}M`;
+  if (size >= 1e3) return `${sign}$${(size / 1e3).toFixed(1)}K`;
+  return `${sign}$${size.toFixed(0)}`;
+}

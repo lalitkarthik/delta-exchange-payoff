@@ -2025,3 +2025,287 @@ button.leg-direction:hover { border-color: currentColor; }
    A stored minute gets the plain `.chip`: nothing about it is happening. */
 .chip.live { color: var(--up); border-color: color-mix(in srgb, var(--up) 45%, transparent); }
 
+/* ------------------------------------------------- the exposure screens (GEX, OI)
+ *
+ * Two screens, one stylesheet block, because they are one layout: a heading with the
+ * board's own qualification beside it, and the shared `.plot` under it. Everything else
+ * — header, pickers, chips, `.notice`, `.note` — is the volatility screen's, reused
+ * rather than re-specified.
+ */
+.exposure-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin: var(--pad) 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+
+/* How much of the board the figures actually cover. Faint, because it qualifies the
+   heading rather than competing with it — but present, because a total drawn from half a
+   board must never be read as a total. */
+.exposure-coverage {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--ink-faint);
+  font-weight: 400;
+}
+
+/* A label on a reference line inside the plot. Small and uppercase like the axis titles,
+   but it takes its colour from the line it names rather than from a token here — the
+   spot mark is amber, the sign change is not, and both are set as props on the `Label`
+   so Recharts does not write its own grey into the markup. */
+.chart-mark {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+/* ------------------------------------------------ the exposure boards
+ *
+ * OI and GEX, restyled to the reference terminal: a tab strip, a band of figures, the
+ * chart, and a panel of expiries and ranked levels down the right. The header, pickers,
+ * chips, `.notice` and `.note` are the volatility screen's, reused rather than
+ * re-specified; everything here is what those two screens add.
+ */
+.board-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--line);
+  padding: 0 var(--pad);
+}
+.board-tabs .tab { text-decoration: none; }
+
+/* Chart left, panel right, and the panel drops under the chart on a narrow screen rather
+   than squeezing it — a bar chart with six pixels per bar is not a chart. */
+.board {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 248px;
+  gap: var(--pad);
+  padding: 0 var(--pad);
+}
+@media (max-width: 900px) {
+  .board { grid-template-columns: minmax(0, 1fr); }
+}
+.board-main { min-width: 0; }
+
+/* The figures under the tabs. One row, wrapping, the same `.stat` recipe the header uses
+   so a number means the same thing wherever it is read. */
+.stat-band {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 22px;
+  padding: 12px 0 4px;
+  border-bottom: 1px solid var(--line);
+}
+.stat-value.tone-up { color: var(--up); }
+.stat-value.tone-down { color: var(--down); }
+.stat-value.tone-flip { color: var(--overlay-24h); }
+
+/* How much of the board the figures actually cover. Faint, because it qualifies the
+   chart rather than competing with it — but present, because a total drawn from half a
+   board must never be read as a total. */
+.board-coverage {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+/* A key per series, drawn here rather than by Recharts, whose own legend writes its
+   colours into presentation attributes and ignores the palette. */
+.chart-legend {
+  display: flex;
+  justify-content: flex-end;
+  gap: 16px;
+  padding: 4px 8px 0;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-faint);
+}
+.chart-key::before {
+  content: "";
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+.chart-key.put::before, .chart-key.up::before { background: var(--up); }
+.chart-key.call::before, .chart-key.down::before { background: var(--down); }
+.chart-key.spot::before { background: var(--accent); }
+.chart-key.flip::before { background: var(--overlay-24h); }
+
+/* The badges drawn inside the SVG — MAX PUT OI, SPOT, FLIP, R1. Uppercase and mono like
+   every other mark on a chart here. `chart-badge` styles a Recharts `Label`, which
+   renders as `text`, so it can only carry type properties. */
+.chart-badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.chart-badge-text {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+/* ------------------------------------------------ the side panel */
+
+.board-side { min-width: 0; }
+.side-title {
+  margin: var(--pad) 0 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-faint);
+  font-weight: 600;
+}
+.expiry-list, .level-list { list-style: none; margin: 0; padding: 0; }
+
+/* One expiry: a tick, the date, and how long it has left. The whole row is the label, so
+   the date is as clickable as the box — a 13px checkbox is not a target. */
+.expiry-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-bottom: 4px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.expiry-row:hover { background: var(--row-hover); color: var(--ink); }
+.expiry-row.on { border-color: var(--accent); color: var(--accent); background: var(--atm); }
+.expiry-row input { accent-color: var(--accent); margin: 0; }
+.expiry-date { flex: 1; }
+.expiry-dte { font-size: 11px; color: var(--ink-faint); }
+.expiry-row.on .expiry-dte { color: var(--accent); }
+.expiry-empty { color: var(--ink-faint); font-family: var(--mono); padding: 6px 9px; }
+
+/* A ranked strike. The rank badge takes the sign's colour, the strike is the figure the
+   reader came for, and the exposure sits under it in the faint tone — present, because a
+   rank says which is largest and not by how much. */
+.level {
+  display: grid;
+  grid-template-columns: 26px 1fr auto;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding: 5px 9px;
+  border-left: 2px solid transparent;
+  margin-bottom: 3px;
+  font-size: 11px;
+}
+.level-up { border-left-color: var(--up); }
+.level-down { border-left-color: var(--down); }
+.level-rank {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+}
+.level-up .level-rank { color: var(--up); }
+.level-down .level-rank { color: var(--down); }
+.level-name { text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-soft); }
+.level-strike {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--ink);
+}
+.level-value {
+  grid-column: 2 / 4;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+}
+
+/* The tooltip's own keys take the series colour, so the hover and the bars agree. */
+.chart-tip-list .key-up { color: var(--up); }
+.chart-tip-list .key-down { color: var(--down); }
+/* ------------------------------------------------ the structure chain
+ *
+ * A matrix rather than a list: rows are strikes, columns are wing widths, and every cell
+ * is one straddle or strangle. The `.grid` recipe above supplies the type and the rules;
+ * what is added here is the horizontal scroll, the sticky first column, and the tint.
+ */
+.structures-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 14px;
+  padding-top: var(--pad);
+}
+
+/* A number box wearing the picker's clothes, so a typed control and a chosen one read as
+   the same kind of thing. Narrow, because none of these is more than two digits, and a
+   wide box invites a number the grid cannot hold. */
+.structures-number {
+  width: 92px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.structures-features { display: inline-flex; gap: 2px; }
+.structures-features .tab { padding: 4px 11px; font-size: 12px; }
+
+/* The grid can be wider than the screen — that is what a COLUMNS control is for — so it
+   scrolls inside its own box rather than pushing the page sideways. */
+.structures-scroll { overflow-x: auto; }
+
+.structures { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.structures th[scope="row"] {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink);
+  padding: 5px 10px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.structures thead th { white-space: nowrap; }
+
+/* `STRADDLE` under the zero column: the one column that is not a strangle, named rather
+   than left for the reader to infer from a heading of `0`. */
+.structures-sub {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--ink-faint);
+  font-weight: 400;
+}
+
+/* The tint is a shading of the cell's own colour by size, set per cell as `--tint` — a
+   number between 0 and 1 — so one rule serves every feature and no second hue implies a
+   scale nobody defined. The text keeps its full-strength colour; only the ground moves. */
+.structures td.gain { background: color-mix(in srgb, var(--call) calc(var(--tint, 0) * 22%), transparent); }
+.structures td.loss { background: color-mix(in srgb, var(--put) calc(var(--tint, 0) * 22%), transparent); }
+
+/* The at-the-money row, marked the way the ladder marks it, so one rule means one thing
+   across both screens. Placed before the hover rule so hovering still wins. */
+.structures tr.at-the-money th[scope="row"] {
+  box-shadow: inset 3px 0 0 0 var(--atm-line);
+  background: var(--atm);
+  color: var(--accent);
+}
+.structures tbody tr:hover td, .structures tbody tr:hover th[scope="row"] { background: var(--row-hover); }
+
