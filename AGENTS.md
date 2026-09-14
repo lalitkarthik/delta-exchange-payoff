@@ -95,14 +95,14 @@ you conclude your change broke something.
   200  docs/design/research/0001-stream-naming-and-payload-format.md  grown  #95
   200  docs/design/research/0009-compaction-cadence.md   created  #76 (f7df53c)
   237  docs/design/events.md                              grown    #81, #110
+  314  docs/payoff-contract.md                          created  payoff
   248  docs/design/cloud/epic.md                          grown    #74 (ceb9911)
   295  docs/iv-vs-rv.md                                   grown    #54 (4209ec2)
   640  docs/architecture.md                               grown    #77 (01710dd)
   962  docs/storage.md                                    grown    #77, #104
   ```
 
-  Legacy — already over the bound before the epic touched them, and named here for the
-  first time; none of the nine below has been triaged yet:
+  Legacy — over the bound before the epic, named here for the first time, none triaged:
 
   ```
   244  docs/superpowers/specs/2026-09-04-iv-vs-rv-design.md
