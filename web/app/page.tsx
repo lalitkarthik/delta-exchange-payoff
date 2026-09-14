@@ -1,10 +1,6 @@
 import ChainScreen from "@/components/ChainScreen";
 import { looksCanonical } from "@/lib/instrument";
-import { parseView } from "@/lib/view";
-
-function firstParam(value: string | string[] | undefined): string | null {
-  return Array.isArray(value) ? (value[0] ?? null) : (value ?? null);
-}
+import { firstParam, parseView } from "@/lib/view";
 
 /**
  * The chain route.
@@ -37,5 +33,14 @@ export default async function ChainPage({
   const initial = parseView(params);
   const instrument = firstParam(params.instrument);
   const initialInstrument = instrument && looksCanonical(instrument) ? instrument : null;
-  return <ChainScreen initial={initial} initialInstrument={initialInstrument} />;
+  /* The raw `legs=` value, undecoded. `ChainScreen` decodes it, because a malformed
+     strategy link has to be reported on screen rather than treated as no strategy —
+     `lib/legs-url.ts` carries the argument. */
+  return (
+    <ChainScreen
+      initial={initial}
+      initialInstrument={initialInstrument}
+      initialLegsParam={firstParam(params.legs)}
+    />
+  );
 }

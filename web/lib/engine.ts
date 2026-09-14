@@ -18,6 +18,18 @@ import {
   type SmileResponse,
   type Underlying,
 } from "./contract";
+import {
+  assertPayoff,
+  refusalDetail,
+  type AnalyseRequest,
+  type AnalyseResponse,
+  type LegRequest,
+} from "./payoff";
+import {
+  ContractViolationError,
+  EngineResponseError,
+  EngineUnreachableError,
+} from "./engine-errors";
 import { FIXTURE_CHAIN, fixtureChain, fixtureExpiries, fixtureSmile } from "./fixture";
 
 export const ENGINE_URL = process.env.NEXT_PUBLIC_ENGINE_URL ?? "http://localhost:8000";
@@ -42,32 +54,14 @@ export interface Loaded<T> {
   preferredExpiry?: string;
 }
 
-/** The engine answered, but with an error status. Carries FastAPI's `detail`. */
-export class EngineResponseError extends Error {
-  constructor(
-    readonly status: number,
-    detail: string,
-  ) {
-    super(detail);
-    this.name = "EngineResponseError";
-  }
-}
-
-/** The engine could not be reached at all — not running, wrong port, CORS, DNS. */
-export class EngineUnreachableError extends Error {
-  constructor(cause: unknown) {
-    super(cause instanceof Error ? cause.message : String(cause));
-    this.name = "EngineUnreachableError";
-  }
-}
-
-/** The engine answered 200 with a body the contract forbids. */
-export class ContractViolationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ContractViolationError";
-  }
-}
+/* The three error types moved to `./engine-errors` when `postAnalyse` landed here: this
+   module has to call `assertPayoff` from `lib/payoff.ts`, and that module has to raise
+   `ContractViolationError`, which is a genuine import cycle. Three classes with no
+   imports of their own cannot participate in one. They are re-exported here so every
+   existing importer of `lib/engine.ts` is unaffected; `lib/payoff.ts` is the one module
+   that imports `./engine-errors` directly, because going through here would put the
+   cycle straight back. */
+export { ContractViolationError, EngineResponseError, EngineUnreachableError };
 
 async function get<T>(path: string): Promise<T> {
   let res: Response;
@@ -432,4 +426,61 @@ export async function commandFeed(
       isEngineError(body) ? body.detail : `${res.status} ${res.statusText}`,
     );
   }
+}
+
+/**
+ * The strategy, analysed. `POST /analyse`, `docs/payoff-contract.md`.
+ *
+ * **No fixture fallback**, and for `loadChainMinutes`'s reason: there is no such thing
+ * as a fixture analysis of *this* strategy. Inventing one would draw a curve for a
+ * position nobody holds, with nothing on the page saying so — worse than the error the
+ * screen already knows how to show.
+ *
+ * `as_of` absent means **live** and is left off the body rather than sent as `null`, so
+ * the request the engine receives is the one the contract's own example spells. Present,
+ * it is a stored minute and the answer never moves.
+ *
+ * **`assertPayoff` runs here**, the same relationship `loadChain` has with
+ * `assertNumeric` and for the same reason: a decimal arriving as a string would not
+ * throw on a chart, it would sort and scale as text and draw a plausible, wrong line
+ * with plausible, wrong metrics underneath it.
+ *
+ * Both refusal envelopes are read through `refusalDetail` — see its own docstring, and
+ * §Refusals of the contract, for why there are two.
+ */
+export async function postAnalyse(
+  legs: LegRequest[],
+  asOf: string | null,
+): Promise<AnalyseResponse> {
+  const body: AnalyseRequest = asOf === null ? { legs } : { legs, as_of: asOf };
+
+  let res: Response;
+  try {
+    res = await fetch(`${ENGINE_URL}/analyse`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+  } catch (cause) {
+    throw new EngineUnreachableError(cause);
+  }
+
+  let payload: unknown;
+  try {
+    payload = await res.json();
+  } catch {
+    throw new EngineResponseError(res.status, `${res.status} ${res.statusText}: body was not JSON`);
+  }
+
+  if (!res.ok) {
+    throw new EngineResponseError(
+      res.status,
+      refusalDetail(payload) ?? `${res.status} ${res.statusText}`,
+    );
+  }
+
+  const analysis = payload as AnalyseResponse;
+  assertPayoff(analysis);
+  return analysis;
 }

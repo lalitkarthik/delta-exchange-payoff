@@ -20,6 +20,8 @@ import {
   formatStrike,
 } from "@/lib/format";
 import { canonicalInstrument } from "@/lib/instrument";
+import { heldAt } from "@/lib/legs";
+import type { Direction as LegDirection, LegRequest } from "@/lib/payoff";
 
 /**
  * Calls left, puts right, strikes down the middle — the sibling chain's table, wearing
@@ -79,6 +81,15 @@ import { canonicalInstrument } from "@/lib/instrument";
  * so inventing one to shade a table would be the worst possible reason to model.
  * `atm_strike` follows the same reference (the engine picks the listed strike nearest
  * spot), so the star and the wash agree.
+ *
+ * **P4 adds a tenth column a side, nearest the strike, when `onPick` is supplied.** The
+ * B/S buttons take the position the diagram above shows Ask holding — the sibling
+ * project's own placement, and the reason repeated at the buttons themselves — which
+ * means "the two columns either side of the strike are always the tradeable prices" is
+ * true only of a read-only ladder now; a pickable one reads pick, then ask, then bid,
+ * outward from the strike on both sides. Nineteen columns becomes twenty-one. `onPick`
+ * absent renders the ladder exactly as this comment already describes — nine a side,
+ * not ten — which is what `tests/ladder-fingerprint.test.tsx` pins.
  */
 
 /** Both comparisons strict, so a strike sitting exactly on spot is in the money on
@@ -117,6 +128,8 @@ function QuoteCells({
   expiry,
   quoteCurrency,
   onSelectContract,
+  legs,
+  onPick,
 }: {
   leg: Leg | null;
   side: "call" | "put";
@@ -135,16 +148,31 @@ function QuoteCells({
    * exactly as before — the ladder has one caller today, but nothing here should break
    * a second one that renders read-only. */
   onSelectContract?: (instrument: string) => void;
+  /** P4: the strategy the B/S buttons read to decide which one is lit. Ignored — and
+   * no buttons rendered at all — when `onPick` is absent, for the same reason
+   * `onSelectContract`'s own comment gives. */
+  legs?: LegRequest[];
+  /** P4: builds or removes one leg. `undefined` renders every cell exactly as before
+   * #46 left them — no picks column, nine cells per side, not ten. */
+  onPick?: (instrument: string, direction: LegDirection) => void;
 }) {
+  const pickable = Boolean(onPick);
+
   if (leg === null) {
     const label = `No ${side} listed at this strike`;
-    // One hatched cell per column on this side. Built from a count rather than repeated
-    // by hand so it cannot drift out of step with `outwardIn` below.
+    // One hatched cell per existing column on this side — never `itm`-washed, since
+    // shading an absence would be a claim about a price that was never printed — plus
+    // one more, distinctly classed, when the picks column is in play. There is nothing
+    // to buy or sell on a side that is not listed at all, so it stays hatched too
+    // rather than growing a live button; `class="picks blank"` (not `class="picks"`
+    // alone) is what lets the DOM fingerprint test tell this cell apart from the
+    // quoted branch's below and strip only what P4 actually added.
     return (
       <>
         {Array.from({ length: COLUMNS_PER_SIDE }, (_, i) => (
           <td key={i} className="blank" title={label} />
         ))}
+        {pickable && <td key="picks" className="picks blank" title={label} />}
       </>
     );
   }
@@ -174,14 +202,20 @@ function QuoteCells({
     ` · Delta Δ ${formatDelta(leg.delta) || DASH}` +
     whyNot;
 
-  // #46: every cell of a listed leg opens the same contract, so the click target is the
-  // whole side rather than one column — a reader should not have to find the one cell
-  // that happens to be wired. Built once per leg rather than per cell so the canonical
-  // string is computed a single time regardless of which of the nine columns is clicked.
-  const instrument = onSelectContract
-    ? canonicalInstrument(underlying, expiry, strike, side, quoteCurrency)
-    : null;
-  const selectLabel = instrument
+  // #46/P4: every cell of a listed leg opens the same contract, and the same string
+  // is what the B/S buttons trade — so it is built once per leg rather than per cell
+  // or per button, regardless of how many of the ten columns want it.
+  const instrument =
+    onSelectContract || onPick
+      ? canonicalInstrument(underlying, expiry, strike, side, quoteCurrency)
+      : null;
+  // **Gated on `onSelectContract` specifically, not on `instrument`.** P4 also needs
+  // `instrument` computed when only `onPick` is supplied, and a caller that wired the
+  // buttons but not the chart must not get "open the chart" wired onto every other
+  // cell for free — that would call `onSelectContract` as a function when it is
+  // `undefined`.
+  const selectable = Boolean(onSelectContract) && instrument !== null;
+  const selectLabel = selectable
     ? `Open the chart for ${side} ${formatStrike(strike)}`
     : undefined;
 
@@ -190,17 +224,17 @@ function QuoteCells({
   // selecting a value to copy it" apart. Refusing to open the panel while the selection
   // this click is ending is non-empty is what keeps copying a bid or a Greek out of the
   // table from also swapping the chart underneath it.
-  const select = instrument
+  const select = selectable
     ? () => {
         if (window.getSelection()?.toString()) return;
-        onSelectContract!(instrument);
+        onSelectContract!(instrument!);
       }
     : undefined;
-  const activate = instrument
+  const activate = selectable
     ? (event: KeyboardEvent<HTMLTableCellElement>) => {
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
-        onSelectContract!(instrument);
+        onSelectContract!(instrument!);
       }
     : undefined;
   const clickable = select ? "clickable" : "";
@@ -209,7 +243,7 @@ function QuoteCells({
   // four — the click guard, the keyboard equivalent, and enough ARIA to be a control
   // rather than data — or none of them, never some, and a cell built without this would
   // be reachable by mouse and invisible to a keyboard.
-  const activation = instrument
+  const activation = selectable
     ? {
         onClick: select,
         onKeyDown: activate,
@@ -267,18 +301,66 @@ function QuoteCells({
     priced("ask"),
   ];
 
-  return <>{side === "call" ? outwardIn : [...outwardIn].reverse()}</>;
+  if (!pickable) {
+    return <>{side === "call" ? outwardIn : [...outwardIn].reverse()}</>;
+  }
+
+  // P4: the one column nearest the strike, on both sides — the sibling project's own
+  // placement (`convex-hedge-payoff/web/components/ChainTable.tsx`), and for the same
+  // reason: a trader is already looking at the strike when the pointer is here.
+  const bought = heldAt(legs ?? [], instrument!, 1);
+  const sold = heldAt(legs ?? [], instrument!, -1);
+  const strikeText = formatStrike(strike);
+  const picks = (
+    <td key="picks" className={`picks ${itm}`.trim()}>
+      <span className="bs">
+        <button
+          type="button"
+          className={`buy ${bought ? "on" : ""}`.trim()}
+          aria-pressed={bought}
+          title={bought ? "Bought — click to remove one lot" : `Buy ${side} ${strikeText}`}
+          onClick={() => onPick!(instrument!, 1)}
+        >
+          B
+        </button>
+        <button
+          type="button"
+          className={`sell ${sold ? "on" : ""}`.trim()}
+          aria-pressed={sold}
+          title={sold ? "Sold — click to remove one lot" : `Sell ${side} ${strikeText}`}
+          onClick={() => onPick!(instrument!, -1)}
+        >
+          S
+        </button>
+      </span>
+    </td>
+  );
+
+  return (
+    <>{side === "call" ? [...outwardIn, picks] : [picks, ...[...outwardIn].reverse()]}</>
+  );
 }
 
 export function ChainLadder({
   chain,
   onSelectContract,
+  legs,
+  onPick,
 }: {
   chain: ChainResponse;
   /** #46: called with a leg's canonical instrument string when a reader clicks it.
    * Optional so a caller that only wants a read-only ladder is unaffected. */
   onSelectContract?: (instrument: string) => void;
+  /** P4: the strategy so far, read by every row's B/S buttons to decide which one is
+   * lit. Unused — and, with `onPick` absent, unrendered — on a caller that passes
+   * neither. */
+  legs?: LegRequest[];
+  /** P4: adds or removes one leg. `undefined` renders the ladder exactly as it stood
+   * before this ticket — nine columns a side, not ten, and no buttons at all. */
+  onPick?: (instrument: string, direction: LegDirection) => void;
 }) {
+  const pickable = Boolean(onPick);
+  const columnsPerSide = COLUMNS_PER_SIDE + (pickable ? 1 : 0);
   const money = useRef<HTMLTableRowElement>(null);
 
   // The previous push's prices, so this one can be compared against them.
@@ -338,11 +420,11 @@ export function ChainLadder({
         </caption>
         <thead>
           <tr>
-            <th className="side-head side-call" colSpan={COLUMNS_PER_SIDE}>
+            <th className="side-head side-call" colSpan={columnsPerSide}>
               Calls
             </th>
             <th className="side-head">Strike</th>
-            <th className="side-head side-put" colSpan={COLUMNS_PER_SIDE}>
+            <th className="side-head side-put" colSpan={columnsPerSide}>
               Puts
             </th>
           </tr>
@@ -356,7 +438,9 @@ export function ChainLadder({
             <th title="Implied volatility, solved from the out-of-the-money leg.">IV</th>
             <th title={`Bid, in ${chain.quote_currency}.`}>Bid&nbsp;({chain.quote_currency})</th>
             <th title={`Ask, in ${chain.quote_currency}.`}>Ask&nbsp;({chain.quote_currency})</th>
+            {pickable && <th className="picks-head">Pick</th>}
             <th style={{ textAlign: "center" }}>Strike</th>
+            {pickable && <th className="picks-head">Pick</th>}
             <th title={`Ask, in ${chain.quote_currency}.`}>Ask&nbsp;({chain.quote_currency})</th>
             <th title={`Bid, in ${chain.quote_currency}.`}>Bid&nbsp;({chain.quote_currency})</th>
             <th title="Implied volatility, solved from the out-of-the-money leg.">IV</th>
@@ -384,6 +468,8 @@ export function ChainLadder({
                   expiry={chain.expiry}
                   quoteCurrency={chain.quote_currency}
                   onSelectContract={onSelectContract}
+                  legs={legs}
+                  onPick={onPick}
                 />
                 <td className="strike">
                   {formatStrike(row.strike)}
@@ -399,6 +485,8 @@ export function ChainLadder({
                   expiry={chain.expiry}
                   quoteCurrency={chain.quote_currency}
                   onSelectContract={onSelectContract}
+                  legs={legs}
+                  onPick={onPick}
                 />
               </tr>
             );

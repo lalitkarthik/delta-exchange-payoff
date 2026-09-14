@@ -1644,3 +1644,384 @@ td.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: -
 .contract-chart { width: 100%; height: 360px; }
 
 .contract-panel .note { padding: 10px var(--pad) 14px; margin: 0; }
+
+/* ------------------------------------------------------- P4: picking legs */
+
+/*
+ * The ladder plus its right-hand column. A plain flex row, not a scroll container of
+ * its own: `.chain-wrap`'s overflow is untouched, so the sticky header keeps sticking
+ * to `.main` exactly as it did before this ticket, and the ladder can still run wider
+ * than the viewport — nineteen columns becoming twenty-one, now beside a 320px aside
+ * rather than above a full-width one. `.chain-side` is a flex sibling rather than a
+ * second scroll pane for that reason — a table wide enough to need its own horizontal
+ * scroll would need this redesigned properly, which is a controller's call, not a CSS
+ * tweak made in passing.
+ */
+.chain-body { display: flex; align-items: flex-start; gap: var(--pad); }
+.chain-main { flex: 1 1 auto; min-width: 0; }
+
+.chain-side {
+  flex: none;
+  width: 320px;
+  position: sticky;
+  top: 0;
+  /* The panel grows with the strategy and with the contract card under it; without a
+     ceiling a sticky column simply runs off the bottom of the viewport and the end of it
+     cannot be reached. It scrolls in itself instead. */
+  max-height: 100vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--pad);
+}
+
+.legs-panel {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 10px var(--pad) var(--pad);
+}
+
+/* P: the strategy is a popup, not a column. It used to sit at the top of a sticky
+   column, where a ladder scrolled past it left the list clipped against the header and
+   unreadable. Floating, it starts in the bottom-right corner and can be dragged anywhere
+   by its title bar; `--x`/`--y` are set by the drag and are unset until then, which is
+   what keeps the default corner in CSS rather than in a measurement at mount. */
+.legs-popup {
+  position: fixed;
+  left: var(--x, auto);
+  top: var(--y, auto);
+  right: var(--pad);
+  bottom: var(--pad);
+  z-index: 30;
+  width: 300px;
+  max-height: 60vh;
+  overflow-y: auto;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.35);
+}
+/* Once dragged the corner offsets must not fight the coordinates. */
+.legs-popup.moved { right: auto; bottom: auto; }
+.legs-popup .legs-panel-title { cursor: grab; user-select: none; }
+.legs-popup .legs-panel-title:active { cursor: grabbing; }
+
+.legs-panel-title {
+  margin: 0 0 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.11em;
+  color: var(--ink-faint);
+  font-weight: 600;
+}
+
+.legs-list { list-style: none; margin: 0 0 10px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+
+.leg-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/* Bought green, sold red — the same `--up`/`--down` pair the bid/ask arrows use, not
+   `--call`/`--put`: those name which *side* a leg is, and reusing them here would make
+   a sold put look like a call. */
+.leg-direction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius);
+  font-weight: 700;
+  font-size: 11px;
+}
+.leg-direction.b { background: color-mix(in srgb, var(--up) 22%, transparent); color: var(--up); }
+.leg-direction.s { background: color-mix(in srgb, var(--down) 22%, transparent); color: var(--down); }
+
+.leg-quantity { color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.leg-label { color: var(--ink); }
+
+/* P5: no longer a disabled button but the link to `/analyse`, opened in a new tab so
+   the ladder behind it keeps streaming. Still shaped like the button it was — `display:
+   block` and `text-align: center` are what an `<a>` needs to fill the panel's width the
+   way the `<button>` did. */
+.analyse {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: center;
+  text-decoration: none;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--ink);
+  border-radius: var(--radius);
+  padding: 7px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.analyse:hover { border-color: var(--accent); color: var(--accent); }
+
+/* The B/S column, nearest the strike on both sides — `ChainLadder.tsx`'s own note on
+   why. Same cell padding as every other column; the buttons fill it rather than the
+   text sizing the row. */
+td.picks { padding: 2px 6px; }
+
+.bs { display: inline-flex; gap: 3px; }
+
+.bs button {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  color: var(--ink-soft);
+  border-radius: var(--radius);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.bs button:hover { border-color: var(--accent); color: var(--accent); }
+.bs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Lit — this exact contract, traded this way, is in the strategy. Filled rather than
+   outlined, so a held leg reads at a glance down a column of otherwise-identical
+   buttons, the same "hover treatment made permanent" idiom the sibling project uses. */
+.bs button.buy.on { background: var(--up); border-color: var(--up); color: var(--bg); }
+.bs button.sell.on { background: var(--down); border-color: var(--down); color: var(--bg); }
+.bs button.buy.on:hover { border-color: var(--up); color: var(--bg); }
+.bs button.sell.on:hover { border-color: var(--down); color: var(--bg); }
+
+th.picks-head { text-align: center; }
+
+/* ------------------------------------------------------- P5: the analyse screen
+ *
+ * A new route rather than a panel on the chain, opened in its own tab, so the two
+ * screens share the shell, the header, the tabs strip and the notices and nothing else.
+ * Every colour below is a token already defined at the top of this file: amber for the
+ * one reference the eye should find first (the forward), the call/put green and red for
+ * profit and loss, and the warm greys for everything that is structure rather than data.
+ */
+
+.analyse-body { display: flex; align-items: flex-start; gap: var(--pad); padding: 0 var(--pad); }
+.analyse-main { flex: 1 1 auto; min-width: 0; }
+
+.analyse-side {
+  flex: none;
+  width: 300px;
+  position: sticky;
+  top: 0;
+}
+
+/* The unit toggle. In the header rather than over one table, because it governs every
+   money column and every Greek column on the screen at once. */
+.unit-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.11em;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.unit-toggle input { accent-color: var(--accent); cursor: pointer; }
+
+.payoff-chart {
+  margin: var(--pad) 0 0;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.payoff-chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px var(--pad);
+  border-bottom: 1px solid var(--line);
+}
+
+.payoff-zoom { display: inline-flex; gap: 4px; }
+.payoff-zoom button {
+  min-width: 26px;
+  height: 22px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg);
+  color: var(--ink-soft);
+  border-radius: var(--radius);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.payoff-zoom button:hover { border-color: var(--accent); color: var(--accent); }
+
+.payoff-svg { display: block; width: 100%; height: auto; }
+
+/* The line itself, and the axis it is read against. The grid is quiet enough to be
+   ignored and the zero line is not, because zero is what every figure here is quoted
+   against — the same reason `verticalSpan` refuses to let it leave the window. */
+.payoff-grid { stroke: var(--line); stroke-width: 1; }
+.payoff-zero { stroke: var(--line-strong); stroke-width: 1.5; }
+.payoff-line { fill: none; stroke: var(--ink); stroke-width: 2; }
+.payoff-tick {
+  fill: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+/* The forward wears the accent: it is the one reference the reader should find first,
+   and it is the price the market implies for the date this curve is about. Spot is not
+   marked at all — the axis is the price at expiry, and spot is not on it. */
+.payoff-forward { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.payoff-forward-label { fill: var(--accent); font-family: var(--mono); font-size: 11px; }
+
+/* A breakeven is a fact about the line, not a reference the line is measured against,
+   so it is drawn quietly and dashed differently from the forward — told apart by the
+   pattern as well as by the hue, which survives a monochrome printout. */
+.payoff-breakeven { stroke: var(--ink-faint); stroke-width: 1; stroke-dasharray: 2 4; }
+.payoff-breakeven-label { fill: var(--ink-faint); font-family: var(--mono); font-size: 10px; }
+
+/* The frame is on the section, not on the table. `border-radius` on a
+   `border-collapse: collapse` table is a no-op, so the panel used to read square beside
+   the chart's rounded frame — and a `<caption>` is laid out outside the table's border
+   box, so the heading was not inside the frame either. Same three-part recipe as
+   `.legs-panel` on the chain screen rather than a second one invented here. */
+.metrics-panel {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 10px var(--pad) var(--pad);
+}
+
+.metrics-title {
+  margin: 0 0 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.11em;
+  color: var(--ink-faint);
+  font-weight: 600;
+}
+
+.metrics {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.metrics td { padding: 6px 0; border-top: 1px solid var(--line); }
+.metrics tr:first-child td { border-top: 0; }
+.metrics td.num {
+  text-align: right;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.metrics-note { color: var(--ink-faint); font-size: 10px; text-transform: uppercase; }
+
+/* The two tables under the tabs. One recipe, because they are the same kind of thing:
+   rows of figures read down a column. */
+.grid {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: var(--pad);
+  font-size: 12px;
+}
+.grid th {
+  text-align: right;
+  padding: 6px 10px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.11em;
+  color: var(--ink-faint);
+  border-bottom: 1px solid var(--line-strong);
+  font-weight: 600;
+}
+.grid th:first-child { text-align: left; }
+.grid td { padding: 5px 10px; border-bottom: 1px solid var(--line); }
+.grid td.num {
+  text-align: right;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.grid tr.total td { border-top: 1px solid var(--line-strong); font-weight: 700; }
+/* The row nearest the forward on the payoff table — the same wash the ladder uses for
+   the at-the-money row, so one colour means one thing across both screens. */
+.grid tr.here td { background: var(--atm); }
+
+.gain { color: var(--call); }
+.loss { color: var(--put); }
+
+/* The tabs strip and the prose under it sit inside `.analyse-body`, which already
+   carries the page's horizontal padding — without these two overrides both would be
+   indented twice and would not line up with the chart above them. */
+.analyse-main .tabs { padding: 0; }
+.analyse-main .note { margin-left: 0; margin-right: 0; }
+.analyse-side .note { margin-left: 0; margin-right: 0; }
+
+/* P6: the editable strategy, and the chip that says whether this tab is keeping up.
+   The panel reuses `.legs-panel` and `.leg-row` from the chain screen — one recipe for
+   "a bordered panel of legs" rather than a second one invented here — and adds only the
+   three fields and the remove button, which the read-only panel has no use for. */
+.analyse-legs { padding: var(--pad) var(--pad) 0; }
+
+.leg-editor .legs-list { gap: 6px; }
+
+.leg-edit-row { flex-wrap: wrap; }
+
+.leg-input {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 4px 6px;
+}
+.leg-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.leg-contract { flex: 1 1 260px; min-width: 220px; }
+.leg-qty { width: 64px; text-align: right; }
+.leg-price { width: 110px; text-align: right; }
+
+.leg-remove {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.leg-remove:hover { color: var(--put); border-color: var(--put); }
+
+
+/* The direction is a control here, not a label — same box, so the row does not move. */
+button.leg-direction { border: 1px solid transparent; cursor: pointer; font-family: inherit; }
+button.leg-direction:hover { border-color: currentColor; }
+
+.leg-add {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 8px;
+  padding: 5px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  background: none;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.leg-add:hover:not(:disabled) { color: var(--ink); border-color: var(--accent); }
+.leg-add:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.leg-editor-note { margin: 0; font-size: 11px; color: var(--ink-faint); }
+
+/* A live tab is the only one that is moving, so it is the only chip that is tinted.
+   A stored minute gets the plain `.chip`: nothing about it is happening. */
+.chip.live { color: var(--up); border-color: color-mix(in srgb, var(--up) 45%, transparent); }
+

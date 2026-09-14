@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ChainLadder } from "@/components/ChainLadder";
 import ContractPanel from "@/components/ContractPanel";
+import LegsPanel from "@/components/LegsPanel";
 import RecordingToggle from "@/components/RecordingToggle";
 import ThemeToggle from "@/components/ThemeToggle";
 import TimeScrubber from "@/components/TimeScrubber";
@@ -17,12 +18,14 @@ import {
 import {
   ENGINE_URL,
   commandFeed,
+  type FeedCommand,
   loadChainAt,
   loadChainMinutes,
   loadExpiries,
-  type FeedCommand,
 } from "@/lib/engine";
 import { looksCanonical } from "@/lib/instrument";
+import { addLeg, dropFirst, heldAt } from "@/lib/legs";
+import { LegsUrlError, analyseHref, decodeLegs, encodeLegs, syncedUrl } from "@/lib/legs-url";
 import {
   feedBadge,
   LIVE_STATUS_LABEL,
@@ -31,6 +34,7 @@ import {
   type LiveStatus,
 } from "@/lib/live";
 import { formatFetchedAt, formatFetchedClock, formatSpot } from "@/lib/format";
+import type { Direction as LegDirection, LegRequest } from "@/lib/payoff";
 import { positionOf } from "@/lib/position";
 import { clampIndex, lastIndex } from "@/lib/timeline";
 import type { ViewRequest } from "@/lib/view";
@@ -50,20 +54,43 @@ function todayUtc(): string {
 }
 
 /**
+ * P4: the strategy the link that opened this page named, decoded exactly once.
+ *
+ * One `try` rather than two computing the same thing independently — this file used
+ * to seed `legs` and `legsError` from two separate `useState` initialisers that each
+ * called `decodeLegs(initialLegsParam)` on their own, agreeing only because nothing
+ * had yet edited one without the other. A malformed `legs=` is never treated as "no
+ * strategy": `decodeLegs` throws naming the part that was wrong, and `error` here
+ * carries that message for `ChainScreen` to show loudly, rather than quietly starting
+ * the reader on an empty position their link did not ask for.
+ */
+function decodeInitialLegs(param: string | null): { legs: LegRequest[]; error: string | null } {
+  try {
+    return { legs: decodeLegs(param), error: null };
+  } catch (err) {
+    return { legs: [], error: err instanceof LegsUrlError ? err.message : message(err) };
+  }
+}
+
+/**
  * `?underlying=BTC&expiry=04-09-2026` live, `&minute=...` added standing anywhere else,
- * `&instrument=...` added whenever the chart panel is open. `lib/view.ts`'s `viewQuery`
- * was not reused: that one always writes a minute, and "live" here is the absence of one
- * rather than a stamp that happens to be the newest.
+ * `&instrument=...` added whenever the chart panel is open, `&legs=...` added whenever
+ * the strategy is non-empty. `lib/view.ts`'s `viewQuery` was not reused: that one always
+ * writes a minute, and "live" here is the absence of one rather than a stamp that
+ * happens to be the newest.
  */
 function chainQuery(
   underlying: Underlying,
   expiry: string,
   minute: string | null,
   instrument: string | null,
+  legs: LegRequest[],
 ): string {
   const params = new URLSearchParams({ underlying, expiry });
   if (minute) params.set("minute", minute);
   if (instrument) params.set("instrument", instrument);
+  const encoded = encodeLegs(legs);
+  if (encoded) params.set("legs", encoded);
   return `?${params.toString().replace(/%3A/g, ":")}`;
 }
 
@@ -97,11 +124,21 @@ function chainQuery(
 export default function ChainScreen({
   initial,
   initialInstrument,
+  initialLegsParam,
 }: {
   initial: ViewRequest;
   /** #46: the canonical instrument string the URL carried on load, or `null`. Read by
    * `app/page.tsx` separately from `initial` — see that file's comment on why. */
   initialInstrument: string | null;
+  /**
+   * P4: the raw `legs=` query value, undecoded. Decoded here rather than in
+   * `app/page.tsx` — unlike `initialInstrument`'s lenient `looksCanonical` gate, a
+   * malformed strategy link is not treated as absent (`lib/legs-url.ts`'s whole reason
+   * to exist), so decoding it has to happen somewhere that can show the reader a loud
+   * notice rather than silently rendering an empty panel. A server component has no
+   * such notice to show into.
+   */
+  initialLegsParam: string | null;
 }) {
   const [underlying, setUnderlying] = useState<Underlying>(initial.underlying ?? "BTC");
   const [expiries, setExpiries] = useState<string[]>([]);
@@ -133,7 +170,31 @@ export default function ChainScreen({
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * P4: `legs` and `legsError` both read off this one state rather than each holding
+   * an independent copy — see `decodeInitialLegs`'s own comment for the bug this
+   * replaced. `error` clears itself the moment the reader makes their own edit
+   * (`pickLeg`, below): once they hold a strategy they built, a stale complaint about
+   * the link that opened the page no longer describes what is on screen.
+   */
+  const [legsState, setLegsState] = useState(() => decodeInitialLegs(initialLegsParam));
+  const legs = legsState.legs;
+  const legsError = legsState.error;
+
+  /**
+   * A strategy cleared out from under the reader without a click of their own —
+   * switching underlying or expiry, `pickUnderlying`/`pickExpiry` below — gets one
+   * line saying so, the same "never silently" rule `legsError` keeps for a malformed
+   * link. Cleared on the next pick or the next switch, so it never survives to
+   * describe a clearing that is no longer the most recent thing that happened.
+   */
+  const [legsClearedNotice, setLegsClearedNotice] = useState<string | null>(null);
+
+  /* The feed controls' in-flight guard. The ref is what makes a double-click a no-op —
+     state alone would let a second click through before React re-rendered the first. */
   const [feedCommandPending, setFeedCommandPending] = useState(false);
+  const feedCommandInFlight = useRef(false);
 
   /** #46: the contract chart panel. `null` means closed. Seeded from the URL so a link
    * carrying a contract opens straight onto its chart, as `docs/bars-contract.md`'s own
@@ -144,7 +205,6 @@ export default function ChainScreen({
   const expiryRequest = useRef(0);
   const minutesRequest = useRef(0);
   const ladderRequest = useRef(0);
-  const feedCommandInFlight = useRef(false);
 
   const loadExpiryList = useCallback(async (next: Underlying, wanted: string | null) => {
     const id = ++expiryRequest.current;
@@ -278,13 +338,25 @@ export default function ChainScreen({
   // mean "live", which is what the reader is looking at, not the last sealed minute.
   useEffect(() => {
     if (!expiry) return;
-    const query = chainQuery(underlying, expiry, following ? null : stamp, panelInstrument);
+    // **`syncedUrl`, never `chainQuery` unwrapped.** Follow-up to P4 (#5): this effect
+    // used to call `chainQuery(...)` unconditionally, so a malformed `?legs=` link was
+    // erased by this very settle timer before the reader could copy the broken text
+    // back out — diagnosed correctly in P4's review, but the remedy applied there
+    // (clearing the notice once the reader made an edit) stopped the notice going
+    // stale without stopping the rewrite that caused it. `syncedUrl` is the shared
+    // gate `lib/legs-url.ts` now carries for exactly this — see its own comment for
+    // the invariant and the rest of this history — and it is what `AnalyseScreen`
+    // already routes its own query builder through, via `syncedAnalyseHref`.
+    const query = syncedUrl(legsError, () =>
+      chainQuery(underlying, expiry, following ? null : stamp, panelInstrument, legs),
+    );
+    if (query === null) return;
     if (window.location.search === query) return;
     const timer = window.setTimeout(() => {
       window.history.replaceState(null, "", query);
     }, URL_SETTLE_MS);
     return () => window.clearTimeout(timer);
-  }, [underlying, expiry, following, stamp, panelInstrument]);
+  }, [underlying, expiry, following, stamp, panelInstrument, legs, legsError]);
 
   const pickUnderlying = (next: Underlying) => {
     setUnderlying(next);
@@ -292,12 +364,55 @@ export default function ChainScreen({
     // A contract from the old underlying's chain has no row on the new one; open panel,
     // wrong ladder underneath it is worse than a closed one.
     setPanelInstrument(null);
+    // Every leg names an instrument on the old underlying's chain — #2's "one expiry
+    // per strategy" refusal is about two expiries of the *same* underlying and does not
+    // even apply across two different underlyings, so there is no series here to carry.
+    // Said out loud (review round 1, minor #7) rather than left to be noticed by its
+    // absence: this screen's organising rule is that a leg is never dropped quietly.
+    if (legs.length > 0) {
+      setLegsClearedNotice(
+        `Switched to ${next} — the strategy named ${legs.length === 1 ? "a contract" : "contracts"} ` +
+          `on the previous underlying's chain, which does not follow across underlyings.`,
+      );
+    }
+    setLegsState({ legs: [], error: null });
   };
 
   const pickExpiry = (next: string) => {
     setExpiry(next);
     setWanted(null);
     setPanelInstrument(null);
+    // A leg names its own expiry inside its instrument string; picking a different one
+    // here would leave the strategy pointed at contracts no longer on this ladder.
+    if (legs.length > 0) {
+      setLegsClearedNotice(
+        `Switched to expiry ${next} — the strategy named ${legs.length === 1 ? "a contract" : "contracts"} ` +
+          `on the previous expiry, which does not follow across expiries.`,
+      );
+    }
+    setLegsState({ legs: [], error: null });
+  };
+
+  /**
+   * B and S both add and remove, depending on what is already held — `lib/legs.ts`'s
+   * `heldAt`/`addLeg`/`dropFirst`, the same pure functions the DOM fingerprint test
+   * pins. The button lights when the contract beside it is in the strategy, so clicking
+   * a lit one has to take it back off; it removes **one lot**, decrementing a leg held
+   * at quantity 2 or more before ever deleting it outright (review round 1, important
+   * #1) — a two-lot position built by clicking B twice comes off one lot at a time.
+   *
+   * Clears both notices: a reader who has just built or edited a leg is not still
+   * looking at a complaint about the link that opened the page, or a note about a
+   * strategy that got cleared several clicks ago.
+   */
+  const pickLeg = (instrument: string, direction: LegDirection) => {
+    setLegsClearedNotice(null);
+    setLegsState((current) => ({
+      legs: heldAt(current.legs, instrument, direction)
+        ? dropFirst(current.legs, instrument, direction)
+        : addLeg(current.legs, instrument, direction),
+      error: null,
+    }));
   };
 
   /** Where the scrubber puts the view. Standing on the right edge is spelled `null` —
@@ -498,34 +613,67 @@ export default function ChainScreen({
 
         {error ? <p className="notice error">{error}</p> : null}
 
-        {chain ? (
-          <ChainLadder
-            key={`${chain.underlying}:${chain.expiry}`}
-            chain={chain}
-            onSelectContract={setPanelInstrument}
-          />
-        ) : error || (following && liveStatus === "error") || historicalWaiting ? null : (
-          <p className="notice">
-            {historicalBusy
-              ? "Reading the stored ladder…"
-              : following && liveStatus === "waiting"
-                ? "Connected. Waiting for the first quotes on this expiry…"
-                : "Connecting to the engine…"}
+        {legsError ? (
+          <p className="notice error">
+            The strategy link could not be read: {legsError}. Starting with no legs
+            rather than guessing which ones were meant.
           </p>
-        )}
+        ) : null}
+
+        {legsClearedNotice ? <p className="notice">{legsClearedNotice}</p> : null}
+
+        {/*
+          The ladder (or its status notice) in the growing column, the legs panel and
+          the #46 chart in a fixed-width one beside it — **unconditionally paired**, so
+          the chart panel's own visibility stays exactly what it was before this ticket
+          (driven only by `panelInstrument`, never by whether the ladder has finished
+          loading). Nesting the aside inside the `chain ?` branch below would make a
+          chart opened from a stale link disappear the instant the reader dragged the
+          slider onto a minute the ladder is still fetching — a regression this ticket
+          does not intend and the DOM fingerprint test does not reach, since it renders
+          `ChainLadder` alone.
+        */}
+        <div className="chain-body">
+          <div className="chain-main">
+            {chain ? (
+              <ChainLadder
+                key={`${chain.underlying}:${chain.expiry}`}
+                chain={chain}
+                onSelectContract={setPanelInstrument}
+                legs={legs}
+                onPick={pickLeg}
+              />
+            ) : error || (following && liveStatus === "error") || historicalWaiting ? null : (
+              <p className="notice">
+                {historicalBusy
+                  ? "Reading the stored ladder…"
+                  : following && liveStatus === "waiting"
+                    ? "Connected. Waiting for the first quotes on this expiry…"
+                    : "Connecting to the engine…"}
+              </p>
+            )}
+          </div>
+
+          {legs.length > 0 || panelInstrument ? (
+            <aside className="chain-side">
+              {legs.length > 0 ? (
+                <LegsPanel legs={legs} href={analyseHref(legs, following ? null : stamp)} />
+              ) : null}
+              {panelInstrument ? (
+                <ContractPanel
+                  key={panelInstrument}
+                  instrument={panelInstrument}
+                  date={date}
+                  liveChain={liveChain}
+                  following={following}
+                  onClose={() => setPanelInstrument(null)}
+                />
+              ) : null}
+            </aside>
+          ) : null}
+        </div>
 
         <TimeScrubber timeline={timeline} index={index} onChange={pickIndex} />
-
-        {panelInstrument ? (
-          <ContractPanel
-            key={panelInstrument}
-            instrument={panelInstrument}
-            date={date}
-            liveChain={liveChain}
-            following={following}
-            onClose={() => setPanelInstrument(null)}
-          />
-        ) : null}
 
         <p className="note">
           A hatched half means that side is not listed at this strike. An empty cell means the

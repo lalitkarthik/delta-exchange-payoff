@@ -69,6 +69,21 @@ function one(value: string | string[] | undefined): string | null {
   return value ?? null;
 }
 
+/**
+ * The first value of a query parameter, or `null`.
+ *
+ * **Exported, and the only copy.** Next hands a repeated parameter down as an array, and
+ * every route that reads the URL has to make the same choice about it. It was private to
+ * `app/page.tsx` and would have been hand-copied into `app/analyse/page.tsx` — two
+ * implementations of one rule, which is exactly how two routes come to disagree about
+ * what `?legs=a&legs=b` means. It belongs in this file for the reason `parseView` and
+ * `viewQuery` do: the URL layer is one subject.
+ */
+export function firstParam(value: string | string[] | undefined): string | null {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+
 function parseTab(value: string | null): Tab | null {
   return TABS.find((tab) => tab === value) ?? null;
 }

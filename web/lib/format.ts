@@ -204,3 +204,74 @@ export function localZoneLabel(iso: string): string {
 export function localZoneName(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
+
+/**
+ *
+ * **Separate from `formatGreek` rather than replacing it**, because the two see numbers
+ * of different sizes. The ladder's Greeks are always per one unit of the underlying and
+ * run from hundredths to hundreds, which two decimals renders exactly. The analyse
+ * screen's may be per *contract*, and `contract_value` is 0.001 — a delta of 0.5231
+ * becomes 0.0005231, which two decimals prints as `0.00` for the whole column. That is
+ * the same lie `formatIv` refuses to tell about a floored volatility and `formatGamma`
+ * refuses to tell about convexity, so a value that is nonzero but would round away keeps
+ * enough precision to stay visibly nonzero.
+ *
+ * A real zero still prints `0.00`, and `null` is still nothing at all.
+ */
+export function formatScaled(value: number | null): string {
+  if (value === null) return EMPTY;
+  if (value !== 0 && Math.abs(value) < 0.005) return value.toPrecision(3);
+  return value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+/**
+ * A bound that may not exist: `null` is **unlimited**, and it is a word.
+ *
+ * Never an infinity, never a large sentinel and never a blank — all three read as a
+ * value, and the last reads as missing data. `null` is also not `0`: a `max_loss` of
+ * `0` is a strategy that cannot lose, and a `max_loss` of `null` is one that can lose
+ * everything, so the two must not look alike.
+ */
+export function formatBound(value: number | null): string {
+  if (value === null) return "unlimited";
+  return formatScaled(value);
+}
+
+/**
+ * Reward against risk, or `n/a` when one side of it is unbounded.
+ *
+ * Dimensionless — a P&L over a P&L — so the per-contract multiplier cancels and this is
+ * the one figure on the screen the toggle does not move. A ratio against an unlimited
+ * gain has no meaning, and a large number in its place would read as a good trade.
+ */
+export function formatRatio(value: number | null): string {
+  if (value === null) return "n/a";
+  return value.toFixed(2);
+}
+
+/**
+ * The per-contract toggle, as one rule rather than as a multiplication scattered over
+ * six components.
+ *
+ * **Every number `/analyse` returns is per one unit of the underlying**, and
+ * `contract_value` — 0.001 for BTC, 0.01 for ETH — is a lot size the screen applies at
+ * the very end. `docs/settlement.md` is explicit that the multiplier never enters a
+ * pricing calculation, and the engine echoes it without ever applying it.
+ *
+ * The factor comes from the response and never from a constant here: two underlyings
+ * with lot sizes a factor of ten apart are on this venue at the same time, and a
+ * hard-coded 0.001 would be silently wrong on one of them.
+ */
+export function unitFactor(perContract: boolean, contractValue: number): number {
+  return perContract ? contractValue : 1;
+}
+
+/** What that factor makes a column mean. Belongs in the column header: with the toggle
+ * on, our Greeks read 1,000x smaller than Delta's own in the ladder beside them, and an
+ * untagged column would give a reader no way to notice. */
+export function unitLabel(perContract: boolean): string {
+  return perContract ? "USD/contract" : "USD";
+}
