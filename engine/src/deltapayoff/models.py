@@ -107,6 +107,15 @@ class ChainResponse(BaseModel):
     #: an observation that can be missing, so even a stored minute with nothing in
     #: `spot-bars` still knows what it would have been quoted in.
     quote_currency: str
+    #: The lot size — how much of the underlying one contract is. 0.001 for BTC, 0.01
+    #: for ETH, `measured`; `chain.CONTRACT_VALUES` is the record and
+    #: `docs/settlement.md` §3.2 the measurement. At the response level for
+    #: `quote_currency`'s reason. **Nullable, and null is never a default**: an
+    #: underlying nobody has walked `/v2/products` for carries `None` rather than
+    #: 0.001 wearing a guess. Carried, never applied — every figure in `rows` is per
+    #: one unit of the underlying, and multiplying by this inside a solver is the bug
+    #: `docs/settlement.md` §4 names.
+    contract_value: float | None = None
     rows: list[ChainRow]
     #: The forward the enrichment priced against, and the discount factor fitted
     #: alongside it. `None` on a chain that has not been enriched, and on one with

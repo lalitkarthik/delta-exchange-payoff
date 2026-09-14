@@ -106,7 +106,7 @@ you conclude your change broke something.
 
   ```
   244  docs/superpowers/specs/2026-09-04-iv-vs-rv-design.md
-  249  docs/chain-contract.md
+  268  docs/chain-contract.md
   263  docs/maths-start-here.md
   264  docs/implied-vol.md
   309  docs/index-history.md

@@ -50,6 +50,7 @@ no reformatting anywhere in the stack.
   "underlying": "BTC",
   "expiry": "04-09-2026",
   "quote_currency": "USD",
+  "contract_value": 0.001,
   "spot": 77543.0,
   "atm_strike": 77500.0,
   "fetched_at": "2026-09-01T09:21:04Z",
@@ -77,6 +78,24 @@ beside a BTC one and only this field tells the ladder which is which. Delta is `
 both quote and settlement, `docs/settlement.md` §3.1; a settlement currency is not on this
 contract because nothing on the screen needs it — a price is always read as quoted, never as
 settled.
+
+**`contract_value` — the lot size, `0.001` for BTC and `0.01` for ETH.** One contract is that
+much of the underlying. `measured` against Delta's own `/v2/products` on 2026-09-01: every one
+of the 594 BTC contracts carried 0.001, and `oi_contracts == oi * 1000` on all 136 captured
+symbols. At the **response level** for `quote_currency`'s reason — a chain is one underlying,
+and the lot is a property of the underlying rather than of a strike.
+
+**`null` for an underlying whose lot has not been measured**, and never a default. Today
+`chain.CONTRACT_VALUES` holds BTC and ETH, which is every underlying the feed carries; a third
+arriving before somebody has walked `/v2/products` for it gets `null` rather than 0.001 wearing
+someone's guess. A screen that needs the lot says so and shows nothing, the way a leg with no
+volatility carries no Greeks.
+
+**The engine never applies it.** Every price, Greek and forward in `rows` is per **one unit of
+the underlying**, which is the convention `forward.py`, `payoff.py` and `greeks.py` all state
+in their own headers; this field is carried so a screen that wants per-contract figures can
+multiply, and so that it multiplies by a number the venue published rather than one somebody
+retyped. `/analyse` echoes the same constant for the same reason.
 
 **`spot` and `atm_strike` are `number | null`, not `number` — #47.** This route always
 populates both: a live chain always carries Delta's own spot price. The type is nullable

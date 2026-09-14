@@ -52,6 +52,22 @@ def test_the_chain_carries_the_quote_currency() -> None:
     assert result.quote_currency == "USD"
 
 
+def test_the_chain_carries_the_lot_size_and_never_applies_it() -> None:
+    """The lot is what turns a per-unit figure into a per-contract one, and the GEX
+    screen needs it in dollars. Carried so the browser multiplies by a number the venue
+    published rather than one somebody retyped; `docs/settlement.md` §4 is why nothing
+    in the engine multiplies by it."""
+    assert build_chain("BTC", EXPIRY, []).contract_value == 0.001
+    assert build_chain("eth", EXPIRY, []).contract_value == 0.01
+
+
+def test_an_unmeasured_underlying_carries_no_lot_size_rather_than_a_default() -> None:
+    """`null` is not 0.001 wearing a guess. Nobody has walked `/v2/products` for a third
+    underlying, so the response says so and a screen that needs the lot shows nothing —
+    the same discipline as a leg with no volatility carrying no Greeks."""
+    assert build_chain("SOL", EXPIRY, []).contract_value is None
+
+
 def test_rows_are_ascending_by_strike(chain_tickers) -> None:
     strikes = [row.strike for row in chain(chain_tickers).rows]
     assert strikes == sorted(strikes)

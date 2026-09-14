@@ -32,7 +32,7 @@ from typing import Any
 
 import polars as pl
 
-from .chain import QUOTE_CURRENCY, nearest_strike
+from .chain import CONTRACT_VALUES, QUOTE_CURRENCY, nearest_strike
 from .models import ChainRow, ComputedLeg, HistoricalChain, Leg
 from .store import BarStore, scan_and_pending
 
@@ -125,6 +125,11 @@ def read_ladder_at(
         # `docs/design/lld/store.md` fixes. `QUOTE_CURRENCY` is therefore the same
         # constant `build_chain` uses for the same reason.
         quote_currency=QUOTE_CURRENCY,
+        # The lot is a fact about the underlying, not about when the ladder was taken,
+        # so a stored minute carries the same figure the live path does. Omitting it
+        # here would make `/chain` and `/chain/at` disagree about one contract, which is
+        # exactly the drift two routes returning one shape exists to prevent.
+        contract_value=CONTRACT_VALUES.get(underlying.upper()),
         rows=rows,
         **_chain_fields(computed),
     )

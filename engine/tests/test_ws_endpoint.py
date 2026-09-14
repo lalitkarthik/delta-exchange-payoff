@@ -102,6 +102,9 @@ def test_the_payload_is_the_same_shape_the_rest_endpoint_returns(live_stream) ->
         # #60 (I1): the currency every price in `rows` is quoted in, so the browser
         # never has to guess it from the venue.
         "quote_currency",
+        # The lot size, so a screen can turn per-unit figures into per-contract ones
+        # by multiplying with the venue's own published number.
+        "contract_value",
         "spot",
         "atm_strike",
         "fetched_at",

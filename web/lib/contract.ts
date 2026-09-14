@@ -129,6 +129,22 @@ export interface ChainResponse {
    */
   quote_currency: string;
   /**
+   * The lot size — how much of the underlying one contract is. `0.001` for BTC,
+   * `0.01` for ETH. `docs/chain-contract.md`; `measured` against Delta's
+   * `/v2/products` on 2026-09-01, all 594 BTC and 318 ETH contracts.
+   *
+   * **Carried, never applied.** Every price, Greek and forward on this response is per
+   * one unit of the underlying; this is what a screen multiplies by at the very end to
+   * read a figure per contract. The GEX screen is the first thing here to need it, and
+   * it is on the wire rather than typed into this app so the number keeps the
+   * measurement behind it.
+   *
+   * `null` for an underlying whose lot nobody has walked `/v2/products` for — never a
+   * default. A screen that needs the lot says so and shows nothing, the way a leg with
+   * no volatility carries no Greeks.
+   */
+  contract_value: number | null;
+  /**
    * Delta's top-level `spot_price`. `greeks.spot` is deliberately not exposed.
    *
    * Always present on this route — a live chain always carries a spot price. Typed
