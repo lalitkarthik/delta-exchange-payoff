@@ -1644,3 +1644,133 @@ td.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: -
 .contract-chart { width: 100%; height: 360px; }
 
 .contract-panel .note { padding: 10px var(--pad) 14px; margin: 0; }
+
+/* ------------------------------------------------ the structure chain
+ *
+ * Every straddle and strangle on one expiry: rows are strikes, columns are wing widths,
+ * and each cell is one structure. A matrix rather than a list, so unlike `table.chain` its
+ * columns are data — which is why this block defines its own table rather than sharing the
+ * ladder's recipe. Everything the screen needs is under `.structures`, so nothing here can
+ * drift when a shared table recipe arrives.
+ */
+.structures-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 14px;
+  padding-top: var(--pad);
+}
+
+/* A number box wearing the picker's clothes, so a typed control and a chosen one read as
+   the same kind of thing. Narrow, because none of these is more than two digits, and a
+   wide box invites a number the grid cannot hold. */
+.structures-number {
+  width: 92px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.structures-features { display: inline-flex; gap: 2px; }
+.structures-features .tab { padding: 4px 11px; font-size: 12px; }
+
+/* What the grid is of, and how much of it carries a figure. The count is faint because it
+   qualifies the heading rather than competing with it — but present, because a grid half
+   full of blanks looks the same as a thin one. */
+.structures-band {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin: var(--pad) 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+.structures-coverage {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--ink-faint);
+  font-weight: 400;
+}
+
+/* The grid can be wider than the screen — that is what a COLUMNS control is for — so it
+   scrolls inside its own box rather than pushing the page sideways. */
+.structures-scroll { overflow-x: auto; }
+
+.structures {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: var(--pad);
+  font-size: 12px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.structures thead th {
+  text-align: right;
+  padding: 6px 10px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.11em;
+  color: var(--ink-faint);
+  border-bottom: 1px solid var(--line-strong);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.structures td {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+}
+
+/* The strike column stays put while the wings scroll past it: a row of figures whose
+   strike has scrolled off the left is a row of figures about nothing. */
+.structures th[scope="row"] {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink);
+  padding: 5px 10px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+
+/* `STRADDLE` under the zero column: the one column that is not a strangle, named rather
+   than left for the reader to infer from a heading of `0`. */
+.structures-sub {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--ink-faint);
+  font-weight: 400;
+}
+
+/* The tint is a shading of the cell's own colour by size, set per cell as `--tint` — a
+   number between 0 and 1 — so one rule serves every feature and no second hue implies a
+   scale nobody defined. The text keeps its full-strength colour; only the ground moves. */
+.structures td.up {
+  color: var(--call);
+  background: color-mix(in srgb, var(--call) calc(var(--tint, 0) * 22%), transparent);
+}
+.structures td.down {
+  color: var(--put);
+  background: color-mix(in srgb, var(--put) calc(var(--tint, 0) * 22%), transparent);
+}
+
+/* The at-the-money row, marked the way the ladder marks it, so one rule means one thing
+   across both screens. Placed before the hover rule so hovering still wins. */
+.structures tr.at-the-money th[scope="row"] {
+  box-shadow: inset 3px 0 0 0 var(--atm-line);
+  background: var(--atm);
+  color: var(--accent);
+}
+.structures tbody tr:hover td,
+.structures tbody tr:hover th[scope="row"] { background: var(--row-hover); }

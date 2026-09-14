@@ -52,6 +52,14 @@ export const SCREENS: readonly Screen[] = [
     icon: "M8 1.75 L14.25 5 L8 8.25 L1.75 5 Z M1.75 8 L8 11.25 L14.25 8 M1.75 11 L8 14.25 L14.25 11",
   },
   {
+    code: "STR",
+    name: "STRUCTURES",
+    href: "/structures",
+    // Two wings either side of a centre line: a strangle seen head-on, which is the
+    // shape every column of that screen is a wider version of.
+    icon: "M8 2.5 L8 13.5 M4.5 6 L4.5 10 M11.5 6 L11.5 10 M4.5 8 L11.5 8",
+  },
+  {
     code: "VOL",
     name: "VOLATILITY",
     href: "/volatility",
