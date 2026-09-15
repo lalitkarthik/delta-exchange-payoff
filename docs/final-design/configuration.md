@@ -1,114 +1,147 @@
 # Configuration
 
-**There is no `.env` and no secret in this repository.** Delta's market data is public: no API key,
-no signed request, no credential to rotate. The one secret the system can hold -- a Discord webhook
--- lives in a git-ignored overlay file and is never committed.
+**What this page contains.** Every setting the system reads, grouped by what it affects, with an
+explanation of what each one does and what goes wrong if it is set incorrectly.
 
-Everything below is an environment variable read at start-up. `stack.env` is the one committed
-environment file and holds non-secret defaults only.
+**How to read it.** Skim the first section, which explains where settings come from, and then jump
+to the group you need. The groups are independent of each other. If a setting's purpose is unclear,
+the page it belongs to -- linked at the end of each group -- explains the mechanism behind it.
 
-## Selecting a topology
+## Where settings come from
 
-| Variable | Default | Read by | Meaning |
-|---|---|---|---|
-| `DELTA_BUS` | unset | all | Unset is the in-process monolith. `redis` selects the four-process split |
-| `DELTA_REDIS_URL` | -- | all | e.g. `redis://redis:6379`. **Mandatory** when `DELTA_BUS=redis` |
-| `DELTA_LIVE_FEED` | `1` | api, feed-in-monolith | `0` serves every route and opens no venue socket. What the tests set |
-| `DELTA_LIVE_UNDERLYINGS` | `BTC,ETH` | feed | The underlyings to list and subscribe. The Docker stack narrows this to `BTC` |
-| `DELTA_FEED_ADAPTER` | the real venue adapter | feed | `module:attribute`. How the smoke test mounts a scripted fake |
+Everything on this page is an **environment variable**: a named value the operating system hands to
+a program when it starts. The program reads them once, at startup; changing one means restarting the
+program.
 
-**An unreachable Redis in split mode fails start-up with `BusUnavailable`, before the feed opens the
-venue socket.** A feed that came up and published into nothing would be a silent data loss.
+**There is no configuration file to create, and no secret in the repository.** Delta's market data
+is public, so there is no key to obtain and nothing to rotate. The only secret the system can hold
+is a Discord address for forwarding alerts, and that lives in a file which is deliberately excluded
+from version control.
 
-**`feed_main` does not consult `DELTA_LIVE_FEED`.** A plain `docker compose up` without the smoke
-override therefore creates a second real venue subscriber beside any live engine.
+For the Docker setup, `stack.env` holds the defaults and is checked into the repository precisely
+because nothing in it is sensitive.
 
-## The bus
+## Choosing how the system runs
 
-| Variable | Default | Meaning |
+These four settings decide the overall shape of what runs. The table below explains each.
+
+| Setting | Default | What it does |
 |---|---|---|
-| `DELTA_BUS_BATCH_MS` | `50` | Publisher batching interval. **The system is sized at 50 ms**; the 100 ms figures in the record belong to a run, not a deployment |
-| `DELTA_BUS_RETENTION_SECONDS` | `1800` | The `XTRIM MINID` window. Thirty minutes is what the bus promises a restarting store |
-| `DELTA_BUS_INSTANCE` | `1` | The instance number in the consumer identity, `{service}-{instance}` |
+| `DELTA_BUS` | not set | Leaving it unset runs everything in one program. Setting it to `redis` runs the four-program arrangement |
+| `DELTA_REDIS_URL` | none | Where to find Redis, such as `redis://redis:6379`. **Required** whenever `DELTA_BUS=redis` |
+| `DELTA_LIVE_FEED` | `1` | Setting it to `0` runs everything normally but never connects to the venue |
+| `DELTA_LIVE_UNDERLYINGS` | `BTC,ETH` | Which underlyings to subscribe to. The Docker setup narrows this to `BTC` alone |
+| `DELTA_FEED_ADAPTER` | the real venue adapter | Which adapter to use. This is how the self-contained test substitutes a fake venue |
 
-Redis itself is configured on its command line, not through these:
+Two consequences are worth stating plainly.
+
+**If Redis cannot be reached in the multi-program arrangement, the feed refuses to start.** It does
+not start and quietly publish into nothing, because a feed that looks healthy while discarding
+everything is the most damaging failure available.
+
+**The feed program does not honour `DELTA_LIVE_FEED`.** Starting the Docker setup without the
+fake-venue override therefore creates a genuine second connection to Delta alongside anything else
+you have running.
+
+## The message bus
+
+These three control how messages are batched, how long they are kept, and how a reader identifies
+itself. See [Message bus](message-bus.md) for what each mechanism does.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `DELTA_BUS_BATCH_MS` | `50` | How long the publisher gathers messages before sending them as a batch. **The system is sized for 50** |
+| `DELTA_BUS_RETENTION_SECONDS` | `1800` | How long messages stay available on the bus. Thirty minutes is the promise made to a restarting recorder |
+| `DELTA_BUS_INSTANCE` | `1` | The number identifying this copy of a program among others of the same kind |
+
+Redis itself is configured on its own command line rather than through these variables:
 
 ```sh
 redis-server --save "" --appendonly no --maxmemory 2gb --maxmemory-policy noeviction
 ```
 
-All four matter, and `noeviction` is a data-loss decision rather than a tuning one. See
-[Message bus](message-bus.md).
+All four of those matter, and the last one is a decision about losing data rather than about
+performance. [Message bus](message-bus.md) explains why.
 
 ## The store
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `DELTA_STORE_ROOT` | `data/` | The dataset root. The Docker stack uses `/data`, bound to `./.stack-data/` |
-| `FLUSH_SECONDS` | `300` | The flush cadence, and **the crash-loss budget** |
-| `STORE_BUS_MONITOR_INTERVAL_SECONDS` | `10` | How often the store asks Redis where its group stands. Shares the `store.state` loop |
-| `STORE_BUS_MONITOR_STALE_INTERVALS` | -- | How many intervals of silence before a reader is called stopped |
-| `STORE_LAG_ALERT_ENTRIES` | -- | Consumer lag past which `store.consumer_lag` is raised |
-| `STORE_STATE_INTERVAL_SECONDS` | `10` | The `store.state` publish cadence |
-| `STORE_STATE_STALE_SECONDS` | -- | How old a `store.state` may be before the api stops trusting it |
-| `STORE_QUEUE_SIZE` | -- | The lossless subscription's watermark |
-| `STORE_CONTROL_QUEUE_SIZE` | -- | The control subscription's bound |
-| `STORE_COMMAND_ACK_TIMEOUT_SECONDS` | -- | How long a command waits for the store to acknowledge |
+These control where data is written, how often, and when the recorder complains. See
+[Data store](data-store.md).
 
-**`data/` is read-only in this repository** -- it holds the live Parquet store, and a second writer
-there would corrupt it. The Docker stack mounts `/data` read-write in `store` and **read-only in the
-api**, which keeps "the store is the only writer" true at the filesystem boundary rather than on
-trust.
+| Setting | Default | What it does |
+|---|---|---|
+| `DELTA_STORE_ROOT` | `data/` | Where the files are written. The Docker setup uses `/data`, which maps to `.stack-data/` on the host |
+| `FLUSH_SECONDS` | `300` | How often accumulated data is written out. **This is also how much work a crash would lose** |
+| `STORE_STATE_INTERVAL_SECONDS` | `10` | How often the recorder reports on itself |
+| `STORE_STATE_STALE_SECONDS` | -- | How old such a report may be before the API stops believing it |
+| `STORE_BUS_MONITOR_INTERVAL_SECONDS` | `10` | How often the recorder checks whether it has fallen behind |
+| `STORE_BUS_MONITOR_STALE_INTERVALS` | -- | How many silent intervals before a reader is presumed dead |
+| `STORE_LAG_ALERT_ENTRIES` | -- | How far behind the recorder may fall before it raises an alert |
+| `STORE_QUEUE_SIZE` | -- | The level at which a lossless backlog starts being reported |
+| `STORE_CONTROL_QUEUE_SIZE` | -- | The same, for operator instructions |
+| `STORE_COMMAND_ACK_TIMEOUT_SECONDS` | -- | How long to wait for the recorder to confirm an instruction |
+
+One rule about locations is worth repeating: **the `data/` folder holds the real recorded history and
+must never be written to by anything other than the live system.** In the Docker setup this is
+enforced rather than trusted -- the recorder gets read-and-write access to the data folder and every
+other container gets read-only access.
 
 ## Alerts
 
-| Variable | Default | Meaning |
+| Setting | Default | What it does |
 |---|---|---|
-| `DISCORD_WEBHOOK_URL` | empty | The webhook the alert consumer posts to. Empty disables posting |
+| `DISCORD_WEBHOOK_URL` | empty | Where alerts are posted. Leaving it empty simply disables posting |
 
-**The real value belongs in `stack.local.env`**, a git-ignored overlay Compose loads after
-`stack.env` for the `discord-alerts` service. No secret is ever committed.
+The real value belongs in `stack.local.env`, a file excluded from version control which Docker loads
+after the committed one. Nothing sensitive is ever committed.
 
-## The web app
+## The web page
 
-| Variable | Default | Meaning |
+| Setting | Default | What it does |
 |---|---|---|
-| `NEXT_PUBLIC_ENGINE_URL` | `http://localhost:8000` | Where the browser reaches the engine |
+| `NEXT_PUBLIC_ENGINE_URL` | `http://localhost:8000` | Where the browser should send its requests |
 
-| Where the web app is built | Value |
-|---|---|
-| `bun run dev` on a laptop | `http://localhost:8000` -- straight at the engine, under the CORS allow-list |
-| The Docker stack | `http://localhost:8080/api` -- same-origin, through the nginx proxy |
-| Amplify | `/api` -- same-origin, through Amplify's rewrite to the instance |
+This one behaves differently from all the others and it catches people out. **Its value is baked
+into the page when the front end is built, not read when it runs.** Changing it therefore requires
+rebuilding the front end; restarting it will have no effect.
 
-**`NEXT_PUBLIC_` values are inlined by `next build`.** It is a build argument, not a run-time
-variable: changing the API endpoint or the rewrite requires a **rebuild**, not a restart.
+Its correct value depends on how the page is being served, as the table below shows.
 
-## Ports and origins
+| How the page is served | Correct value | Why |
+|---|---|---|
+| `bun run dev` on your machine | `http://localhost:8000` | The browser calls the back end directly, which is permitted for port 3000 |
+| The Docker setup | `http://localhost:8080/api` | Everything goes through one proxy, so the browser only sees one address |
+| Production, on Amplify | `/api` | The same idea: Amplify forwards anything starting with `/api` to the back end |
+
+## Ports
+
+The table below lists every port involved and what listens on it.
 
 | Port | What |
 |---|---|
-| 8000 | The engine, in development |
-| 3000 | `next dev` |
-| 8080 | The Docker stack's only host listener |
+| 8000 | The back end, when running it directly |
+| 3000 | The front end, when running it directly |
+| 8080 | The Docker setup's single entry point |
 
-**CORS allows only port 3000**, `localhost` and `127.0.0.1`. Serving the web side from another port
-fails in a way that looks exactly like the engine being down. The stack sidesteps this entirely: the
-proxy makes the browser same-origin, so no cross-origin request is made and the allow-list is never
-consulted. `/ws/chain` is a websocket handshake and is not subject to CORS in either case.
+**The back end only permits browser requests from port 3000**, on either `localhost` or `127.0.0.1`.
+Serving the front end from another port produces a page that loads and then stays empty, which looks
+identical to the back end being down. The Docker setup and production both avoid the issue entirely
+by putting everything behind one address.
 
-## Compose overrides
+## Docker setup overrides
 
-| Variable | Default | Meaning |
+These two exist so that a second copy of the Docker setup can run alongside one that is already
+running, which is what the self-contained test needs.
+
+| Setting | Default | What it does |
 |---|---|---|
-| `DXP_CONTAINER_PREFIX` | `dxp` | The container-name prefix |
-| `DXP_PROXY_PORT` | `8080` | The one published host port |
+| `DXP_CONTAINER_PREFIX` | `dxp` | The prefix given to every container's name |
+| `DXP_PROXY_PORT` | `8080` | The single port published to the host |
 
-Both exist so a **second** Compose project can run the same file beside a live one. `container_name`
-overrides Compose's own project-service-index naming outright, so before these were interpolated a
-second project collided on `/dxp-redis` and never started -- and two tickets deferred their
-end-to-end runs on the strength of a flag that could not isolate anything.
+Both are needed together. Changing only the port is not enough, because container names must also be
+unique on a machine -- two copies would collide on a name and the second would simply fail to start.
 
-## Related guides
+## Where to go next
 
-[Getting started](getting-started.md) | [Message bus](message-bus.md) | [Data store](data-store.md)
+[Getting started](getting-started.md) shows these settings in use.
+[Deployment](deployment.md) describes how they are set in production.

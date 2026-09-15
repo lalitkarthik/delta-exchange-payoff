@@ -1,116 +1,185 @@
 # Overview
 
-**delta-exchange-payoff** is an option chain, volatility and payoff workbench for
-[Delta Exchange India](https://www.delta.exchange/) crypto options. It holds one websocket to the
-venue, solves implied volatility and Greeks from the order book rather than reading the venue's,
-streams the result to a browser once a second, and folds the same stream into a permanent
-one-minute Parquet record.
+**What this page contains.** A description of what the system does, written for somebody who has
+never seen the project and does not need to know any finance to follow it. It starts with the
+problem the project exists to solve, explains the small amount of options vocabulary needed to
+understand that problem, and then walks through each feature in turn.
 
-It is a **learning and research system**, not an execution system. There is no order path, no API
-key and no private endpoint: everything here runs on public market data.
+**How to read it.** Read it from the top; each section assumes the one before it. If a word is
+unfamiliar and not explained here, it will be in the [Glossary](glossary.md). When you have
+finished, [Architecture](architecture.md) shows how the software is arranged to do all of this.
 
-## The thesis
+## The short version
 
-**The two venue channels are not interchangeable, and that gap is the whole point.**
+Delta Exchange India is an online marketplace where people trade **options** on Bitcoin and
+Ethereum. This project connects to that marketplace, continuously receives the prices being quoted
+there, performs its own mathematics on those prices, displays the result on a web page that refreshes
+about once a second, and writes a permanent minute-by-minute record of everything it saw so that any
+past day can be examined again later.
 
-| Channel | Carries | Refresh |
+It is a tool for studying a market, not for trading in one. It places no orders, holds no money, and
+needs no account: everything it reads is public.
+
+## A little vocabulary
+
+An **option** is a contract about the future. It gives its owner the right -- but not the obligation
+-- to buy or sell something at a price agreed today, on a date agreed today. The "something" is
+called the **underlying**, and here it is Bitcoin or Ethereum. The agreed price is the **strike**,
+and the agreed date is the **expiry**. An option to buy is a **call**; an option to sell is a
+**put**.
+
+For one underlying and one expiry, the venue lists many contracts: a call and a put at each of
+several dozen strikes. Displayed together as a table, one row per strike with calls on the left and
+puts on the right, that is an **option chain**, and it is the main screen of this application.
+
+The interesting question about an option is not really its price. It is what that price implies
+about how much people expect the underlying to move around before the expiry date. That expected
+amount of movement is called **volatility**, and the figure recovered backwards out of a market
+price is called **implied volatility**. Computing it well, and honestly, is what this project is
+mostly about.
+
+## The problem the project exists to solve
+
+The venue sends us two separate streams of information, and they do not arrive at the same speed.
+
+The table below shows the two streams, what each one carries, and how often each contract's
+information is refreshed on it. The refresh figures were measured against the live venue.
+
+| Stream | What it carries | How often it refreshes |
 |---|---|---|
-| `ob_l2` | top of book | `measured` **508 ms** per contract |
-| `ticker` | spot, open interest, and the venue's own IV and Greeks | `measured` **5,001 ms** per contract |
+| The order book stream | The best price anyone is currently offering to buy at, and to sell at | `measured` every **508 milliseconds** per contract |
+| The ticker stream | The underlying's price, how many contracts are outstanding, and the venue's own implied volatility and Greeks | `measured` every **5,001 milliseconds** per contract |
 
-The venue's implied volatility is fitted to prices that are, on average, **9.8x** staler than the
-book we can see. So Delta's IV and Greeks are carried as **reference columns only and never
-consumed as inputs** -- `tests/test_no_delta_inputs.py` pins that -- and the system recovers its own
-forward, its own volatility and its own Greeks from the book, then stores both side by side.
+The second stream is roughly **ten times slower** than the first. That matters, because the venue's
+own implied volatility figures travel on the slow stream. They were calculated from prices that, by
+the time we see them, may be several seconds out of date, while the actual buying and selling prices
+have moved on.
 
-## What it does
+So this project takes a deliberate position: **the venue's implied volatility and Greeks are
+recorded but never used in any calculation.** They are kept as a column to compare against, nothing
+more. Everything the project shows as its own number is worked out from the fast stream, from the
+prices people are actually quoting. There is an automated test whose entire job is to fail if any
+venue-supplied volatility figure is ever fed into a calculation.
 
-### Live option chain
+## What the system does, feature by feature
 
-Every listed expiry for BTC and ETH, one at a time, calls left and puts right, streamed over
-`/ws/chain`. The websocket sends the identical object `/chain` returns, so one renderer serves
-both. A feed badge on the ladder header appears whenever the connection is not `connected` and
-clears on recovery.
+### The live option chain
 
-### Implied volatility, solved here
+The main screen shows one underlying and one expiry at a time: every strike, calls on the left,
+puts on the right, updating about once a second over a connection that stays open. Above the table
+sits a small badge that appears whenever the connection to the venue is not healthy, and disappears
+by itself when it recovers, so nobody is left reading stale numbers and believing they are live.
 
-**IV is a property of the strike, not of the leg.** It is recovered by inverting the
-**out-of-the-money** leg's bid/ask midpoint -- calls above the forward, puts below -- where the
-whole price is time value and vega is largest, then written to both legs with `iv_leg` naming the
-source. A leg with no volatility carries **no Greeks**: reporting them at a default sigma would put
-five plausible numbers on screen that describe nothing.
+### Implied volatility, computed here
 
-**Four solvers and four forwards, built to be compared.** S1 Newton, S2 Brent, S3 Jaeckel-shaped,
-S4 vectorised; F1-F4 for the forward. `agreement.py` measures where they disagree. They exist
-because "which method" is a question this project wants answered with data.
+Working out implied volatility means running a standard pricing formula backwards: searching for the
+volatility figure that would produce the price the market is charging. The project does that with
+two deliberate choices.
+
+The first is that **volatility is treated as a property of the strike, not of the individual
+contract**. For a given strike the call and the put describe the same expectation, so the project
+computes one figure and writes it to both, recording which of the two it came from.
+
+The second is *which* of the two it uses. It always inverts the **out-of-the-money** contract -- the
+call if the strike is above the expected future price, the put if below. That contract's price is
+made up almost entirely of expectation rather than of present value, which makes the answer far more
+stable.
+
+There is also a rule about failure. **If no volatility can be recovered for a strike, that strike
+shows no Greeks at all.** Filling them in using some default volatility would put five plausible
+numbers on the screen that describe nothing, and a reader has no way to tell them from real ones.
 
 ### Greeks
 
-Delta, gamma, vega, theta and rho, in the sibling project's conventions rather than the textbook's:
-delta and gamma undiscounted, vega and rho discounted and per one percent, theta a one-calendar-day
-repricing. Delta India's options are **vanilla, linear and USD-settled**, so textbook
-Black-Scholes and put-call parity apply with no correction term.
+Once volatility is known, the project computes the five **Greeks** -- the numbers describing how an
+option's price responds to a change in the underlying's price, in volatility, in time, and in
+interest rates. Because Delta's options settle in ordinary US dollars, the standard textbook
+mathematics applies directly, with none of the corrections that some other crypto venues require.
 
-### The volatility surface and the smile
+### The volatility smile
 
-`/smile` serves the stored surface for one expiry; the browser renders it with the fitted curve
-and the points it was fitted from. Implied against realised volatility (`/volatility`) puts our
-solved IV beside a realised series computed from the index, over a chosen window.
+If you plot implied volatility against strike for one expiry, the result is usually a curve rather
+than a flat line -- traditionally called a **smile**. One screen draws that curve for any expiry from
+the stored record, together with the individual points it was fitted from.
+
+### Implied against realised volatility
+
+Implied volatility is an expectation about the future. **Realised volatility** is a measurement of
+what actually happened. Putting the two side by side over a chosen window is one of the more
+interesting things you can do with this data, and one screen does exactly that.
 
 ### Structures
 
-Every straddle and strangle on one expiry, priced on one grid, from the same live ladder.
+Traders rarely buy a single option; they buy combinations. Two of the most common are the
+**straddle** and the **strangle**. One screen prices every straddle and strangle available on an
+expiry and lays them out on a single grid.
 
-### History, with no invention
+### History, with nothing invented
 
-Four read paths answer from the Parquet store: a whole ladder at a past minute (`/chain/at`), the
-minutes that exist (`/chain/minutes`), one contract's day of candles (`/bars`), and the volatility
-series. A time slider on the ladder has "live" at its right edge and every stored minute of the day
-to its left.
+Everything that arrives is folded into one-minute summaries and written to permanent files, so any
+past minute can be reconstructed. Four ways of reading it are provided: the whole chain as it stood
+at a chosen past minute, the list of minutes that exist at all, one contract's day as a candle
+chart, and the volatility series. The live chain screen has a slider whose right-hand end is "now"
+and whose left-hand end is the start of the stored day.
 
-**Never forward-fill.** A minute with no arrivals produces **no row** -- not nulls, and never the
-previous close. This is the system's moral as well as its rule: Delta's own
-`/v2/history/candles` pads with the last trade and does not say so. `C-BTC-60000-270624` returns
-801 daily bars of which **797 are fabricated**; with `end` set to the contract's
-`settlement_time` the same request returns 4 bars, all real.
+There is one rule here that shapes everything else. **A minute during which nothing arrived produces
+no record at all** -- not a row of blanks, and certainly not a copy of the previous minute's prices.
+This is not a small point of tidiness. The venue's own historical price service does copy the last
+known price forward and does not say so: asking it for the daily history of one expired contract
+returns 801 days of prices, of which 797 are manufactured by repetition. A system that quietly
+invents data is worse than one that admits a gap, and this project always admits the gap.
 
-### The recording
+### The permanent record
 
-Five hive-partitioned dataset roots -- `quote-bars`, `reference-bars`, `spot-bars`,
-`computed-bars` and `index-bars` -- written by a lossless consumer so that a dropped message is
-never a permanent hole. What the book did, what the venue said, and what we made of it, each in its
-own table, joinable on `date` and `underlying`. See [Data store](data-store.md).
+The stored data is split into five separate collections, so that what we observed, what the venue
+claimed, and what we concluded are never mixed up with one another. The table below names each one.
+
+| Collection | What it holds |
+|---|---|
+| `quote-bars` | What the order book did: bids, asks, and the sizes offered |
+| `reference-bars` | What the venue said: its mark price, open interest, and its own volatility figures |
+| `spot-bars` | What the underlying itself was worth |
+| `computed-bars` | What this project concluded: our forward, our implied volatility, our Greeks |
+| `index-bars` | Longer-range index price history, filled in separately |
 
 ### Alerts
 
-An `alert` event is anything a person should see: a nearly spent reconnect budget, a stale
-connection, a failed flush, an empty generation while recording. A dedicated consumer posts them to
-a Discord webhook and never opens the feed, store or api to do it.
+Some conditions need a person to notice them: the connection has given up reconnecting, a file could
+not be written, the recording has been producing empty results while it believed it was recording.
+These raise an **alert**, and a small dedicated program forwards alerts to a Discord channel. It
+does nothing else, so it cannot interfere with the parts doing the real work.
 
-## What it is not
+## What this project is not
 
-- **Not an execution system.** No orders, no positions, no API key. The event envelope is shaped so
-  an order path could share it, and that is all.
-- **Not a backtester**, though the store is written so one can be built on it in any language --
-  the same tree answers Polars, DuckDB and Athena with no export step.
-- **Not a fork of the NIFTY sibling.** The architecture carries over; the maths does not.
+It is worth being explicit about the boundaries, because several of them look like omissions.
 
-## The shape of the code
+It is **not a trading system.** There is no order placement, no position tracking, no account, no
+secret key anywhere in the repository. The internal message format was designed so that an order
+system *could* later share it, and that is as far as it goes.
 
-```
-engine/   FastAPI. One venue socket, the pure pricing core, the store writer, every route.
-web/      Next.js. Renders. Computes nothing and calls parseFloat nowhere.
-tools/    Probes. Every number in the docs came from one of these.
-docs/     The contracts, and the design record behind them.
-```
+It is **not a backtesting engine**, although the stored files are deliberately written in a format
+that a backtester in any language can read directly, with no export step.
 
-**The pure core** -- `chain.py`, `wire.py`, `convert.py`, `compute.py`, `forward.py`,
-`solvers.py`, `black76.py`, `black_scholes.py`, `greeks.py`, `bars.py` -- takes data in and returns
-data out: no socket, no clock, no filesystem. Only `delta_client.py` talks to Delta and only
-`store.py` touches a file. That is why the suite can be both large and fast.
+It is **not a copy of the team's other project** for Indian index options. The overall shape of the
+software carries over; almost none of the mathematics does, because the two markets work differently.
 
-## Related guides
+## How the code is arranged
 
-- [Getting started](getting-started.md) -- install and run it
-- [Architecture](architecture.md) -- the processes, the topologies and the AWS shape
-- [Events](events.md) -- the ten events everything crosses on
+Four folders, each with one job. The table below is the map most people need on their first day.
+
+| Folder | What lives there |
+|---|---|
+| `engine/` | The Python back end: the venue connection, the mathematics, the file writer, the web API |
+| `web/` | The Next.js front end. It displays things and performs no arithmetic of its own |
+| `tools/` | Small standalone scripts for measuring the venue and inspecting the stored files |
+| `docs/` | The contracts that define the interfaces, and the design record |
+
+One principle governs where new code goes. Most of the engine is **pure**: it takes values in and
+returns values out, without touching the network, the clock or the disk. Only one file talks to the
+venue and only one file writes to disk. Keeping it that way is what allows the project to have
+sixteen hundred automated tests that run in seconds.
+
+## Where to go next
+
+[Architecture](architecture.md) explains how these features are divided between running programs.
+[Getting started](getting-started.md) gets it running on your own machine.

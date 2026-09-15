@@ -1,181 +1,177 @@
 # Deployment
 
-**Two places, and one line between them.** Everything that touches the venue, the bus, the store and
-the API runs on **one EC2 instance**. The front end is built and served by **AWS Amplify**.
+**What this page contains.** Where the system runs when it is not on somebody's laptop: which Amazon
+services are used, how the parts are divided between them, how the machine is sized, what it costs,
+how a new version is released, and what routine attention it needs.
+
+**How to read it.** Start with the picture and the two sections after it, which explain the shape
+and the reasoning. The sizing, cost and operations sections are reference material to come back to.
+
+**One thing to know first: none of this is built yet.** There is no Amazon account attached to this
+project at the time of writing. These are the decisions that have been made, not a description of
+something currently running. What *is* running is the Docker setup described in
+[Getting started](getting-started.md), which mirrors this shape closely.
+
+## The shape, in one picture
+
+The back end runs together on one rented computer. The web page is served separately by a service
+that specialises in exactly that.
 
 ```
                         DELTA EXCHANGE
                               |
    +--------------------------v---------------------------+
-   |  EC2 -- one c7g.xlarge, ap-south-1, host networking   |
+   |  One EC2 computer, in the Mumbai region               |
    |                                                       |
-   |   feed  -->  redis  -->  store  -->  S3 (bar tables)  |
+   |   feed  -->  redis  -->  store  -->  S3 (the files)   |
    |                 |                                     |
    |                 +----->  api                          |
-   |                 +----->  discord-alerts               |
+   |                 +----->  alert forwarder              |
    |                                                       |
-   |   proxy (TLS) -- the one public listener, for the api |
+   |   a small proxy, the only thing reachable from        |
+   |   outside, and only for the API                       |
    +--------------------------^---------------------------+
-                              | HTTPS, one rewrite rule
+                              | one forwarding rule, over HTTPS
                     +---------+----------+
-                    |  Amplify -- web    |
+                    |  Amplify: the web  |
+                    |  page              |
                     +---------+----------+
                               |
-                           a browser
+                          a browser
 ```
 
-## What runs where
+## Why it is divided this way
 
-| Tier | Runs | Holds |
-|---|---|---|
-| **EC2** | ECS on EC2, one task definition, `host` network mode | `feed`, `redis`, `store`, `api`, `discord-alerts`, and a proxy that terminates TLS for the API |
-| **Amplify** | Amplify Hosting, built from the repository on push | `web` -- the Next.js front end, its build, its CDN and its certificate |
-| **S3** | one bucket per environment | the four bar tables, in the hive layout the engine already writes |
+**The back end is on one machine because it is one pipeline.** The feed publishes to Redis, and the
+store and the API read from that same Redis. Putting them on one computer means those messages never
+travel over a network at all -- they go through the machine's own internal loopback, which is as
+fast as it is possible to be, and cannot fail independently of the machine itself. The API in
+particular belongs here rather than anywhere else, because the calculations it performs are driven
+by the same stream of messages.
 
-**The back end stays on one box because it is one pipeline.** `feed` publishes to Redis on
-`127.0.0.1`, `store` and `api` read from the same loopback, and nothing between them crosses a
-network. `host` network mode is what keeps that true.
-
-**The front end is the one piece with no reason to be there.** It holds no state, talks to no
-venue, and is a static build plus server-side rendering -- exactly what Amplify is. Moving it off
-the instance takes a container, a build step and a certificate off the box and gives the browser a
-CDN it would otherwise not have.
-
-## The instance
-
-| | Value |
-|---|---|
-| Region | **`ap-south-1`**, Mumbai -- in-country, and the CloudFront edge that serves the venue is in the same city |
-| Instance | **`c7g.xlarge`** -- Graviton3, **4 vCPU, 8 GiB**, 30 GB gp3 root |
-| Architecture | `linux/arm64`. The x86 twin of the same shape costs 82% more here |
-| Orchestrator | **Amazon ECS, EC2 launch type** -- a restart is a platform event something can alarm on, and EC2 compute adds $0 over running Compose by hand |
-| Network mode | **`host`** |
-| Subnet | **public**, one in-use public IPv4 |
-| NAT gateway | **none** |
-| Inbound | **one HTTPS listener, for the API**, reached by Amplify's rewrite. Nothing else is public |
-
-**No NAT gateway.** The feed pulls a `measured` 843.4 KB/s, which is `derived` 2,216.5 GB a month.
-Inbound to AWS is free; a NAT gateway meters it, and the bill would be `derived` **$165.00 a
-month** -- more than the compute it fronts. The instance sits in a public subnet so its own public
-IPv4 is the egress. `awsvpc` network mode is not used for the same reason: task ENIs on EC2 get no
-public IP, so it forces a private subnet and a NAT gateway with it.
+**The web page is elsewhere because it has no reason to be here.** It holds no data, connects to no
+venue, and does nothing but display what the API sends it. Served by Amplify it gains a worldwide
+delivery network, a managed security certificate, and an automatic rebuild whenever the code
+changes -- and the back-end machine loses a container, a build step and one more thing to secure.
 
 ## How the browser reaches the API
 
-**One origin, one rewrite rule.** Amplify serves the app and rewrites `/api/<*>` to the instance's
-HTTPS endpoint as a **200 rewrite**, so the browser makes no cross-origin request and no preflight.
+Amplify serves the page, and it is configured with one forwarding rule: anything the page requests
+beginning with `/api` is passed through to the back-end machine, and the answer is returned as
+though Amplify had produced it.
 
-| | |
-|---|---|
-| Browser origin | the Amplify domain, and nothing else |
-| `/api/<*>` | rewritten to `https://<api endpoint>/<*>` |
-| Everything else | served by Amplify |
-| CORS | **not consulted** -- the browser never addresses the instance |
-| `/ws/chain` | the same prefix; a websocket handshake, never subject to CORS |
+The consequence is that **the browser only ever talks to one address**. It never makes a request to a
+second server, so the browser safety rules about cross-address requests never come into play, and
+nothing has to be configured to permit them. This is the same arrangement the local Docker setup
+uses, with the nginx container replaced by Amplify's forwarding rule.
 
-This is the shape the local stack already runs behind nginx, with Amplify's rewrite standing in for
-the `proxy` container. It is why `NEXT_PUBLIC_ENGINE_URL` is a **path** and not a host: the browser
-asks its own origin for `/api/chain` in development and in production alike.
+The back-end machine therefore has exactly one thing reachable from outside: the API, behind a small
+proxy that handles encryption. Nothing else on it accepts connections from the internet.
 
-**The API endpoint is public but not advertised.** It answers Amplify's rewrite and health checks
-and nothing else; the dashboard is the only client, and it never sees the address.
+## The machine
+
+The table below lists what is rented and why each choice was made.
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Region | `ap-south-1` (Mumbai) | The cheapest of those compared, and in the same city as the network point the venue is served from |
+| Computer | One `c7g.xlarge`: 4 processors, 8 GB memory, 30 GB disk | Sized below |
+| Processor type | ARM | The equivalent Intel machine costs 82 percent more here for the same capability |
+| Who starts the containers | Amazon ECS | It restarts a container that stops **and records that it did**, which running them by hand would not |
+| Networking | Containers share the machine's own network | This is what keeps Redis on the internal loopback |
+| Internet connection | A directly connected machine, with its own address | Explained below |
+| Files | Amazon S3 | One bucket per environment |
+
+**There is deliberately no NAT gateway.** A NAT gateway is the usual way to give machines internet
+access without exposing them, and it bills for every byte passing through it. The feed downloads
+roughly 2,200 GB a month, so routing it through a NAT gateway would cost `derived` **$165 a month**
+-- more than the computer it would be protecting. Connecting the machine directly, with a single
+address and only the API reachable, costs a few dollars and achieves the same isolation.
 
 ## Sizing
 
-Six containers on the instance, with `web` no longer among them.
+Six containers share the machine. The table below lists what each is allocated.
 
-| Container | vCPU | Memory |
+| Container | Processors | Memory |
 |---|---|---|
-| `feed` | **1.0** (1,024 CPU units) | 1 GB |
-| `store` | 0.5 | 1 GB |
-| `api` | 1.0 | 2 GB |
-| `redis` | 0.5 | **3 GB** -- the `maxmemory 2gb` ceiling plus overhead |
-| `discord-alerts` | 0.05 | 0.25 GB |
+| feed | **1.0** | 1 GB |
+| store | 0.5 | 1 GB |
+| api | 1.0 | 2 GB |
+| redis | 0.5 | 3 GB |
+| alert forwarder | 0.05 | 0.25 GB |
 | proxy | 0.25 | 0.5 GB |
 | **Total** | **3.30** | **7.75 GB** |
 
-**`feed` reserves a whole core** because one Python process is one core, and it is the process that
-must never fall behind a socket. **The host overcommits vCPU**: the reservations total 3.30 against
-4, and three one-core Python services cannot starve `feed` at its 1,024 units.
+**The feed is given a whole processor** because a Python program cannot use more than one anyway,
+and this is the program that must never fall behind the venue's connection. The others cannot crowd
+it out even if they are all busy at once.
 
-The reservations under-count CPU and over-count memory: the `derived` need at today's rate is
-1.21-1.95 cores and 5.05 GiB, which is why the instance is 4 vCPU and not 2. **At ten times the
-rate it is a `c7g.4xlarge` to `c7g.8xlarge`** -- that is the re-size trigger, and nothing else about
-the topology changes with it.
-
-## Amplify
-
-| | Value |
-|---|---|
-| Source | this repository, `web/`, built on push to the deployment branch |
-| Framework | Next.js, with server-side rendering |
-| TLS and domain | Amplify's, managed |
-| API routing | one 200 rewrite, `/api/<*>` to the instance |
-| Build-time variable | `NEXT_PUBLIC_ENGINE_URL=/api` |
-
-**`NEXT_PUBLIC_` values are inlined by `next build`.** Changing the API endpoint or the rewrite is a
-**rebuild**, not a restart -- the same rule that holds in the Docker stack, for the same reason.
-
-## Storage
-
-**Amazon S3 Standard, one bucket per environment**, `s3://<env>-deltapayoff-bars/`, written by
-`store` and read by the four historical routes. Versioning off, Block Public Access on, SSE-S3, and
-one lifecycle rule that only aborts incomplete multipart uploads. Bars are kept indefinitely.
-**Compaction is nightly**, every partition strictly before today. The layout, the write path and the
-compaction contract are [Data store](data-store.md).
+The allocations add up to 3.30 out of 4 processors, which is intentional: containers can borrow
+capacity from each other, and reserving every last processor would leave nothing for the operating
+system. The current measured usage is comfortably inside these numbers. **If the amount of data ever
+grows tenfold, the answer is a larger machine of the same type** -- nothing else about the
+arrangement has to change, which is the main practical benefit of keeping the pipeline together.
 
 ## What it costs
 
-| Line | 1x | 10x |
+Every figure below is `derived` from Amazon's published prices and our own measured data volumes.
+
+| Item | At today's volume | At ten times today's volume |
 |---|---|---|
-| EC2, all-in | `derived` $78.07 | `derived` $295.72-582.39 |
-| S3 Standard, compacted, BTC+ETH | `derived` $1.92 | `derived` $19.19 |
-| Redis | $0 -- its memory is bought inside the instance | $0 |
-| Amplify hosting | `assumed` small: build minutes and GB served, at one dashboard's traffic | `assumed` small |
-| **Total** | **`derived` $79.99** plus Amplify | **`derived` $314.91-601.58** plus Amplify |
+| The computer, all in | $78.07 a month | $295 to $582 a month |
+| File storage | $1.92 a month | $19.19 a month |
+| Redis | $0 -- it runs on the computer already paid for | $0 |
+| Amplify | `assumed` small: charged per build and per gigabyte delivered | `assumed` small |
+| **Total** | **about $80 a month** | **about $315 to $600 a month** |
 
-An unexpected line on a bill is almost always a NAT gateway or a forgotten public IPv4.
+If a bill ever comes in noticeably higher than this, the cause is almost always one of two things: a
+NAT gateway that somebody added, or a spare internet address left allocated and forgotten.
 
-## The services this system buys
+## The services used
 
-| Service | For |
+The table below lists every Amazon service involved.
+
+| Service | What it does here |
 |---|---|
-| Amazon ECS, EC2 launch type | one task definition holding the six back-end containers |
-| Amazon EC2 | one `c7g.xlarge`, `host` network mode |
-| AWS Amplify Hosting | the front end: build, CDN, TLS, and the API rewrite |
-| Amazon VPC | one public subnet, one in-use public IPv4, no NAT gateway |
-| Amazon EBS gp3 | the instance's 30 GB root volume, and nothing else |
-| Amazon S3 Standard | the four bar tables, one bucket per environment |
-| Amazon ECR | the images a deploy registers |
-| Amazon CloudWatch | alarms on a stopped task and on the box |
+| EC2 | Rents the computer |
+| ECS | Starts the containers on it and restarts them if they stop |
+| Amplify | Builds and serves the web page, and forwards `/api` to the computer |
+| VPC | The network the computer sits on: one directly connected subnet, one address |
+| EBS | The computer's own 30 GB disk |
+| S3 | Permanent storage for the data files |
+| ECR | Stores the container images that a release uses |
+| CloudWatch | Raises an alarm if a container stops or the machine misbehaves |
 
-Two fallbacks are named in advance, so neither is a decision taken under pressure:
-**ElastiCache for Valkey** replaces the Redis container, and it is one endpoint string.
-**RDS for PostgreSQL** holds order-management state when an order path arrives -- beside the bars,
-never holding them.
+Two replacements have been chosen in advance, so that neither has to be decided in a hurry.
+If the Redis container ever becomes unsuitable, **ElastiCache** replaces it and the change is one
+connection string. When an order-management system eventually needs somewhere to keep its state,
+**a managed PostgreSQL database** goes alongside the files rather than replacing them.
 
-## Deploying
+## Releasing a new version
 
-**The back end**: build the image, push to ECR, register a task definition revision,
-`aws ecs update-service`. The platform holds the desired state, so a deploy is a revision rather
-than an `ssh`.
+**The back end.** Build the container image, upload it to ECR, register the new version with ECS,
+and tell ECS to update the service. ECS handles replacing the running containers. Releasing is
+therefore a recorded change rather than somebody logging into a machine.
 
-**The front end**: push to the deployment branch. Amplify builds and promotes it.
+**The web page.** Push the code. Amplify notices, builds it, and publishes it.
 
-**The images are identical in both environments.** One `Dockerfile` per service, built
-`linux/arm64`, and the same tag runs on a laptop and on the instance.
+The container images are **identical in every environment**. The same image that runs on a laptop
+runs on the machine; only the settings differ.
 
-## A month of operations
+## What a month of looking after it involves
 
-1. **Patch the AMI** -- replace the instance, do not patch in place. ~30 minutes.
-2. **Read the ECS event stream** for task stops nobody noticed, and their stopped-reason strings.
-3. **Check disk on the root volume** -- images, logs, anything left locally.
-4. **Check the bill** against the `derived` $78.07.
-5. **Check the Amplify build history** for a failed build nobody was watching.
+1. **Update the machine image.** Replace the machine with one running the current image rather than
+   patching the running one. About half an hour.
+2. **Read the container event history** for anything that stopped when nobody was watching, and why.
+3. **Check the disk** on the machine for accumulated images and logs.
+4. **Check the bill** against the figures above.
+5. **Check the web page's build history** for a failed build nobody noticed.
 
-**What the platform does instead of us**: restarts a container that exited, reports that it did,
-replaces a task that fails its health check, and rebuilds the front end on every push.
+Everything else the platform does by itself: restarting a container that stopped, recording that it
+did so, replacing one that stops answering its health check, and rebuilding the page on every code
+change.
 
-## Related guides
+## Where to go next
 
-[Architecture](architecture.md) | [Data store](data-store.md) | [Message bus](message-bus.md)
+[Architecture](architecture.md) explains what each container actually does.
+[Configuration](configuration.md) lists the settings applied to them.

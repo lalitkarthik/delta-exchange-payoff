@@ -1,25 +1,44 @@
 # Logging
 
-The engine writes **one structured JSON object per line**, per operational record. A day's file can
-be filtered by `event`, `venue`, `instrument` or `conn_state`, which is what makes a hole in the
-Parquet store visible instead of silently lost.
+**What this page contains.** What the system writes down about its own behaviour, where those
+records go, how they are structured, what every kind of record means, and how much of it there is.
 
-## The record
+**How to read it.** The first three sections explain the format and where to find it, which is what
+you need when something has gone wrong at two in the morning. The catalogue after them is a
+reference to come back to. Nothing here requires having read any other page.
 
-Five fields are always present.
+## Why the logs are structured
 
-| Field | Meaning |
+A log written as ordinary English sentences is pleasant to read one line at a time and almost
+useless in bulk. You cannot reliably ask it "show me everything about this contract" or "how many
+times did the connection drop yesterday" without inventing fragile text searching.
+
+So every record this system writes is a single line of JSON: a small block of labelled fields rather
+than a sentence. That makes a day's log something you can filter, count and group with ordinary
+tools. In particular it makes a gap in the permanent record *visible* -- you can ask when the writer
+last succeeded -- rather than something nobody notices for a week.
+
+## What a record looks like
+
+Five fields are present on every record, whatever it is about. The table below lists them.
+
+| Field | What it holds |
 |---|---|
-| `ts` | UTC, ISO 8601, millisecond precision |
-| `level` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `logger` | The Python logger name |
-| `event` | A short stable name from the catalogue below |
-| `msg` | The human sentence. **Not machine-matched** |
+| `ts` | When it happened, in UTC, to the millisecond |
+| `level` | How serious it is: `DEBUG`, `INFO`, `WARNING` or `ERROR` |
+| `logger` | Which part of the code wrote it |
+| `event` | A short, stable name for *what kind of thing* this is. This is the field you filter on |
+| `msg` | A sentence for a human. **Never** match on this; it is free to change at any time |
 
-Optional fields are `venue`, `instrument`, `conn_state` and `event_id`. Anything else passed as
-`extra` lands beside them under its own name -- `table`, `rows`, `file` and `duration_seconds` on a
-`store.flush`. **A `None` value is dropped rather than sent as `null`**, for the same reason the
-wire omits an absent field rather than spelling it.
+Four more fields appear when they apply: `venue`, `instrument`, `conn_state` and `event_id`.
+Anything else a particular record wants to say appears alongside under its own name -- for a file
+write, that is which collection, how many rows, which file, and how long it took.
+
+A field with no value is **left out entirely** rather than written as empty. This is the same rule
+the rest of the system follows for absent values, and it keeps "we did not record this" clearly
+different from "this was zero".
+
+Here is a complete record, wrapped across lines for readability:
 
 ```json
 {"ts":"2026-09-14T09:08:35.798Z","level":"INFO","logger":"deltapayoff.store",
@@ -27,122 +46,129 @@ wire omits an absent field rather than spelling it.
  "file":"20260914T090800Z-000287.parquet","duration_seconds":0.214}
 ```
 
-## One function, and it refuses an unknown name
+The `event_id` field is the one that repays knowing about. Every message on the bus carries a unique
+identifier, and a log record caused by one carries the same identifier, so a record and the message
+behind it can be lined up exactly rather than guessed at from their timestamps.
 
-```python
-log_event(logger, level, event, msg, **extra)
-```
+## One way in, and it refuses unknown names
 
-Every call site uses it, and **it raises if `event` is not in `log_events.ALL`**. A name invented at
-a call site would be a name no filter and no runbook knows, discovered during the incident it was
-written for. A raw logger call still produces a parseable line, with `event: "log"`.
+Every log record in the codebase is written through a single function, and **that function refuses
+any `event` name that is not on a central registered list.**
 
-`event_id` is the join key. A record carrying the `event_id` of the bus event that caused it can be
-lined up against that event without a timestamp guess.
+This looks like bureaucracy and is not. A name invented on the spot at a call site is a name that no
+filter, no dashboard and no written procedure knows about -- and it will be discovered during the
+incident it was written for, which is the worst possible moment. Requiring registration means the
+list of things the system can say is finite, knowable and documented below.
 
-## The sinks
+## Where records go
 
-**A daily file.** One `DailyFileHandler` per process writes `<repo root>/logs/<YYYY-MM-DD>.log`,
-one JSON line per record, **checking the date on every `emit()` rather than with a timer** -- a
-timer is another thing that can stop, and the check costs a comparison.
+Records are written to two places at once.
 
-**Standard error, always.** A second handler always writes to `sys.stderr`; `is_terminal` decides
-only its **formatter** -- colour at a terminal, JSON otherwise -- so redirected stderr contains no
-ANSI escapes and a container is never silent.
+**A file, one per day**, at `logs/<date>.log`, one JSON record per line. The date is checked every
+time a record is written rather than by a timer, since a timer is one more thing that can silently
+stop.
 
-**The gate is on the formatter and never on the handler.** In a container `/proc/1/fd/2` is a pipe,
-so gating the handler on `isatty()` detaches it entirely and the only diagnostics the system has go
-to a file nobody mounted. Both halves are held: stderr always carries records, and Compose mounts
-`./.stack-logs/<service>` over `/app/logs` -- one directory per service, so writers cannot collide
-on one day's file.
+**Standard error, always.** This is what `docker logs` and any container platform will show you.
+Whether that output is coloured depends on whether it is going to a terminal, but **whether it is
+written at all does not depend on anything.** That distinction matters: inside a container, standard
+error is a pipe rather than a terminal, so a system that only writes when it detects a terminal
+writes nothing at all in production -- and the only diagnostics it has go to a file inside a
+container that nobody has mounted. Both halves are held here: records always go to standard error,
+and the container setup also mounts the log folder out to the host, one folder per program so that
+two programs cannot write over each other's day.
 
-Both handlers attach to `logging.getLogger("deltapayoff")`, **not root**, and `propagate` stays true
-so pytest's `caplog` captures through the root handler. Configuration is idempotent, so repeated
-imports do not multiply the handlers or the volume.
+## How serious is each thing
 
-## Levels
+Choosing the level well is what makes a log searchable by severity rather than by guesswork. The
+table below gives the rule for each kind of record.
 
-| Record | Level | Why |
+| What happened | Level | Why that level |
 |---|---|---|
-| An ordinary transition | Info | The baseline |
-| `stopped` by a spent budget | Error | No other symptom exists |
-| Entering `degraded` | Warning | The staleness question this project exists to answer |
-| Touching `reconnecting` | Warning | Worth attention whether or not it recovers |
-| Contracts newly subscribed | Info | Rare; the record of what is being recorded |
-| A flush | Info | Routine, and useful to see the cadence |
-| A replay gap | Error | A saved position needs entries the bus has trimmed |
-| A committed checkpoint | Info | The generation's files are durable |
-| A lossless drop | Error | Should be impossible |
-| The recompute set changing | Debug | Rare; for someone reading closely |
-| A websocket client attaching or detaching | Debug | Volume matters more than one connection |
-| An alert | Warning | Always, regardless of the alert's own severity |
-| A defensive catch-all | Error | Never an expected path |
+| An ordinary connection change | Info | The normal baseline |
+| Giving up after exhausting reconnection attempts | Error | Nothing else would reveal it |
+| The connection going quiet | Warning | This is the precise question the project exists to study |
+| Anything involving a reconnect | Warning | Worth a look whether or not it recovered |
+| New contracts subscribed | Info | Rare, and it is the record of what is being recorded |
+| A file being written | Info | Routine, and seeing the rhythm is useful |
+| Needing data the bus had already discarded | Error | A real gap in the permanent record |
+| A recording period being safely finished | Info | The files are now durable |
+| A message dropped from a lossless subscription | Error | This should not be possible |
+| The set of expiries being calculated changing | Debug | Rare, and only of interest to someone reading closely |
+| A browser connecting or disconnecting | Debug | Routine; the total matters more than any one |
+| An alert being raised | Warning | Always, whatever the alert's own severity says |
+| An unexpected failure | Error | Never an expected path |
 
-**An alert is logged at warning before the publish is attempted**, so an alert that could not reach
-the bus is still in the file.
+An alert is written to the log **before** any attempt is made to send it onward, so an alert that
+could not be delivered is still recorded somewhere.
 
-## The catalogue
+## The catalogue of record names
 
-Every registered name. `tests/test_logging.py` parses these names out of the design documents and
-asserts the set equals `log_events.ALL`, so prose and code cannot drift apart.
+Every name the system is allowed to use. There is a test that compares this list against the code
+and fails if they ever disagree.
 
 | `event` | What it records |
 |---|---|
-| `feed.transition` | Any ordinary connection move, including the first connect and a resume |
-| `feed.stale` | The connection crossed the staleness bound and entered `degraded` |
-| `feed.reconnect` | Any move touching `reconnecting` -- a close, prolonged silence, or a redial |
-| `feed.instruments` | The venue listing caused new contracts to be subscribed |
-| `store.flush` | One `BarStore.flush()` writing one file. An empty flush writes nothing and logs nothing |
-| `store.replay_gap` | A saved stream position had entries trimmed before it, with both bounds and an exact `lost` count |
-| `store.checkpoint` | A generation became durable, a start-up adopted a checkpoint, or a generation committed zero rows |
-| `queue.drop` | A record dropped off a lossless subscription |
-| `bus.selected` | Which bus the process selected at start-up; also the drop-oldest resync record |
-| `bus.reader` | A bus reader's own lifetime: a retry, a recovery, or a reader that gave up |
-| `compute.recompute_set` | The set of pairs being recomputed changed |
-| `ws.client_attach` / `ws.client_detach` | A browser `/ws/chain` socket was accepted, or ended |
-| `alert` | An `events.Alert` was raised |
-| `engine.error` | A defensive branch failed. Always error; never an expected path |
+| `feed.transition` | Any ordinary connection change, including the first connection and a resume |
+| `feed.stale` | The connection went quiet for longer than the limit |
+| `feed.reconnect` | Anything involving a reconnect: a closure, prolonged silence, or a redial |
+| `feed.instruments` | The venue's contract listing caused new contracts to be subscribed |
+| `store.flush` | One file was written. An empty write produces no file and no record |
+| `store.replay_gap` | Data was needed that the bus had already discarded, with both boundaries and an exact count |
+| `store.checkpoint` | Three related things -- see below |
+| `queue.drop` | A message was dropped from a lossless subscription |
+| `bus.selected` | Which message bus this program chose at startup |
+| `bus.reader` | A bus reader retried, recovered, or gave up |
+| `compute.recompute_set` | The set of expiries being calculated changed |
+| `ws.client_attach`, `ws.client_detach` | A browser connected or disconnected |
+| `alert` | An alert was raised |
+| `engine.error` | Something failed that was never expected to |
 
-### Three records worth knowing before an incident
+### Three records worth understanding before you need them
 
-**`store.checkpoint` carries three sentences under one name.** A committed generation (info, once
-per generation, with the generation, stream count and four `sealed_through_us` values). A start-up
-adoption (info, exactly once per process start **whether or not a gap was found**, naming every
-stream and the position it reads forward from). And a generation that committed **zero rows across
-all four tables** -- warning while recording, info while paused, beside a
-`store.empty_generation` alert on the recording case only.
+**`store.checkpoint` covers three different situations under one name.** A recording period was
+safely finished and its files are durable. A program started up and adopted a saved position --
+written on *every* start, whether or not anything was wrong, because a silent clean start leaves a
+restart that dropped a minute with nothing at all to show it happened. And a recording period that
+finished having written no rows at all.
 
-That last one exists because **sealed-empty is correct behaviour and is indistinguishable from a
-dead system on disk**, so the store says which it was. For the same reason the adoption record is
-emitted on every start, gap or no gap: a silent clean replay leaves a restart that dropped a minute
-with nothing to show it happened.
+That third case exists because finishing with nothing recorded is, on disk, completely
+indistinguishable from the system being dead -- in both cases there is no file. So the store says
+which it was: a warning if it believed it was recording, a quiet note if it had been paused.
 
-**`bus.reader` is warning while a reader is still running and error once it is not** -- a retry, a
-recovery after consecutive failures, and a reader that reached its retry bound are three different
-records, because a bus reader can die while its process stays healthy.
+**`bus.reader` is a warning while a reader is still running and an error once it is not.** A retry
+after a failure, a recovery after several, and a reader that gave up entirely are three different
+records, because a bus reader can die while the program containing it stays perfectly healthy and
+continues answering its health check.
 
-**`feed.instruments` is the record of what is being recorded.** A contract listed after start-up and
-never subscribed damages only the history, and nothing else would say so.
+**`feed.instruments` is the record of what is being recorded.** A contract that the venue listed
+after we started, and that we therefore never subscribed to, damages only the historical record --
+quietly, invisibly, and permanently. Nothing else would ever say so.
 
-## Volume
+## How much of it there is
 
-**Nothing scales with message rate**, and that is a design constraint rather than an observation.
-The recurring part is `store.flush` -- 8 records per flush, four tables across two underlyings -- so
-at `FLUSH_SECONDS=300` the whole steady-state volume is `derived` **96 records an hour** plus a
-dozen checkpoints. Bounding the cost by the flush interval is what makes info-level flush logging
-affordable on a feed carrying over a thousand messages a second.
+**Nothing in the log volume scales with the number of market messages.** That is a design
+constraint, not an observation, and it is what makes it affordable to log every file write at
+info level on a feed carrying over a thousand messages a second.
 
-## Failure modes
+The recurring part is the file writes: eight records each time, being four collections across two
+underlyings. At a five-minute interval that is `derived` **96 records an hour**, plus about a dozen
+checkpoint records. Everything else is occasional.
+
+## When logging itself fails
+
+The table below lists what happens in each case, since a logging system that fails silently would
+defeat its own purpose.
 
 | Failure | What happens |
 |---|---|
-| A record's `event` is not registered | `log_event` raises before the record is built |
-| The logs directory cannot be created | `DailyFileHandler.__init__` raises and start-up fails loudly |
-| A write to the day's file fails | `handleError` prints to stderr once; nothing else stops |
-| Midnight UTC passes while up | The next `emit()` opens the new file |
-| `main` imported twice | `configure_logging()` is a no-op the second time |
-| The venue's listing cannot be read | `feed.instruments` at warning, and the cycle retries |
+| A record uses an unregistered name | The function raises before the record is built |
+| The log folder cannot be created | Startup fails immediately and loudly |
+| Writing one record fails | A note is printed to standard error once; nothing else stops |
+| Midnight passes while running | The next record opens the new day's file |
+| The setup code runs twice | The second time does nothing, so records are not duplicated |
+| The venue's contract listing cannot be read | A warning, and the attempt is repeated later |
 
-## Related guides
+## Where to go next
 
-[Events](events.md) -- the `alert` event and its codes | [Architecture](architecture.md)
+[Events](events.md) describes the alerts that appear in this log.
+[Data flow](data-flow.md) explains the connection states the `feed.*` records refer to.

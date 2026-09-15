@@ -1,197 +1,154 @@
 # Adapters
 
-**An adapter is the one class that knows a venue.** Everything it says outward is in our language
--- canonical `Instrument`s and catalogued `Event`s -- and everything it hears inward is in the
-venue's: the socket, the REST calls, the symbol spelling, the channel names, the wire layout.
-**Nothing downstream of an adapter ever sees venue JSON.**
+**What this page contains.** An explanation of what an adapter is and why the system has one, a
+description of the eight things every adapter must be able to do, and a walk through how the Delta
+Exchange adapter is built, ending with what it does when a message cannot be used.
 
-In split mode `feed` owns the adapter exclusively; the api holds no venue socket and the store has
-never had one.
+**How to read it.** Read the sections in order; each builds on the one before. When you want to
+connect a different exchange, [Adding an adapter](adding-an-adapter.md) is the practical guide, and
+it only makes sense after this page. Both assume you have read [Events](events.md), because an
+adapter's whole job is to produce events.
 
-## The protocol
+## What an adapter is
 
-Eight members in three groups. Implementing them is the whole of being a venue here.
+Every exchange describes the world slightly differently. It has its own names for contracts, its own
+field names, its own way of saying "there is no price", its own idea of which updates belong on
+which connection. If that vocabulary were allowed to spread through the codebase, adding a second
+exchange later would mean editing every file.
 
-| Group | Member | Contract |
+An **adapter** is the one piece of code that knows a particular exchange. Everything it says outward
+is in our own vocabulary -- the contracts and events described in [Events](events.md) -- and
+everything it hears inward is in the exchange's. **Nothing downstream of an adapter ever sees the
+exchange's own data format**, or its names, or its channels.
+
+In the multi-process arrangement, the feed program owns the adapter and is the only program that has
+one. The API has no connection to any exchange, and the store has never had one.
+
+## What an adapter must be able to do
+
+An adapter has to provide eight things, and no more. They fall into three groups, which the table
+below lists along with what each one promises.
+
+| Group | What it provides | What it promises |
 |---|---|---|
-| Describe | `venue` | The venue's short name, upper case: `DELTA`, later `NSE` |
-| Describe | `underlyings` | What this adapter records. **Configuration, not a constant** |
-| Feed | `instruments(underlying)` | Every listed contract, as canonical instruments, with `venue_symbol` riding along |
-| Feed | `subscribe(instruments)` | Register for streaming. **Safe before anything is connected** |
-| Feed | `on_connection` / `off_connection` | Register and unregister a socket-signal listener |
-| Feed | `stream(publish)` | **Connect once and stream until the connection closes. Then return** |
-| Feed | `stop()` | Ask `stream` to return. Synchronous, safe before `stream` runs |
-| Read | `expiries`, `chain_snapshot` | The two venue REST reads the screens need. They are on the adapter because the venue client *is* part of knowing a venue |
+| Describe itself | `venue` | The exchange's short name in capitals, such as `DELTA` |
+| Describe itself | `underlyings` | Which underlyings to record. This is configuration, not something fixed in code |
+| Feed | `instruments` | Every contract the exchange currently lists for one underlying, described in our vocabulary |
+| Feed | `subscribe` | Register interest in contracts. Must work even before any connection exists |
+| Feed | `on_connection` / `off_connection` | Let something else be told when the connection opens and closes, and stop being told |
+| Feed | `stream` | **Connect once, deliver messages until that connection ends, then return** |
+| Feed | `stop` | Ask `stream` to return |
+| Read | `expiries`, `chain_snapshot` | Answer two ordinary questions the screens need, by asking the exchange directly |
 
-**`stream` is push, not an async generator**, because the socket owner already publishes and
-returns. `publish` is synchronous and must never block: the socket reader calls it between reads, so
-anything that suspends there suspends the socket.
+A few of these carry important subtleties.
 
-**Reconnect is not on the interface, and not below it either.** One call is one connection: dial,
-replay, publish until the socket ends, return. Backoff, the budget and the decision to redial belong
-to `controller.py` and `supervisor.py` above it -- the layer that can say *we have given up* out
-loud is the layer that decides it. `stream` **returns rather than raises** on every ending, and a
-`stop()` returns *without* reporting a close: a stop is not a drop, and the controller reads exactly
-that difference.
+**`stream` handles exactly one connection.** It dials, re-registers every subscription, delivers
+messages until that connection ends, and returns. It does not retry. Deciding whether to try again,
+how long to wait first, and when to give up altogether belongs to the layer above it -- because the
+layer that has to announce "we have given up" is the layer that should be deciding it.
 
-**An adapter reports facts about its socket, never states.** `ConnectionSignal` has two members:
-`OPENED` and `CLOSED`. What they mean -- `connected`, `degraded`, `reconnecting` -- is the
-controller's to decide; an adapter that reported states would be a second state machine disagreeing
-with the first. `OPENED` means the socket is up **and every subscription has been replayed**: a
-fresh socket with no subscriptions delivers nothing, the failure-with-no-error this layer exists to
-prevent.
+**`stream` pushes messages rather than being asked for them.** It is handed a function to call for
+each message. That function must never pause, because the same loop is reading the connection, and a
+pause there loses the connection.
 
-**`off_connection` exists because a register with no way out is a leak with a voice**: a replaced
-controller would keep driving a state machine nobody reads, off a socket it no longer owns.
+**An adapter reports facts about its connection, never conclusions.** It can say "the connection
+opened" and "the connection closed", and nothing else. Whether that means the system is healthy,
+degraded, or reconnecting is decided elsewhere, by the state machine described in
+[Data flow](data-flow.md). An adapter that reported states would be a second state machine quietly
+disagreeing with the first.
 
-**Conformance is structural, not nominal.** An explicit subclass of a `Protocol` inherits
-`...`-bodied stubs returning `None`, so a missing `stream` would deliver silence instead of raising
-`AttributeError`. The structural `isinstance` check does fail, and a test pins that it still can.
+**"Opened" means more than "connected".** An adapter must only report that its connection is open
+once it has also re-registered interest in every contract. A freshly opened connection with no
+subscriptions on it delivers nothing at all, and looks perfectly healthy while doing so. That is
+precisely the failure this whole layer exists to prevent.
 
-## The Delta adapter
+## How the Delta adapter is built
 
-| File | Holds |
+The table below lists the files involved and what each one holds.
+
+| File | What it holds |
 |---|---|
-| `adapters/base.py` | The `Adapter` protocol and the `Publish` callable |
-| `adapters/delta.py` | `DeltaAdapter`, `instrument_from_symbol`, `VENUE` |
-| `adapters/delta_socket.py` | `DeltaFeed`, `VenueMessage`, and **the two channel names** |
-| `wire.py`, `delta_client.py` | The frame offsets and the REST reads, reached through the adapter and nothing else |
-| `tests/fakes/scripted_adapter.py` | The scripted double |
+| `adapters/base.py` | The list of eight things an adapter must provide |
+| `adapters/delta.py` | The Delta adapter itself, and the conversion from Delta's contract names to ours |
+| `adapters/delta_socket.py` | The connection to Delta, and the only two places the exchange's channel names appear |
+| `wire.py`, `delta_client.py` | Where each field sits in Delta's messages, and the ordinary web requests |
 
-The two channel strings appear **nowhere in `src/` outside this package**, and a test asserts it.
-`delta_socket.py` decodes nothing: it publishes a `VenueMessage` -- the frame verbatim, with its
-channel and arrival stamp -- and the decode happens one layer up.
+There is an automated test whose only job is to search the whole codebase for Delta's two channel
+names and fail if they appear anywhere outside this folder.
 
-### The three mappings
+The connection file itself performs no interpretation. It reads a message, attaches the channel it
+came from and the time it arrived, and passes it on unchanged. The interpretation happens one layer
+above, which keeps the part that must never pause as simple as possible.
 
-```
-ob_l2  frame  ->  md.option_quote
-ticker frame  ->  md.option_reference
-ticker frame  ->  md.index_quote      one per frame
-```
+### Turning exchange messages into ours
 
-**One index quote per ticker frame, not one per change**, and the reason is the store rather than
-the screen: the spot bars count observations, `spot_ticks` is the column that says whether the
-ingester was running at all, and a deduplicated stream cannot say how long a price held.
+Delta's two streams produce three kinds of our events, as the table below shows.
 
-### The symbol mapping
+| Delta sends | We produce |
+|---|---|
+| An order book update | One top-of-book event for that contract |
+| A ticker update | One reference event for that contract |
+| A ticker update | One spot-price event for the underlying |
 
-```
-C-BTC-77600-040926   ->   DELTA-BTC-20260904-77600-C-USD
-```
+The last row deserves a note, because it looks wasteful. Every ticker message carries the
+underlying's price, and that price is usually identical to the one in the previous message. We
+publish it every time anyway. The reason is the permanent record rather than the screen: the stored
+data counts how many observations a minute contained, and that count is what later tells "the price
+did not move" apart from "nothing was running at all". A deduplicated stream cannot answer that.
 
-The venue's string is kept verbatim in `venue_symbol`. **A symbol that is not a contract returns
-`None` and is counted, never raised**: `underlying` is a partition directory name, and a wrong guess
-files quotes under an asset they did not happen in.
+### Turning exchange names into ours
 
-`quote_currency` and `settlement_currency` are set **explicitly** by the adapter rather than left to
-a class default: the requirement is that the adapter states them. Neither is on the ticker frame --
-the venue carries them on a different endpoint, one call per symbol, for a value that is today
-always `USD`. The constants live in `chain.py` and are re-exported, so two files read one fact.
+Delta calls a contract `C-BTC-77600-040926`. We call the same contract
+`DELTA-BTC-20260904-77600-C-USD`, and we keep Delta's own name alongside so we can always ask Delta
+about it again without a lookup table.
 
-### `null` is not `0` -- the boundary lives here
+If a name arrives that does not describe an option at all, the adapter returns nothing and counts
+it, rather than raising an error or guessing. Guessing would be actively dangerous here: the
+underlying becomes a folder name in the permanent record, and a wrong guess would file Bitcoin
+quotes under Ethereum.
 
-Delta spells an absent quote three ways: `"0"`, `""` and `null`. All three become `None` on a price,
-a size or an implied volatility, because rendering one as `0.0` claims somebody bid zero. A real
-zero in open interest or a greek stays `0.0`. `convert.to_quote_number` and `convert.to_number` are
-that split, applied field by field in `wire.py`.
+### The rule about absent prices
 
-**The events cannot enforce it** -- a string `"0"` handed to a pydantic `float` field is coerced to
-`0.0` -- which is why the rule lives with the adapter, where the venue's spellings are known. A
-fixture lifting those spellings verbatim pins it.
+This is the single most important thing the adapter does, and it cannot be fixed anywhere else.
 
-**A non-finite number is absent, counted, and takes its size with it.** The event model refuses
-`NaN` outright, so the adapter converts to `None` first and increments `non_finite`; an absent price
-drops its size, or the size would describe an order at no price. Reachable, not defensive:
-`json.loads` accepts the bare tokens `NaN` and `Infinity`.
+Delta expresses "nobody is offering a price" in three different ways: the text `"0"`, an empty
+string, and a proper null. All three become *absent* in our events -- for prices, sizes and
+volatility figures alike -- because displaying any of them as zero would claim somebody offered to
+buy at nothing. A genuine zero in a quantity like open interest stays zero, because there it is a
+real measurement.
 
-### Both stamps travel
+The reason this must happen in the adapter is that nothing downstream can undo it. Our event format
+cannot enforce the rule on its own: the text `"0"` handed to a numeric field is silently converted
+to the number zero, and by then the distinction is gone forever.
 
-`ts_venue` is the venue's own microsecond stamp, converted by integer arithmetic so the last digit
-survives -- the store buckets on it. `ts_received` is our wall clock at the socket read. **Neither is
-corrected against the other: the arrival lag is the data.**
+A related rule covers nonsense numbers. JSON technically permits the values `NaN` and `Infinity`,
+and our event format refuses them outright. So the adapter converts them to absent first and counts
+how often it happened. When a price is absent, the size that went with it is dropped too -- a size
+without a price would describe an order at no price at all.
 
-## Failure modes
+### Timestamps
+
+Delta's own timestamp is converted carefully enough that the last digit survives, because the
+permanent record groups observations by it. Our own arrival time is recorded separately. **Neither
+is ever corrected against the other**: the gap between them is real information about the network.
+
+## When things go wrong
+
+The table below lists every way a message can be unusable and what the adapter does about it. The
+pattern throughout is that a bad message is counted and skipped, never allowed to stop the feed.
 
 | What goes wrong | What happens |
 |---|---|
-| Frame is not JSON | `feed.malformed` grows; the read loop continues |
-| Frame is JSON and makes no sense | `adapter.undecodable` grows; **nothing reaches the bus**. The **first** is logged and the counter carries the rest -- logging each would flood at 1,323 msg/s |
-| The symbol is not an option symbol | `unparseable_symbols` grows; no events at all |
-| A price is `NaN` or `Infinity` | Carried as `None`; `non_finite` grows |
-| The venue gives no stamp | `ts_venue` is `null`; our clock is never substituted |
-| Control traffic (`subscriptions`, `error`) | Dropped in the socket layer; never on a bus |
-| Configuration names an asset the venue does not list | Dropped, logged at error; the rest still record |
-| The venue is unreachable at start-up | `DeltaUnavailable`; REST serves, the socket says `waiting` |
+| The message is not valid JSON | A counter increases; reading continues |
+| The message is valid JSON but makes no sense | A counter increases and **nothing is published**. The first such message is logged; the rest are only counted, because logging each one would flood the log at over a thousand messages a second |
+| The name is not an option contract | A counter increases; no events are produced |
+| A price is `NaN` or `Infinity` | Treated as absent, and counted |
+| The exchange gives no timestamp | The field is left empty. Our clock is never substituted for it |
+| The exchange sends its own housekeeping messages | Discarded at the connection layer; they never reach the bus |
+| Configuration names an underlying the exchange does not list | It is dropped and logged as an error; the others still record |
+| The exchange is unreachable at startup | The ordinary web routes still answer; the connection reports that it is waiting |
 
-## Building a new adapter
+## Where to go next
 
-### 1. Satisfy the protocol, and nothing else
-
-The protocol is the whole test of the abstraction: a venue with a different shape -- NSE spells the
-same contract `NIFTY-20260908-25500CE`, in rupees, in lots, off a different calendar -- must fill it
-**without the interface bending**. A member added for one venue means the design is wrong elsewhere.
-
-### 2. Keep the venue's vocabulary inside the package
-
-Channel names, endpoint paths, field offsets and symbol spellings live in your adapter package and
-nowhere else. Write the test that greps `src/` for your channel strings; it is the cheapest
-guarantee in this repository.
-
-### 3. Emit the existing events. Do not invent one
-
-The ten events are the contract. A venue carrying something none of them holds is a **catalogue**
-change -- argued in [Events](events.md), under the version rule -- not a payload the adapter
-smuggles through.
-
-### 4. Hold the boundary rules at the boundary
-
-`null` is not `0`; every decimal is a JSON number; non-finite is absent and counted; both timestamps
-travel uncorrected. Nothing downstream can recover a distinction the adapter collapsed.
-
-### 5. Follow the naming scheme
-
-| Thing | Rule | Example |
-|---|---|---|
-| Venue name | Upper case, one word, no `-` | `DELTA`, `NSE` |
-| Underlying | Upper case, no `-` | `BTC`, `NIFTY` |
-| Adapter package | `adapters/<venue lower>.py`, socket in `<venue lower>_socket.py` | `adapters/nse.py` |
-| `VENUE` constant | Module-level, upper case, the string every `Instrument` carries | `VENUE = "NSE"` |
-| Canonical symbol | `VENUE-UNDERLYING-YYYYMMDD-STRIKE-C\|P-CCY` | `NSE-NIFTY-20260908-25500-C-INR` |
-| Option right | `C` and `P`. One spelling, no mapping table | |
-| Stream name | `{event_type}:{VENUE}[:{UNDERLYING}]` | `md.option_quote:NSE:NIFTY` |
-| Consumer group | The **service** name, lower case, one word -- never the venue | `store`, `api` |
-| Consumer name | `{service}-{instance}` | `store-1` |
-| Log `event` | `{area}.{noun}`, registered in `log_events.ALL` | `feed.transition` |
-| Alert `code` | `{area}.{condition}`, short and stable | `store.flush_failed` |
-| Environment variable | `DELTA_`-style prefix per venue, or a service prefix | `DELTA_LIVE_UNDERLYINGS` |
-| Dataset root | `<noun>-bars`, hive-partitioned `underlying=/date=` | `quote-bars` |
-
-**The venue appears in the stream key and the canonical symbol, and nowhere else.**
-
-### 6. Write the scripted double before the socket
-
-`ScriptedAdapter` implements the same protocol and does what it is told. Four verbs, walked in order
-by `stream`:
-
-| Verb | Means |
-|---|---|
-| `Frames(channel, frames)` | These arrived; their events are published |
-| `Close(reason)` | Dropped and came back, **replaying every subscription** |
-| `Silence(seconds)` | Nothing arrives for this long; nothing is published |
-| `Resume()` | The feed returns with the book it left with -- the last `Frames` again |
-
-So `[Frames(...), Close(), Silence(20.0), Resume()]` produces the events, then nothing, then the
-events again. **`Silence` does not wait**: the clock is injected, so twenty seconds are free and
-still assertable, which makes a 15-second staleness bound cheap to test. **It emits no
-`feed.connection` events** -- a double that pre-empted the state machine would make the machine's
-own tests assert against the double.
-
-### 7. Expose the decode as a pure function
-
-`events_from_frame(channel, frame, received_at)` -- three plain values, no socket, no bus, no clock.
-Every captured fixture frame runs through it, so the boundary is asserted against real contracts on
-both channels, and every consumer test decodes through it so none drifts from it.
-## Related guides
-
-[Events](events.md) | [Message bus](message-bus.md) | [Architecture](architecture.md)
+[Adding an adapter](adding-an-adapter.md) is the step-by-step guide to connecting another exchange.
+[Events](events.md) describes what an adapter must produce.

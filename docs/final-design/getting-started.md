@@ -1,132 +1,148 @@
 # Getting started
 
-This page takes a fresh checkout to a live option ladder in the browser. Two processes in the
-simple case: the **engine** on port 8000 and the **web app** on port 3000. A seven-container
-Docker stack on port 8080 is the third option, and the closest thing to production.
+**What this page contains.** Everything needed to get the project running on your own machine, from
+installing the tools to seeing a live option chain in a browser, followed by how to run the tests
+and how to start the full multi-program setup.
 
-## Requirements
+**How to read it.** Work through it in order the first time. The three ways of running it are
+independent -- pick the first one to begin with, and come back for the others when you need them.
+If a term is unfamiliar, the [Glossary](glossary.md) has it.
 
-| Thing | Version | Note |
+## What you will need
+
+The table below lists everything that must be installed, and why.
+
+| Tool | Version | What it is for |
 |---|---|---|
-| Python | 3.13 | `measured` 3.13.13 on 2026-09-14. 3.12 runs, with one known solver failure |
-| Bun | current | The web toolchain. Not npm, not pnpm |
-| Docker | 29.x | Only for the local stack and the Redis-backed tests |
-| An API key | none | Delta's market data is public. There is no `.env` and no secret |
+| Python | 3.13 | The back end. Version 3.12 works, with one known test failure |
+| Bun | Current | The tool that installs and runs the front end. **Not npm and not pnpm** |
+| Docker | 29 or later | Only needed for the full multi-container setup and a few tests |
 
-Every outbound request needs a `User-Agent` header or Delta's edge answers `403` with HTML.
-The client sets one; a hand-rolled `curl` must too.
+**You do not need an account, an API key, or any credentials.** Everything this project reads from
+Delta Exchange is public. There is no `.env` file to create and no secret to obtain.
 
-## Install
+One quirk to know about in advance: Delta's servers reject any request that does not identify itself
+with a `User-Agent` header, answering with an error page instead of data. The code always sets one.
+If you try a request by hand with `curl` and get an unexpected error, that is usually why.
 
-From `engine/`:
+## Installing
+
+Two installations, one for each half of the project.
+
+For the back end, from inside the `engine/` folder, create an isolated Python environment and
+install into it:
 
 ```sh
 python -m venv .venv
-.venv/bin/python -m pip install -r requirements-dev.txt         # POSIX
-.venv/Scripts/python.exe -m pip install -r requirements-dev.txt # Windows
+.venv/bin/python -m pip install -r requirements-dev.txt          # macOS and Linux
+.venv/Scripts/python.exe -m pip install -r requirements-dev.txt  # Windows
 ```
 
-`requirements.txt` is the runtime (FastAPI, httpx, uvicorn, polars, redis). `requirements-dev.txt`
-pulls that in and adds pytest and ruff. There is **no install step for the package itself** --
-`--app-dir src` is what puts `deltapayoff` on the path.
+There are two requirement files. `requirements.txt` lists what is needed to run the software;
+`requirements-dev.txt` includes those and adds the testing tools. Install the second one unless you
+have a reason not to.
 
-From `web/`:
+Note that there is no step that installs the project itself as a package. Instead, the command that
+starts it points at the source folder directly, which is what the `--app-dir src` argument below is
+doing.
+
+For the front end, from inside the `web/` folder:
 
 ```sh
 bun install
 ```
 
-## Run the monolith
+## The simplest way to run it
 
-Engine first, from `engine/`:
+This runs everything in one program, which is the easiest arrangement to work with. Start the back
+end first, from `engine/`:
 
 ```sh
 .venv/bin/python -m uvicorn --app-dir src deltapayoff.main:app --port 8000 --reload
 ```
 
-Then the web app, from `web/`:
+Then start the front end, from `web/`:
 
 ```sh
-bun run dev        # http://localhost:3000
+bun run dev
 ```
 
-**CORS allows only port 3000** (`localhost` and `127.0.0.1`). Serving the web side from any
-other port fails in a way that looks exactly like the engine being down. `/ws/chain` is a
-websocket handshake and is not subject to CORS.
+Open http://localhost:3000. You should see the option chain filling in within a few seconds.
 
-With no environment set, `deltapayoff.main:app` is the in-process monolith: it opens the single
-venue websocket, fans out to the chain cache and the bar writer, and serves every route.
+**The front end must be on port 3000.** For safety, browsers refuse to let a page call a server at a
+different address unless that server explicitly permits it, and the back end permits port 3000 and
+nothing else. If you serve the front end from any other port, the page will load but stay empty, and
+it will look exactly as though the back end is not running.
 
-### Running without the venue
+### Running without connecting to the venue
+
+Sometimes you want the back end running -- to work on the historical screens, or to run something
+against it -- without opening a live connection to Delta. Set one variable:
 
 ```sh
 DELTA_LIVE_FEED=0 .venv/bin/python -m uvicorn --app-dir src deltapayoff.main:app --port 8000
 ```
 
-The REST routes and the websocket serve; no socket to Delta is opened. This is what the test
-suite sets, and it is the right setting for working on the read paths offline.
+Everything answers normally; nothing connects to the venue. This is also what the test suite does.
 
-## Run the split stack
+## Running the full multi-program setup
 
-Three apps and a Redis replace the monolith when `DELTA_BUS=redis` is set. Each is an ordinary
-uvicorn app:
-
-```sh
-DELTA_BUS=redis DELTA_REDIS_URL=redis://127.0.0.1:6379 \
-  .venv/bin/python -m uvicorn --app-dir src deltapayoff.feed_main:app --port 8001
-# and likewise deltapayoff.store_main:app, deltapayoff.main:app, deltapayoff.alert_main:app
-```
-
-Redis is **mandatory** in that mode: an unreachable Redis fails startup with `BusUnavailable`
-before the feed opens the venue socket. See [Configuration](configuration.md) for the full
-variable list and [Architecture](architecture.md) for what each process owns.
-
-## Run the Docker stack
-
-Seven containers -- `feed`, `store`, `api`, `web`, `discord-alerts`, `redis` and an nginx
-proxy -- behind one host port. From the repository root:
+In production the work is divided between four programs and a Redis server. The easiest way to run
+that arrangement locally is with Docker, which starts all of it together. From the top of the
+repository:
 
 ```sh
 docker compose --project-name dxp --env-file stack.env up -d --wait --wait-timeout 120
 ```
 
-Open [http://localhost:8080/](http://localhost:8080/). Tear it down by project name, never by a
-prune:
+Then open http://localhost:8080. To stop it, use the same project name -- never a general cleanup
+command, which would also remove containers belonging to other work:
 
 ```sh
 docker compose --project-name dxp --env-file stack.env down --remove-orphans
 ```
 
-Port 8080 is the stack's only host listener: a dev engine owns 8000 and a dev web server owns
-3000, and the stack binds neither. The proxy makes the browser same-origin, so CORS does not
-apply -- `/api/` is stripped and forwarded to the api, and everything else goes to `web`.
+Three things about this setup are worth knowing.
 
-The stack's store root is `./.stack-data/`, **never** `data/`, which holds the live store and is
-read-only. Start-to-healthy is `measured` **14.11 s** for the whole stack.
+**It uses port 8080 and nothing else.** A development back end already owns 8000 and a development
+front end owns 3000, so the containers deliberately avoid both. Everything reaches the browser
+through a single small proxy, which means the browser only ever talks to one address -- and the
+browser safety rule described above never comes into play at all.
 
-### Smoke test
+**It writes its data somewhere separate.** The containers write to `.stack-data/`, never to the
+`data/` folder, which holds the real recorded history and is read-only.
 
-A scripted fake adapter, no venue contact, and a real Parquet file as the assertion:
+**It connects to the real venue.** Starting it creates a genuine second subscriber alongside
+anything else you have running. That is within what the venue allows, but do not leave it running by
+accident.
+
+The whole stack takes about fifteen seconds to become ready.
+
+### Proving it works without touching the venue
+
+There is a self-contained check that starts the stack with a *fake* venue that replays a recorded
+script, drives the web page and the API, and then verifies that a real data file appeared on disk:
 
 ```sh
 engine/.venv/bin/python tools/smoke_stack.py --project-name smoke65 --proxy-port 8099
 ```
 
-Use that form whenever a stack is already running. The script tears down whatever project it was
-given, so a bare run with the default project name is the one that would stop yours.
+Always pass those two arguments if you already have a stack running, since the script shuts down
+whichever project it was given when it finishes.
 
-## Verify
+## Running the tests
 
 From `engine/`:
 
 ```sh
 .venv/bin/python -m pytest -q      # the whole suite
-.venv/bin/python -m ruff check .
+.venv/bin/python -m ruff check .   # the style and correctness checker
 ```
 
-The suite is **1,610** tests with Docker available (`measured` 2026-09-14 at `7783a4b`).
-Without Docker the Redis-backed parametrisations skip: the collected count is the same and the
-passed count is lower. A run that collects far fewer has failed to collect, whatever it printed.
+The suite is about **1,610 tests** and takes seconds. If Docker is not available, the tests that
+need Redis are skipped rather than failed, so the number reported as passing will be lower while the
+number collected stays the same. **If far fewer than 1,610 tests are collected, something failed to
+load** -- that is a real problem regardless of what the summary says.
 
 From `web/`:
 
@@ -136,24 +152,25 @@ bun run test
 bun run build
 ```
 
-**No test may touch the network.** `tests/conftest.py` sets `DELTA_LIVE_FEED=0` and replaces the
-async client factory with one that raises, so a test that tries fails loudly.
+**No test is allowed to touch the network.** The test setup disables the live connection and
+replaces the thing that makes web requests with one that raises an error, so a test that tries to
+reach the internet fails loudly rather than passing slowly and unpredictably.
 
-## Probes
+## Useful tools
 
-`tools/` holds probes, not engine code. They answer questions about the venue and the store without
-touching either service:
+The `tools/` folder holds small standalone scripts that are not part of the running system. They
+answer questions about the venue and about the stored data without either half of the project
+needing to be running. The table below lists the ones most people want first.
 
-```sh
-python tools/measure_feed.py          # channel refresh rates
-python tools/measure_arrival_lag.py   # ts_received - ts_venue, per channel
-python tools/measure_store.py         # what the store writes, and how big
-python tools/probe_api.py             # the REST surface
-```
+| Script | What it tells you |
+|---|---|
+| `measure_feed.py` | How often the venue actually sends each kind of update |
+| `measure_arrival_lag.py` | How long messages are taking to reach us |
+| `measure_store.py` | What is in the stored files and how much space it uses |
+| `probe_api.py` | What the venue's ordinary web API returns |
 
-## Related guides
+## Where to go next
 
-- [Overview](overview.md) -- what the system does and why
-- [Architecture](architecture.md) -- what each process owns
-- [Configuration](configuration.md) -- every environment variable
-- [API reference](api-reference.md) -- the routes the web app calls
+[Overview](overview.md) explains what you are looking at on screen.
+[Architecture](architecture.md) explains how the parts you just started fit together.
+[Configuration](configuration.md) lists every setting you can change.
