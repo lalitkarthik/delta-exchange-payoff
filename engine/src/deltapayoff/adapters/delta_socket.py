@@ -87,6 +87,7 @@ from typing import Any
 
 from .. import log_events
 from ..logging_setup import log_event
+from ..throughput import TRACE
 
 logger = logging.getLogger(__name__)
 
@@ -455,6 +456,21 @@ class DeltaFeed:
                     self.malformed += 1
                     continue
                 if venue_message is not None:
+                    # **Behind the gate, and the branch is a bare module constant.** At
+                    # `measured` 5,122 frames a second this line runs five thousand times
+                    # a second whether or not anybody wants the trace, so it costs one
+                    # already-resolved boolean and never an `os.environ` lookup.
+                    if TRACE:
+                        log_event(
+                            logger,
+                            logging.DEBUG,
+                            log_events.FEED_MESSAGE,
+                            "frame on %s",
+                            venue_message.channel,
+                            channel=venue_message.channel,
+                            instrument=venue_message.symbol,
+                            bytes=len(raw),
+                        )
                     self.sink.publish(venue_message)
         finally:
             # This connection is over, so nothing may be sent on it again: a live

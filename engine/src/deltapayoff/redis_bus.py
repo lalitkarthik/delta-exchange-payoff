@@ -54,6 +54,7 @@ from . import log_events
 from .events.redis_wire import decode, encode, stream_name, stream_names, stream_type
 from .fanout import Subscription
 from .logging_setup import log_event
+from .throughput import TRACE
 
 logger = logging.getLogger(__name__)
 
@@ -571,6 +572,18 @@ class RedisBus:
             )
             return
 
+        if TRACE:
+            log_event(
+                logger,
+                logging.DEBUG,
+                log_events.BUS_PUBLISH,
+                "%s queued for %s",
+                getattr(record, "type", type(record).__name__),
+                key,
+                event_type=getattr(record, "type", type(record).__name__),
+                key=key,
+                outbox=len(self._outbox) + 1,
+            )
         self._outbox.append((key, fields))
         if len(self._outbox) > self.config.max_outbox:
             # The fan-out's rule, one layer up: bounded, oldest first, and counted.
@@ -783,6 +796,7 @@ class RedisBus:
         return {
             name: {
                 "offered": s.offered,
+                "consumed": s.consumed,
                 "dropped": s.dropped,
                 "queued": s.queue.qsize(),
                 "lossless": s.lossless,
@@ -1367,6 +1381,22 @@ class RedisBus:
         for key, entries in got:
             if entries:
                 pipe.xack(key, sub.group, *[entry_id for entry_id, _ in entries])
+                if TRACE:
+                    # **Per batch, not per entry.** An ack covers a whole read and a line
+                    # apiece would be the flood the gate exists to keep optional even when
+                    # the gate is open; the count is the part that says what left.
+                    log_event(
+                        logger,
+                        logging.DEBUG,
+                        log_events.BUS_RELEASE,
+                        "%d entries acked on %s for %s",
+                        len(entries),
+                        _text(key),
+                        sub.name,
+                        subscriber=sub.name,
+                        key=_text(key),
+                        entries=len(entries),
+                    )
         await pipe.execute()
         for key, entries in got:
             name = _text(key)

@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import logging.handlers
+import os
 import sys
 from collections.abc import Callable
 from datetime import UTC, date, datetime
@@ -45,7 +46,98 @@ from . import log_events
 
 #: Extra fields with a fixed, documented meaning. Anything else passed as `extra` lands
 #: beside them under its own name — see `JsonFormatter.format`.
-FIXED_EXTRA_FIELDS = ("venue", "instrument", "conn_state", "event_id")
+FIXED_EXTRA_FIELDS = ("component", "venue", "instrument", "conn_state", "event_id")
+
+#: Which **subsystem** a record came from, keyed by the module that logged it.
+#:
+#: **Not the process.** Naming the process was the first design, and in the split
+#: deployment it reads well — but in the ordinary `uvicorn main:app` monolith there is
+#: exactly one process, so every line said `api` and `tools/logs.py feed` printed nothing
+#: while the socket was busily reading Delta *inside that same process*. The subsystem is
+#: the thing an operator actually wants to filter on, and it is right in both
+#: deployments: in the split stack the feed process only runs feed modules anyway, so the
+#: two answers coincide there and only the monolith gains.
+#:
+#: A module with no entry falls back to the process name below, so a new module is
+#: unlabelled rather than mislabelled, and `deltapayoff.adapters.delta_socket` matches on
+#: `adapters.delta_socket` — the longest suffix wins, so a package entry can cover a
+#: subtree without naming every module in it.
+COMPONENT_BY_MODULE: dict[str, str] = {
+    "adapters": "feed",
+    "adapters.delta": "feed",
+    "adapters.delta_socket": "feed",
+    "controller": "feed",
+    "delta_client": "feed",
+    "feed_main": "feed",
+    "feed_runtime": "feed",
+    "supervisor": "feed",
+    "fanout": "bus",
+    "redis_bus": "bus",
+    "bar_buffer": "store",
+    "bars": "store",
+    "contract_bars": "store",
+    "historical": "store",
+    "store": "store",
+    "store_home": "store",
+    "store_main": "store",
+    "chain": "chain",
+    "compute": "chain",
+    "iv_index": "chain",
+    "smile": "chain",
+    "stream": "chain",
+    "volatility": "chain",
+    "alert_consumer": "alerts",
+    "alert_main": "alerts",
+    "discord_alerts": "alerts",
+    "main": "api",
+}
+
+#: What to call records from a module `COMPONENT_BY_MODULE` does not name — uvicorn's own
+#: loggers, a library's, a module nobody has classified yet. Each entrypoint sets it, and
+#: `DELTA_COMPONENT` overrides the default for a deployment.
+#:
+#: A module global read at **emit** time rather than an argument to `configure_logging`,
+#: because `main.py` configures at import and `feed_main.py` imports `main` — so whichever
+#: entrypoint you launch, main's call is the one that wins and `_configured_loggers` makes
+#: every later call a no-op. A parameter would stamp `api` on the feed process. This way
+#: the ordering cannot matter.
+_component = os.environ.get("DELTA_COMPONENT", "api")
+
+
+def set_component(name: str) -> None:
+    """Name the process, for records no module mapping claims. Called by an entrypoint."""
+    global _component
+    _component = name
+
+
+def current_component() -> str:
+    return _component
+
+
+def component_for(logger_name: str) -> str:
+    """The subsystem a logger belongs to; the process name when nothing claims it."""
+    parts = logger_name.removeprefix("deltapayoff.").split(".")
+    for start in range(len(parts)):
+        found = COMPONENT_BY_MODULE.get(".".join(parts[start:]))
+        if found is not None:
+            return found
+    return _component
+
+
+class _ComponentFilter(logging.Filter):
+    """Stamp the subsystem on every record that does not carry one already."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "component", None) is None:
+            record.component = component_for(record.name)
+        return True
+
+
+#: Attributes a library puts on its own records that are noise in ours. Uvicorn attaches
+#: `color_message` — the same sentence again with ANSI escapes in it — to every line it
+#: logs, and a log file that gets grepped a week later does not want a second, escaped
+#: copy of every message.
+_NOISE_ATTRS = frozenset({"color_message"})
 
 #: A record's own attributes before any `extra` is applied, computed once from a real
 #: `LogRecord` rather than hand-copied from the documentation — so a future Python that
@@ -101,6 +193,8 @@ class JsonFormatter(logging.Formatter):
             payload["exc_info"] = self.formatException(record.exc_info)
         for key, value in record.__dict__.items():
             if key in _STANDARD_ATTRS or key in FIXED_EXTRA_FIELDS or key == "event":
+                continue
+            if key in _NOISE_ATTRS:  # a library's escaped copy of its own message
                 continue
             payload[key] = value
         return json.dumps(payload, default=str)
@@ -227,6 +321,7 @@ def configure_logging(
     directory = default_logs_directory() if directory is None else Path(directory)
     file_handler = DailyFileHandler(directory)
     file_handler.setFormatter(JsonFormatter())
+    file_handler.addFilter(_ComponentFilter())
     target.addHandler(file_handler)
 
     # **A tty chooses the formatter, never whether the handler exists** (#103). It was
@@ -238,7 +333,21 @@ def configure_logging(
     # wants, and for anything that parses a line rather than looks at it.
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setFormatter(ColorFormatter() if is_terminal() else JsonFormatter())
+    console_handler.addFilter(_ComponentFilter())
     target.addHandler(console_handler)
+
+    # **Uvicorn's own loggers, onto the same two handlers.** They are not children of
+    # `deltapayoff`, so until now they propagated to root with the default format and
+    # never reached the day's file — which is why `docker logs` in #103 showed four
+    # lines of uvicorn and nothing else. A server's "application startup complete" and
+    # its access lines belong in the same stream as everything else the api process
+    # says. `propagate`
+    # goes false so root does not print a second, unformatted copy beside ours. They
+    # arrive without an `event`, which `JsonFormatter` already renders as `"log"`.
+    if logger_name == "deltapayoff":
+        uvicorn_logger = logging.getLogger("uvicorn")
+        uvicorn_logger.handlers = [file_handler, console_handler]
+        uvicorn_logger.propagate = False
 
     _configured_loggers.add(logger_name)
     return target

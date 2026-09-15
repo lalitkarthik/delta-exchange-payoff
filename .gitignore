@@ -19,6 +19,9 @@ tools/.env
 
 # probe output
 tools/out/
+# A websocket tick-rate capture carries a per-contract chain snapshot beside its
+# counts — market data, and never committed for the same reason data/ is not.
+tools/ws-tick-rate-*.json
 
 # the bar store. Market data is never committed: it is regenerable from the feed,
 # it is Delta's to publish rather than ours to redistribute, and at a measured

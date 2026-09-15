@@ -21,11 +21,16 @@ import pytest
 
 from deltapayoff import log_events
 from deltapayoff.logging_setup import (
+    COMPONENT_BY_MODULE,
     ColorFormatter,
     DailyFileHandler,
     JsonFormatter,
+    _configured_loggers,
+    component_for,
     configure_logging,
+    current_component,
     log_event,
+    set_component,
 )
 
 REPO = Path(__file__).resolve().parents[2]
@@ -347,3 +352,128 @@ def test_color_formatter_actually_emits_ansi_codes_when_used() -> None:
     assert "\033[" in line
     assert "feed.stale" in line
     assert "conn_state=degraded" in line
+
+
+def test_a_record_carries_the_component_the_process_named_itself(tmp_path: Path) -> None:
+    """Every line says which *process* wrote it, not only which module.
+
+    `logger` is the module, and in split mode (`DELTA_BUS=redis`) the api and the store
+    process both run `deltapayoff.redis_bus` — so without this field a line from one is
+    indistinguishable from a line from the other in the combined log.
+    """
+    logger = configure_logging(
+        "deltapayoff.test.component", directory=tmp_path, is_terminal=lambda: False
+    )
+    handler = next(h for h in logger.handlers if isinstance(h, DailyFileHandler))
+    before = current_component()
+    try:
+        set_component("store")
+        log_event(logger, logging.INFO, log_events.STORE_FLUSH, "wrote", rows=12)
+    finally:
+        set_component(before)
+
+    written = json.loads(
+        handler.current_path.read_text(encoding="utf-8").splitlines()[-1]
+    )
+
+    assert written["component"] == "store"
+    assert written["logger"] == "deltapayoff.test.component"
+    assert written["rows"] == 12
+
+
+def test_an_explicit_component_on_the_call_wins_over_the_process_name(
+    tmp_path: Path,
+) -> None:
+    """The filter fills the field in; it does not overwrite one a caller supplied, so a
+    process relaying another's record can say whose it was."""
+    logger = configure_logging(
+        "deltapayoff.test.component_explicit",
+        directory=tmp_path,
+        is_terminal=lambda: False,
+    )
+    handler = next(h for h in logger.handlers if isinstance(h, DailyFileHandler))
+    before = current_component()
+    try:
+        set_component("store")
+        log_event(logger, logging.INFO, log_events.ALERT, "relayed", component="feed")
+    finally:
+        set_component(before)
+
+    written = json.loads(
+        handler.current_path.read_text(encoding="utf-8").splitlines()[-1]
+    )
+
+    assert written["component"] == "feed"
+
+
+def test_uvicorns_own_loggers_reach_the_same_handlers(tmp_path: Path) -> None:
+    """#103's other half: uvicorn is not a child of `deltapayoff`, so its records went to
+    root with the default format and never reached the day's file — which is why
+    `docker logs` showed four lines of uvicorn and nothing of the engine underneath."""
+    uvicorn_logger = logging.getLogger("uvicorn")
+    engine_logger = logging.getLogger("deltapayoff")
+    saved = (uvicorn_logger.handlers, uvicorn_logger.propagate, engine_logger.handlers)
+    configured = "deltapayoff" in _configured_loggers
+    _configured_loggers.discard("deltapayoff")
+    try:
+        configure_logging("deltapayoff", directory=tmp_path, is_terminal=lambda: False)
+        handler = next(
+            h for h in uvicorn_logger.handlers if isinstance(h, DailyFileHandler)
+        )
+        uvicorn_logger.warning("application startup complete")
+        written = json.loads(
+            handler.current_path.read_text(encoding="utf-8").splitlines()[-1]
+        )
+        # false, so root does not print an unformatted second copy beside ours
+        assert uvicorn_logger.propagate is False
+    finally:
+        uvicorn_logger.handlers, uvicorn_logger.propagate, engine_logger.handlers = saved
+        if configured:
+            _configured_loggers.add("deltapayoff")
+        else:
+            _configured_loggers.discard("deltapayoff")
+
+    # No `event` was given, so the formatter's documented fallback applies.
+    assert written["event"] == "log"
+    assert written["msg"] == "application startup complete"
+    assert written["logger"] == "uvicorn"
+    assert written["component"]
+
+
+def test_the_component_is_the_subsystem_not_the_process(tmp_path: Path) -> None:
+    """`tools/logs.py feed` must show something in the monolith, where there is no feed
+    *process* -- the socket runs inside the api's. Naming the process was the first design
+    and it made every line in an ordinary `uvicorn main:app` run say `api`, including the
+    ones the venue socket wrote while it was reading Delta."""
+    before = current_component()
+    try:
+        set_component("api")
+
+        assert component_for("deltapayoff.adapters.delta_socket") == "feed"
+        assert component_for("deltapayoff.controller") == "feed"
+        assert component_for("deltapayoff.fanout") == "bus"
+        assert component_for("deltapayoff.redis_bus") == "bus"
+        assert component_for("deltapayoff.store") == "store"
+        assert component_for("deltapayoff.stream") == "chain"
+        assert component_for("deltapayoff.main") == "api"
+        # nothing claims these, so they fall back to the process rather than guess
+        assert component_for("uvicorn.error") == "api"
+        assert component_for("deltapayoff.not_a_real_module") == "api"
+        set_component("store")
+        assert component_for("uvicorn.error") == "store"
+        # ...but a module that *is* claimed keeps its own subsystem whatever the process
+        assert component_for("deltapayoff.adapters.delta_socket") == "feed"
+    finally:
+        set_component(before)
+
+
+def test_every_mapped_module_exists(tmp_path: Path) -> None:
+    """A mapping entry for a module that has been renamed is a line that will silently
+    fall back to the process name forever. The map is only useful while it is true."""
+    package = Path(__file__).resolve().parents[1] / "src" / "deltapayoff"
+
+    for module in COMPONENT_BY_MODULE:
+        relative = module.replace(".", "/")
+        assert (package / f"{relative}.py").exists() or (
+            package / relative
+        ).is_dir(), f"{module} is mapped to a component but no such module exists"

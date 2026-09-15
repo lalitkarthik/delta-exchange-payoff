@@ -77,6 +77,16 @@ class _Subscription:
         self.event_types = tuple(event_types) if event_types is not None else None
         self.queue: asyncio.Queue = asyncio.Queue()
 
+    async def take(self):
+        """`fanout.Subscription.take()`, which is how every consumer now reads.
+
+        The real one counts the read and, under `DELTA_LOG_TRACE`, says so; a double that
+        only offered `queue.get()` let a consumer calling `take()` die of an
+        `AttributeError` inside a background task, which surfaced here as a 503 with no
+        obvious cause. Mirroring the seam is the point of the double.
+        """
+        return await self.queue.get()
+
 
 class _Client:
     def __init__(self) -> None:

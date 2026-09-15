@@ -22,7 +22,7 @@ from fastapi import FastAPI, Response
 from . import log_events
 from .bars import COMPUTED_SPLIT_GRACE_SECONDS, ComputedAggregator
 from .events import Alert, ControlCommand, StoreState
-from .logging_setup import configure_logging, log_event
+from .logging_setup import configure_logging, log_event, set_component
 from .main import live_underlyings
 from .redis_bus import Position, RedisBus, StreamLag
 from .store import (
@@ -41,9 +41,11 @@ from .store import (
     resolve_root,
     write_checkpoint,
 )
+from .throughput import start as start_throughput
 
 logger = logging.getLogger(__name__)
 configure_logging()
+set_component("store")
 
 STORE_EVENT_TYPES = (
     "md.option_quote",
@@ -488,7 +490,7 @@ async def publish_state_forever(
 async def consume_control(process: StoreProcess) -> None:
     """Queue commands so the writer applies them at its next drained point."""
     while True:
-        event = await process.control_subscription.queue.get()
+        event = await process.control_subscription.take()
         if isinstance(event, ControlCommand):
             process.writer.enqueue_command(event)
 
@@ -747,6 +749,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         asyncio.create_task(publish_state_forever(process), name="store-state"),
         asyncio.create_task(monitor_bus_forever(process), name="store-bus-monitor"),
     ]
+    # No socket here -- the feed is its own process -- so the bus is the only subject.
+    start_throughput(process.tasks, bus=process.bus)
     publish_state(process)
     app.state.process = process
     app.state.bus = process.bus

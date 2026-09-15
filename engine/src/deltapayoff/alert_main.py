@@ -7,7 +7,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -15,11 +15,16 @@ from fastapi import FastAPI, Response
 
 from . import alert_consumer, discord_alerts, log_events
 from .fanout import FanOut
-from .logging_setup import configure_logging, log_event
+from .logging_setup import configure_logging, log_event, set_component
 from .redis_bus import REDIS_BUS, BusConfig, RedisBus, selected_bus
+from .throughput import start as start_throughput
 
 logger = logging.getLogger(__name__)
-configure_logging(is_terminal=lambda: True)
+# **Not `is_terminal=lambda: True`.** Forcing colour here wrote ANSI escape codes into
+# `docker logs dxp-discord-alerts-1` while the other three services wrote JSON. The
+# default predicate asks the stream itself, which is what every other entrypoint does.
+configure_logging()
+set_component("alerts")
 
 #: The committed stack environment reserves this name; the real secret belongs in the
 #: optional, git-ignored `stack.local.env` overlay.
@@ -35,6 +40,8 @@ class AlertProcess:
     consumer: alert_consumer.AlertConsumer
     webhook_url: str | None
     task: asyncio.Task | None = None
+    #: The periodic `bus.throughput` reporter. Cancelled with the consumer.
+    throughput_tasks: list[asyncio.Task] = field(default_factory=list)
 
 
 async def _post_discord(
@@ -72,6 +79,11 @@ async def _close_process(process: AlertProcess) -> None:
         process.task.cancel()
         await asyncio.gather(process.task, return_exceptions=True)
         process.task = None
+    for task in process.throughput_tasks:
+        task.cancel()
+    if process.throughput_tasks:
+        await asyncio.gather(*process.throughput_tasks, return_exceptions=True)
+        process.throughput_tasks = []
     if isinstance(process.bus, RedisBus):
         await process.bus.aclose()
 
@@ -105,6 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if isinstance(bus, RedisBus):
             await bus.start()
         process.task = asyncio.create_task(consumer.run(), name="alert-consumer")
+        start_throughput(process.throughput_tasks, bus=bus)
         _set_state(app, process)
         yield
     finally:

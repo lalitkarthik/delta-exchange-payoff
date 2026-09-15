@@ -146,4 +146,4 @@ class BarBuffer:
         if self._subscription is None:
             raise RuntimeError("attach() the bar buffer before running it")
         while True:
-            self.apply(await self._subscription.queue.get())
+            self.apply(await self._subscription.take())

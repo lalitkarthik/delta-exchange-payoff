@@ -51,6 +51,7 @@ from typing import Any
 
 from . import log_events
 from .logging_setup import log_event
+from .throughput import TRACE
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class Subscription:
         "queue",
         "dropped",
         "offered",
+        "consumed",
         "lossless",
         "capacity",
         "over_capacity",
@@ -84,11 +86,65 @@ class Subscription:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=0 if lossless else maxsize)
         self.dropped = 0
         self.offered = 0
+        #: What a consumer actually took off this queue, via `take()`.
+        self.consumed = 0
         #: Offers made while the queue already stood at or above `capacity`.
         self.over_capacity = 0
         #: The deepest the queue has ever been. Lossless only — under drop-oldest it is
         #: `capacity` by construction and says nothing.
         self.backlog_peak = 0
+
+    async def take(self) -> Any:
+        """The one way a consumer reads. Blocks until a record is there.
+
+        **Every consumer goes through here rather than touching `queue` directly**, which
+        is what makes `bus.consume` and `bus.release` possible to say at all: a `get()` on
+        the raw queue is invisible to the bus, and a lifecycle nobody can observe the end
+        of is not a lifecycle.
+
+        On this bus the read *is* the release -- each subscriber holds its own copy, so a
+        record is gone from this subscription the instant it is dequeued, and gone from
+        the bus when the last subscription has done so. `consumed` is what makes that
+        countable; the fan-out itself cannot see a `get()`.
+        """
+        return self._took(await self.queue.get())
+
+    def take_nowait(self) -> Any:
+        """`take()` without awaiting; raises `asyncio.QueueEmpty` like the queue does.
+
+        The bar writer drains its backlog in a tight loop between awaits, and those reads
+        are the ones a lossless consumer's backlog is made of -- counting the awaited read
+        and not this one would report a store that had fallen behind as one that had
+        stopped consuming entirely.
+        """
+        return self._took(self.queue.get_nowait())
+
+    def _took(self, record: Any) -> Any:
+        self.consumed += 1
+        if TRACE:
+            event_type = getattr(record, "type", type(record).__name__)
+            log_event(
+                logger,
+                logging.DEBUG,
+                log_events.BUS_CONSUME,
+                "%s read by %s",
+                event_type,
+                self.name,
+                subscriber=self.name,
+                event_type=event_type,
+                queued=self.queue.qsize(),
+            )
+            log_event(
+                logger,
+                logging.DEBUG,
+                log_events.BUS_RELEASE,
+                "%s released by %s",
+                event_type,
+                self.name,
+                subscriber=self.name,
+                event_type=event_type,
+            )
+        return record
 
     def offer(self, record: Any) -> None:
         """Put `record` on the queue. **Never blocks and never awaits.**
@@ -183,6 +239,16 @@ class FanOut:
         anything that could suspend here suspends the socket.
         """
         self.published += 1
+        if TRACE:
+            log_event(
+                logger,
+                logging.DEBUG,
+                log_events.BUS_PUBLISH,
+                "%s entered the bus",
+                getattr(record, "type", type(record).__name__),
+                event_type=getattr(record, "type", type(record).__name__),
+                subscribers=len(self._subscriptions),
+            )
         for subscription in self._subscriptions.values():
             subscription.offer(record)
 
@@ -194,6 +260,7 @@ class FanOut:
                 # read — the bus cannot know the latter. `offered - dropped` is what
                 # survived to be readable; `queued` is what is waiting right now.
                 "offered": subscription.offered,
+                "consumed": subscription.consumed,
                 "dropped": subscription.dropped,
                 "queued": subscription.queue.qsize(),
                 "lossless": subscription.lossless,
