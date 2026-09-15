@@ -1,199 +1,198 @@
 # Message bus
 
-**One producer, many independent consumers.** The bus is two methods --
-`publish(event)` and `subscribe(name, maxsize, lossless)` -- and every design choice below exists
-to keep those two methods honest across an in-process queue and a network broker.
+**What this page contains.** What the message bus is, its two implementations, the two delivery
+guarantees it offers and why there are two, and the rules for naming, acknowledging, discarding and
+persisting messages.
 
-What travels on it is [Events](events.md), which wins on names and directions.
+**How to read it.** The first three sections are concepts and are worth reading in order; the rest
+are operational rules to come back to when changing the bus or diagnosing a problem. It assumes you
+know what an event is -- if not, read [Events](events.md) first.
 
-## The interface, and why it is two methods
+## What the bus is
 
-`Bus` is a `runtime_checkable` `Protocol` naming `publish` and `subscribe`, and **it defines no
-behaviour**. Queue policy belongs to the implementation that argues it.
+The bus is the thing that carries messages from the part that produced them to the parts that want
+them. It offers exactly two operations, and the entire design exists to keep those two honest.
 
-**Conformance is structural, not nominal.** `class FanOut(Bus)` was written first and reverted: a
-`Protocol`'s methods are not abstract, so a subclass implementing *neither* still constructs and
-inherits `...`-bodied stubs returning `None`. A missing `publish` would stop raising
-`AttributeError` and start **dropping messages silently**, and an `isinstance` test against a
-nominal subclass is `True` whatever the class contains. The structural check fails when a method
-goes missing; that is the whole reason it is the one used.
-
-**The publisher never blocks.** The socket handler publishes and returns; if it blocked, the OS
-receive buffer would fill and the venue would close us. That rule is why the bus exists at all,
-rather than the socket reader calling the consumers directly.
-
-## Queue policy is per subscription, and does not change
-
-| Consumer | Policy | Why |
-|---|---|---|
-| Bar writer | **lossless** | A dropped message is a permanent hole in the record. Drop-oldest under load systematically shaves the highs and lows bars exist to capture |
-| Chain cache | **drop-oldest** | It holds only the newest frame per contract anyway, and a four-second-old quote is worthless to a screen |
-| Feed/store state caches | drop-oldest | Only the latest state matters |
-| Alert consumer | lossless | An alert nobody sees is the failure it was raised about |
-
-**Every drop is counted, because a silent drop is a lie.** On Redis, so is every entry a reader
-skipped: Redis trims silently and this does not.
-
-For a lossless subscription `maxsize` is a **watermark**, not a ceiling -- an over-capacity offer
-is counted and delivered. A genuine lossless drop is logged at **error**, because under the current
-construction it should be impossible.
-
-## Two implementations behind one seam
-
-| | `fanout.py` | `redis_bus.py` |
-|---|---|---|
-| Selected by | `DELTA_BUS` unset (the default) | `DELTA_BUS=redis` |
-| Transport | asyncio queues in one process | Redis Streams |
-| Scope | the monolith | the four-process split |
-| Delivery | direct | pipelined batches, `XADD` |
-
-A producer and a consumer are opened by neither choice. Redis is **mandatory** in split mode: an
-unreachable Redis raises `BusUnavailable` at startup, before the feed opens the venue socket.
-
-## Why Redis Streams, and not a managed service
-
-**No AWS message service carries this bus.** Redis Streams does, in a container beside the
-services, on the instance's own loopback under `host` network mode.
-
-| Rejected | Why |
+| Operation | What it does |
 |---|---|
-| ElastiCache for Valkey | `derived` $47.30/month against a container's $0. **The named fallback** if the hosting criteria move -- one endpoint string |
-| ElastiCache Serverless | It has no `maxmemory`, so a trim that stops working is a bill and not an error |
-| MemoryDB | Durability is the product and cannot be turned off, for frames the venue can re-tell |
-| ZeroMQ | Settled against in-process fan-out early; do not reopen |
+| **Publish** | Put one event onto the bus. Returns immediately; the publisher never learns who read it |
+| **Subscribe** | Ask for a copy of every event on a named stream, choosing a delivery policy |
 
-**A container, not a managed cache, because the bus is a pipe.** Losing it costs a restart and not
-history: the store replays from its checkpoint, and the api refills its cache from the live events
-that follow, inside one book refresh -- `measured` 508 ms a contract.
+Because that is the whole interface, producers and consumers are written without either knowing how
+delivery happens -- in memory, or across a network. **Publishing must never wait.** The code reading the venue's connection publishes and returns to
+reading immediately. If publishing could block, the venue's messages would pile up in the operating
+system's buffer, the buffer would fill, and the venue would close the connection on us. That single
+requirement is why a bus exists at all, instead of the reading loop simply calling the other parts.
 
-## Stream names
+## Two implementations, one interface
+
+The same interface has two implementations, and a single setting chooses between them.
+
+| | In-process fan-out | Redis Streams |
+|---|---|---|
+| Chosen by | leaving `DELTA_BUS` unset -- the default | setting `DELTA_BUS=redis` |
+| How it delivers | queues inside one running program | through a Redis server, between programs |
+| Used by | the single-process arrangement | the multi-process arrangement, including production |
+
+Neither choice requires a producer or consumer to be written differently. In the multi-process
+arrangement **Redis is required**: if it cannot be reached the feed refuses to start, because a feed
+that looks healthy while silently discarding everything it receives is the worst failure available.
+
+## The two delivery policies
+
+Every subscriber picks one of two policies when it subscribes, and the choice does not change later.
+The table below explains both.
+
+| Policy | Behaviour when a reader falls behind | Who uses it |
+|---|---|---|
+| **Drop-oldest** | The oldest waiting messages are discarded, and the number discarded is counted | The live screen, and the small caches that track the feed's and the store's condition |
+| **Lossless** | Nothing is discarded, however far behind the reader falls | The file writer, and the alert forwarder |
+
+The reasoning differs in each case. For the live screen a price from four seconds ago is useless --
+it keeps only the newest price per contract anyway, so discarding an older one loses nothing. For
+the file writer a discarded message is a hole in the record that no later run can fill, and dropping
+under load would systematically remove the busiest moments, which are exactly the ones a price
+summary exists to capture.
+
+**Every discard is counted, because a silent discard is a lie.** That extends to Redis, which
+discards old entries quietly on its own: our reader notices how many it skipped and reports that
+too. For a lossless subscription the configured size is a *warning level* rather than a hard limit --
+exceeding it is counted and reported, but the message is still delivered, and an actual lossless
+drop is logged as an error because it should be impossible.
+
+## Why Redis, running as a container
+
+Redis is not a message broker in the traditional sense; it is a fast in-memory data store that
+happens to offer a stream data type, which is what we use. It runs as an ordinary container beside
+the other programs, so publishing never leaves the machine. **It is treated as a pipe, not as
+storage.** Losing it entirely costs a restart, not history: the
+recorder resumes from its saved position and the screen refills within about half a second from the
+prices that arrive next. The permanent record is the Parquet files. Moving to a managed Redis
+service later would be a change of one connection string, with the configuration described under
+*Persistence* below.
+
+## How streams are named
+
+Messages are separated into named **streams**, so a reader only receives what it asked for. Names
+follow one pattern:
 
 ```
-{event_type}:{VENUE}[:{UNDERLYING}]
+{kind of event}:{VENUE}[:{UNDERLYING}]
+
 md.option_quote:DELTA:BTC
 ```
 
-`:` separates sections and `.` lives inside one, which is Redis's own convention. The event type is
-the first section, dots included.
+The colon separates sections, which is Redis's own convention, and dots stay inside a section. The
+table below shows how finely each kind of stream is divided, and why.
 
-| Arity | Streams |
+| Level of detail | Which streams | Why that level |
+|---|---|---|
+| One per venue and underlying | the market-data and computed streams | A reader interested in Bitcoin must not have to receive and discard Ethereum |
+| One per venue | the store's state, connection changes, heartbeats, operator commands | There is one connection and one recorder per venue, so no finer split is meaningful |
+| One overall | alerts | Nobody wants a subset of the alerts |
+
+**Stream names carry no environment name.** There is one Redis on a laptop and a different one in
+production, never shared, so writing "production" into every key would record a fact already obvious
+from which server you are talking to.
+
+**A reader is told which streams to read; it never goes looking.** There is no wildcard and no
+scanning. That sounds restrictive and is deliberate: a stream that appeared after a reader started
+would silently not be read, and the damage would stay invisible until somebody examined the
+historical record weeks later.
+
+## How an event is laid out on the wire
+
+Each event becomes one entry in a stream: the envelope fields written out individually, and
+everything specific to that kind of event in one block of JSON called `payload`. The table below
+shows which fields are always present and which are left out when they do not apply.
+
+| Field | When it is present |
 |---|---|
-| Per venue and underlying | `md.option_quote`, `md.option_reference`, `md.index_quote`, `md.option_bar`, `computed.chain` |
-| Per venue | `store.state`, `feed.connection`, `heartbeat`, `control.command` |
-| Global | `alert` -- `adapter` is nullable and no reader wants a subset |
+| `type`, `event_id`, `schema_version`, `source`, `ts_received`, `payload` | Always |
+| `ts_venue` | Only when the venue supplied a time |
+| `instrument` | Only when the event concerns one specific contract |
+| `venue_symbol` | Only when we know the venue's own name for that contract |
 
-**No environment section.** There is one Redis on a laptop and one in prod, and they never share
-one. **Numbered databases are not used and `SELECT` is never called**: Redis Cluster supports
-database zero only, so a layout depending on database numbers cannot move to a managed Redis.
+Two rules govern this layout. **Absence is expressed by leaving the field out entirely** -- never by
+writing an empty string, the word "null" or a zero -- and **inside the JSON payload a missing number
+is written as JSON's own `null`**, which really does mean "no value" as distinct from zero.
 
-`computed.chain` keeps the expiry in the payload rather than the key, because expiries list and
-settle daily and **a key that appears daily is a key a reader misses**. `md.option_bar` keeps its
-`table` discriminator in the payload, because four names for one envelope would be four registries.
+Together these mean the whole event can be reassembled and validated by exactly the same code that
+validates a locally produced one, so nothing extra had to be written to keep the guarantees working
+across a network. Finally, **if an event's declared type disagrees with the stream it arrived on,
+that is an error**: the stream's name is a claim about its contents, and a reader that trusts that
+claim must be able to.
 
-### Discovery is forbidden
+## Keeping your place in a stream
 
-**A reader builds its key list from configuration and never from the keyspace.** No `KEYS`, no
-`SCAN`, no pattern. `XREAD` and `XREADGROUP` take an explicit list and have no wildcard, so a
-stream discovered late is a stream that was silently not read -- which is exactly the failure that
-once left contracts listed after start-up unsubscribed, damaging only the history.
-
-## The envelope on the wire
-
-One stream entry per event: `XADD <stream> * field value ...`. The envelope is **flat**, one Redis
-field per key; the type's own keys are **one nested JSON object** in `payload`.
-
-| Redis field | Present |
-|---|---|
-| `type`, `event_id`, `schema_version`, `source`, `ts_received`, `payload` | always |
-| `ts_venue` | omitted when the venue gave none |
-| `instrument` | omitted when the event is not about one contract |
-| `venue_symbol` | omitted when the instrument carries none |
-
-1. **Absent is omitted, never spelled.** No field carries `""`, `"None"`, `"null"` or `0` to mean
-   absent. A Redis stream field is a binary string with no null in it, which is why absent values
-   live inside `payload`, where JSON has one.
-2. **`null` is not `0`**, and inside `payload` it is a JSON `null`.
-3. **`payload` plus the envelope fields is the whole event.** Reassembling them and calling
-   `parse_event` is the only decode there is, so `UnknownEventType`, `UnknownSchemaVersion`,
-   `extra="forbid"` and the non-finite refusal all keep working over the wire with nothing new
-   written to hold the line.
-4. **Field order is as tabled**, because a stream whose entries repeat one field set in one order
-   is the case Redis's listpack encoding compresses against.
-5. **A `type` that disagrees with the stream it arrived on is an error**, not a preference.
-
-## Consumer groups
+Redis lets several readers read one stream independently, each tracking its own position, by giving
+each a **consumer group** name. The rules are short.
 
 | Thing | Rule |
 |---|---|
-| Group name | the service name, lower case, one word: `store`, `api` |
-| Consumer name | `{service}-{instance}` |
-| Creation | `XGROUP CREATE <stream> <group> <id> MKSTREAM` |
-| Start id, unstated | `$`. `0` replays everything still held and has to be typed |
-| Start id, `store` | its checkpoint id for that stream; on first start the head; **never `0`** |
-| Start id, `api` | `$` -- it never replays |
+| Group name | The name of the service, lower case, one word: `store`, `api` |
+| Reader name within the group | The service name and an instance number, such as `store-1` |
+| Where a reader starts by default | At the end -- new messages only, nothing historical |
+| Where the recorder starts | At its saved position; on its very first run, at the end. **Never from the beginning** |
 
-**No environment and no venue in a group name**: the stream key already carries the venue.
-**One group per service, never one per instance** -- that is what makes the store and the screen
-independent readers of one stream rather than competitors for one message.
+Starting the recorder from the beginning would re-record everything Redis still happens to be
+holding, duplicating data already written. **There is one group per service, never one per running
+copy** -- that is what makes the screen and the recorder independent readers of the same messages
+rather than competitors splitting them between themselves.
 
-## Acknowledgement
+## Acknowledging, discarding and persisting
+
+These three rules together decide what a restart loses, so read all three before changing one.
+
+### Acknowledging
+
+A reader tells Redis it has taken a batch **immediately on receipt, before doing the work**. This is
+the opposite of the usual advice, and the reason is specific: acknowledging one message tells us
+nothing about whether it reached a file, so it cannot be the safety net. The recorder's real safety
+net is the position it saves after each successful file write, and it resumes from there.
+
+A second benefit falls out of it. Because acknowledgement happens on receipt, anything still listed
+as unacknowledged means precisely "handed over but not processed", so after a crash those entries
+can be re-read and processed exactly once. Acknowledging after the work would mix processed and
+unprocessed entries in that list and make it useless. The other rules that go with it follow.
 
 | Rule | What it says |
 |---|---|
-| A1 | Every consumer acks a batch **on receipt**, before the work, never after it |
-| A2 | The durability boundary is the **store flush**, not the ack |
-| A3 | The store restarts from its **checkpoint**, never from the pending list and never from `0` |
-| A4 | The api joins at `$` and never replays |
-| A5 | A trimmed position is a **replay gap**: replay the retained suffix, report both bounds and an exact count, alert, and never refuse start-up. **Checked continuously**, on the ten-second `store.state` cadence |
-| A6 | While any stream is behind, the seal clock is `min(wall clock, the time inside the last id of any stream still behind)` |
-| A7 | A pass that fails **after** `XREADGROUP` returned leaves its batch in the pending list, and the next pass reads it back with `XREADGROUP ... 0` before it reads `>` |
+| The durability boundary is the **file write**, not the acknowledgement | Up to five minutes of sealed data can be waiting in memory |
+| The API never replays anything | It starts at the end and refills from what arrives next |
+| A discarded position is reported, not fatal | The recorder replays what is left, reports exactly how many entries it lost, alerts, and carries on |
+| That check runs continuously | Checking only at start-up would miss a reader that dies while running |
+| While catching up, "now" means the time inside the messages | Otherwise a catch-up judges every replayed minute late and discards what it just recovered |
 
-**Acking on receipt is deliberate, and it is not the textbook pattern.** The textbook acks after the
-work and recovers with `XAUTOCLAIM`. A per-message ack tells us nothing about what reached a file,
-so the store records the id it last flushed and reads forward from there. A1 is also what makes A7
-exact: acked on receipt, the pending list means *handed over and not delivered* and nothing else, so
-reading it delivers each entry exactly once. Acked after delivery it would hold delivered entries
-too, and recovery could not tell them apart.
+### Discarding old messages
 
-**A5 protects a running store, not only a starting one.** A live store once lost **97 minutes** of
-market data while its own `/health` reported `replay_gap_entries: 0` throughout, because its bus
-reader had died and the gap check only ever ran at start-up. It now runs on the same loop that
-publishes `store.state`.
+Redis holds messages until told to discard them. We discard by **age**, keeping a thirty-minute
+window, and the instruction rides along with every batch of new messages rather than running on its
+own timer -- one fewer thing that can stop.
 
-**A6 is what makes a replay produce the bars a live run would have produced.** Without it the first
-drain pass after any absence seals the whole backlog as late and discards what it just replayed.
+Age is used rather than a count because a count is really a guess about how busy the market is: it
+would hold hours in a quiet market and four minutes in a busy one. Thirty minutes is the promise the
+bus makes to a recorder that has to restart.
 
-## Trimming and persistence
+### Persistence
 
-| Rule | Value |
-|---|---|
-| Retention | **thirty minutes**, `assumed`, by age and never by count |
-| Command | `XTRIM <stream> MINID ~ <now - 1800s>` |
-| When | in the **same pipeline as that batch's `XADD`s**, on every batch write |
-| `XACK` | frees no stream memory -- `measured`: 5,000 entries acked, `XLEN` still 5,000 |
+Redis is started with all of the following, and each matters.
 
-**Trim by age and never by `MAXLEN`, because a count is a guess about rate**: it would hold hours in
-a quiet market and four minutes in a loud one. The trim is free at our shape -- `measured` 31.8 us
-an entry with it and 31.8 us without -- and a separate trim timer would be one more thing that can
-stop.
+| Setting | Effect | Why |
+|---|---|---|
+| `appendonly no` | No write-ahead log on disk | The Parquet files are the archive |
+| `save ""` | No periodic snapshots | The default settings would make Redis copy itself to disk roughly every minute at our message rate |
+| no attached disk | Nothing survives the container | Deliberate: there is nothing here worth surviving |
+| `maxmemory 2gb` | A ceiling on memory use | Roughly twice what thirty minutes of both underlyings needs |
+| `maxmemory-policy noeviction` | At the ceiling, **refuse new writes with an error** | See below |
 
-```
-redis-server --save "" --appendonly no --maxmemory 2gb --maxmemory-policy noeviction
-```
+That last one is a decision about losing data, not about tuning. Redis's usual behaviour at its
+memory ceiling is to quietly discard whole keys to make room -- and one of our keys is one entire
+stream, so a whole category of market data could vanish with nothing reported. A loud error at the
+publisher is far better. Managed Redis services default to the quiet behaviour and must be
+reconfigured.
 
-| Flag | Why |
-|---|---|
-| `appendonly no` | The Parquet store is the archive |
-| `save ""` | The stock image ships `save 3600 1 300 100 60 10000`, which at our rate forks every minute |
-| no volume, no backup | A container with no volume leaves no file behind |
-| `maxmemory 2gb` | 2x the `derived` memory at thirty minutes; `measured` 1,056.4 MiB for BTC+ETH |
-| `maxmemory-policy noeviction` | **A data-loss decision, not a tuning one** |
+## Where to go next
 
-**`noeviction` is load-bearing.** Under `allkeys-lru` Redis evicts whole keys, and one of our keys
-is one stream: `md.option_quote:DELTA:BTC` would stop existing with nothing raised. At the ceiling
-we want an error **at the publisher** instead. A managed cache must pin this in its parameter
-group, because ElastiCache defaults to `volatile-lru`.
-
-## Related guides
-
-- [Events](events.md), [Architecture](architecture.md), [Configuration](configuration.md)
+[Events](events.md) describes the messages themselves; [Configuration](configuration.md) lists every
+setting named here.

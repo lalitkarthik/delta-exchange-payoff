@@ -1,130 +1,169 @@
 # API reference
 
-Every route the engine serves. `docs/chain-contract.md` is the authority on the ladder's shape and
-`web/lib/contract.ts` mirrors it field for field; this page is the surface, not the schemas.
+**What this page contains.** Every web address the back end answers on, what each expects to be
+given, and what it sends back. It also explains the conventions those answers follow, which matter
+if you are writing something that reads them.
 
-**Two mutating routes and no more.** Everything else is a read.
+**How to read it.** Read the conventions first -- they apply to every address and explain several
+things that would otherwise look like mistakes. After that the sections are independent; go to the
+one you need. The addresses are grouped by what they are for: live data, historical data,
+volatility, and operations.
 
 ## Conventions
 
-- **Every decimal is a JSON number or `null`, never a string.** The web app never calls
-  `parseFloat`, and raises `ContractViolationError` if the engine breaches this.
-- **IV is a decimal fraction** on the wire and a percentage only on screen.
-- **`underlying`** is `BTC` or `ETH`. **`expiry`** is `DD-MM-YYYY`, as the venue spells it.
-  **`date`** is `YYYY-MM-DD`, the store's own spelling. **`minute`** is ISO 8601 UTC at second
-  precision.
-- **Absence from the store is `200` and empty, never `404`.** A day nobody has lived through yet is
-  "nothing yet", not an error. Only the venue-backed routes can answer `502`.
-- Interactive docs are at `/docs`, `/redoc` and `/openapi.json` -- **not proxied** by the stack.
+These hold everywhere, without exception.
 
-## Live chain
+**Numbers are always numbers.** Every decimal value is sent as a JSON number or as `null`, never as
+text. The front end never converts text to numbers, and it raises an error rather than displaying a
+value that arrives in the wrong shape.
 
-| Route | Query | Returns |
+**`null` means "there is no value", and it is not zero.** An absent price means nobody is offering
+one. A zero would mean somebody offered nothing. Do not treat them alike.
+
+**Volatility is a fraction, not a percentage.** A value of `0.62` means 62 percent. The conversion
+happens only when the number is displayed.
+
+**Asking for data that does not exist is not an error.** The addresses that read the stored history
+answer normally with an empty result if nothing was recorded. A day nobody has lived through yet is
+"nothing yet", not a mistake, and a `404` would suggest otherwise. Only the addresses that ask the
+venue itself can fail because the venue failed.
+
+The table below shows how each kind of parameter is written, since the formats differ and it is a
+common source of confusion.
+
+| Parameter | Format | Example |
 |---|---|---|
-| `GET /expiries` | `underlying` | Every listed expiry, ascending. The dropdown's source |
-| `GET /chain` | `underlying`, `expiry` | The pivoted ladder for one expiry |
+| `underlying` | Capitals | `BTC` |
+| `expiry` | Day-month-year, as the venue writes it | `27-06-2026` |
+| `date` | Year-month-day, as the stored files are named | `2026-09-08` |
+| `minute` | Full timestamp in UTC, to the second | `2026-09-04T09:00:00Z` |
+| `instrument` | Our own contract name | `DELTA-BTC-20260627-60000-C-USD` |
 
-In split mode both answer from `ChainStream` rather than the venue, so the api never opens a socket
-to Delta to serve a screen.
+Interactive documentation generated from the code itself is available at `/docs` when the back end
+is running. It is not exposed through the production setup.
 
-### `WS /ws/chain`
+## Live data
 
-Query `underlying`, `expiry`, and an optional `interval` (default one second).
+Two ordinary addresses and one long-lived connection.
 
-**The payload is the identical `ChainResponse` `/chain` returns**, wrapped in an envelope so the
-four things the socket can say stay distinguishable -- a ladder, a `waiting`, a `feed` state change
-and an error. `ChainLadder.tsx` renders either unchanged.
-
-The socket **sends the feed state once on connect**, so a browser that joined mid-stream is not
-blind, and forwards every `feed.connection` transition after that. It is a handshake, not a
-cross-origin request, so CORS does not apply to it.
-
-## History
-
-All four read Parquet and never the venue.
-
-| Route | Query | Returns |
+| Address | Give it | Get back |
 |---|---|---|
-| `GET /chain/minutes` | `underlying`, `expiry`, `date` | Every minute the store holds quotes for. The slider's domain, and by omission its gaps |
-| `GET /chain/at` | `underlying`, `expiry`, `minute` | The ladder as it stood at one stored minute, **in the `/ws/chain` envelope** so a client needs no third vocabulary |
-| `GET /bars` | `instrument` (canonical string), `date` | One contract's minute bars, from `quote-bars` and `reference-bars` |
-| `GET /smile` | `underlying`, `expiry` | Every stored minute of implied volatility for one expiry |
+| `GET /expiries` | `underlying` | Every expiry the venue currently lists, earliest first. This is what fills the dropdown |
+| `GET /chain` | `underlying`, `expiry` | The full option chain for that expiry |
 
-`GET /bars?instrument=DELTA-BTC-20260627-60000-C-USD&date=2026-09-08`.
+In the multi-program arrangement both of these are answered from the API's own in-memory picture
+rather than by asking the venue, so displaying a screen never causes a request to Delta.
 
-**These are `def`, not `async def`, and that is deliberate.** They open Parquet files, which blocks;
-FastAPI runs a plain `def` route on a thread pool, so a slow read cannot stall the event loop that
-is reading the venue socket.
+### The streaming connection
+
+`WS /ws/chain`, given `underlying` and `expiry`, and optionally how often to send (one second by
+default).
+
+What it sends is **the same chain object that `GET /chain` returns**, wrapped in a small envelope so
+that the four things the connection can say stay distinguishable: here is a chain, I am still
+waiting for data, the venue connection changed state, or something went wrong. Because the chain
+itself is identical, one piece of display code handles both sources.
+
+It sends the current state of the venue connection **once, immediately on connecting**, so a browser
+that joins halfway through is never left guessing, and then sends every subsequent change.
+
+## Historical data
+
+All four of these read the stored files and never contact the venue.
+
+| Address | Give it | Get back |
+|---|---|---|
+| `GET /chain/minutes` | `underlying`, `expiry`, `date` | Which minutes of that day have data. This is what the time slider uses, and the minutes it does *not* list are the gaps |
+| `GET /chain/at` | `underlying`, `expiry`, `minute` | The whole chain as it stood at that minute, **in the same envelope the streaming connection uses** |
+| `GET /bars` | `instrument`, `date` | One contract's minute-by-minute record for that day |
+| `GET /smile` | `underlying`, `expiry` | Every stored minute of implied volatility for that expiry |
+
+A complete example:
+
+```
+GET /bars?instrument=DELTA-BTC-20260627-60000-C-USD&date=2026-09-08
+```
 
 ## Volatility
 
-| Route | Query | Returns |
+| Address | Give it | Get back |
 |---|---|---|
-| `GET /volatility/bounds` | `underlying`, `interval` (default `1m`) | What `N` may be, before anyone has chosen one |
-| `GET /volatility` | `underlying`, `lookback_days`, `interval`, `estimators`, `alignment`, `max_points` | Implied against realised, in the units the chart draws |
+| `GET /volatility/bounds` | `underlying`, optionally `interval` | What range of lookback periods the stored data can actually support |
+| `GET /volatility` | `underlying`, `lookback_days`, and several optional settings | Implied and realised volatility over that period |
 
-**A store holding nothing usable answers `200` with `usable: false`**, not an error. "No lookback
-works yet" is a real answer a screen can print, and printing it is the difference between an
-instrument that is honest about its range and one that looks broken for a month.
+The first of these exists for a specific reason. When the system has only just started recording,
+there is not yet enough history to compute anything meaningful. Rather than failing, it answers
+normally and says that no usable range exists yet. "Not enough data yet" is a true answer that a
+screen can display, and displaying it is the difference between an instrument that is honest about
+its limits and one that merely looks broken for its first month.
 
-`lookback_days` is deliberately one parameter rather than two: it sets both series at once, so the
-two cannot be compared over different windows by accident.
+Note that `lookback_days` is deliberately a single value covering both series. Allowing two would
+allow somebody to compare implied volatility over one period against realised volatility over a
+different one and not notice.
 
 ## Operations
 
-| Route | Body / path | Does |
+| Address | Give it | Effect |
 |---|---|---|
-| `GET /health` | -- | Liveness, watched pairs, and the **remote** feed state |
-| `GET /recording` | -- | Whether the store is writing |
-| `POST /recording` | `{"recording": bool}` | Stop or start the store |
-| `POST /feed/{adapter}/{command}` | `pause`, `resume`, `reconnect` | Drive one adapter's connection |
+| `GET /health` | -- | Whether this program is alive, and what it knows about the venue connection |
+| `GET /recording` | -- | Whether data is currently being recorded |
+| `POST /recording` | `{"recording": true}` or `false` | Start or stop recording |
+| `POST /feed/{adapter}/{command}` | `pause`, `resume` or `reconnect` in the address | Control the venue connection |
 
-### `/health`
+### Health
 
-Authoritative about remote feed state, projected from the `feed.connection` and `heartbeat`
-observations in `FeedConnectionCache`, and carrying process liveness and the watched pairs beside
-it. The websocket badge is derived from that same projection, heartbeat-silence rule included.
+The API's health address is the authoritative answer about the venue connection -- but note that it
+knows this from the connection's own messages on the bus, not by asking it. The badge on the web
+page is derived from exactly the same information, so the page and the health check can never
+disagree.
 
-The other two processes serve their own `/health`: **`feed`** answers 503 when stopped, paused, out
-of reconnect budget, silent past 135 s, or when its bus reader, flusher or control consumer has
-died. **`store`** answers readiness rather than liveness -- 503 once its reader stops, its group is
-trimmed past, or its lag passes the threshold.
+The other two programs answer their own health addresses, and they mean different things.
+[Data flow](data-flow.md) sets out what each one actually reports.
 
-### `POST /recording`
+### Starting and stopping recording
 
-**The engine's only mutating data route, and the state lives here and nowhere else** -- not in the
-browser and not in `localStorage`. Two tabs must not be able to disagree about whether the store is
-writing, and a reader arriving on a fresh page is told the truth rather than a default.
+This is the only address that changes stored data, and there is one important design decision behind
+it: **whether recording is on lives in the back end and nowhere else.** Not in the browser, and not
+in a browser's local storage. Two open tabs must not be able to disagree about it, and somebody
+opening a fresh page must be told the truth rather than shown a default.
 
-It answers with the state **after** the change, so a client needs no second request and cannot
-render a state that was never true. Idempotent. **Switching off flushes what is buffered before it
-stops**: the buffer holds up to a five-minute interval of sealed bars, and discarding them would
-throw away data the store already has.
+It answers with the state *after* the change, so no second request is needed and a caller cannot
+display a state that was never true. Calling it twice with the same value is harmless.
 
-### `POST /feed/{adapter}/{command}`
+**Switching recording off writes out whatever is buffered before stopping.** Up to five minutes of
+finished data can be waiting in memory, and discarding it would throw away data the system already
+had.
 
-The route is thin on purpose: it checks the two names, builds one `control.command` and hands it to
-the supervisor, which puts it on the bus and offers it to the controller that owns the adapter.
-**Everything a command does is the controller's.** No service-to-service HTTP is involved.
+### Controlling the venue connection
 
-| Command | Effect |
+This address is deliberately thin: it checks the two names, builds one instruction message, and puts
+it on the bus. Everything the instruction actually *does* happens in the part that owns the
+connection. No program calls another program directly, even for this.
+
+| Command | What it does |
 |---|---|
-| `pause` | To `stopped`, reason `paused`, **spending no reconnect budget** |
-| `resume` | To `connecting`, with the budget restored in full |
-| `reconnect` | Cut the socket and let ordinary close handling reach `reconnecting`. Feed-only |
+| `pause` | Disconnect and stay disconnected. **Uses none of the reconnection allowance**, because a pause is a decision rather than a failure |
+| `resume` | Start connecting again, with the allowance restored in full |
+| `reconnect` | Drop the current connection and let the normal reconnection logic take over |
 
-**It answers with the adapter's health line after the command has been applied**, not before, so the
-response is never a claim about an intention.
+It answers with the connection's state **after** the instruction has taken effect, so the answer is
+never merely a statement of intent.
 
-## Through the Docker proxy
+## How the browser reaches all of this
 
-One origin, one host port. `/api/` is stripped and forwarded to the api; everything else goes to
-`web`. So `/api/chain` reaches the engine as `/chain`, and the websocket uses the same prefix.
+In every environment the browser talks to exactly one address, and something in front forwards
+anything beginning with `/api` to the back end. So the browser asks for `/api/chain` and the back
+end receives `/chain`. The streaming connection uses the same prefix.
 
-**`/volatility` is a deliberate collision**: the api declares the route and the web app has a page
-at the same path, so no per-route table could serve both. The api's series wins, and the web page at
-that path is not reachable through the proxy today.
+The table below shows what performs that forwarding in each environment.
 
-## Related guides
+| Environment | What forwards the requests |
+|---|---|
+| Docker setup | A small nginx container, on the single published port |
+| Production | Amplify, which forwards `/api` to the back end machine |
+| `bun run dev` | Nothing -- the browser calls port 8000 directly, which is specifically permitted |
 
-[Architecture](architecture.md) | [Data store](data-store.md) | [Events](events.md)
+## Where to go next
+
+[Data store](data-store.md) explains where the historical answers come from.
+[Events](events.md) explains the messages behind the operational addresses.

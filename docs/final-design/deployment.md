@@ -1,191 +1,177 @@
 # Deployment
 
-**Nothing here is built.** There is no AWS account on this machine, and no figure on this page was
-taken against one: every dollar is `derived` from `measured` AWS Price List Bulk API unit prices
-read 2026-09-09 in `ap-south-1`, on-demand, 730 hours a month. Treat every latency figure as a
-floor, not a reading.
+**What this page contains.** Where the system runs when it is not on somebody's laptop: which Amazon
+services are used, how the parts are divided between them, how the machine is sized, what it costs,
+how a new version is released, and what routine attention it needs.
 
-The shape that *is* built is the local Compose stack -- see [Getting started](getting-started.md).
+**How to read it.** Start with the picture and the two sections after it, which explain the shape
+and the reasoning. The sizing, cost and operations sections are reference material to come back to.
 
-## The platform, in one line
+**One thing to know first: none of this is built yet.** There is no Amazon account attached to this
+project at the time of writing. These are the decisions that have been made, not a description of
+something currently running. What *is* running is the Docker setup described in
+[Getting started](getting-started.md), which mirrors this shape closely.
 
-**ECS on EC2: one `c7g.xlarge` in a public subnet of `ap-south-1` (Mumbai), one task definition
-holding all seven containers, `host` network mode.** `derived` **$78.07 a month** of compute, and
-**$79.99 all-in** for BTC and ETH.
+## The shape, in one picture
 
-| | `dev` | `prod` |
+The back end runs together on one rented computer. The web page is served separately by a service
+that specialises in exactly that.
+
+```
+                        DELTA EXCHANGE
+                              |
+   +--------------------------v---------------------------+
+   |  One EC2 computer, in the Mumbai region               |
+   |                                                       |
+   |   feed  -->  redis  -->  store  -->  S3 (the files)   |
+   |                 |                                     |
+   |                 +----->  api                          |
+   |                 +----->  alert forwarder              |
+   |                                                       |
+   |   a small proxy, the only thing reachable from        |
+   |   outside, and only for the API                       |
+   +--------------------------^---------------------------+
+                              | one forwarding rule, over HTTPS
+                    +---------+----------+
+                    |  Amplify: the web  |
+                    |  page              |
+                    +---------+----------+
+                              |
+                          a browser
+```
+
+## Why it is divided this way
+
+**The back end is on one machine because it is one pipeline.** The feed publishes to Redis, and the
+store and the API read from that same Redis. Putting them on one computer means those messages never
+travel over a network at all -- they go through the machine's own internal loopback, which is as
+fast as it is possible to be, and cannot fail independently of the machine itself. The API in
+particular belongs here rather than anywhere else, because the calculations it performs are driven
+by the same stream of messages.
+
+**The web page is elsewhere because it has no reason to be here.** It holds no data, connects to no
+venue, and does nothing but display what the API sends it. Served by Amplify it gains a worldwide
+delivery network, a managed security certificate, and an automatic rebuild whenever the code
+changes -- and the back-end machine loses a container, a build step and one more thing to secure.
+
+## How the browser reaches the API
+
+Amplify serves the page, and it is configured with one forwarding rule: anything the page requests
+beginning with `/api` is passed through to the back-end machine, and the answer is returned as
+though Amplify had produced it.
+
+The consequence is that **the browser only ever talks to one address**. It never makes a request to a
+second server, so the browser safety rules about cross-address requests never come into play, and
+nothing has to be configured to permit them. This is the same arrangement the local Docker setup
+uses, with the nginx container replaced by Amplify's forwarding rule.
+
+The back-end machine therefore has exactly one thing reachable from outside: the API, behind a small
+proxy that handles encryption. Nothing else on it accepts connections from the internet.
+
+## The machine
+
+The table below lists what is rented and why each choice was made.
+
+| Decision | Choice | Reasoning |
 |---|---|---|
-| Runs on | Docker Compose on a laptop | ECS on one EC2 instance |
-| Instance | -- | `c7g.xlarge`, Graviton3, 4 vCPU, 8 GiB, 30 GB gp3 root |
-| Containers | the same seven | the same seven |
-| Networking | the Compose network | `host` mode -- every container on the instance's stack |
-| Store root | `data/` (or `./.stack-data/`) | `s3://<env>-deltapayoff-bars/` |
-| Reachable from | the laptop | a tunnel or Tailscale only; **never a public listener** |
-| Stream names | no environment in the name | **the same names**; one Redis each, never shared |
+| Region | `ap-south-1` (Mumbai) | The cheapest of those compared, and in the same city as the network point the venue is served from |
+| Computer | One `c7g.xlarge`: 4 processors, 8 GB memory, 30 GB disk | Sized below |
+| Processor type | ARM | The equivalent Intel machine costs 82 percent more here for the same capability |
+| Who starts the containers | Amazon ECS | It restarts a container that stops **and records that it did**, which running them by hand would not |
+| Networking | Containers share the machine's own network | This is what keeps Redis on the internal loopback |
+| Internet connection | A directly connected machine, with its own address | Explained below |
+| Files | Amazon S3 | One bucket per environment |
 
-**The images are identical.** One `Dockerfile` per service, built `linux/arm64`, and the same tag
-runs in both places. Graviton is not a preference: the x86 twin of the same shape costs **82% more**
-in ap-south-1.
-
-## Why this platform
-
-Four platforms against five criteria, at today's `measured` footprint and ten times it.
-
-| | Invariants | Ops for 2-3 people | $/mo, 1x to 10x | Path to more services | Latency |
-|---|---|---|---|---|---|
-| **ECS on EC2** (chosen) | a dead container restarts **and the restart is an alarmable event** | one AMI to patch; restarts and deploys are the platform's | **$48.94 to $179.43** | a new consumer is a container in the task | Redis on `127.0.0.1` under `host` mode |
-| EC2 with Compose | identical, but **nothing records that it restarted** | you are the only restarter; every deploy is an `ssh` | $48.94 to $179.43 -- ECS adds $0 | one YAML file on one box | same |
-| ECS on Fargate | identical; no host to misconfigure | lightest: no AMI, no agent, no disk | $89.33 to $242.41 | best per-service isolation | `awsvpc` is mandatory, putting a VPC hop between `feed` and Redis |
-| EKS | identical | heaviest: a Kubernetes minor upgrade at least yearly | $121.94 to $252.43 one node | the most, and the most unused | same as ECS on EC2 |
-| *behind a NAT gateway* | -- | -- | *+$165.00 to +$1,282.09* | -- | -- |
-
-**Two rows tie exactly on cost**, because ECS on the EC2 launch type charges $0 for compute. When
-the cost criterion ties, the decision moves up to operations, and that is where plain Compose loses:
-a container that dies at 02:00 restarts with **no record anywhere that it happened**.
-
-## The network shape, and the number behind it
-
-| Rule | Value | Why |
-|---|---|---|
-| Subnet | **public** | so the instance's own public IPv4 is the egress |
-| Public IPv4 | one, in-use | `measured` $0.005/hour = `derived` **$3.65/month** |
-| NAT gateway | **none** | `derived` **$165.00/month** at 1x, **$1,282.09** at 10x |
-| ECS network mode | **`host`** | `feed` to Redis stays loopback |
-| Inbound listeners | **none public** | the dashboard is reached over a tunnel or Tailscale |
-
-**A NAT gateway would cost more than the compute it fronts.** The feed pulls a `measured` 843.4 KB/s
--- `derived` **2,216.5 GB a month**. Inbound to AWS is free; a NAT gateway meters it at `measured`
-$0.056/GB, so the same bytes become `derived` $124.12 a month of data processing on top of $40.88 of
-gateway hours. **The platform question is partly a subnet question**, and that is the number that
-makes it one.
-
-`awsvpc` mode is rejected for the same reason: on EC2, task ENIs get no public IP, so tasks must run
-in a private subnet with a NAT gateway. A third path exists and is not built -- both venue endpoints
-resolve `AAAA`, so IPv6-only egress through an egress-only internet gateway is free of both charges.
+**There is deliberately no NAT gateway.** A NAT gateway is the usual way to give machines internet
+access without exposing them, and it bills for every byte passing through it. The feed downloads
+roughly 2,200 GB a month, so routing it through a NAT gateway would cost `derived` **$165 a month**
+-- more than the computer it would be protecting. Connecting the machine directly, with a single
+address and only the API reachable, costs a few dollars and achieves the same isolation.
 
 ## Sizing
 
-Reservations, not measurements of split containers. **Sized at the 50 ms batch interval**, which is
-the only interval this system is configured to run at.
+Six containers share the machine. The table below lists what each is allocated.
 
-| Container | vCPU | Memory | Basis |
-|---|---|---|---|
-| `feed` | **1.0** | 1 GB | `measured` 0.3592 core at 1x; `derived` 0.52-0.71 with encode and publish at 50 ms. **1,024 CPU units** |
-| `store` | 0.5 | 1 GB | `measured` 0.3048 core, 1.49 KB/s to disk; a five-minute flush buffer |
-| `api` | 1.0 | 2 GB | `measured` 0.3045 core, +0.0466 for the first viewer; a 175.227 ms full solve pass |
-| `web` | 0.25 | 0.5 GB | `measured` 110.6 MiB idle, no CPU with no viewer |
-| `discord-alerts` | 0.05 | 0.25 GB | Subscribes to `alert` only, so it pays no market-data decode |
-| `proxy` | 0.25 | 0.5 GB | `assumed` |
-| `redis` | 0.5 | **3 GB** | the `maxmemory 2gb` ceiling plus overhead |
-| **Total** | **3.55** | **8.25 GB** | -> `c7g.xlarge`; the host overcommits vCPU |
+| Container | Processors | Memory |
+|---|---|---|
+| feed | **1.0** | 1 GB |
+| store | 0.5 | 1 GB |
+| api | 1.0 | 2 GB |
+| redis | 0.5 | 3 GB |
+| alert forwarder | 0.05 | 0.25 GB |
+| proxy | 0.25 | 0.5 GB |
+| **Total** | **3.30** | **7.75 GB** |
 
-**`feed` is sized on 29.96 points of CPU and not on 5.88%, and the difference is five-fold.** 5.88%
-is the publisher measured **alone, on loopback, at a 100 ms batch** -- Redis's own write cost. At the
-chosen 50 ms the same publisher inside the feed costs `derived` 29.96 points (`measured` 70.73%
-against a bus-off control's 40.77%). Sizing from the smaller figure under-counts by 3.6-5.7x, and is
-how an earlier pass reached 6 vCPU at 10x.
+**The feed is given a whole processor** because a Python program cannot use more than one anyway,
+and this is the program that must never fall behind the venue's connection. The others cannot crowd
+it out even if they are all busy at once.
 
-**These reservations under-count CPU and over-count memory**: the `derived` need at 1x is 1.21-1.95
-cores and 5.05 GiB. **The split costs `derived` 1.0888 cores against the monolith's 0.31** -- 3.52x.
-At ten times the rate it is `c7g.4xlarge` to `c7g.8xlarge`, `derived` $295.72-582.39.
+The allocations add up to 3.30 out of 4 processors, which is intentional: containers can borrow
+capacity from each other, and reserving every last processor would leave nothing for the operating
+system. The current measured usage is comfortably inside these numbers. **If the amount of data ever
+grows tenfold, the answer is a larger machine of the same type** -- nothing else about the
+arrangement has to change, which is the main practical benefit of keeping the pipeline together.
 
-**Why not `t4g.medium` at $22.74.** Burstable instances have a CPU baseline -- 20% per vCPU, so 0.4
-of a core. The split's `derived` 1.21-1.95 cores is three to five times that, and out of credits the
-instance is throttled to baseline **with nothing raised**. `t4g.large` at $39.09 is the honest cheap
-option; $9.85 a month removes the credit model entirely.
+## What it costs
 
-## One instance or several
+Every figure below is `derived` from Amazon's published prices and our own measured data volumes.
 
-- **One `c7g.xlarge`, $78.07 at 1x.** On 4 vCPU three one-core Python services cannot starve `feed`,
-  which reserves 1,024 CPU units.
-- Two boxes cost $73.22-84.46; one per service is $128.07 at the 1x upper bound.
-- **Split into `feed`+`store`+Redis and `api`+`web`+proxy** when the box passes 2.8 cores, or when an
-  order path places its first order.
-- The same-AZ hop is `derived` at most 1 ms, invisible to every real consumer. Same-AZ transfer is
-  free on private addresses only.
+| Item | At today's volume | At ten times today's volume |
+|---|---|---|
+| The computer, all in | $78.07 a month | $295 to $582 a month |
+| File storage | $1.92 a month | $19.19 a month |
+| Redis | $0 -- it runs on the computer already paid for | $0 |
+| Amplify | `assumed` small: charged per build and per gigabyte delivered | `assumed` small |
+| **Total** | **about $80 a month** | **about $315 to $600 a month** |
 
-## The region
+If a bill ever comes in noticeably higher than this, the cause is almost always one of two things: a
+NAT gateway that somebody added, or a spare internet address left allocated and forgotten.
 
-**`ap-south-1`, Mumbai.** Cheapest of the four priced, in-country for the NSE adapter named next, and
-in the same city as the CloudFront edge that serves us.
+## The services used
 
-| | ap-south-1 | ap-southeast-1 | ap-northeast-1 | us-east-1 |
-|---|---|---|---|---|
-| 1x | **$48.94** | $80.99 | $83.47 | $65.62 |
-| 10x | **$179.43** | $307.25 | $317.18 | $246.72 |
+The table below lists every Amazon service involved.
 
-**What is between us and the venue, `measured` 2026-09-09.** Both Delta endpoints are Amazon
-CloudFront, and our POP is `BOM78-P11`, Mumbai. Delta's own documentation says the origin is "AWS
-Tokyo", and a cache-busted REST call costs `measured` 191.18 ms more than a cacheable one --
-`derived` ~167 ms of edge-to-origin round trip. **So a region buys the client-to-edge leg only**,
-except in ap-northeast-1, which would sit in the venue's own region. That is the last criterion, and
-execution is out of scope.
-
-Every latency figure was taken through an active tunnel and is an upper bound on one laptop, not a
-statement about an EC2 instance. **The from-AWS measurement has not been taken.**
-
-## What it costs, all in
-
-| Line | Underlying set | 1x | 10x |
-|---|---|---|---|
-| ECS on EC2, all-in | BTC+ETH | $78.07 | $295.72-582.39 |
-| S3 Standard, compacted | BTC+ETH | $1.92 | $19.19 |
-| Redis container | BTC+ETH | $0 -- its memory is bought inside the compute | $0 |
-| **Total** | BTC+ETH | **$79.99** | **$314.91-601.58** |
-
-**Quote the BTC+ETH row.** An earlier total mixed two underlying sets -- BTC+ETH compute against a
-BTC-only S3 bill. The difference is $0.40 a month, which is why it went unnoticed for as long as it
-did: the error is the mixing, not the amount.
-
-## The services bought, and the ones not
-
-| Bought | For |
+| Service | What it does here |
 |---|---|
-| Amazon ECS, EC2 launch type | one task definition holding every container |
-| Amazon EC2 | one `c7g.xlarge`, `host` network mode |
-| Amazon VPC | one public subnet, one in-use public IPv4, no NAT gateway |
-| Amazon EBS gp3 | the instance's 30 GB root volume, and nothing else |
-| Amazon S3 Standard | the four bar tables, one bucket per environment |
-| Amazon ECR | the images a deploy registers |
-| Amazon CloudWatch | alarms on a stopped task and on the box |
+| EC2 | Rents the computer |
+| ECS | Starts the containers on it and restarts them if they stop |
+| Amplify | Builds and serves the web page, and forwards `/api` to the computer |
+| VPC | The network the computer sits on: one directly connected subnet, one address |
+| EBS | The computer's own 30 GB disk |
+| S3 | Permanent storage for the data files |
+| ECR | Stores the container images that a release uses |
+| CloudWatch | Raises an alarm if a container stops or the machine misbehaves |
 
-| Not bought | Why, in one line |
-|---|---|
-| ElastiCache for Valkey | `derived` $47.30/month against a container's $0. **The named fallback for Redis** |
-| ElastiCache Serverless | no `maxmemory`, so a trim that stops working is a bill and not an error |
-| MemoryDB | durability is the product and cannot be turned off, for frames the venue can re-tell |
-| RDS for PostgreSQL | $61.32/month to be awake. **The named fallback for OMS state**, beside the bars, never holding them |
-| Timestream | one flavour is closed to new customers; the other is a second query language |
-| Athena | it reads the same files, and one catalogue adds it later with no file changed |
-| Amazon EKS | `measured` $73.00/month of control plane before a container starts |
-| ECS on Fargate | `awsvpc` is mandatory. **The named fallback for the platform**, if host work becomes the constraint |
-| NAT gateway | more than the compute it fronts |
+Two replacements have been chosen in advance, so that neither has to be decided in a hurry.
+If the Redis container ever becomes unsuitable, **ElastiCache** replaces it and the change is one
+connection string. When an order-management system eventually needs somewhere to keep its state,
+**a managed PostgreSQL database** goes alongside the files rather than replacing them.
 
-## A month of operations
+## Releasing a new version
 
-1. **Patch the AMI** -- replace the instance, do not patch in place. ~30 minutes, monthly.
-2. **Read the ECS event stream** for task stops nobody noticed, and the stopped-reason strings. ~10
-   minutes.
-3. **Check disk on the root volume** -- images, logs, anything left locally. ~5 minutes.
-4. **Check the bill** against the `derived` $78.07. An unexpected line is usually a NAT gateway or a
-   forgotten public IP. ~5 minutes.
-5. **Confirm the private path still works** -- the tunnel that fronts the dashboard.
-6. **Deploy, when there is one**: build, push to ECR, register a task definition revision,
-   `aws ecs update-service`. Per change, not monthly.
+**The back end.** Build the container image, upload it to ECR, register the new version with ECS,
+and tell ECS to update the service. ECS handles replacing the running containers. Releasing is
+therefore a recorded change rather than somebody logging into a machine.
 
-**What the platform does instead of us**: restarts a container that exited, reports that it did,
-replaces a task that fails its health check, and holds the desired state so a deploy is a revision
-rather than an `ssh`.
+**The web page.** Push the code. Amplify notices, builds it, and publishes it.
 
-## What nobody has measured
+The container images are **identical in every environment**. The same image that runs on a laptop
+runs on the machine; only the settings differ.
 
-1. **Venue latency from ap-south-1 and ap-northeast-1.** The commands are written out in the design
-   record.
-2. **The network hop to a managed Redis endpoint.**
-3. **S3 read latency, and the request count per Parquet read.** The `assumed` 2 requests per object
-   is a floor and is labelled as one.
-4. **The same-AZ hop**, if the topology ever splits.
+## What a month of looking after it involves
 
-## Related guides
+1. **Update the machine image.** Replace the machine with one running the current image rather than
+   patching the running one. About half an hour.
+2. **Read the container event history** for anything that stopped when nobody was watching, and why.
+3. **Check the disk** on the machine for accumulated images and logs.
+4. **Check the bill** against the figures above.
+5. **Check the web page's build history** for a failed build nobody noticed.
 
-[Architecture](architecture.md) | [Data store](data-store.md) | [Message bus](message-bus.md)
+Everything else the platform does by itself: restarting a container that stopped, recording that it
+did so, replacing one that stops answering its health check, and rebuilding the page on every code
+change.
+
+## Where to go next
+
+[Architecture](architecture.md) explains what each container actually does.
+[Configuration](configuration.md) lists the settings applied to them.

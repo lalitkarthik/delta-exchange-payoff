@@ -1,166 +1,178 @@
 # Data store
 
-The store is the system's permanent record: **one-minute bars, folded from the same event stream
-the screen reads, written as Parquet and never forward-filled.** It is written by exactly one
-process and read by four routes.
+**What this page contains.** How the permanent record of past prices is organised, how it gets
+written, what happens after a restart, how it is read back, and why it is tidied up every night.
 
-## Five dataset roots
+**How to read it.** The first two sections describe what is on disk and are useful on their own.
+The rest follows the life of a minute of data from arrival to long-term storage; read it in order.
+[Data flow](data-flow.md) covers the earlier part of that journey, before the store sees anything.
 
-Under a gitignored `<repo>/data/` locally, or one S3 bucket per environment in production.
+## What the store is for
 
-| Root | Holds | Written by |
-|---|---|---|
-| `quote-bars` | What the book did: bid, ask, sizes, `from_book`, `last_lts` | the bar writer |
-| `reference-bars` | What the venue said: mark, OI, turnover, its own IV and Greeks | the bar writer |
-| `spot-bars` | The underlying's index price, and `spot_ticks` | the bar writer |
-| `computed-bars` | What we made of it: our forward, IV and Greeks | the bar writer |
-| `index-bars` | Index history, backfilled | `tools/backfill_index_bars.py`, read by `/volatility` |
+Everything the system sees is fleeting. The venue sends a price, it is displayed, and a moment later
+it is replaced by a newer one. The store exists so that any past minute can be examined again: to
+check what the market was doing at a particular time, to compare what we computed against what
+happened next, or to test an idea against months of real data.
 
-**Four roots, not one with a `table=` key.** A shared root forces every scan to carry a filter a
-prefix should have answered, and puts four schemas in one dataset for Parquet's metadata to
-reconcile on every read. They share the same two partition keys, so a reader joins spot to quotes to
-our volatility on `date` and `underlying` with no translation.
+It holds **one-minute summaries, not individual prices.** Every observation of a contract within one
+minute is folded into a single row recording the first, highest, lowest and last values seen, and
+how many observations there were.
 
-## The layout
+## Five separate collections
+
+The record is deliberately split into five collections rather than one big table, so that what we
+observed, what the venue claimed, and what we concluded are never confused with each other. The
+table below names each one.
+
+| Collection | What it holds |
+|---|---|
+| `quote-bars` | What the order book did -- bids, asks, and the sizes offered |
+| `reference-bars` | What the venue said -- its mark price, open interest, turnover, and its own volatility figures |
+| `spot-bars` | What the underlying itself was worth |
+| `computed-bars` | What this project concluded -- our expected future price, our volatility, our Greeks |
+| `index-bars` | Longer-range index history, filled in separately by a tool rather than by the live system |
+
+Keeping them apart has a practical benefit beyond tidiness. Each collection has its own set of
+columns, so a program reading one of them opens files containing only the columns it cares about. A
+single combined table would force every read to carry a filter, and would make every file a mixture
+of five different shapes.
+
+All five share the same two organising keys, so joining them together -- our volatility beside the
+venue's, beside the underlying's price, for the same minute -- needs no translation.
+
+## How the files are organised
+
+Each collection is a folder tree, and the folder names contain the information needed to skip
+irrelevant files without opening them:
 
 ```
 quote-bars/underlying=BTC/date=2026-09-08/20260908T131500Z-000287.parquet
 ```
 
-**`underlying=` and `date=`, and nothing else.** Expiry, strike and option type stay **columns**:
-as partition levels they explode into thousands of directories holding a handful of rows each, and
-object storage is worse at that than a disk is.
+This naming style is a widely used convention, so other tools recognise it without being configured.
+A program looking for Bitcoin data on 8 September can see from the folder names alone that every
+other folder is irrelevant.
 
-**Polars is not allowed to lay out the tree.** `write_parquet(partition_by=...)` names its output
-`00000000.parquet` in every partition on every call, so the 10:00 flush would silently overwrite
-the 09:00 one. Directories are built by hand, each flush writes a uniquely named file, and a test
-pins it. On S3 that same default would be a silent overwrite rather than a noisy one.
+**Only the underlying and the date are folders. Everything else is a column.** It is tempting to
+make the expiry a folder too, but there are thousands of expiry-and-strike combinations and doing so
+would produce thousands of folders each holding a handful of rows -- which is slow on a disk and
+expensive on cloud storage, where every file costs money to list and to open.
 
-## Sealing a minute
+One implementation detail is worth knowing because it has bitten before. The library we use to write
+Parquet files offers to lay out these folders for you, and if allowed to, it names every file it
+writes identically. The ten o'clock write would silently replace the nine o'clock one. So the
+folders are created by hand, every file gets a unique name, and there is a test that fails if that
+ever stops being true.
 
-1. A tick is bucketed on **`ts_venue` alone**. `lts`, the venue's last-trade stamp, is carried as a
-   column and never bucketed on.
-2. A minute seals once its **grace** elapses. The two channels seal on different graces because
-   their arrival lags differ by an order of magnitude -- `measured` p50 212.6 ms on the book against
-   a median 3,176 ms on the ticker.
-3. **A minute with no arrivals produces no row.** Not nulls, and never the previous close.
-4. A sealed minute is published as `md.option_bar` (in the store process) and accumulates in memory.
-5. Every `FLUSH_SECONDS` -- 300 by default -- the buffer is written, **one object per table per
-   partition per flush**, on a worker thread.
+## From an observation to a file
 
-**The flush interval is the crash-loss budget**, and replay from the last flushed message id is what
-closes it. A write is one whole object; there is no append, which is why the move to object storage
-changes no code path.
+The journey has four stages.
 
-### Quote provenance
+**1. Bucketing.** Each observation is placed in the bucket for the minute it happened in, according
+to **the venue's timestamp, not ours**. If we used our own arrival time, network delay would
+occasionally push an observation into the wrong minute.
 
-The quote bars carry `from_book`: whether a minute's prices came from the venue's order book or from
-the slower channel standing in for a silent one. **The event type is the provenance** -- a tick from
-`md.option_quote` is a book tick, one from `md.option_reference`'s bid and ask is a fallback tick.
-Nothing on the bus carries a channel name.
+**2. Sealing.** When a minute is over, and a short grace period has passed to allow for messages
+still in transit, the bucket is *sealed* and nothing further can be added. The two venue streams get
+different grace periods, because their delays differ by roughly a factor of ten; a single grace
+period would either seal the slow stream too early and lose data, or make everything wait for it.
 
-## Replay and the checkpoint
+**3. Accumulating.** Sealed minutes pile up in memory. They are announced on the bus as they are
+sealed, so other parts can use them immediately without waiting for a file.
 
-The store keeps a **per-stream checkpoint** -- an id and a logical index -- in
-`<root>/_store-checkpoint.json`, and restarts from it. Never from the pending list, and **never from
-`0`**, which would re-record up to thirty minutes the old writer already wrote as duplicates.
+**4. Writing.** Every five minutes, everything accumulated is written out -- one file per collection
+per underlying per write. The write happens on a separate thread so that it cannot pause the part of
+the program reading from the venue.
 
-**A trimmed position is a replay gap, not a refusal to start.** The store replays the retained
-suffix, reports both bounds and an exact `lost` count, raises a `store.replay_gap` alert, and keeps
-going. The check runs continuously on the ten-second `store.state` cadence, not once at start-up.
+That five-minute interval is worth understanding, because **it is exactly the amount of work that
+would be lost if the program were killed at the worst possible moment.** That is why the store also
+keeps track of how far it had read, so it can go back and recover after a restart.
 
-**While any stream is behind, the seal clock is `min(wall clock, the time inside the last id of any
-stream still behind)`.** Without that, the first drain pass after any absence would seal the whole
-backlog as late and discard the bytes it just replayed.
+**A minute in which nothing arrived produces no row and no file.** Not a row of blanks, and never a
+copy of the previous minute. This is the most important rule in the whole store.
 
-## Reading it
+## Restarting without losing or duplicating data
 
-Four read paths, all `pl.scan_parquet(..., hive_partitioning=True)` against the same tree. The glob
-stays `**/*.parquet`: a bare prefix refuses the whole dataset the moment it holds one non-Parquet
-file, and compaction puts two there while it runs.
+After each successful write, the store records how far through the message stream it had got. On
+restart, it carries on from that recorded position -- never from the beginning, which would
+re-record everything and produce duplicates, and never from wherever the stream happens to be now,
+which would silently skip whatever arrived while it was down.
 
-| Route | Reads | uncompacted | compacted |
-|---|---|---|---|
-| `/chain/at`, `/chain/minutes` | one minute, four tables | 117.8 ms | **21.3 ms** |
-| `/bars` | one contract's day, two tables | 137.2 ms | **41.2 ms** |
-| a whole-day backtest read | four tables | 206.4 ms | **82.0 ms** |
+Sometimes the messages it needs have already been discarded by the bus, which only keeps thirty
+minutes. When that happens the store does not refuse to start. It reads whatever is still available,
+reports exactly how many entries it lost and between which two points, raises an alert, and carries
+on. A visible, counted gap is recoverable; a silent one is not.
 
-`measured` 2026-09-09 on 2026-09-08, BTC, 2,217,941 rows, local disk, warm cache, minimum of five.
-**These are a floor for S3, and the ratio is the part that transfers.**
+There is one subtlety while it is catching up. During a catch-up, "now" is taken from the timestamps
+inside the messages being processed rather than from the clock on the wall. Without that, the first
+pass after an outage would consider every recovered minute to be hopelessly late and discard the
+very data it had just gone to the trouble of recovering.
 
-In split mode the api also holds a lossless `BarBuffer` of `md.option_bar` events, so the read paths
-can union the newest sealed minutes with what is on disk without a local writer.
+## Reading it back
 
-**A backtest need not be written in this language.** The same tree answers DuckDB with
-`read_parquet('.../*/*/*.parquet', hive_partitioning = true)` and partition-key filters pushed down,
-with no export step and no service to keep running. Athena reads it too; adding it changes no file,
-only a catalogue.
+All four ways of reading are the same operation against the same folder tree, with filters that the
+folder names answer before any file is opened. The table below lists them.
 
-## Compaction
+| What asks | What it reads |
+|---|---|
+| The historical chain screen | One minute, across four collections |
+| The contract chart | One contract's whole day, across two collections |
+| The volatility screen | One expiry's stored volatility |
+| A backtest, or a person exploring | Whole days, across all collections |
 
-**Nightly, one process, every partition strictly before today.** `tools/compact_store.py`.
+In the multi-process arrangement the API also keeps a short in-memory copy of the most recently
+sealed minutes, received over the bus. That is what lets it answer questions about the last few
+minutes accurately even though it is not the program writing the files.
 
-It reads every input in a partition, writes a temporary file, **reads that file back in full to
-verify**, writes a manifest, deletes the inputs, and only then publishes. A gap is visible and
-recoverable; a doubling is invention.
+**A program reading this data does not have to be written in our language.** The folder layout and
+file format are both standard, so DuckDB, Athena, pandas or anything else reads the same files
+directly, with no export step and no service that has to be running.
 
-`measured` 2026-09-08, one real closed day of five-minute flush files, BTC and ETH:
+## Compaction: tidying up overnight
 
-```
-2,040 objects -> 8,  3,061,741 rows,  174.22 MiB -> 144.81 MiB  (16.9% smaller),  4.6 s
-```
+Writing every five minutes produces a great many small files -- around two thousand for a busy day.
+Small files are slow to read and, on cloud storage, expensive: every file costs a request to find
+and another to open, and a single historical query might touch a thousand of them.
 
-**On object storage the file count is a bill.** Uncompacted, one `/chain/at` read touches 1,152
-objects, each costing at least a footer request and a data request; compacted it touches 4. Same
-dashboard, same data, 288x the requests -- `derived` **$27.55 a month** of `GET` charges saved at an
-`assumed` 1,000 ladder reads a day, against $0.016 of compaction requests.
+So once a night, a tool merges each finished day's files into one file per collection. A real day
+folds from around two thousand files into eight, and gets about a sixth smaller into the bargain.
+The same query afterwards touches four files instead of over a thousand.
 
-**Nightly, not on the go.** Parquet cannot append, so "on the go" means folding today's partition
-while the store flushes into it. `measured` on a real day cut at 15:00Z: `/chain/at` 93.5 ms median
-and 115.1 ms p95, against 34.1 / 45.5 ms folded into hour files. A `derived` ~60 ms does not pay for
-an hourly job, a fold and a compactor beside the live writer. That flips when a route reads *today*
-from S3.
+Because this deletes data, the order of operations is careful and deliberately paranoid:
 
-## Storage class, and the 128 KB cliff
+1. Read every file in the day's folder.
+2. Write the merged result to a temporary file.
+3. **Read that temporary file back in full** and check it contains what it should.
+4. Write a small manifest recording what was merged into what.
+5. Only then delete the original files, and publish the merged one.
 
-**S3 Standard.** Both cheaper classes have a 128 KB rule, and `measured` we sit on the wrong side of
-it before compaction:
+The principle behind that ordering is that **a missing file is a visible problem that can be fixed,
+while a duplicated one is invented data that may never be noticed.** If the process is interrupted,
+the manifest is what makes the state recoverable.
 
-| table | objects | median object | under 128 KB |
-|---|---|---|---|
-| `quote-bars` | 821 | 73,442 B | **98.4%** |
-| `reference-bars` | 821 | 230,112 B | 0.6% |
-| `computed-bars` | 821 | 90,240 B | **98.4%** |
-| `spot-bars` | 821 | 2,334 B | **100%** |
+It runs overnight on finished days rather than continuously on today's data. Parquet files cannot be
+appended to, so merging today's folder would mean rewriting it repeatedly while the store is still
+writing into it -- a lot of machinery, running beside the live writer, to speed up a query that is
+already fast enough.
 
-**Standard-IA bills a 128 KB minimum per object**, so `spot-bars` at 2.3 KB would be billed at 55
-times its own size. **Intelligent-Tiering does not monitor or tier an object under 128 KB** at all.
-After compaction every daily object is megabytes and Intelligent-Tiering would work at `derived`
-$0.70/month against Standard's $1.52 -- but its saving is conditional on nobody reading a day older
-than thirty days, and the product is a backtester. Revisit with a measured access pattern.
+## Storage in production
 
-## Bucket settings
+In production the files live in Amazon S3 rather than on a local disk, in one bucket per
+environment, and the code path is unchanged: the same call, a different root location. A few
+settings on that bucket are chosen deliberately, and the table below explains them.
 
-| Setting | Value | Why |
+| Setting | Choice | Why |
 |---|---|---|
-| Versioning | **off** | Compaction deletes inputs only after a verified read-back; versioning would keep them alive and let a naive `list` read the day doubled |
-| Block Public Access | on | |
-| Default encryption | SSE-S3 | |
-| Lifecycle | one rule, aborting incomplete multipart uploads after 7 days | Nothing transitions and nothing expires: bars are kept indefinitely |
+| Keeping old versions of files | Off | Compaction's safety argument depends on deleted files actually being gone. Kept versions would let a careless listing read the day twice |
+| Public access | Blocked | Nothing here should be reachable from the internet |
+| Encryption | On, managed by Amazon | No reason not to |
+| Automatic deletion | None | Bars are kept indefinitely. The only rule cleans up half-finished uploads |
+| Storage class | Standard | The cheaper classes charge a minimum size per file, and before compaction most of our files are far below it -- one collection's files would be billed at fifty times their actual size |
 
-## What it costs
+The storage bill for both underlyings comes to roughly two dollars a month, which is set out
+alongside the rest of the costs in [Deployment](deployment.md).
 
-| Line | BTC alone | BTC+ETH |
-|---|---|---|
-| Objects written per day | `derived` 1,152 | `derived` 2,304 |
-| Bytes written per day, before compaction | `derived` 172.1 MB | `derived` 201.5 MB |
-| Bytes retained per day, after compaction | `derived` 143 MB | `derived` 167.4 MB |
-| **S3 Standard, compacted, a month** | `derived` **$1.52** | `derived` **$1.92** |
+## Where to go next
 
-**Do not put 201.5 MB/day beside 143 MB/day and call the gap 1.4x.** They are different quantities:
-one is bytes **written** before compaction, the other bytes **retained** after it. Like for like, the
-second underlying costs `derived` 1.17x the bytes and 2x the objects.
-
-## Related guides
-
-[Events](events.md) | [Message bus](message-bus.md) | [Deployment](deployment.md)
+[Data flow](data-flow.md) covers what happens before the store sees a message.
+[API reference](api-reference.md) lists the web addresses that read this data.
