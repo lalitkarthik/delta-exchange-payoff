@@ -4,9 +4,10 @@ Option chain, volatility and payoff analysis for **Delta Exchange India** crypto
 (BTC, ETH). One websocket to the venue, one canonical event stream, a solved strike ladder on
 screen once a second, and a Parquet store that folds the same stream into one-minute bars.
 
-These pages are the reader's entry point. They summarise and link to the design record under
-[`docs/design/`](../design/), which stays the authority where the two disagree; where a page
-here and a contract document disagree about a wire shape, the contract wins.
+**These pages carry the decisions and nothing else** -- what the system does, how it is shaped, and
+what it runs on. The alternatives weighed, the measurements taken and the records behind each choice
+live under [`docs/design/`](../design/). Where a page here and a wire contract disagree about a
+payload, the contract wins.
 
 ## Getting started
 
@@ -36,8 +37,7 @@ here and a contract document disagree about a wire shape, the contract wins.
 
 ## Conventions used throughout
 
-- **Every number is tagged.** `measured` names the run that produced it, `derived` the
-  arithmetic, `assumed` the guess. Never quote a figure from prose as if you observed it.
+- **Every number is tagged** `measured`, `derived` or `assumed`.
 - **`null` is not `0`.** An absent quote is `null` even where the venue spells it `"0"`;
   a zero in open interest or a greek is a real zero.
 - **Every decimal is a JSON number or `null`, never a string.** Converted once, at the

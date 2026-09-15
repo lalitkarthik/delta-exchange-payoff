@@ -11,12 +11,11 @@ What travels on it is [Events](events.md), which wins on names and directions.
 `Bus` is a `runtime_checkable` `Protocol` naming `publish` and `subscribe`, and **it defines no
 behaviour**. Queue policy belongs to the implementation that argues it.
 
-**Conformance is structural, not nominal.** `class FanOut(Bus)` was written first and reverted: a
-`Protocol`'s methods are not abstract, so a subclass implementing *neither* still constructs and
-inherits `...`-bodied stubs returning `None`. A missing `publish` would stop raising
-`AttributeError` and start **dropping messages silently**, and an `isinstance` test against a
-nominal subclass is `True` whatever the class contains. The structural check fails when a method
-goes missing; that is the whole reason it is the one used.
+**Conformance is structural, not nominal.** A `Protocol`'s methods are not abstract, so an explicit
+subclass implementing neither still constructs and inherits `...`-bodied stubs returning `None`: a
+missing `publish` would **drop messages silently** instead of raising `AttributeError`. The
+structural `isinstance` check does fail when a method goes missing, and that is why it is the one
+used.
 
 **The publisher never blocks.** The socket handler publishes and returns; if it blocked, the OS
 receive buffer would fill and the venue would close us. That rule is why the bus exists at all,
@@ -50,21 +49,15 @@ construction it should be impossible.
 A producer and a consumer are opened by neither choice. Redis is **mandatory** in split mode: an
 unreachable Redis raises `BusUnavailable` at startup, before the feed opens the venue socket.
 
-## Why Redis Streams, and not a managed service
+## Redis Streams, in a container
 
-**No AWS message service carries this bus.** Redis Streams does, in a container beside the
-services, on the instance's own loopback under `host` network mode.
-
-| Rejected | Why |
-|---|---|
-| ElastiCache for Valkey | `derived` $47.30/month against a container's $0. **The named fallback** if the hosting criteria move -- one endpoint string |
-| ElastiCache Serverless | It has no `maxmemory`, so a trim that stops working is a bill and not an error |
-| MemoryDB | Durability is the product and cannot be turned off, for frames the venue can re-tell |
-| ZeroMQ | Settled against in-process fan-out early; do not reopen |
-
-**A container, not a managed cache, because the bus is a pipe.** Losing it costs a restart and not
+**The bus is a pipe, so it runs as a container beside the services** -- on the instance's own
+loopback under `host` network mode, never as a managed cache. Losing it costs a restart and not
 history: the store replays from its checkpoint, and the api refills its cache from the live events
-that follow, inside one book refresh -- `measured` 508 ms a contract.
+that follow, inside one book refresh.
+
+**ElastiCache for Valkey is the named fallback**, and moving there is one endpoint string. A managed
+cache must pin `maxmemory-policy` in its parameter group, for the reason under *Persistence* below.
 
 ## Stream names
 
@@ -155,10 +148,9 @@ exact: acked on receipt, the pending list means *handed over and not delivered* 
 reading it delivers each entry exactly once. Acked after delivery it would hold delivered entries
 too, and recovery could not tell them apart.
 
-**A5 protects a running store, not only a starting one.** A live store once lost **97 minutes** of
-market data while its own `/health` reported `replay_gap_entries: 0` throughout, because its bus
-reader had died and the gap check only ever ran at start-up. It now runs on the same loop that
-publishes `store.state`.
+**A5 protects a running store, not only a starting one.** A gap check that ran once at start-up
+would miss a reader that died while running -- its `/health` would report `replay_gap_entries: 0`
+for as long as it stayed up. The check runs on the same loop that publishes `store.state`.
 
 **A6 is what makes a replay produce the bars a live run would have produced.** Without it the first
 drain pass after any absence seals the whole backlog as late and discards what it just replayed.
@@ -170,12 +162,11 @@ drain pass after any absence seals the whole backlog as late and discards what i
 | Retention | **thirty minutes**, `assumed`, by age and never by count |
 | Command | `XTRIM <stream> MINID ~ <now - 1800s>` |
 | When | in the **same pipeline as that batch's `XADD`s**, on every batch write |
-| `XACK` | frees no stream memory -- `measured`: 5,000 entries acked, `XLEN` still 5,000 |
+| `XACK` | frees no stream memory. Only `XTRIM` does |
 
 **Trim by age and never by `MAXLEN`, because a count is a guess about rate**: it would hold hours in
-a quiet market and four minutes in a loud one. The trim is free at our shape -- `measured` 31.8 us
-an entry with it and 31.8 us without -- and a separate trim timer would be one more thing that can
-stop.
+a quiet market and four minutes in a loud one. The trim rides in the batch's own pipeline because it
+costs nothing there, and a separate trim timer would be one more thing that can stop.
 
 ```
 redis-server --save "" --appendonly no --maxmemory 2gb --maxmemory-policy noeviction
@@ -186,7 +177,7 @@ redis-server --save "" --appendonly no --maxmemory 2gb --maxmemory-policy noevic
 | `appendonly no` | The Parquet store is the archive |
 | `save ""` | The stock image ships `save 3600 1 300 100 60 10000`, which at our rate forks every minute |
 | no volume, no backup | A container with no volume leaves no file behind |
-| `maxmemory 2gb` | 2x the `derived` memory at thirty minutes; `measured` 1,056.4 MiB for BTC+ETH |
+| `maxmemory 2gb` | Twice the thirty-minute working set for BTC and ETH |
 | `maxmemory-policy noeviction` | **A data-loss decision, not a tuning one** |
 
 **`noeviction` is load-bearing.** Under `allkeys-lru` Redis evicts whole keys, and one of our keys

@@ -116,10 +116,17 @@ the supervisor, which puts it on the bus and offers it to the controller that ow
 **It answers with the adapter's health line after the command has been applied**, not before, so the
 response is never a claim about an intention.
 
-## Through the Docker proxy
+## Behind a proxy
 
-One origin, one host port. `/api/` is stripped and forwarded to the api; everything else goes to
-`web`. So `/api/chain` reaches the engine as `/chain`, and the websocket uses the same prefix.
+**The browser always sees one origin**, in the Docker stack and in production alike. `/api/` is
+stripped and forwarded to the api; everything else is the front end. So `/api/chain` reaches the
+engine as `/chain`, and the websocket uses the same prefix.
+
+| Environment | What does the stripping |
+|---|---|
+| The Docker stack | the `nginx` proxy container, on one host port |
+| Production | Amplify's 200 rewrite of `/api/<*>` to the instance's HTTPS endpoint |
+| `bun run dev` | nothing -- the browser calls port 8000 directly, under the CORS allow-list |
 
 **`/volatility` is a deliberate collision**: the api declares the route and the web app has a page
 at the same path, so no per-route table could serve both. The api's series wins, and the web page at

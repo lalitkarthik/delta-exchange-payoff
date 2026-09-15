@@ -1,190 +1,180 @@
 # Deployment
 
-**Nothing here is built.** There is no AWS account on this machine, and no figure on this page was
-taken against one: every dollar is `derived` from `measured` AWS Price List Bulk API unit prices
-read 2026-09-09 in `ap-south-1`, on-demand, 730 hours a month. Treat every latency figure as a
-floor, not a reading.
+**Two places, and one line between them.** Everything that touches the venue, the bus, the store and
+the API runs on **one EC2 instance**. The front end is built and served by **AWS Amplify**.
 
-The shape that *is* built is the local Compose stack -- see [Getting started](getting-started.md).
+```
+                        DELTA EXCHANGE
+                              |
+   +--------------------------v---------------------------+
+   |  EC2 -- one c7g.xlarge, ap-south-1, host networking   |
+   |                                                       |
+   |   feed  -->  redis  -->  store  -->  S3 (bar tables)  |
+   |                 |                                     |
+   |                 +----->  api                          |
+   |                 +----->  discord-alerts               |
+   |                                                       |
+   |   proxy (TLS) -- the one public listener, for the api |
+   +--------------------------^---------------------------+
+                              | HTTPS, one rewrite rule
+                    +---------+----------+
+                    |  Amplify -- web    |
+                    +---------+----------+
+                              |
+                           a browser
+```
 
-## The platform, in one line
+## What runs where
 
-**ECS on EC2: one `c7g.xlarge` in a public subnet of `ap-south-1` (Mumbai), one task definition
-holding all seven containers, `host` network mode.** `derived` **$78.07 a month** of compute, and
-**$79.99 all-in** for BTC and ETH.
-
-| | `dev` | `prod` |
+| Tier | Runs | Holds |
 |---|---|---|
-| Runs on | Docker Compose on a laptop | ECS on one EC2 instance |
-| Instance | -- | `c7g.xlarge`, Graviton3, 4 vCPU, 8 GiB, 30 GB gp3 root |
-| Containers | the same seven | the same seven |
-| Networking | the Compose network | `host` mode -- every container on the instance's stack |
-| Store root | `data/` (or `./.stack-data/`) | `s3://<env>-deltapayoff-bars/` |
-| Reachable from | the laptop | a tunnel or Tailscale only; **never a public listener** |
-| Stream names | no environment in the name | **the same names**; one Redis each, never shared |
+| **EC2** | ECS on EC2, one task definition, `host` network mode | `feed`, `redis`, `store`, `api`, `discord-alerts`, and a proxy that terminates TLS for the API |
+| **Amplify** | Amplify Hosting, built from the repository on push | `web` -- the Next.js front end, its build, its CDN and its certificate |
+| **S3** | one bucket per environment | the four bar tables, in the hive layout the engine already writes |
 
-**The images are identical.** One `Dockerfile` per service, built `linux/arm64`, and the same tag
-runs in both places. Graviton is not a preference: the x86 twin of the same shape costs **82% more**
-in ap-south-1.
+**The back end stays on one box because it is one pipeline.** `feed` publishes to Redis on
+`127.0.0.1`, `store` and `api` read from the same loopback, and nothing between them crosses a
+network. `host` network mode is what keeps that true.
 
-## Why this platform
+**The front end is the one piece with no reason to be there.** It holds no state, talks to no
+venue, and is a static build plus server-side rendering -- exactly what Amplify is. Moving it off
+the instance takes a container, a build step and a certificate off the box and gives the browser a
+CDN it would otherwise not have.
 
-Four platforms against five criteria, at today's `measured` footprint and ten times it.
+## The instance
 
-| | Invariants | Ops for 2-3 people | $/mo, 1x to 10x | Path to more services | Latency |
-|---|---|---|---|---|---|
-| **ECS on EC2** (chosen) | a dead container restarts **and the restart is an alarmable event** | one AMI to patch; restarts and deploys are the platform's | **$48.94 to $179.43** | a new consumer is a container in the task | Redis on `127.0.0.1` under `host` mode |
-| EC2 with Compose | identical, but **nothing records that it restarted** | you are the only restarter; every deploy is an `ssh` | $48.94 to $179.43 -- ECS adds $0 | one YAML file on one box | same |
-| ECS on Fargate | identical; no host to misconfigure | lightest: no AMI, no agent, no disk | $89.33 to $242.41 | best per-service isolation | `awsvpc` is mandatory, putting a VPC hop between `feed` and Redis |
-| EKS | identical | heaviest: a Kubernetes minor upgrade at least yearly | $121.94 to $252.43 one node | the most, and the most unused | same as ECS on EC2 |
-| *behind a NAT gateway* | -- | -- | *+$165.00 to +$1,282.09* | -- | -- |
+| | Value |
+|---|---|
+| Region | **`ap-south-1`**, Mumbai -- in-country, and the CloudFront edge that serves the venue is in the same city |
+| Instance | **`c7g.xlarge`** -- Graviton3, **4 vCPU, 8 GiB**, 30 GB gp3 root |
+| Architecture | `linux/arm64`. The x86 twin of the same shape costs 82% more here |
+| Orchestrator | **Amazon ECS, EC2 launch type** -- a restart is a platform event something can alarm on, and EC2 compute adds $0 over running Compose by hand |
+| Network mode | **`host`** |
+| Subnet | **public**, one in-use public IPv4 |
+| NAT gateway | **none** |
+| Inbound | **one HTTPS listener, for the API**, reached by Amplify's rewrite. Nothing else is public |
 
-**Two rows tie exactly on cost**, because ECS on the EC2 launch type charges $0 for compute. When
-the cost criterion ties, the decision moves up to operations, and that is where plain Compose loses:
-a container that dies at 02:00 restarts with **no record anywhere that it happened**.
+**No NAT gateway.** The feed pulls a `measured` 843.4 KB/s, which is `derived` 2,216.5 GB a month.
+Inbound to AWS is free; a NAT gateway meters it, and the bill would be `derived` **$165.00 a
+month** -- more than the compute it fronts. The instance sits in a public subnet so its own public
+IPv4 is the egress. `awsvpc` network mode is not used for the same reason: task ENIs on EC2 get no
+public IP, so it forces a private subnet and a NAT gateway with it.
 
-## The network shape, and the number behind it
+## How the browser reaches the API
 
-| Rule | Value | Why |
-|---|---|---|
-| Subnet | **public** | so the instance's own public IPv4 is the egress |
-| Public IPv4 | one, in-use | `measured` $0.005/hour = `derived` **$3.65/month** |
-| NAT gateway | **none** | `derived` **$165.00/month** at 1x, **$1,282.09** at 10x |
-| ECS network mode | **`host`** | `feed` to Redis stays loopback |
-| Inbound listeners | **none public** | the dashboard is reached over a tunnel or Tailscale |
+**One origin, one rewrite rule.** Amplify serves the app and rewrites `/api/<*>` to the instance's
+HTTPS endpoint as a **200 rewrite**, so the browser makes no cross-origin request and no preflight.
 
-**A NAT gateway would cost more than the compute it fronts.** The feed pulls a `measured` 843.4 KB/s
--- `derived` **2,216.5 GB a month**. Inbound to AWS is free; a NAT gateway meters it at `measured`
-$0.056/GB, so the same bytes become `derived` $124.12 a month of data processing on top of $40.88 of
-gateway hours. **The platform question is partly a subnet question**, and that is the number that
-makes it one.
+| | |
+|---|---|
+| Browser origin | the Amplify domain, and nothing else |
+| `/api/<*>` | rewritten to `https://<api endpoint>/<*>` |
+| Everything else | served by Amplify |
+| CORS | **not consulted** -- the browser never addresses the instance |
+| `/ws/chain` | the same prefix; a websocket handshake, never subject to CORS |
 
-`awsvpc` mode is rejected for the same reason: on EC2, task ENIs get no public IP, so tasks must run
-in a private subnet with a NAT gateway. A third path exists and is not built -- both venue endpoints
-resolve `AAAA`, so IPv6-only egress through an egress-only internet gateway is free of both charges.
+This is the shape the local stack already runs behind nginx, with Amplify's rewrite standing in for
+the `proxy` container. It is why `NEXT_PUBLIC_ENGINE_URL` is a **path** and not a host: the browser
+asks its own origin for `/api/chain` in development and in production alike.
+
+**The API endpoint is public but not advertised.** It answers Amplify's rewrite and health checks
+and nothing else; the dashboard is the only client, and it never sees the address.
 
 ## Sizing
 
-Reservations, not measurements of split containers. **Sized at the 50 ms batch interval**, which is
-the only interval this system is configured to run at.
+Six containers on the instance, with `web` no longer among them.
 
-| Container | vCPU | Memory | Basis |
-|---|---|---|---|
-| `feed` | **1.0** | 1 GB | `measured` 0.3592 core at 1x; `derived` 0.52-0.71 with encode and publish at 50 ms. **1,024 CPU units** |
-| `store` | 0.5 | 1 GB | `measured` 0.3048 core, 1.49 KB/s to disk; a five-minute flush buffer |
-| `api` | 1.0 | 2 GB | `measured` 0.3045 core, +0.0466 for the first viewer; a 175.227 ms full solve pass |
-| `web` | 0.25 | 0.5 GB | `measured` 110.6 MiB idle, no CPU with no viewer |
-| `discord-alerts` | 0.05 | 0.25 GB | Subscribes to `alert` only, so it pays no market-data decode |
-| `proxy` | 0.25 | 0.5 GB | `assumed` |
-| `redis` | 0.5 | **3 GB** | the `maxmemory 2gb` ceiling plus overhead |
-| **Total** | **3.55** | **8.25 GB** | -> `c7g.xlarge`; the host overcommits vCPU |
+| Container | vCPU | Memory |
+|---|---|---|
+| `feed` | **1.0** (1,024 CPU units) | 1 GB |
+| `store` | 0.5 | 1 GB |
+| `api` | 1.0 | 2 GB |
+| `redis` | 0.5 | **3 GB** -- the `maxmemory 2gb` ceiling plus overhead |
+| `discord-alerts` | 0.05 | 0.25 GB |
+| proxy | 0.25 | 0.5 GB |
+| **Total** | **3.30** | **7.75 GB** |
 
-**`feed` is sized on 29.96 points of CPU and not on 5.88%, and the difference is five-fold.** 5.88%
-is the publisher measured **alone, on loopback, at a 100 ms batch** -- Redis's own write cost. At the
-chosen 50 ms the same publisher inside the feed costs `derived` 29.96 points (`measured` 70.73%
-against a bus-off control's 40.77%). Sizing from the smaller figure under-counts by 3.6-5.7x, and is
-how an earlier pass reached 6 vCPU at 10x.
+**`feed` reserves a whole core** because one Python process is one core, and it is the process that
+must never fall behind a socket. **The host overcommits vCPU**: the reservations total 3.30 against
+4, and three one-core Python services cannot starve `feed` at its 1,024 units.
 
-**These reservations under-count CPU and over-count memory**: the `derived` need at 1x is 1.21-1.95
-cores and 5.05 GiB. **The split costs `derived` 1.0888 cores against the monolith's 0.31** -- 3.52x.
-At ten times the rate it is `c7g.4xlarge` to `c7g.8xlarge`, `derived` $295.72-582.39.
+The reservations under-count CPU and over-count memory: the `derived` need at today's rate is
+1.21-1.95 cores and 5.05 GiB, which is why the instance is 4 vCPU and not 2. **At ten times the
+rate it is a `c7g.4xlarge` to `c7g.8xlarge`** -- that is the re-size trigger, and nothing else about
+the topology changes with it.
 
-**Why not `t4g.medium` at $22.74.** Burstable instances have a CPU baseline -- 20% per vCPU, so 0.4
-of a core. The split's `derived` 1.21-1.95 cores is three to five times that, and out of credits the
-instance is throttled to baseline **with nothing raised**. `t4g.large` at $39.09 is the honest cheap
-option; $9.85 a month removes the credit model entirely.
+## Amplify
 
-## One instance or several
-
-- **One `c7g.xlarge`, $78.07 at 1x.** On 4 vCPU three one-core Python services cannot starve `feed`,
-  which reserves 1,024 CPU units.
-- Two boxes cost $73.22-84.46; one per service is $128.07 at the 1x upper bound.
-- **Split into `feed`+`store`+Redis and `api`+`web`+proxy** when the box passes 2.8 cores, or when an
-  order path places its first order.
-- The same-AZ hop is `derived` at most 1 ms, invisible to every real consumer. Same-AZ transfer is
-  free on private addresses only.
-
-## The region
-
-**`ap-south-1`, Mumbai.** Cheapest of the four priced, in-country for the NSE adapter named next, and
-in the same city as the CloudFront edge that serves us.
-
-| | ap-south-1 | ap-southeast-1 | ap-northeast-1 | us-east-1 |
-|---|---|---|---|---|
-| 1x | **$48.94** | $80.99 | $83.47 | $65.62 |
-| 10x | **$179.43** | $307.25 | $317.18 | $246.72 |
-
-**What is between us and the venue, `measured` 2026-09-09.** Both Delta endpoints are Amazon
-CloudFront, and our POP is `BOM78-P11`, Mumbai. Delta's own documentation says the origin is "AWS
-Tokyo", and a cache-busted REST call costs `measured` 191.18 ms more than a cacheable one --
-`derived` ~167 ms of edge-to-origin round trip. **So a region buys the client-to-edge leg only**,
-except in ap-northeast-1, which would sit in the venue's own region. That is the last criterion, and
-execution is out of scope.
-
-Every latency figure was taken through an active tunnel and is an upper bound on one laptop, not a
-statement about an EC2 instance. **The from-AWS measurement has not been taken.**
-
-## What it costs, all in
-
-| Line | Underlying set | 1x | 10x |
-|---|---|---|---|
-| ECS on EC2, all-in | BTC+ETH | $78.07 | $295.72-582.39 |
-| S3 Standard, compacted | BTC+ETH | $1.92 | $19.19 |
-| Redis container | BTC+ETH | $0 -- its memory is bought inside the compute | $0 |
-| **Total** | BTC+ETH | **$79.99** | **$314.91-601.58** |
-
-**Quote the BTC+ETH row.** An earlier total mixed two underlying sets -- BTC+ETH compute against a
-BTC-only S3 bill. The difference is $0.40 a month, which is why it went unnoticed for as long as it
-did: the error is the mixing, not the amount.
-
-## The services bought, and the ones not
-
-| Bought | For |
+| | Value |
 |---|---|
-| Amazon ECS, EC2 launch type | one task definition holding every container |
+| Source | this repository, `web/`, built on push to the deployment branch |
+| Framework | Next.js, with server-side rendering |
+| TLS and domain | Amplify's, managed |
+| API routing | one 200 rewrite, `/api/<*>` to the instance |
+| Build-time variable | `NEXT_PUBLIC_ENGINE_URL=/api` |
+
+**`NEXT_PUBLIC_` values are inlined by `next build`.** Changing the API endpoint or the rewrite is a
+**rebuild**, not a restart -- the same rule that holds in the Docker stack, for the same reason.
+
+## Storage
+
+**Amazon S3 Standard, one bucket per environment**, `s3://<env>-deltapayoff-bars/`, written by
+`store` and read by the four historical routes. Versioning off, Block Public Access on, SSE-S3, and
+one lifecycle rule that only aborts incomplete multipart uploads. Bars are kept indefinitely.
+**Compaction is nightly**, every partition strictly before today. The layout, the write path and the
+compaction contract are [Data store](data-store.md).
+
+## What it costs
+
+| Line | 1x | 10x |
+|---|---|---|
+| EC2, all-in | `derived` $78.07 | `derived` $295.72-582.39 |
+| S3 Standard, compacted, BTC+ETH | `derived` $1.92 | `derived` $19.19 |
+| Redis | $0 -- its memory is bought inside the instance | $0 |
+| Amplify hosting | `assumed` small: build minutes and GB served, at one dashboard's traffic | `assumed` small |
+| **Total** | **`derived` $79.99** plus Amplify | **`derived` $314.91-601.58** plus Amplify |
+
+An unexpected line on a bill is almost always a NAT gateway or a forgotten public IPv4.
+
+## The services this system buys
+
+| Service | For |
+|---|---|
+| Amazon ECS, EC2 launch type | one task definition holding the six back-end containers |
 | Amazon EC2 | one `c7g.xlarge`, `host` network mode |
+| AWS Amplify Hosting | the front end: build, CDN, TLS, and the API rewrite |
 | Amazon VPC | one public subnet, one in-use public IPv4, no NAT gateway |
 | Amazon EBS gp3 | the instance's 30 GB root volume, and nothing else |
 | Amazon S3 Standard | the four bar tables, one bucket per environment |
 | Amazon ECR | the images a deploy registers |
 | Amazon CloudWatch | alarms on a stopped task and on the box |
 
-| Not bought | Why, in one line |
-|---|---|
-| ElastiCache for Valkey | `derived` $47.30/month against a container's $0. **The named fallback for Redis** |
-| ElastiCache Serverless | no `maxmemory`, so a trim that stops working is a bill and not an error |
-| MemoryDB | durability is the product and cannot be turned off, for frames the venue can re-tell |
-| RDS for PostgreSQL | $61.32/month to be awake. **The named fallback for OMS state**, beside the bars, never holding them |
-| Timestream | one flavour is closed to new customers; the other is a second query language |
-| Athena | it reads the same files, and one catalogue adds it later with no file changed |
-| Amazon EKS | `measured` $73.00/month of control plane before a container starts |
-| ECS on Fargate | `awsvpc` is mandatory. **The named fallback for the platform**, if host work becomes the constraint |
-| NAT gateway | more than the compute it fronts |
+Two fallbacks are named in advance, so neither is a decision taken under pressure:
+**ElastiCache for Valkey** replaces the Redis container, and it is one endpoint string.
+**RDS for PostgreSQL** holds order-management state when an order path arrives -- beside the bars,
+never holding them.
+
+## Deploying
+
+**The back end**: build the image, push to ECR, register a task definition revision,
+`aws ecs update-service`. The platform holds the desired state, so a deploy is a revision rather
+than an `ssh`.
+
+**The front end**: push to the deployment branch. Amplify builds and promotes it.
+
+**The images are identical in both environments.** One `Dockerfile` per service, built
+`linux/arm64`, and the same tag runs on a laptop and on the instance.
 
 ## A month of operations
 
-1. **Patch the AMI** -- replace the instance, do not patch in place. ~30 minutes, monthly.
-2. **Read the ECS event stream** for task stops nobody noticed, and the stopped-reason strings. ~10
-   minutes.
-3. **Check disk on the root volume** -- images, logs, anything left locally. ~5 minutes.
-4. **Check the bill** against the `derived` $78.07. An unexpected line is usually a NAT gateway or a
-   forgotten public IP. ~5 minutes.
-5. **Confirm the private path still works** -- the tunnel that fronts the dashboard.
-6. **Deploy, when there is one**: build, push to ECR, register a task definition revision,
-   `aws ecs update-service`. Per change, not monthly.
+1. **Patch the AMI** -- replace the instance, do not patch in place. ~30 minutes.
+2. **Read the ECS event stream** for task stops nobody noticed, and their stopped-reason strings.
+3. **Check disk on the root volume** -- images, logs, anything left locally.
+4. **Check the bill** against the `derived` $78.07.
+5. **Check the Amplify build history** for a failed build nobody was watching.
 
 **What the platform does instead of us**: restarts a container that exited, reports that it did,
-replaces a task that fails its health check, and holds the desired state so a deploy is a revision
-rather than an `ssh`.
-
-## What nobody has measured
-
-1. **Venue latency from ap-south-1 and ap-northeast-1.** The commands are written out in the design
-   record.
-2. **The network hop to a managed Redis endpoint.**
-3. **S3 read latency, and the request count per Parquet read.** The `assumed` 2 requests per object
-   is a floor and is labelled as one.
-4. **The same-AZ hop**, if the topology ever splits.
+replaces a task that fails its health check, and rebuilds the front end on every push.
 
 ## Related guides
 

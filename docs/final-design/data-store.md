@@ -40,9 +40,8 @@ pins it. On S3 that same default would be a silent overwrite rather than a noisy
 
 1. A tick is bucketed on **`ts_venue` alone**. `lts`, the venue's last-trade stamp, is carried as a
    column and never bucketed on.
-2. A minute seals once its **grace** elapses. The two channels seal on different graces because
-   their arrival lags differ by an order of magnitude -- `measured` p50 212.6 ms on the book against
-   a median 3,176 ms on the ticker.
+2. A minute seals once its **grace** elapses. The two channels seal on different graces, because
+   their arrival lags differ by an order of magnitude.
 3. **A minute with no arrivals produces no row.** Not nulls, and never the previous close.
 4. A sealed minute is published as `md.option_bar` (in the store process) and accumulates in memory.
 5. Every `FLUSH_SECONDS` -- 300 by default -- the buffer is written, **one object per table per
@@ -75,18 +74,18 @@ backlog as late and discard the bytes it just replayed.
 
 ## Reading it
 
-Four read paths, all `pl.scan_parquet(..., hive_partitioning=True)` against the same tree. The glob
-stays `**/*.parquet`: a bare prefix refuses the whole dataset the moment it holds one non-Parquet
-file, and compaction puts two there while it runs.
+Four read paths, all `pl.scan_parquet(..., hive_partitioning=True)` against the same tree, and all
+answering from local disk or S3 with the same call and a different root.
 
-| Route | Reads | uncompacted | compacted |
-|---|---|---|---|
-| `/chain/at`, `/chain/minutes` | one minute, four tables | 117.8 ms | **21.3 ms** |
-| `/bars` | one contract's day, two tables | 137.2 ms | **41.2 ms** |
-| a whole-day backtest read | four tables | 206.4 ms | **82.0 ms** |
+| Route | Reads |
+|---|---|
+| `/chain/at`, `/chain/minutes` | one minute, four tables |
+| `/bars` | one contract's day, two tables |
+| `/smile` | one expiry's stored volatility |
 
-`measured` 2026-09-09 on 2026-09-08, BTC, 2,217,941 rows, local disk, warm cache, minimum of five.
-**These are a floor for S3, and the ratio is the part that transfers.**
+**The glob stays `**/*.parquet`.** A bare prefix refuses the whole dataset the moment it holds one
+non-Parquet file, and compaction puts two there while it runs. A filter on `date` or `underlying` is
+answered by the key before an object is opened.
 
 In split mode the api also holds a lossless `BarBuffer` of `md.option_bar` events, so the read paths
 can union the newest sealed minutes with what is on disk without a local writer.
@@ -102,42 +101,26 @@ only a catalogue.
 
 It reads every input in a partition, writes a temporary file, **reads that file back in full to
 verify**, writes a manifest, deletes the inputs, and only then publishes. A gap is visible and
-recoverable; a doubling is invention.
+recoverable; a doubling is invention. A real closed day folds ~2,000 flush objects into 8 and loses
+about a sixth of its bytes.
 
-`measured` 2026-09-08, one real closed day of five-minute flush files, BTC and ETH:
+**On object storage the file count is a bill.** Uncompacted, one `/chain/at` read touches over a
+thousand objects, each costing at least a footer request and a data request; compacted it touches
+four. Same dashboard, same data.
 
-```
-2,040 objects -> 8,  3,061,741 rows,  174.22 MiB -> 144.81 MiB  (16.9% smaller),  4.6 s
-```
+**Nightly, and not on the go.** Parquet cannot append, so "on the go" would mean folding today's
+partition while the store is still flushing into it -- a fold and a compactor running beside the
+live writer, for a read the dashboard does not wait on. **`os.replace` is not atomic on S3**, so
+publishing there is a `COPY` plus a `DELETE`, and the manifest is what makes that window
+recoverable. It is a sidecar in the prefix it describes, so a partition is recoverable on its own.
 
-**On object storage the file count is a bill.** Uncompacted, one `/chain/at` read touches 1,152
-objects, each costing at least a footer request and a data request; compacted it touches 4. Same
-dashboard, same data, 288x the requests -- `derived` **$27.55 a month** of `GET` charges saved at an
-`assumed` 1,000 ladder reads a day, against $0.016 of compaction requests.
+## Storage class
 
-**Nightly, not on the go.** Parquet cannot append, so "on the go" means folding today's partition
-while the store flushes into it. `measured` on a real day cut at 15:00Z: `/chain/at` 93.5 ms median
-and 115.1 ms p95, against 34.1 / 45.5 ms folded into hour files. A `derived` ~60 ms does not pay for
-an hourly job, a fold and a compactor beside the live writer. That flips when a route reads *today*
-from S3.
-
-## Storage class, and the 128 KB cliff
-
-**S3 Standard.** Both cheaper classes have a 128 KB rule, and `measured` we sit on the wrong side of
-it before compaction:
-
-| table | objects | median object | under 128 KB |
-|---|---|---|---|
-| `quote-bars` | 821 | 73,442 B | **98.4%** |
-| `reference-bars` | 821 | 230,112 B | 0.6% |
-| `computed-bars` | 821 | 90,240 B | **98.4%** |
-| `spot-bars` | 821 | 2,334 B | **100%** |
-
-**Standard-IA bills a 128 KB minimum per object**, so `spot-bars` at 2.3 KB would be billed at 55
-times its own size. **Intelligent-Tiering does not monitor or tier an object under 128 KB** at all.
-After compaction every daily object is megabytes and Intelligent-Tiering would work at `derived`
-$0.70/month against Standard's $1.52 -- but its saving is conditional on nobody reading a day older
-than thirty days, and the product is a backtester. Revisit with a measured access pattern.
+**S3 Standard.** Both cheaper classes have a 128 KB rule, and before compaction most of our objects
+sit on the wrong side of it: Standard-IA bills a 128 KB minimum per object, so a 2.3 KB spot-bars
+file would be billed at fifty times its own size, and Intelligent-Tiering does not monitor or tier
+an object that small at all. After compaction the daily objects are megabytes, which is a class
+decision to revisit against a real access pattern and not before.
 
 ## Bucket settings
 
@@ -150,16 +133,8 @@ than thirty days, and the product is a backtester. Revisit with a measured acces
 
 ## What it costs
 
-| Line | BTC alone | BTC+ETH |
-|---|---|---|
-| Objects written per day | `derived` 1,152 | `derived` 2,304 |
-| Bytes written per day, before compaction | `derived` 172.1 MB | `derived` 201.5 MB |
-| Bytes retained per day, after compaction | `derived` 143 MB | `derived` 167.4 MB |
-| **S3 Standard, compacted, a month** | `derived` **$1.52** | `derived` **$1.92** |
-
-**Do not put 201.5 MB/day beside 143 MB/day and call the gap 1.4x.** They are different quantities:
-one is bytes **written** before compaction, the other bytes **retained** after it. Like for like, the
-second underlying costs `derived` 1.17x the bytes and 2x the objects.
+`derived` **$1.92 a month** on S3 Standard for BTC and ETH, compacted, at today's rate. The line
+sits in the bill beside the compute in [Deployment](deployment.md).
 
 ## Related guides
 

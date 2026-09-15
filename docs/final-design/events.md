@@ -24,9 +24,9 @@ Seven fields, on every event. Frozen once built, extra fields forbidden, registe
 
 **Neither timestamp is a latency clock.** `ts_received` comes from `time.time()`, which can step
 backwards under an NTP correction; elapsed time is measured on the monotonic clock. The
-arrival-lag column is `ts_received - ts_venue`, and it is data rather than an error to correct:
-`measured` p50 212.6 ms, p99 365.3 ms, max 510.3 ms on `ob_l2` against a median 3,176 ms on
-`ticker` -- which is why the two seal on different graces.
+arrival-lag column is `ts_received - ts_venue`, and it is data rather than an error to correct.
+The two channels' lags differ by an order of magnitude -- `measured` p50 212.6 ms on `ob_l2`
+against a median 3,176 ms on `ticker` -- which is why they seal on different graces.
 
 ## The canonical instrument
 
@@ -155,9 +155,8 @@ one question: the quote bars store `from_book`, which says whether a minute's pr
 book or from the slower channel standing in for a silent one.
 
 **The event type is the provenance.** A tick built from `md.option_quote` is a book tick; one built
-from `md.option_reference`'s `bid`/`ask` is a fallback tick. Nothing is added to a payload. The
-rejected alternative was a `channel` string, which would put a venue's vocabulary back on the bus
-to redraw a line two type names already draw.
+from `md.option_reference`'s `bid`/`ask` is a fallback tick. Nothing is added to a payload, and no
+event carries a channel name.
 
 ## Versioning
 

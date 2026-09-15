@@ -17,9 +17,6 @@ A `schema_version` this build does not know raises at parse, naming both version
 symbol in the pre-currency form raises rather than defaulting a currency onto it. A stale cache
 key should be a crash, not a silent guess.
 
-**Measure rather than assert.** Every number in these documents is tagged `measured`, `derived` or
-`assumed` and names the run behind it. `tools/` regenerates them.
-
 **Keep the core pure.** Anything that can take data in and return data out does. Only
 `delta_client.py` talks to the venue and only `store.py` touches a file.
 
@@ -130,42 +127,57 @@ liveness**: 503 once its reader stops, its group is trimmed past, or its lag pas
 
 ## Where it runs on AWS
 
-**ECS on EC2: one `c7g.xlarge` in a public subnet of `ap-south-1` (Mumbai), one task definition
-holding all seven containers, `host` network mode.** `derived` **$78.07 a month** of compute,
-on-demand, 2026-09-12; **$79.99 all-in** with S3 for BTC and ETH.
+**Two tiers.** Everything that touches the venue, the bus, the store and the API runs on **one EC2
+instance**; the front end is built and served by **AWS Amplify**.
 
-| Concern | Choice | Why |
+| Tier | Holds | Shape |
 |---|---|---|
-| Orchestrator | Amazon ECS, EC2 launch type | A restart is an alarmable platform event, and EC2 compute adds $0 over plain Compose |
-| Instance | one `c7g.xlarge` -- Graviton3, **4 vCPU, 8 GiB**, 30 GB gp3 root | Reservations total 3.55 vCPU and 8.25 GB across seven containers |
-| Architecture | `linux/arm64` | `m7i.large`, the x86 twin, costs **82% more** in ap-south-1 for the same shape |
-| Region | `ap-south-1` | Cheapest of four priced, in-country for the NSE adapter named next |
-| Network mode | `host` | Keeps the publisher on `127.0.0.1`; `awsvpc` would put a VPC hop between `feed` and Redis |
-| Subnet | public, one in-use IPv4 | **A NAT gateway would cost `derived` $165/month** -- more than the compute it fronts |
-| Inbound | none public | The dashboard is reached over a tunnel or Tailscale |
-| Bus | Redis in a container, not ElastiCache | The bus is a pipe; losing it costs a restart, not history |
-| Store | **Amazon S3 Standard**, one bucket per environment | `s3://<env>-deltapayoff-bars/`, the same hive layout the engine already writes |
-| Images | Amazon ECR | One `Dockerfile` per service; the same tag runs in dev and prod |
-| Alarms | Amazon CloudWatch | A stopped task, and the box |
+| **EC2** | `feed`, `redis`, `store`, `api`, `discord-alerts`, a TLS proxy for the API | ECS on EC2, one `c7g.xlarge` in `ap-south-1`, one task definition, `host` network mode |
+| **Amplify** | `web` | Built from the repository on push; CDN, TLS and domain are Amplify's |
+| **S3** | the four bar tables | `s3://<env>-deltapayoff-bars/`, the same hive layout the engine writes locally |
+
+**The back end is one box because it is one pipeline.** `feed` publishes to Redis on `127.0.0.1`,
+`store` and `api` read from the same loopback, and nothing between them crosses a network. `host`
+network mode is what keeps that true, and it is why the API sits here rather than anywhere else:
+the process that solves a ladder reads the bus, and the bus is on this instance.
+
+**The front end is the one piece with no reason to be there.** It holds no state and touches no
+venue. On Amplify it gets a CDN and a managed certificate, and the instance loses a container, a
+build step and a listener.
+
+**The browser sees one origin.** Amplify rewrites `/api/<*>` to the instance's HTTPS endpoint as a
+200 rewrite, so no cross-origin request is made and CORS is never consulted -- the same shape the
+local stack runs behind nginx. `/ws/chain` uses the same prefix.
+
+| Decision | Value |
+|---|---|
+| Region | `ap-south-1`, Mumbai |
+| Instance | `c7g.xlarge`, Graviton3, **4 vCPU, 8 GiB**, 30 GB gp3 root, `linux/arm64` |
+| Subnet | public, one in-use public IPv4, **no NAT gateway** |
+| Inbound | one HTTPS listener for the API, reached by Amplify's rewrite. Nothing else is public |
+| Bus | Redis in a container on the instance, not a managed cache |
+| Store | Amazon S3 Standard, one bucket per environment |
+| Images | Amazon ECR, one `Dockerfile` per service, identical tags in both environments |
+| Alarms | Amazon CloudWatch, on a stopped task and on the box |
 
 ### Container reservations
 
-| Container | vCPU | Memory | Basis |
-|---|---|---|---|
-| `feed` | **1.0** | 1 GB | `measured` 0.3592 core at 1x; `derived` 0.52-0.71 with the publisher at a 50 ms batch |
-| `store` | 0.5 | 1 GB | `measured` 0.3048 core; `derived` 201.5 MB/day written for BTC+ETH |
-| `api` | 1.0 | 2 GB | `measured` 0.3045 core, +0.0466 for the first viewer; a 175 ms full solve pass |
-| `web` | 0.25 | 0.5 GB | `measured` 110.6 MiB idle, no CPU with no viewer |
-| `discord-alerts` | 0.05 | 0.25 GB | Subscribes to `alert` only, so it pays no market-data decode |
-| `proxy` | 0.25 | 0.5 GB | `assumed` |
-| `redis` | 0.5 | **3 GB** | The `maxmemory 2gb` ceiling plus overhead |
+| Container | vCPU | Memory |
+|---|---|---|
+| `feed` | **1.0** (1,024 CPU units) | 1 GB |
+| `store` | 0.5 | 1 GB |
+| `api` | 1.0 | 2 GB |
+| `redis` | 0.5 | **3 GB** -- the `maxmemory 2gb` ceiling plus overhead |
+| `discord-alerts` | 0.05 | 0.25 GB |
+| proxy | 0.25 | 0.5 GB |
+| **Total** | **3.30** | **7.75 GB** |
 
-**These reservations under-count CPU and over-count memory**: the `derived` need at 1x is 1.21-1.95
-cores and 5.05 GiB, which is why the instance is 4 vCPU and not 2. At ten times the rate it is
-`c7g.4xlarge`-`c7g.8xlarge`, `derived` $295.72-582.39.
+**`feed` reserves a whole core**, because one Python process is one core and it is the process that
+must never fall behind a socket. The host overcommits vCPU: 3.30 reserved against 4, and three
+one-core services cannot starve `feed` at its 1,024 units. **At ten times today's rate the instance
+becomes a `c7g.4xlarge` to `c7g.8xlarge`**, and nothing else about the topology changes.
 
-Full sizing arithmetic, the four-platform comparison, the region table and the month of operations
-are in [Deployment](deployment.md).
+Sizing, cost, the deploy path and the month of operations are [Deployment](deployment.md).
 
 ## Related guides
 

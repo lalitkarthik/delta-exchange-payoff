@@ -139,10 +139,10 @@ bun run build
 **No test may touch the network.** `tests/conftest.py` sets `DELTA_LIVE_FEED=0` and replaces the
 async client factory with one that raises, so a test that tries fails loudly.
 
-## Probe the venue yourself
+## Probes
 
-`tools/` holds probes, not engine code. They are how every number in these documents was
-produced, and re-running one beats trusting a quoted figure:
+`tools/` holds probes, not engine code. They answer questions about the venue and the store without
+touching either service:
 
 ```sh
 python tools/measure_feed.py          # channel refresh rates

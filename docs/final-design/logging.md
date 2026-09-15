@@ -50,12 +50,11 @@ timer is another thing that can stop, and the check costs a comparison.
 only its **formatter** -- colour at a terminal, JSON otherwise -- so redirected stderr contains no
 ANSI escapes and a container is never silent.
 
-That handler used to be gated on `sys.stderr.isatty()`, and in a container `/proc/1/fd/2` is a pipe,
-so it was never attached. Seven hours of records -- 252 `store.flush` among them -- went only to
-`/app/logs`, which no volume was mounted on, while `docker logs` showed four lines of uvicorn and
-the store had stopped consuming. **Both halves were fixed**: the formatter gate replaced the handler
-gate, and Compose now mounts `./.stack-logs/<service>` over `/app/logs`, one directory per service
-so four writers cannot collide on one day's file.
+**The gate is on the formatter and never on the handler.** In a container `/proc/1/fd/2` is a pipe,
+so gating the handler on `isatty()` detaches it entirely and the only diagnostics the system has go
+to a file nobody mounted. Both halves are held: stderr always carries records, and Compose mounts
+`./.stack-logs/<service>` over `/app/logs` -- one directory per service, so writers cannot collide
+on one day's file.
 
 Both handlers attach to `logging.getLogger("deltapayoff")`, **not root**, and `propagate` stays true
 so pytest's `caplog` captures through the root handler. Configuration is idempotent, so repeated
@@ -114,25 +113,24 @@ all four tables** -- warning while recording, info while paused, beside a
 `store.empty_generation` alert on the recording case only.
 
 That last one exists because **sealed-empty is correct behaviour and is indistinguishable from a
-dead system on disk**, so the store says which it was. Before it, a clean replay was silent and a
-restart that dropped a minute left no record that the restart had happened. Three separate losses
-in one day wore exactly that face.
+dead system on disk**, so the store says which it was. For the same reason the adoption record is
+emitted on every start, gap or no gap: a silent clean replay leaves a restart that dropped a minute
+with nothing to show it happened.
 
-**`bus.reader` is warning while a reader is still running and error once it is not.** It was added
-after one 2-second Redis read timeout killed every bus reader in three services inside 34 seconds,
-leaving a single `engine.error` apiece as the only trace.
+**`bus.reader` is warning while a reader is still running and error once it is not** -- a retry, a
+recovery after consecutive failures, and a reader that reached its retry bound are three different
+records, because a bus reader can die while its process stays healthy.
 
 **`feed.instruments` is the record of what is being recorded.** A contract listed after start-up and
 never subscribed damages only the history, and nothing else would say so.
 
 ## Volume
 
-`measured`: a live 300.4 s window produced **29 records and 8,813 bytes**.
-
-**Nothing scales with message rate.** The recurring part is `store.flush` at `measured` 8 per flush
-(four tables x two underlyings), so at `FLUSH_SECONDS=300` that is `derived` **96 records an hour**,
-plus `derived` 12 `store.checkpoint`. The cost is bounded by the flush interval, which is the
-property that makes info-level flush logging affordable at 1,323 messages a second.
+**Nothing scales with message rate**, and that is a design constraint rather than an observation.
+The recurring part is `store.flush` -- 8 records per flush, four tables across two underlyings -- so
+at `FLUSH_SECONDS=300` the whole steady-state volume is `derived` **96 records an hour** plus a
+dozen checkpoints. Bounding the cost by the flush interval is what makes info-level flush logging
+affordable on a feed carrying over a thousand messages a second.
 
 ## Failure modes
 

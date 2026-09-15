@@ -70,11 +70,9 @@ ticker frame  ->  md.option_reference
 ticker frame  ->  md.index_quote      one per frame
 ```
 
-Over the committed captures, 136 book frames yield 136 quotes and 136 ticker frames yield 136
-references and **136** index quotes -- all carrying an identical spot, which an earlier build
-deduplicated. **The suppression was removed, and the reason is the store rather than the screen**:
-the spot bars count observations, `spot_ticks` is the column that says whether the ingester was
-running at all, and a deduplicated stream cannot say how long a price held.
+**One index quote per ticker frame, not one per change**, and the reason is the store rather than
+the screen: the spot bars count observations, `spot_ticks` is the column that says whether the
+ingester was running at all, and a deduplicated stream cannot say how long a price held.
 
 ### The symbol mapping
 
@@ -192,8 +190,8 @@ own tests assert against the double.
 ### 7. Expose the decode as a pure function
 
 `events_from_frame(channel, frame, received_at)` -- three plain values, no socket, no bus, no clock.
-Every captured fixture frame runs through it, so the boundary is asserted against 136 real contracts
-on both channels, and every consumer test decodes through it so none drifts from it.
+Every captured fixture frame runs through it, so the boundary is asserted against real contracts on
+both channels, and every consumer test decodes through it so none drifts from it.
 ## Related guides
 
 [Events](events.md) | [Message bus](message-bus.md) | [Architecture](architecture.md)

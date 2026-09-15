@@ -73,10 +73,16 @@ trust.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `NEXT_PUBLIC_ENGINE_URL` | `http://localhost:8000` | Where the browser reaches the engine. The stack builds it as `http://localhost:8080/api` |
+| `NEXT_PUBLIC_ENGINE_URL` | `http://localhost:8000` | Where the browser reaches the engine |
+
+| Where the web app is built | Value |
+|---|---|
+| `bun run dev` on a laptop | `http://localhost:8000` -- straight at the engine, under the CORS allow-list |
+| The Docker stack | `http://localhost:8080/api` -- same-origin, through the nginx proxy |
+| Amplify | `/api` -- same-origin, through Amplify's rewrite to the instance |
 
 **`NEXT_PUBLIC_` values are inlined by `next build`.** It is a build argument, not a run-time
-variable: changing the proxy mount or origin requires a **rebuild**, not a restart.
+variable: changing the API endpoint or the rewrite requires a **rebuild**, not a restart.
 
 ## Ports and origins
 

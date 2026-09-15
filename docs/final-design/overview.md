@@ -20,9 +20,8 @@ key and no private endpoint: everything here runs on public market data.
 
 The venue's implied volatility is fitted to prices that are, on average, **9.8x** staler than the
 book we can see. So Delta's IV and Greeks are carried as **reference columns only and never
-consumed as inputs** -- `tests/test_no_delta_inputs.py` pins that -- and the system recovers its
-own forward, its own volatility and its own Greeks from the book, then stores both side by side so
-the difference is measurable rather than asserted.
+consumed as inputs** -- `tests/test_no_delta_inputs.py` pins that -- and the system recovers its own
+forward, its own volatility and its own Greeks from the book, then stores both side by side.
 
 ## What it does
 
@@ -102,7 +101,7 @@ a Discord webhook and never opens the feed, store or api to do it.
 engine/   FastAPI. One venue socket, the pure pricing core, the store writer, every route.
 web/      Next.js. Renders. Computes nothing and calls parseFloat nowhere.
 tools/    Probes. Every number in the docs came from one of these.
-docs/     Contracts, design records and measured findings.
+docs/     The contracts, and the design record behind them.
 ```
 
 **The pure core** -- `chain.py`, `wire.py`, `convert.py`, `compute.py`, `forward.py`,
