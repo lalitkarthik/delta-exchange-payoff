@@ -28,6 +28,28 @@ FEED_RECONNECT = "feed.reconnect"
 #: record rather than a failure of the feed. Issue #51 existed for six and a half hours
 #: of one night's data because nothing anywhere said either sentence.
 FEED_INSTRUMENTS = "feed.instruments"
+#: One frame arrived from the venue. **Debug, and off unless `DELTA_LOG_TRACE=1`**:
+#: `measured` 2026-09-02, BTC alone on four channels delivered 307,301 frames a minute --
+#: 5,122 a second, of which `ob_l1` was 4,874 -- so a line per frame is some 1-2 MB/s of
+#: log, and the write would sit on the one code path `delta_socket` documents as never
+#: allowed to block. `feed.throughput` is the same question answered affordably.
+FEED_MESSAGE = "feed.message"
+#: What the socket has read since the last report: frames, bytes, malformed, and the rate.
+#: Info, every `throughput.REPORT_SECONDS`. **This is the record that answers "is the feed
+#: alive"** -- the one thing a quiet market and a dead socket look identical without.
+FEED_THROUGHPUT = "feed.throughput"
+#: One event entered the bus. Debug, `DELTA_LOG_TRACE=1` only -- see `FEED_MESSAGE`; this
+#: is the same flood one layer down.
+BUS_PUBLISH = "bus.publish"
+#: One event was read off the bus by a consumer. Debug, `DELTA_LOG_TRACE=1` only.
+BUS_CONSUME = "bus.consume"
+#: One event left the bus for good -- the last subscriber dequeued its copy, or Redis
+#: acknowledged and trimmed it. Debug, `DELTA_LOG_TRACE=1` only.
+BUS_RELEASE = "bus.release"
+#: What the bus moved since the last report: published, and per consumer what was offered,
+#: read, dropped and left queued. Info, every `throughput.REPORT_SECONDS`. A consumer
+#: whose `queued` climbs report over report is the backlog this exists to make visible.
+BUS_THROUGHPUT = "bus.throughput"
 #: A `store.BarStore.flush()` wrote a file. Info, with the table, the rows, the file and
 #: the time it took — the numbers an operator wants after the three-day hole.
 STORE_FLUSH = "store.flush"
@@ -82,6 +104,12 @@ ALL = frozenset(
         FEED_STALE,
         FEED_RECONNECT,
         FEED_INSTRUMENTS,
+        FEED_MESSAGE,
+        FEED_THROUGHPUT,
+        BUS_PUBLISH,
+        BUS_CONSUME,
+        BUS_RELEASE,
+        BUS_THROUGHPUT,
         STORE_FLUSH,
         STORE_REPLAY_GAP,
         STORE_CHECKPOINT,

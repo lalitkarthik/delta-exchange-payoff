@@ -99,7 +99,7 @@ from .events.instrument import Instrument, InstrumentParseError
 from .fanout import FanOut
 from .feed_runtime import relist_forever, relist_instruments
 from .historical import list_minutes, read_ladder_at
-from .logging_setup import configure_logging, log_event
+from .logging_setup import configure_logging, log_event, set_component
 from .models import (
     AdapterHealth,
     BarBufferReport,
@@ -135,6 +135,7 @@ from .store import (
 )
 from .stream import ChainStream, recompute_every_minute, recompute_forever
 from .supervisor import FeedSupervisor, worst
+from .throughput import start as start_throughput
 from .volatility import (
     ALIGNMENTS,
     INTERVALS,
@@ -160,6 +161,7 @@ logger = logging.getLogger(__name__)
 # `logging_setup.configure_logging` — so importing `main` more than once, which pytest
 # does per test file, attaches the file and console handlers exactly once each.
 configure_logging()
+set_component("api")
 
 #: How often a connected browser is sent the chain. One second is well under what anyone
 #: reads and far above what the eye needs, and it is one JSON push regardless of how many
@@ -438,7 +440,7 @@ class FeedConnectionCache:
         if self._subscription is None:
             raise RuntimeError("attach() the feed connection cache before running it")
         while True:
-            self.apply(await self._subscription.queue.get())
+            self.apply(await self._subscription.take())
 
     def _adapter_name(self, adapter: str) -> str:
         if adapter.upper() == self.venue.upper():
@@ -723,7 +725,7 @@ class StoreStateCache:
         if self._subscription is None:
             raise RuntimeError("attach() the store state cache before running it")
         while True:
-            self.apply(await self._subscription.queue.get())
+            self.apply(await self._subscription.take())
 
     def clear(self) -> None:
         self.event = None
@@ -1118,6 +1120,9 @@ async def start_consumer_stack(stack: FeedStack) -> None:
         ),
         asyncio.create_task(stack.bar_buffer.run(), name="bar-buffer"),
     ]
+    # No socket in this composition -- the feed is its own process -- so the bus is the
+    # only thing here with a throughput to report.
+    start_throughput(stack.tasks, bus=stack.events)
     for task in stack.tasks:
         task.add_done_callback(_report_finished_task)
 
@@ -1176,6 +1181,11 @@ async def start_feed_stack(stack: FeedStack) -> None:
         # read on a loop that a feed running at `measured` 1,693.6 msg/s must not notice.
         asyncio.create_task(relist_forever(stack), name="instrument-relist"),
     ]
+    # **What says the feed is alive.** Every counter these read was already kept and
+    # never spoken aloud, so the log could say a connection was `connected` and not
+    # whether a byte had crossed it since. See `throughput.py` for why it is a summary
+    # rather than a line per frame.
+    start_throughput(stack.tasks, adapter=stack.adapter, bus=stack.events)
     for task in stack.tasks:
         task.add_done_callback(_report_finished_task)
 

@@ -17,10 +17,20 @@ from .controller import REASON_PAUSED, RECONNECT_AFTER_SECONDS
 from .delta_client import DeltaClient, DeltaUnavailable
 from .events import ConnectionState, ControlCommand
 from .feed_runtime import relist_forever, relist_instruments
+from .logging_setup import configure_logging, set_component
 from .main import live_underlyings
 from .models import HealthReport
 from .redis_bus import BusConfig, RedisBus
 from .supervisor import FeedSupervisor
+from .throughput import start as start_throughput
+
+# **Configured here, not inherited.** This module was logging only as a side effect of
+# `from .main import live_underlyings` above — drop that import in a refactor and the
+# feed container goes silent. The call is idempotent, so saying it twice costs nothing.
+# `set_component` comes after the imports on purpose: `main` names itself `api` at its
+# own import, and the last caller wins because the name is read when a record is emitted.
+configure_logging()
+set_component("feed")
 
 ADAPTER_ENV = "DELTA_FEED_ADAPTER"
 
@@ -62,6 +72,9 @@ class FeedProcess:
     relist_task: asyncio.Task | None = None
     control_subscription: Any = None
     control_task: asyncio.Task | None = None
+    #: The periodic `feed.throughput` and `bus.throughput` reporters. Cancelled with the
+    #: rest in `_close_process`.
+    throughput_tasks: list[asyncio.Task] = field(default_factory=list)
 
 
 def build_adapter(client: DeltaClient, underlyings: tuple[str, ...]) -> Any:
@@ -106,7 +119,7 @@ def _clear_state(app: FastAPI) -> None:
 async def _consume_control(process: FeedProcess) -> None:
     """Apply commands already published to the feed's inbound stream."""
     while True:
-        event = await process.control_subscription.queue.get()
+        event = await process.control_subscription.take()
         if isinstance(event, ControlCommand):
             process.supervisor.dispatch_command(event)
 
@@ -121,6 +134,11 @@ async def _close_process(process: FeedProcess) -> None:
         process.control_task.cancel()
         await asyncio.gather(process.control_task, return_exceptions=True)
         process.control_task = None
+    for task in process.throughput_tasks:
+        task.cancel()
+    if process.throughput_tasks:
+        await asyncio.gather(*process.throughput_tasks, return_exceptions=True)
+        process.throughput_tasks = []
     await process.supervisor.aclose()
     await process.bus.aclose()
     await process.client.aclose()
@@ -163,6 +181,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             yield
         else:
             supervisor.start()
+            # **This process is the one holding the socket**, so it is the one that can
+            # say whether anything is arriving on it -- the question a `connected` badge
+            # cannot answer. See `throughput.py`.
+            start_throughput(
+                process.throughput_tasks, adapter=process.adapter, bus=process.bus
+            )
             process.relist_task = asyncio.create_task(
                 relist_forever(process), name="instrument-relist"
             )

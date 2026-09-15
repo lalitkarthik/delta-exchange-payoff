@@ -1854,21 +1854,23 @@ class BarWriter:
         """
         if self._subscription is None:
             raise RuntimeError("attach() the writer to a FanOut before running it")
-        queue = self._subscription.queue
+        subscription = self._subscription
         if self._last_flush is None:
             self._last_flush = self.clock()
 
         while True:
             try:
                 self.ingest(
-                    await asyncio.wait_for(queue.get(), timeout=self.tick_seconds)
+                    await asyncio.wait_for(
+                        subscription.take(), timeout=self.tick_seconds
+                    )
                 )
             except TimeoutError:
                 pass
             # Whatever else is already queued, without awaiting. One wakeup per burst.
             while True:
                 try:
-                    self.ingest(queue.get_nowait())
+                    self.ingest(subscription.take_nowait())
                 except asyncio.QueueEmpty:
                     break
 
@@ -2537,15 +2539,32 @@ def prefer_disk(
     *,
     schema: Mapping[str, Any],
 ) -> pl.LazyFrame:
-    """Union two sources once per stored identity, with the committed file winning."""
+    """Union two sources once per stored identity, with the committed file winning.
+
+    **The buffer is reordered onto the disk frame's columns before the concat, because
+    `vertical_relaxed` relaxes dtypes and not column *order*.** `scan()` takes its hive
+    column order from the paths it globbed, so a store still holding pre-migration
+    `date=/underlying=` directories beside migrated `underlying=/date=` ones yields
+    `[..., date, underlying]` while `pending()` always builds `[..., underlying, date]`
+    from `HIVE_SCHEMA` — and the concat then failed with `schema names differ: got date,
+    expected underlying`, a polars query plan rather than a sentence, on every read path
+    that routes through here. `tools/migrate_store.py` is the cure for the tree; this is
+    the cure for the read, and it holds for any future column order too.
+
+    A `select` rather than `how="diagonal_relaxed"`: diagonal would also paper over a
+    genuinely different column *set* by filling the missing side with nulls, and a
+    fabricated null is the one thing this store does not do. A set that really differs
+    still raises here, by name, which is what it should do.
+    """
     rank = "_source_rank"
     identity = ("underlying", "date", "minute")
     if "symbol" in schema:
         identity += ("symbol",)
+    columns = disk.collect_schema().names()
     ranked = pl.concat(
         [
             disk.with_columns(pl.lit(0).alias(rank)),
-            buffer.with_columns(pl.lit(1).alias(rank)),
+            buffer.select(columns).with_columns(pl.lit(1).alias(rank)),
         ],
         how="vertical_relaxed",
     )

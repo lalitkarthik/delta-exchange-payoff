@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import pytest
 
+from deltapayoff import fanout
+from deltapayoff.events import ControlCommand
 from deltapayoff.fanout import FanOut
 
 
@@ -303,3 +306,116 @@ def test_a_lossless_drop_is_impossible_but_logged_if_it_ever_happens(
     assert len(records) == 1, [r.getMessage() for r in caplog.records]
     assert records[0].levelno == logging.ERROR
     assert "writer" in records[0].getMessage()
+
+
+def test_take_is_the_one_way_a_consumer_reads_and_it_counts(caplog) -> None:
+    """The bus can count what it handed to a queue; it cannot see a `get()`.
+
+    So `consumed` — and with it `bus.consume`, `bus.release` and the `offered`-versus-
+    `consumed` gap in `bus.throughput` — exists only because every consumer in the engine
+    goes through `take()`. A bare `queue.get()` is invisible here, which is why there are
+    none left in `engine/src`.
+    """
+
+    async def drive() -> tuple[object, int, int]:
+        bus = FanOut()
+        subscription = bus.subscribe("reader", maxsize=10)
+        record = object()
+        bus.publish(record)
+        got = await subscription.take()
+        return got, subscription.consumed, subscription.queue.qsize()
+
+    got, consumed, queued = asyncio.run(drive())
+
+    assert consumed == 1
+    assert queued == 0
+    assert got is not None
+
+
+def test_the_per_record_trace_is_silent_unless_it_is_turned_on(
+    caplog, monkeypatch
+) -> None:
+    """`measured` 5,122 frames a second: a line per record is 1 MB/s of log for one
+    underlying, multiplied by the consumer count, written on the path the socket owner
+    documents as never allowed to block. It exists, and it is off."""
+    monkeypatch.setattr(fanout, "TRACE", False)
+
+    async def drive() -> None:
+        bus = FanOut()
+        subscription = bus.subscribe("reader", maxsize=10)
+        bus.publish(object())
+        await subscription.take()
+
+    with caplog.at_level(logging.DEBUG, logger="deltapayoff.fanout"):
+        asyncio.run(drive())
+
+    assert [r for r in caplog.records if r.event.startswith("bus.")] == []
+
+
+def test_the_trace_says_enter_read_and_release_when_it_is_turned_on(
+    caplog, monkeypatch
+) -> None:
+    """The three moments of one record's life on the bus, in order.
+
+    On this bus each subscriber holds its own copy, so the read *is* the release — they
+    are one `take()` apart rather than separated by an acknowledgement, which is the
+    difference from Redis Streams that `logging-catalogue.md` records.
+    """
+    monkeypatch.setattr(fanout, "TRACE", True)
+
+    async def drive() -> None:
+        bus = FanOut()
+        subscription = bus.subscribe("reader", maxsize=10)
+        bus.publish(
+            ControlCommand(
+                event_id="0f7c2a9e5b1d4c8fa3e6b0d2c4f18a97",
+                ts_venue=datetime(2026, 9, 15, 8, 0, tzinfo=timezone.utc),
+                ts_received=datetime(2026, 9, 15, 8, 0, tzinfo=timezone.utc),
+                source="operator",
+                adapter="delta",
+                command="pause",
+            )
+        )
+        await subscription.take()
+
+    with caplog.at_level(logging.DEBUG, logger="deltapayoff.fanout"):
+        asyncio.run(drive())
+
+    events = [r.event for r in caplog.records if r.event.startswith("bus.")]
+    assert events == ["bus.publish", "bus.consume", "bus.release"]
+    published = next(r for r in caplog.records if r.event == "bus.publish")
+    assert published.subscribers == 1
+    assert published.event_type == "control.command"
+    consumed = next(r for r in caplog.records if r.event == "bus.consume")
+    assert consumed.subscriber == "reader"
+    assert consumed.queued == 0
+
+
+def test_a_drained_backlog_is_counted_as_read_not_as_a_stall() -> None:
+    """`take_nowait` is the drain loop's counterpart, and it has to count too.
+
+    `BarWriter.run` takes one record awaited and then drains whatever else is queued in a
+    tight loop — which is exactly what a lossless consumer's backlog is made of. Counting
+    the awaited read and not the drained ones would report a store that had fallen behind
+    as one that had stopped consuming altogether, which is the opposite diagnosis.
+    """
+
+    async def drive() -> tuple[int, int]:
+        bus = FanOut()
+        subscription = bus.subscribe("bar-writer", maxsize=10, lossless=True)
+        for _ in range(5):
+            bus.publish(object())
+        await subscription.take()
+        drained = 0
+        while True:
+            try:
+                subscription.take_nowait()
+            except asyncio.QueueEmpty:
+                break
+            drained += 1
+        return subscription.consumed, drained
+
+    consumed, drained = asyncio.run(drive())
+
+    assert drained == 4
+    assert consumed == 5, "the drained four are reads, not a stall"
