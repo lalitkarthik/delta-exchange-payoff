@@ -97,6 +97,7 @@ you conclude your change broke something.
   237  docs/design/events.md                              grown    #81, #110
   248  docs/design/cloud/epic.md                          grown    #74 (ceb9911)
   295  docs/iv-vs-rv.md                                   grown    #54 (4209ec2)
+  225  docs/superpowers/specs/2026-09-16-execution-half-design.md  created  PR #127 — a spec is one contract, cut into tickets rather than split; kept local until the senior's review
   640  docs/architecture.md                               grown    #77 (01710dd)
   962  docs/storage.md                                    grown    #77, #104
   ```
