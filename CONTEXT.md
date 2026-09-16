@@ -179,3 +179,32 @@ word `healthy`), **3** and **6**. **1**, **4** and **5** are not scannable and t
 says why against each — a scan that claims to hold a rule it cannot is worse than none.
 **5 is the one to notice: it is the refusal #103 was about, and no text scan can reach a
 value.** #114.
+
+## 8. The execution half
+
+**Decided, not built.** These terms come from [docs/design/execution/](docs/design/execution/) and
+name things that do not yet exist in `engine/src/deltapayoff/`. Rule 2 above ("the code wins")
+applies the day they land; until then the design pages are the authority.
+
+| Term | What it is | Where it lives |
+|---|---|---|
+| book | A table of signed lots per contract. Positive long, negative short. A snapshot of a position, never of prices or orders. | [books.md](docs/design/execution/books.md) |
+| desired book | What someone wants to hold. Book 1 (`desired:<strategy>`) and Book 2 (`desired:pooled`). | the same |
+| actual book | What is held. Book 3 (`actual:<strategy>`), Book 4 (`actual:engine`), Book 5 (`actual:broker`, the truth), Book 6 (`actual:discretionary`, derived as 5 − 4). | the same |
+| working orders | Orders sent and not yet filled, cancelled or rejected. Not a book; subtracted from the gap. | the same |
+| gap | `Book 1 − Book 3 − working`, per strategy and contract. What the OMS turns into intents. | [oms.md](docs/design/execution/oms.md) |
+| strategy | One running program that publishes a desired position and nothing else. | [strategy-worker.md](docs/design/execution/strategy-worker.md) |
+| strategy set | Every strategy currently running. **Not "portfolio"**, which the terminal uses for a set of backtest runs. | [00-overview.md](docs/design/execution/00-overview.md) |
+| target | A `strategy.target` event: one strategy's whole Book 1, republished on every change. | [events-and-tracing.md](docs/design/execution/events-and-tracing.md) |
+| `oms` | The one process that keeps the books, computes the gap, runs the risk checks and sends orders. Risk checks and execution are modules inside it. | [oms.md](docs/design/execution/oms.md) |
+| intent | The OMS's decision that one order is needed. It precedes the risk verdict. | the same |
+| risk verdict | Pass or reject, from one of six checks. **A check never changes an order.** | [rms.md](docs/design/execution/rms.md) |
+| client order id | The string the OMS chooses per order and the broker echoes on orders and fills. `E.<strategy id>.<sequence>`, ≤ 32 characters. The engine's mark. | [oms.md](docs/design/execution/oms.md) |
+| engine fill, manual fill | A fill with our client order id, and one without. The adapter decides, per broker. | [books.md](docs/design/execution/books.md) |
+| reconciliation | Every ten seconds and on every fill: rebuild Book 4 from the broker's marked fills and check `Book 4 + Book 6 = Book 5` and `Σ Book 3 = Book 4`. A mismatch freezes that contract. | the same |
+| freeze, kill | A contract-level stop and the engine-wide stop. Neither closes a position. | [operations.md](docs/design/execution/operations.md) |
+| broker adapter | The one module that speaks a broker's API. Delta, and the paper broker. | [paper-broker.md](docs/design/execution/paper-broker.md) |
+| paper broker | An adapter with no external API: fills at the touch against live quotes, keeps its own Book 5, venue `PAPER`. | the same |
+| manual door | `control.command` target `paper`, command `manual-order`: a fill with no client order id, so Book 6 can be tested locally. | the same |
+| legging | Buy legs first, wait for their fills, then sell legs. An execution rule, never a strategy's. | [oms.md](docs/design/execution/oms.md) |
+| `correlation_id`, `causation_id`, `actor` | The three fields added to every envelope: the decision that started a chain, the one event that directly caused this one, and who emitted it. | [events-and-tracing.md](docs/design/execution/events-and-tracing.md) |
