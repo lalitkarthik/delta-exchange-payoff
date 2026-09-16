@@ -117,11 +117,10 @@ you conclude your change broke something.
   493  docs/superpowers/specs/2026-09-03-crypto-iv-research-design.md
   ```
 
-  `events.md`: do **not** split — `tests/test_events.py` parses it and the parser does not
-  survive a split. `epic.md`: mirrors issue #57, see Off limits — do not restructure.
-  `architecture.md` and `storage.md`: large legacy documents; splitting either is its own
-  ticket with its own risk, not attempted here. `0009-compaction-cadence.md` sits exactly
-  at the bound and is a plausible near-term split candidate.
+  `events.md`: do **not** split — `tests/test_events.py` parses it and the parser does not survive
+  a split. `epic.md`: mirrors issue #57, see Off limits — do not restructure. `architecture.md` and
+  `storage.md`: large legacy documents; splitting either is its own ticket with its own risk, not
+  attempted here. `0009-compaction-cadence.md` sits exactly at the bound and is a plausible near-term split candidate.
 
   `0001-stream-naming-and-payload-format.md` was **199** before #95 and is **200** after, so
   every future addition to it must move something out first. #95's units-correction evidence
