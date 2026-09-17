@@ -390,7 +390,7 @@ class ChainStream:
         if self._subscription is None:
             raise RuntimeError("attach() the stream to a bus before running it")
         while True:
-            self.apply(await self._subscription.queue.get())
+            self.apply(await self._subscription.take())
 
     def instruments(self, underlying: str, expiry: str) -> list[str]:
         """Canonical strings for the contracts seen on this underlying and expiry, sorted.

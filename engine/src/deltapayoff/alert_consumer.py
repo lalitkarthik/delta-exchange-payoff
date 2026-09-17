@@ -80,7 +80,7 @@ class AlertConsumer:
 
     async def _run_once(self) -> None:
         """Dispatch one queue item, keeping the loop alive after a bad alert."""
-        event = await self.subscription.queue.get()
+        event = await self.subscription.take()
         if not isinstance(event, Alert):
             return
         if self.started_at is not None and event.ts_received < self.started_at:

@@ -156,6 +156,9 @@ def test_redis_bus_is_a_consumer_only_composition(monkeypatch, tmp_path) -> None
             # already holds. This is the task that gives the split read paths a right
             # edge.
             "bar-buffer",
+            # The periodic `bus.throughput` record. No `feed-throughput` beside it: this
+            # composition holds no socket, which is the whole of what it is asserting.
+            "bus-throughput",
         }
         stats = main.app.state.events.stats()
         assert set(stats) == {

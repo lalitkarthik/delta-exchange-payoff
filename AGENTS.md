@@ -100,6 +100,8 @@ you conclude your change broke something.
   225  docs/superpowers/specs/2026-09-16-execution-half-design.md  created  PR #127 — a spec is one contract, cut into tickets rather than split; kept local until the senior's review
   640  docs/architecture.md                               grown    #77 (01710dd)
   962  docs/storage.md                                    grown    #77, #104
+  290  docs/design/lld/logging.md            exempt: the one path a newcomer reads
+  242  docs/design/lld/logging-catalogue.md  exempt: parsed, as events.md is; 21 records
   ```
 
   Legacy — already over the bound before the epic touched them, and named here for the
@@ -127,8 +129,6 @@ you conclude your change broke something.
   already went to a sibling, `0001-units-reconciliation.md`; the record keeps a one-line
   pointer. Split it properly the next time it is touched — it is the tightest file here.
 
-  `docs/design/lld/logging.md` is no longer over: #63 split it, 213 becomes 92 plus a
-  75-line `logging-catalogue.md` (**99** and **101** on 2026-09-14), and generalised the parser to a tuple.
   `docs/design/hld.md` is **197**; it was 219 before #62 moved its evidence into
   `hld-evidence.md`. `docs/design/lld/store.md` is **199**; it was 204 before #81 moved its
   evidence into `store-numbers.md`, then lost a paragraph #87 found stale. Three times now,

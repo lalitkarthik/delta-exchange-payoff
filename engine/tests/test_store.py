@@ -69,6 +69,7 @@ from deltapayoff.store import (
     FlushInterrupted,
     Intent,
     StoreHomeUnavailable,
+    prefer_disk,
     read_checkpoint,
     read_intent,
     recover_intent,
@@ -3207,3 +3208,47 @@ def test_partitions_skip_non_directories_and_return_sorted_public_tuples(
         ("2026-09-04", "ETH"),
         ("2026-09-05", "BTC"),
     ]
+
+
+def test_a_store_holding_both_partition_layouts_still_unions_disk_and_buffer(
+    tmp_path: Path,
+) -> None:
+    """A tree that was never run through `tools/migrate_store.py` must not break the read.
+
+    `scan()` takes its hive column order from the paths it globbed, so a store holding
+    pre-migration `date=/underlying=` directories beside migrated `underlying=/date=`
+    ones reports `[..., date, underlying]`, while `pending()` always builds
+    `[..., underlying, date]` from `HIVE_SCHEMA`. `vertical_relaxed` relaxes dtypes and
+    not column order, so every read path that unions the two — the whole historical
+    chain, the smile, the contract series — died on `schema names differ: got date,
+    expected underlying`, a polars query plan rather than a sentence, the moment the
+    chain screen asked for a minute list.
+    """
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    minute = datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc)
+    store.add([computed_bar(minute=minute)])
+    filed = store.pending().collect()
+    # the same rows a legacy `date=/underlying=` tree scans back as: identical columns,
+    # the two partition keys the other way round
+    legacy = filed.select(
+        [name for name in filed.columns if name not in ("underlying", "date")]
+        + ["date", "underlying"]
+    ).lazy()
+
+    unioned = prefer_disk(legacy, store.pending(), schema=store.schema).collect()
+
+    assert unioned.height == 1, "one bar, from whichever side won"
+    assert unioned.row(0, named=True)["underlying"] == "BTC"
+    assert unioned.row(0, named=True)["date"] == date(2026, 9, 4)
+
+
+def test_a_buffer_missing_a_column_outright_still_raises(tmp_path: Path) -> None:
+    """The other half of the guard above: reordering is forgiven, a genuinely different
+    column set is not. `diagonal_relaxed` would have filled the missing side with nulls,
+    and a fabricated null is the one thing this store does not do."""
+    store = BarStore(tmp_path, dataset=COMPUTED_DATASET, schema=COMPUTED_SCHEMA)
+    store.add([computed_bar(minute=datetime(2026, 9, 4, 9, 0, tzinfo=timezone.utc))])
+    short = store.pending().drop("date")
+
+    with pytest.raises(pl.exceptions.ColumnNotFoundError):
+        prefer_disk(store.pending(), short, schema=store.schema).collect()
