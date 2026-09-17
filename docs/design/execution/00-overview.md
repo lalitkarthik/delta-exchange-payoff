@@ -55,10 +55,10 @@ Green boxes are new. Everything else is running today and is unchanged by this d
 | Part | What it does | What it deliberately does not do |
 |---|---|---|
 | **Strategy** | Decides what position it wants to hold, and publishes that whole position every time its mind changes. One running program per strategy. | Never names an order, a price, an order type, or the sequence legs are sent in. |
-| **OMS** (order management system) | Keeps the books, works out the difference between what strategies want and what is held, checks each order against the risk rules, and sends it. | Never decides *whether* to trade. That is the strategy's job. |
+| **OMS** (order management system) | Keeps the books, works out the difference between what the strategies want **as a whole** and what is held, checks each order against the risk rules, and sends it. | Never decides *whether* to trade. That is the strategy's job. |
 | **Risk checks** (RMS, risk management system) | A module inside the OMS. Every order passes through six checks before it is sent. A failed check rejects the order outright. | Never shrinks or reshapes an order. It says yes or no. |
 | **Broker adapter** | The one part that speaks a broker's own API. Two exist at first: the real Delta adapter, and a **paper broker** that fills orders against the live prices without touching the venue. | Nothing outside the adapter learns a broker's vocabulary. |
-| **Postgres** | The database holding orders, fills, book snapshots, each strategy's counters, and the trace of every event on the order path. | Never a source of market data. That stays on the bus and in Parquet. |
+| **Postgres** | The database holding orders, fills, book snapshots and each strategy's counters — every piece of state that must outlive a process. | Never a source of market data, and not a log sink: the event trace lives in the log files. |
 
 ## The vocabulary the design uses
 
@@ -72,16 +72,16 @@ Three words are overloaded elsewhere and are pinned here.
 
 ## The rules every page follows
 
-1. **A strategy publishes a position, never an order.** Everything about *how* to trade lives in the OMS.
+1. **A strategy publishes a position, never an order.** Everything about *how* to trade lives in the OMS, and a strategy's position reaches the order path only through the **pooled** desired book, so two strategies that want opposite things trade nothing. [books.md](books.md).
 2. **The broker is the truth about what is held.** The engine keeps its own record and checks it against the broker's, contract by contract, every ten seconds. When they disagree, that contract is frozen and a person is told.
-3. **Every event says who caused it.** Three identifiers on every message make any fill traceable back to the decision that started it. [events-and-tracing.md](events-and-tracing.md).
+3. **Every event says who caused it.** Three identifiers on every message — `decision_id`, `parent_event_id`, `actor` — make any fill traceable back to the decision that started it. [events-and-tracing.md](events-and-tracing.md).
 4. **A risk check says no, or nothing.** It never changes an order.
 5. **The sandbox is the same software.** A second OMS instance with the paper broker behind it, reading the same live prices. Stream names carry the venue, so `PAPER` and `DELTA` never mix.
 6. **No real money in this phase.** The paper broker runs the sample strategy first; the venue's testnet is next; live trading is a decision taken later, by a person.
 
 ## Reading order
 
-1. [books.md](books.md) — the six books, working orders, and the check that catches a double fire
+1. [books.md](books.md) — the six books, working orders, how an order is derived, and the check that catches a double fire
 2. [strategy-worker.md](strategy-worker.md) — what a strategy is, and the sample iron condor as a state machine
 3. [oms.md](oms.md) — from desired position to sent order: the order lifecycle, legging, and the tables
 4. [rms.md](rms.md) — the six risk checks and what happens when one fails
@@ -91,7 +91,7 @@ Three words are overloaded elsewhere and are pinned here.
 
 ## What is out of scope, on purpose
 
-- Pooling orders across strategies so that opposite positions cancel out. Orders are per strategy for now; [books.md](books.md) says why.
+- Splitting one pooled order across the strategies that caused it. Orders **are** pooled, and each carries the tag of the strategy whose change caused it; when two strategies move one contract at once, that tag is approximate. [books.md](books.md) says what breaks and when.
 - Any execution method beyond "limit at the touch, then cancel and replace".
 - A dashboard page. The API gains read-only routes; a page is a later ticket.
 - A second real broker. The adapter interface is designed so IBKR could be added; only Delta and the paper broker are built.

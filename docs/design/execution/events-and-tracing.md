@@ -15,13 +15,25 @@ event of every type, including the market-data events that exist today (where th
 
 | Field | What it holds | Rule for setting it |
 |---|---|---|
-| `correlation_id` | The identifier of the **decision that started this chain** | Set once, when a strategy decides to act. Copied unchanged onto every event that follows from that decision: the target, each intent, each risk verdict, each order, each ack, each fill. |
-| `causation_id` | The `event_id` of the **one event that directly caused this one** | Set fresh at every hop. A fill's causation is the order; the order's is the intent; the intent's is the target. |
+| `decision_id` | The identifier of the **decision that started this chain** | Set once, when a strategy decides to act. Copied unchanged onto every event that follows from that decision: the target, each intent, each risk verdict, each order, each ack, each fill. |
+| `parent_event_id` | The `event_id` of the **one event that directly caused this one** | Set fresh at every hop. A fill's parent is the order; the order's is the intent; the intent's is the target. |
 | `actor` | **Who emitted it** | `strategy:<id>`, `oms`, `rms`, `execution`, `broker:delta`, `broker:paper`, or `operator:<name>` for a command a person sent. |
 
-Together they answer the two questions the senior asked for: *what caused this?* (follow `causation_id`
-backwards, one hop at a time) and *who started this?* (read `actor` on the event whose `event_id`
-equals the `correlation_id`).
+Together they answer the two questions the senior asked for: *what caused this?* (follow
+`parent_event_id` backwards, one hop at a time) and *who started this?* (read `actor` on the event
+whose `event_id` equals the `decision_id`).
+
+**On the names.** The event-sourcing literature calls these two `correlation_id` and `causation_id`,
+and that is what Nautilus and every article on the pattern will say. They are spelled out here instead:
+`parent_event_id` says exactly what it holds, which `causation_id` does not, and `decision_id` matches
+the sentence below that a chain begins when a strategy decides. The standard names are kept in the
+glossary so the pattern is still searchable.
+
+**No fourth field naming the causing actor.** It was asked for and is not added: the parent's actor is
+one lookup away, and a duplicated field is a field that can drift out of step with the row it copies.
+The lookup is made free instead by putting the emitter in the id — an `event_id` reads
+`oms-01J…`, `strategy:icbtc1-01J…` — so `parent_event_id` already shows who emitted the parent without
+reading it.
 
 **A market tick never starts a chain.** Ticks arrive about 1,850 times a second; a chain per tick would
 be noise. A chain starts when a strategy decides, and the deciding event records which chain snapshot
@@ -40,7 +52,7 @@ envelope fields, one JSON payload. Venue is `DELTA` or `PAPER`.
 | Event | Emitted by | When | Payload, in short |
 |---|---|---|---|
 | `strategy.target` | a strategy | its desired position changes | strategy id, the whole Book 1, the chain snapshot it used |
-| `strategy.state` | a strategy | its state machine moves | strategy id, from, to, the counters |
+| `strategy.transition` | a strategy | its state machine moves | strategy id, from, to, the counters |
 | `order.intent` | oms | a non-zero gap row is found | strategy id, contract, signed lots, the target's ids |
 | `risk.verdict` | rms | every intent | pass or reject, the check, the number and the limit |
 | `order.sent`, `order.acked`, `order.replaced`, `order.cancelled`, `order.rejected` | execution | each lifecycle step | client order id, venue order id once known, contract, lots, limit price |
@@ -57,17 +69,21 @@ is while paper trading.
 
 ## Where to look
 
-**Postgres first.** Every event on the order path is also written to the `event_log` table with its
-three identifiers as columns. One query returns a whole chain in order:
+**The JSON log files, and nothing else.** Every log record already carries `event_id`; it now carries
+the three identifiers too, so one filter over the day's file returns a whole chain in order:
 
-```sql
-select ts, type, actor, event_id, causation_id, payload
-from event_log where correlation_id = 'c-2026-09-17-icbtc1-0001' order by ts;
+```sh
+jq -c 'select(.decision_id == "d-2026-09-17-icbtc1-0001")' logs/2026-09-17.jsonl
 ```
 
-**The JSON log files second.** Every log record already carries `event_id`; it now carries the three
-identifiers too, so the same filter works over the day's file with `jq` or DuckDB. No log server is
-added in this phase. Loki was considered and is the wrong tool for this question: it indexes labels,
+**There is no `event_log` table, and that is a change from the first draft.** A table copying every
+order-path event into Postgres was written and then dropped: `orders`, `fills`, `book_snapshots` and
+`recon_results` already hold the state that matters, the log files already hold the events, and a chain
+is a handful of rows in a file that DuckDB reads directly. A second copy of the same events is a second
+thing to keep in step. Add the table the first time a chain genuinely cannot be reconstructed from the
+files; that day has not come, and may not.
+
+No log server either. Loki was considered and is the wrong tool for this question: it indexes labels,
 and an identifier per chain is exactly the high-cardinality field it warns against. If the log volume
 ever justifies a server, VictoriaLogs is the named choice.
 
@@ -80,33 +96,34 @@ sequenceDiagram
   participant S as strategy icbtc1
   participant O as oms (rms, execution)
   participant P as paper broker
-  Note over S: 08:00 IST — decides. correlation_id = C1, actor strategy:icbtc1
-  S->>O: strategy.target (four legs) [C1, caused by: the decision]
-  O->>O: 4 × order.intent [C1, caused by: the target]
-  O->>O: 4 × risk.verdict pass [C1, caused by: each intent]
-  O->>P: order.sent × 2 buy wings [C1, caused by: each verdict]
-  P-->>O: order.fill × 2, origin engine [C1, caused by: each order]
-  O->>P: order.sent × 2 sell bodies [C1]
-  P-->>O: order.fill × 2 [C1]
-  O-->>S: book.snapshot (Book 3: four legs) [C1]
-  Note over S: 11:42 IST — put body delta reaches 0.45. New decision, correlation_id C2
-  S->>O: strategy.target (call side only) [C2]
-  O->>P: order.sent × 2 closes, buys first [C2]
-  P-->>O: order.fill × 2 [C2]
-  Note over S: 11:43 IST — re-entry on the put side. correlation_id C3
+  Note over S: 08:00 IST — decides. decision_id = D1, actor strategy:icbtc1
+  S->>O: strategy.target (four legs) [D1, caused by: the decision]
+  O->>O: 4 × order.intent [D1, caused by: the target]
+  O->>O: 4 × risk.verdict pass [D1, caused by: each intent]
+  O->>P: order.sent × 2 buy wings [D1, caused by: each verdict]
+  P-->>O: order.fill × 2, origin engine [D1, caused by: each order]
+  O->>P: order.sent × 2 sell bodies [D1]
+  P-->>O: order.fill × 2 [D1]
+  O-->>S: book.snapshot (Book 3: four legs) [D1]
+  Note over S: 11:42 IST — put body delta reaches 0.45. New decision, decision_id D2
+  S->>O: strategy.target (call side only) [D2]
+  O->>P: order.sent × 2 closes, buys first [D2]
+  P-->>O: order.fill × 2 [D2]
+  Note over S: 11:43 IST — re-entry on the put side. decision_id D3
 ```
 
-At nine in the evening: "why is there a fill at 11:42?" Read its `correlation_id`, C2. Query
-`event_log` for C2. The first row is a `strategy.target` with actor `strategy:icbtc1` and a payload
-naming the chain snapshot and the delta that crossed 0.45. The chain of `causation_id` from the fill
-back to that row is four hops long and every hop is a row in the same result.
+At nine in the evening: "why is there a fill at 11:42?" Read its `decision_id`, D2. Filter the day's
+log on D2. The first line is a `strategy.target` with actor `strategy:icbtc1` and a payload naming
+the chain snapshot and the delta that crossed 0.45. The chain of `parent_event_id` from the fill back
+to that line is four hops long and every hop is a line in the same result.
 
 ## Open questions
 
 - Whether `actor` should also carry the process instance (a restart counter), as Nautilus's
   `instance_id` does, so two runs of the same strategy on one day can be told apart in the log. Cheap,
   and probably yes.
-- Retention of `event_log`. Written: forever, it is small; revisit when it is not.
+- Whether the trace ever needs a table of its own after all. Written: no. The question comes back the
+  first time a chain has to be read across a log rotation.
 
 ## Where to go next
 

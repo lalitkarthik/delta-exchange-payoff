@@ -40,6 +40,20 @@ added against us on every fill. They exist so a later run can ask "what if execu
 Filling at the touch rather than at mid is the whole point. On a 0dte wing the spread *is* the cost of
 the trade; a paper broker that fills at mid would show every strategy an edge it does not have.
 
+**In practice this makes the sandbox an instant-fill venue, with no code that says so.** Execution
+places its limit *at the touch* ([oms.md](oms.md)), so the order crosses by construction and fills in
+the tick it arrives; working orders exist in the sandbox but are empty a moment later. That is worth
+saying out loud because the obvious alternative — a branch reading "if sandbox, fill immediately" —
+would give the sandbox a code path the live system never runs, which is the one thing a sandbox must
+not have. Nothing special is written. It simply comes out instant.
+
+**What the fill rule ignores: size.** The quotes on the bus are `ob_l2` frames, which carry the whole
+book as `[[price, size], …]` on each side and refresh every 508 ms, so the data for a size-aware fill
+is already there and is thrown away — `wire.py` keeps only the best bid and ask because nothing has
+needed more. This broker fills the whole quantity at the touch whatever size is resting there: an order
+for 50 lots fills as easily as one for 1. That is the ceiling to remember when reading a paper result,
+and lifting it is the same change as simulating partial fills, below.
+
 Partial fills are not simulated in this phase. Every fill is recorded with a quantity, so the record's
 shape already allows them.
 
@@ -53,10 +67,14 @@ margin model the risk checks use.
 
 ## The manual door
 
-A person can place an order at the paper broker directly, bypassing every strategy and the OMS, through
-a `control.command` with target `paper` and command `manual-order`, sent the same way the feed is
-paused today: an HTTP request to the API, which publishes it. The order names a contract, a side and a
-quantity, and fills by the rule above.
+The paper broker accepts an order placed directly on it, bypassing every strategy and the OMS. It names
+a contract, a side and a quantity, and fills by the rule above.
+
+**It is a test hook, not a feature.** It exists for one reason: to make Book 6 non-zero on a laptop
+with no account, so that the reconciliation can be exercised. A test calls it. There is no API route,
+no `control.command` and no operator command behind it — an earlier draft had all three, and they were
+removed, because real manual trades are placed on Delta's own app and the engine's whole job there is
+to notice them and keep its hands off ([operations.md](operations.md)).
 
 **A manual fill carries no client order id.** The adapter marks it *manual*, exactly as it would a
 Delta fill with no id. It appears in Book 5 and not in Book 4, so Book 6 becomes non-zero, and the
@@ -65,15 +83,11 @@ check idea, runnable on a laptop before any account exists.
 
 ```mermaid
 sequenceDiagram
-  participant P as person
-  participant API as api
-  participant BUS as bus
+  participant P as a test
   participant OMS as sandbox oms
   participant PB as paper broker (inside oms)
-  P->>API: POST /paper/manual-order {contract, side, lots}
-  API->>BUS: control.command target=paper
-  BUS->>OMS: control.command
-  OMS->>PB: manual order
+  participant BUS as bus
+  P->>PB: manual order {contract, side, lots}
   PB->>PB: fill at touch, no client order id
   PB-->>OMS: fill marked MANUAL, position updated
   OMS->>OMS: reconcile: Book 5 moved, Book 4 did not, Book 6 = difference
@@ -85,7 +99,9 @@ sequenceDiagram
 - Whether the paper broker should apply Delta's actual fee schedule by default rather than zero.
   Zero is written so the first runs measure the strategy and nothing else.
 - A latency model: today a crossing order fills in the same tick it arrives. A configurable delay is a
-  small later addition.
+  small later addition, and the first thing that would make working orders visible in the sandbox.
+- Whether to keep the depth from `ob_l2` rather than discarding it, so that a fill can be capped at the
+  size actually resting at the touch. The data is already on the bus; only the chain drops it.
 
 ## Where to go next
 
