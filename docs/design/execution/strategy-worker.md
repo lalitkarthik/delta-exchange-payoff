@@ -24,7 +24,7 @@ event a strategy can publish that carries an order.
 | Input | Where it comes from | Why |
 |---|---|---|
 | The option chain with our Greeks | the `computed.chain` events for its underlying | Strike selection by delta uses **our** delta. The venue's Greeks are reference columns and never inputs, a rule the whole repository already keeps. |
-| Its own actual position | Book 3 for its strategy identifier, published by the OMS | So it knows whether it is in, and with what, without ever talking to a broker. |
+| Its own actual position | Book 3 for its strategy identifier, published by the OMS | So it knows whether it is in, and with what, without ever talking to a broker. Book 3 can move without a fill of its own: orders are pooled, so lots the engine already held may be reallocated between strategies ([books.md](books.md)). A strategy reads its book and never assumes it changes only when it acted. |
 | The time | a small `Clock` object it asks | Live, the clock is the wall clock. The same object can later be fed the timestamps of replayed events, so a strategy could run against the Parquet store without a change. That replay is not built; the object costs one interface now. |
 | Its parameters | environment variables set in the compose file | Lots, times, delta targets, limits. Read once at start. |
 
@@ -50,7 +50,9 @@ a message bus at all.
 ## What survives a restart
 
 In-memory state dies with a process. The senior named this as the gap in his own system. Here a
-strategy writes **one row in Postgres** every time its state changes, and reads it once at start:
+strategy writes **one row in Postgres** every time its state changes — the `strategy_state` table, one
+row per strategy — and reads it once at start. The *event* it publishes on the same move is
+`strategy.transition`, named differently on purpose so that the row and the event are never confused:
 
 | Field | What it holds |
 |---|---|

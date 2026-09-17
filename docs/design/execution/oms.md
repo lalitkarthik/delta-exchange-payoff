@@ -28,7 +28,8 @@ names already carry the venue, so the two never see each other's traffic.
 
 ```mermaid
 flowchart LR
-  T["strategy.target<br/>(Book 1)"] --> G["gap = Book 1 − Book 3 − working<br/>per strategy, per contract"]
+  T["strategy.target<br/>(Book 1)"] --> P["Book 2 = Σ Book 1<br/>after the settling window"]
+  P --> G["gap = Book 2 − Book 4 − working<br/>per contract"]
   G -->|"one intent per non-zero row"| I["order intent"]
   I --> R["risk checks<br/>(six, in order)"]
   R -->|"any check fails"| RJ["risk rejected<br/>event with the reason"]
@@ -71,9 +72,9 @@ stateDiagram-v2
 
 | Term | Meaning |
 |---|---|
-| **Intent** | The OMS has decided an order is needed. It has a strategy identifier, a contract, a signed quantity, and the identifiers of the target that caused it. |
-| **Working** | Sent, acked, or partially filled: on its way, and subtracted from the gap. |
-| **Client order id** | The string the OMS chooses for each order and the broker echoes back. Delta caps it at 32 characters and requires it to be unique among the account's open orders. Format: `E.<strategy id>.<sequence>`, so a fill's origin and strategy can be read straight off it. |
+| **Intent** | The OMS has decided an order is needed. It has a contract, a signed quantity, the strategy whose target change caused it, and the identifiers of that target. |
+| **Working** | Sent, acked, or partially filled: on its way, and subtracted from the gap. Held in the execution module's memory, never in a table, and rebuilt on restart from the broker's open orders ([books.md](books.md)). |
+| **Client order id** | The string the OMS chooses for each order and the broker echoes back. Delta caps it at 32 characters and requires it to be unique among the account's open orders. Format: `E.<strategy id>.<sequence>`, so a fill's origin and strategy can be read straight off it. Orders are pooled, so the strategy named is the one whose change caused the order; [books.md](books.md) says when that is not the whole truth. |
 | **Cancel and replace** | The one execution method in this phase: place a limit at the current best price on our side (the **touch**), wait N seconds, and if unfilled cancel it and place a new one at the new touch. Give up after M attempts and raise an alert. N and M are OMS parameters. |
 
 Market orders are not used. On a thin 0dte wing a market order is how a stop-loss becomes a large loss.
@@ -108,18 +109,23 @@ string; the deployment page already names a managed PostgreSQL as the OMS's home
 | `orders` | order | The lifecycle above, with every timestamp and the client and venue order ids |
 | `fills` | fill | Price, quantity, fee, the order it belongs to, and whether the adapter marked it engine or manual |
 | `book_snapshots` | book, per minute and on every change | So any book can be read back for any moment |
-| `working_orders` | working order | The current set, rebuilt from `orders` on restart |
 | `strategy_state` | strategy | The counters and entry credit each strategy persists ([strategy-worker.md](strategy-worker.md)) |
 | `pnl_snapshots` | strategy or engine, per minute | Realised and unrealised profit and loss ([rms.md](rms.md)) |
 | `recon_results` | reconciliation run | Both records of Book 4, the identity check, and any frozen contract |
-| `event_log` | event on the order path | The trace. One query by `correlation_id` returns a whole chain ([events-and-tracing.md](events-and-tracing.md)) |
+| `reallocations` | Book 3 transfer with no fill behind it | The pooled-neutral case in [books.md](books.md): which strategy gave up which lots, and why |
 
 Redis stays a pipe. Nothing the OMS needs after a restart lives only in Redis.
 
+**Two things deliberately have no table.** Working orders, because the broker's open orders are the
+better record of them. And the event trace: every event is already a line in the JSON log files with
+the identifiers on it, and a chain is a handful of rows, so it is filtered there with `jq` or DuckDB
+rather than copied into a table nobody has needed yet ([events-and-tracing.md](events-and-tracing.md)).
+
 ## What the API exposes
 
-Read-only routes, JSON, so a person can look without opening SQL: the books, working orders, today's
-orders and fills, the profit and loss snapshots, and the frozen contracts. A page on top of them is a
+Read-only routes, JSON, so a person can look without opening SQL: the books, working orders (read from
+the execution module, the only place they exist), today's orders and fills, the profit and loss
+snapshots, and the frozen contracts. A page on top of them is a
 later ticket.
 
 ## Open questions
@@ -130,6 +136,8 @@ later ticket.
   Better execution, later.
 - How the OMS should treat a target that changes while a wave is in flight. Written: finish or cancel
   the wave first, then recompute the gap.
+- Whether the trace ever needs its own Postgres table. Written: no, the log files answer it. Revisit
+  the first time a chain cannot be reconstructed from them.
 
 ## Where to go next
 

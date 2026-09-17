@@ -22,6 +22,12 @@ Two families of check exist, as the senior's diagram draws them:
 
 A limit that is not configured is not checked, and the startup log says which checks are active.
 
+**Orders are pooled, so one order can belong to two strategies.** When it does, it must pass the
+strategy-wise checks of **every** strategy whose desire contributed to it, not only the one named in
+its client order id. A limit that could be stepped over by pairing with another strategy is not a
+limit. With one strategy running the two readings are the same; the rule is written now so that the
+second strategy does not quietly widen the first one's ceiling.
+
 ## The six checks, in the order they run
 
 The senior named these six as required. Each is written here as one sentence of arithmetic.
@@ -41,12 +47,22 @@ it. An intent whose contract has no two-sided quote fails this check.
 
 | Compares | Against | From |
 |---|---|---|
-| Blocked margin now, plus this order's estimated margin | The engine's margin ceiling | the wallet's blocked-margin figures from the adapter; the estimate from a margin model in the adapter; the ceiling from configuration |
+| The estimated margin of the **resulting position** — Book 4 plus working plus this intent | The engine's margin ceiling | a margin model in the adapter; the ceiling from configuration; the wallet's blocked margin as the check on the model |
 
-Delta offers no endpoint that estimates the margin a proposed order would need, so the estimate is
-ours, kept in the adapter with the broker's published rules. The paper broker uses the same model.
-After each fill the wallet's actual blocked margin is read back, so the estimate is checked against the
-truth every time it is used.
+**Margin is not additive per order, and an earlier draft of this check assumed it was.** A short option
+is far cheaper to hold once the long option that caps its loss is already held — that is the whole
+reason [oms.md](oms.md) sends buy legs first. A check that priced each order on its own would put a
+standalone short's margin against the ceiling and reject the second half of every spread the legging
+rule was designed to make cheap. So the model is applied to the **portfolio the order would produce**,
+and the number compared against the ceiling is that portfolio's margin, not the order's.
+
+Delta offers no endpoint that estimates the margin of a proposed order or portfolio, so the model is
+ours, kept in the adapter with the broker's published rules, and the paper broker uses the same one.
+**It starts unvalidated, so it starts as an alert and not a rejection.** After each fill the wallet's
+actual blocked margin is read back and compared with what the model predicted; until a week of paper
+fills says how far the two drift, a breach of this check raises an alert and lets the order through.
+Turning it into a rejection is a one-line configuration change and a deliberate act. Rejecting on a
+number with no measurements behind it is how a system stops trading for a reason nobody can explain.
 
 ### 3. Position limits
 
@@ -124,8 +140,8 @@ A key that is absent switches that check off for that scope. The startup log lis
 
 - Whether the price band should widen automatically on a fast market, or whether a rejection there is
   exactly what is wanted. Written: a fixed band; a rejection is loud.
-- The margin model's rules for Delta's options, and how far the estimate may drift from the wallet's
-  figure before that itself is an alert.
+- The margin model's rules for Delta's options, the drift at which the estimate itself is an alert,
+  and the evidence that turns check 2 from an alert into a rejection.
 - Whether a net-delta or net-gamma limit belongs in this phase. Written: not until positions exist to
   measure it on.
 
