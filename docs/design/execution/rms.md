@@ -15,7 +15,7 @@ shrink the quantity, move the price, or drop a leg. A scaled order silently chan
 meant, and a value that quietly stops meaning what it says is the defect this repository has learned to
 fear most.
 
-Two families of check exist, as the senior's diagram draws them:
+Two families of check exist:
 
 - **Strategy-wise** checks compare the intent against limits set for that strategy.
 - **Engine-wise** checks compare it against limits set for the whole strategy set.
@@ -30,7 +30,7 @@ second strategy does not quietly widen the first one's ceiling.
 
 ## The six checks, in the order they run
 
-The senior named these six as required. Each is written here as one sentence of arithmetic.
+Each is written here as one sentence of arithmetic.
 
 ### 1. Order check
 
@@ -49,7 +49,7 @@ it. An intent whose contract has no two-sided quote fails this check.
 |---|---|---|
 | The estimated margin of the **resulting position** — Book 4 plus working plus this intent | The engine's margin ceiling | a margin model in the adapter; the ceiling from configuration; the wallet's blocked margin as the check on the model |
 
-**Margin is not additive per order, and an earlier draft of this check assumed it was.** A short option
+**Margin is not additive per order.** A short option
 is far cheaper to hold once the long option that caps its loss is already held — that is the whole
 reason [oms.md](oms.md) sends buy legs first. A check that priced each order on its own would put a
 standalone short's margin against the ceiling and reject the second half of every spread the legging

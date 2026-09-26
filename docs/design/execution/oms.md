@@ -2,7 +2,8 @@
 
 **What this page contains.** What the OMS is, why it is one process with modules inside it rather than
 three processes, the path an order takes from a strategy's target to a fill, how the four legs of a
-spread are sent, and the tables it keeps.
+spread are sent, which brokers it can send to, the tables its records land in, and what it does on a
+restart.
 
 **How to read it.** The first section is the shape. The order lifecycle and the legging rule are the
 two things a newcomer most needs before reading code. The tables at the end are reference.
@@ -14,8 +15,7 @@ sent*. It keeps the books, computes the gap, checks each order, sends it through
 records everything it did. It never decides whether to trade.
 
 **One process, three modules.** Risk checks and execution are modules inside the OMS, not separate
-processes. The senior's reason for separate processes is that a new strategy must not disturb a
-running one. The OMS, its risk checks and its execution change together and share the state of every
+processes. Strategies are separate processes so that a new strategy cannot disturb a running one. The OMS, its risk checks and its execution change together and share the state of every
 order; a bus hop between them would add latency and two more places for a silent stall, and buy no
 change-safety. The risk module has one entry point, so it can be lifted into its own process later
 without changing what it checks.
@@ -23,6 +23,10 @@ without changing what it checks.
 **Two instances, one image.** The live OMS is configured with the Delta adapter and reads targets for
 venue `DELTA`. The sandbox OMS is the same image with the paper adapter and reads venue `PAPER`. Stream
 names already carry the venue, so the two never see each other's traffic.
+
+**No database connection.** The OMS publishes its records as events, and the persistence service
+writes them to Postgres ([message-bus.md](message-bus.md)). It never reads Postgres directly either:
+after a restart it asks for its records over the bus.
 
 ## From a target to a sent order
 
@@ -77,6 +81,9 @@ stateDiagram-v2
 | **Client order id** | The string the OMS chooses for each order and the broker echoes back. Delta caps it at 32 characters and requires it to be unique among the account's open orders. Format: `E.<strategy id>.<sequence>`, so a fill's origin and strategy can be read straight off it. Orders are pooled, so the strategy named is the one whose change caused the order; [books.md](books.md) says when that is not the whole truth. |
 | **Cancel and replace** | The one execution method in this phase: place a limit at the current best price on our side (the **touch**), wait N seconds, and if unfilled cancel it and place a new one at the new touch. Give up after M attempts and raise an alert. N and M are OMS parameters. |
 
+**The record goes first.** The execution module publishes `order.sent` and only then hands the order to
+the broker adapter, so no order can reach a broker without a record of it on the bus.
+
 Market orders are not used. On a thin 0dte wing a market order is how a stop-loss becomes a large loss.
 
 ## Legging: buys first
@@ -96,20 +103,39 @@ The order in which legs are sent, the waiting, and the timeout all live here and
 ## Reconciliation
 
 Every ten seconds, and on every fill, the OMS asks the adapter for positions and recent fills and runs
-the check in [books.md](books.md). A disagreeing contract is frozen: its intents are refused with the
-reason `frozen`, everything else continues, and an alert is raised. A person unfreezes it.
+the check in [books.md](books.md). The broker's record wins. The OMS repairs what it can: it fires again
+for a gap left open by a cancelled order, up to 3 times per contract per decision, and it adopts the
+broker's Book 4 when its own disagrees, up to 2 times per contract per day. Past either limit the
+contract is frozen: its intents are refused with the reason `frozen`, everything else continues, and an
+alert is raised. A person unfreezes it.
 
-## What the OMS stores
+## Which brokers it sends to
 
-Postgres, one schema, the tables below. Local development and production differ by one connection
-string; the deployment page already names a managed PostgreSQL as the OMS's home.
+The OMS talks to a broker only through a **broker adapter**, which has one interface: place, cancel,
+list open orders, list fills since a time, list positions, read the wallet.
+
+| Adapter | Status in this phase |
+|---|---|
+| **Paper broker** | Built first, and the focus of this phase ([paper-broker.md](paper-broker.md)) |
+| **Delta** | Built next, and run against Delta's India testnet |
+| a broker for NIFTY and Sensex | Not chosen |
+| a broker for SPX and SPXW | Not chosen |
+
+A new broker is a new adapter. Nothing else in the OMS changes.
+
+## What the OMS's records hold
+
+Postgres, one schema, the tables below, all written by the persistence service from events on the bus.
+Local development and production differ by one connection string, held by the persistence service
+alone; the deployment page names a managed PostgreSQL for production.
 
 | Table | One row per | Why it exists |
 |---|---|---|
 | `orders` | order | The lifecycle above, with every timestamp and the client and venue order ids |
 | `fills` | fill | Price, quantity, fee, the order it belongs to, and whether the adapter marked it engine or manual |
 | `book_snapshots` | book, per minute and on every change | So any book can be read back for any moment |
-| `strategy_state` | strategy | The counters and entry credit each strategy persists ([strategy-worker.md](strategy-worker.md)) |
+| `strategy_checkpoints` | strategy checkpoint | Each strategy's state as JSONB, never overwritten ([strategy-worker.md](strategy-worker.md)) |
+| `signal_cards` | leg of a decision | What a strategy saw when it decided, for slippage research; never read by the order path ([strategy-worker.md](strategy-worker.md)) |
 | `pnl_snapshots` | strategy or engine, per minute | Realised and unrealised profit and loss ([rms.md](rms.md)) |
 | `recon_results` | reconciliation run | Both records of Book 4, the identity check, and any frozen contract |
 | `reallocations` | Book 3 transfer with no fill behind it | The pooled-neutral case in [books.md](books.md): which strategy gave up which lots, and why |
@@ -117,9 +143,19 @@ string; the deployment page already names a managed PostgreSQL as the OMS's home
 Redis stays a pipe. Nothing the OMS needs after a restart lives only in Redis.
 
 **Two things deliberately have no table.** Working orders, because the broker's open orders are the
-better record of them. And the event trace: every event is already a line in the JSON log files with
+better record of them; they live in the execution module's memory. And the event trace: every event is already a line in the JSON log files with
 the identifiers on it, and a chain is a handful of rows, so it is filtered there with `jq` or DuckDB
 rather than copied into a table nobody has needed yet ([events-and-tracing.md](events-and-tracing.md)).
+
+## What happens on a restart
+
+1. The OMS publishes a restore request. The persistence service replies with the latest snapshot of
+   every book and today's `orders` rows ([message-bus.md](message-bus.md)). Until the reply arrives,
+   the OMS sends nothing and raises an alert every 10 seconds.
+2. The execution module asks the broker for its open orders and rebuilds the working orders from them,
+   matched to the `orders` rows by client order id. An open order with no matching row freezes its
+   contract and raises an alert.
+3. A reconciliation runs before the first intent is computed.
 
 ## What the API exposes
 

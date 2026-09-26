@@ -19,7 +19,7 @@ event of every type, including the market-data events that exist today (where th
 | `parent_event_id` | The `event_id` of the **one event that directly caused this one** | Set fresh at every hop. A fill's parent is the order; the order's is the intent; the intent's is the target. |
 | `actor` | **Who emitted it** | `strategy:<id>`, `oms`, `rms`, `execution`, `broker:delta`, `broker:paper`, or `operator:<name>` for a command a person sent. |
 
-Together they answer the two questions the senior asked for: *what caused this?* (follow
+Together they answer two questions: *what caused this?* (follow
 `parent_event_id` backwards, one hop at a time) and *who started this?* (read `actor` on the event
 whose `event_id` equals the `decision_id`).
 
@@ -29,8 +29,7 @@ and that is what Nautilus and every article on the pattern will say. They are sp
 the sentence below that a chain begins when a strategy decides. The standard names are kept in the
 glossary so the pattern is still searchable.
 
-**No fourth field naming the causing actor.** It was asked for and is not added: the parent's actor is
-one lookup away, and a duplicated field is a field that can drift out of step with the row it copies.
+**No fourth field naming the causing actor.** The parent's actor is one lookup away, and a duplicated field is a field that can drift out of step with the row it copies.
 The lookup is made free instead by putting the emitter in the id — an `event_id` reads
 `oms-01J…`, `strategy:icbtc1-01J…` — so `parent_event_id` already shows who emitted the parent without
 reading it.
@@ -40,9 +39,9 @@ be noise. A chain starts when a strategy decides, and the deciding event records
 it looked at, so the tick is still reachable.
 
 This is the correlation-and-causation pattern from event-sourced systems, the same one Nautilus Trader
-(the senior's reference) uses under the names `strategy_id`, `client_order_id` and `venue_order_id`.
-OpenTelemetry was considered and set aside: Python has no ready instrumentation for Redis Streams, so
-it would be hand-built, and it answers a latency question nobody has asked yet.
+uses under the names `strategy_id`, `client_order_id` and `venue_order_id`. OpenTelemetry is not used:
+Python has no ready instrumentation for Redis Streams, and it answers a latency question nobody has
+asked.
 
 ## The new events
 
@@ -53,14 +52,19 @@ envelope fields, one JSON payload. Venue is `DELTA` or `PAPER`.
 |---|---|---|---|
 | `strategy.target` | a strategy | its desired position changes | strategy id, the whole Book 1, the chain snapshot it used |
 | `strategy.transition` | a strategy | its state machine moves | strategy id, from, to, the counters |
+| `strategy.checkpoint` | a strategy | its state changes | strategy id, `seq`, the state as JSON ([strategy-worker.md](strategy-worker.md)) |
+| `strategy.signal_card` | a strategy | with every target | one entry per leg: quote, our Greeks and IV, underlying price, the chain snapshot |
+| `strategy.restore_request`, `oms.restore_request` | a strategy, or the oms | on start | who is asking ([message-bus.md](message-bus.md)) |
+| `strategy.restore`, `oms.restore` | persistence service | in reply | the latest checkpoint, or the latest books and today's orders |
 | `order.intent` | oms | a non-zero gap row is found | strategy id, contract, signed lots, the target's ids |
 | `risk.verdict` | rms | every intent | pass or reject, the check, the number and the limit |
 | `order.sent`, `order.acked`, `order.replaced`, `order.cancelled`, `order.rejected` | execution | each lifecycle step | client order id, venue order id once known, contract, lots, limit price |
 | `order.fill` | the adapter | a fill arrives, engine or manual | client order id if any, `origin` engine or manual, strategy id if engine, price, lots, fee |
 | `book.snapshot` | oms | any book changes, and every minute | which book, the rows |
+| `book.reallocation` | oms | Book 3 moves with no fill behind it | the strategies, the contract, the lots moved ([books.md](books.md)) |
 | `pnl.snapshot` | oms | every second | scope (strategy or engine), realised, unrealised, day total |
-| `recon.result` | oms | every reconciliation | both records of Book 4, the identity check, frozen contracts |
-| `alert` | any | as today, plus: frozen contract, legging timeout, loss limit breached | existing shape |
+| `recon.result` | oms | every reconciliation | both records of Book 4, the identity check, repairs made, frozen contracts |
+| `alert` | any | as today, plus: frozen contract, legging timeout, loss limit breached, restore not answered, persistence lag, calendar mismatch, lot size or multiplier changed | existing shape |
 | `control.command` | a person, via the API | as today, with new targets | see [operations.md](operations.md) |
 
 The alert forwarder subscribes to two more streams than today, `order.fill` and `risk.verdict`
@@ -76,15 +80,14 @@ the three identifiers too, so one filter over the day's file returns a whole cha
 jq -c 'select(.decision_id == "d-2026-09-17-icbtc1-0001")' logs/2026-09-17.jsonl
 ```
 
-**There is no `event_log` table, and that is a change from the first draft.** A table copying every
-order-path event into Postgres was written and then dropped: `orders`, `fills`, `book_snapshots` and
-`recon_results` already hold the state that matters, the log files already hold the events, and a chain
+**There is no `event_log` table.** `orders`, `fills`, `book_snapshots` and `recon_results` already hold
+the state that matters, the log files already hold the events, and a chain
 is a handful of rows in a file that DuckDB reads directly. A second copy of the same events is a second
 thing to keep in step. Add the table the first time a chain genuinely cannot be reconstructed from the
 files; that day has not come, and may not.
 
-No log server either. Loki was considered and is the wrong tool for this question: it indexes labels,
-and an identifier per chain is exactly the high-cardinality field it warns against. If the log volume
+No log server either. Loki is the wrong tool for this question: it indexes labels, and an identifier
+per chain is exactly the high-cardinality field it warns against. If the log volume
 ever justifies a server, VictoriaLogs is the named choice.
 
 ## One day, traced
