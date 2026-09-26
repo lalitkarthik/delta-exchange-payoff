@@ -65,6 +65,10 @@ a time, read the wallet. The sandbox OMS therefore runs the same reconciliation,
 as the live one. The paper wallet holds a configured starting balance and blocks margin using the same
 margin model the risk checks use.
 
+Its positions live in memory, and every fill it makes is published and kept in the `fills` table. When
+the sandbox OMS restarts, the paper broker rebuilds its positions from every paper fill, which the OMS
+receives in its restore reply ([message-bus.md](message-bus.md)). A sandbox restart loses nothing.
+
 ## The manual door
 
 The paper broker accepts an order placed directly on it, bypassing every strategy and the OMS. It names
@@ -72,9 +76,9 @@ a contract, a side and a quantity, and fills by the rule above.
 
 **It is a test hook, not a feature.** It exists for one reason: to make Book 6 non-zero on a laptop
 with no account, so that the reconciliation can be exercised. A test calls it. There is no API route,
-no `control.command` and no operator command behind it — an earlier draft had all three, and they were
-removed, because real manual trades are placed on Delta's own app and the engine's whole job there is
-to notice them and keep its hands off ([operations.md](operations.md)).
+no `control.command` and no operator command behind it, because real manual trades are placed on
+Delta's own app and the engine's whole job there is to notice them and keep its hands off
+([operations.md](operations.md)).
 
 **A manual fill carries no client order id.** The adapter marks it *manual*, exactly as it would a
 Delta fill with no id. It appears in Book 5 and not in Book 4, so Book 6 becomes non-zero, and the

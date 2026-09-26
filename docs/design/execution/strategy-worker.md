@@ -1,10 +1,11 @@
 # The strategy worker
 
 **What this page contains.** What a strategy program is allowed to know and to say, how one is started,
-what it keeps across a restart, and the sample strategy (a daily iron condor) drawn as a state machine
-so that every rule in its description has one place to live.
+what it keeps across a restart and how it gets it back, the signal card it records at every decision,
+and the sample strategy (a daily iron condor) drawn as a state machine so that every rule in its
+description has one place to live.
 
-**How to read it.** The first three sections are the contract every strategy obeys. The sample strategy
+**How to read it.** The first five sections are the contract every strategy obeys. The sample strategy
 after them is a worked example of that contract, and the place to check that the contract is enough.
 
 ## What a strategy is
@@ -15,9 +16,8 @@ lots per contract. That is the entire output.
 
 **Logic only.** A strategy never says *how* to get from what is held to what it wants. It never names
 an order, a limit price, a market order, a leg sequence, or a retry. When a strategy wants out of a
-leg, it publishes a target without that leg. The OMS does the rest. This is the one rule the senior set
-for this part, and the contract is shaped so that breaking it is not possible by accident: there is no
-event a strategy can publish that carries an order.
+leg, it publishes a target without that leg. The OMS does the rest. The contract is shaped so that breaking this rule is not
+possible by accident: there is no event a strategy can publish that carries an order.
 
 ## What a strategy reads and asks
 
@@ -36,8 +36,7 @@ once a second on the clock, so a time rule fires even when the market is silent.
 **One compose service per running strategy, all from one image.** The service's environment says
 which strategy logic to run, what to call this instance, which venue's books it targets, and its
 parameters. Adding a strategy is adding a service; nothing running is touched. Compose and ECS restart,
-log and health-check each one on its own. This is the change-safety the senior gave as the reason for
-a message bus at all.
+log and health-check each one on its own, so a new strategy cannot disturb a running one.
 
 | Setting | Example | Meaning |
 |---|---|---|
@@ -49,27 +48,69 @@ a message bus at all.
 
 ## What survives a restart
 
-In-memory state dies with a process. The senior named this as the gap in his own system. Here a
-strategy writes **one row in Postgres** every time its state changes — the `strategy_state` table, one
-row per strategy — and reads it once at start. The *event* it publishes on the same move is
-`strategy.transition`, named differently on purpose so that the row and the event are never confused:
+In-memory state dies with a process, so a strategy saves a **checkpoint** every time its state
+changes. It has no database connection: it publishes the checkpoint as a `strategy.checkpoint` event,
+and the persistence service writes it to Postgres ([message-bus.md](message-bus.md)).
+
+**One table for every strategy, one row per checkpoint, none ever overwritten.** The table is
+`strategy_checkpoints`:
+
+| Column | What it holds |
+|---|---|
+| `strategy_id` | Which strategy, so the table is strategy-wise without a table per strategy |
+| `seq` | The checkpoint's number, rising by one each time |
+| `taken_at` | When it was taken |
+| `decision_id` | The decision that moved the state, so a checkpoint can be found from a trace |
+| `state` | The strategy's own state, as JSONB |
+
+The `state` of the sample strategy holds:
 
 | Field | What it holds |
 |---|---|
+| `schema_version` | The shape of this JSONB, so newer strategy code can recognise an older checkpoint and convert it or refuse it |
 | `state` | Which box of the state machine below it is in |
 | `entries_today`, `reentries_after_stop`, `reentries_after_profit` | The counters the re-entry rules read |
 | `entry_credit` | The net premium received when the current position was opened |
 | `intended_legs` | The four contracts it chose, so a restart can tell a fill from a stranger |
 | `day` | The trading day the counters belong to; a new day resets them |
 
+A strategy changes state a few dozen times a day, so keeping every checkpoint costs little, and a
+person tracing a decision can read the state at any moment.
+
+**Getting it back.** On start, a strategy publishes `strategy.restore_request` with its id. The
+persistence service reads the row with the highest `seq` for that strategy and publishes it back as
+`strategy.restore`. Until that reply arrives the strategy **does not evaluate**: it raises an alert and
+asks again every 10 seconds. A strategy with no checkpoint at all (its first run) receives an empty
+reply and starts in `Idle`.
+
 Its *position* is never stored by the strategy. Book 3 is the truth for that, and a restarted strategy
-reads Book 3 first and its row second. If Book 3 holds legs the row does not know, the strategy alerts
-and does nothing until a person looks. That is the one behaviour on this page chosen for safety over
-convenience.
+reads its checkpoint first and Book 3 second. If Book 3 holds legs the checkpoint does not know, the
+strategy alerts and does nothing until a person looks. That is the one behaviour on this page chosen
+for safety over convenience.
+
+## The signal card
+
+At every decision a strategy records what it saw, so that later the price it acted on can be compared
+with the price it got. This record is the **signal card**. It is published as a
+`strategy.signal_card` event with the same `decision_id` as the target it explains, and the persistence
+service writes it to the `signal_cards` table, **one row per leg**:
+
+| Field | What it holds |
+|---|---|
+| `decision_id`, `strategy_id`, `decided_at` | Which decision, by whom, when |
+| `contract` | The leg |
+| `bid`, `ask`, `mid` | The quote at decision time |
+| `delta`, `gamma`, `vega`, `theta`, `iv` | **Our** Greeks and implied volatility for that contract |
+| `underlying_price` | The underlying's price at decision time |
+| `chain_snapshot` | Which chain snapshot it looked at, so the whole chain can be opened from S3 |
+
+**Slippage is one join**: `fills` to `signal_cards` on `decision_id` and contract. The signal card is
+research data and **nothing on the order path reads it**. The whole chain stays in the Parquet files on
+S3; the card only names the snapshot.
 
 ## The sample strategy: a daily 0dte iron condor
 
-The description, as given:
+The description:
 
 > Every day at 08:00 IST, sell a 0dte iron condor: each body leg targets |delta| = 0.25, wings two
 > strikes further out. Take profit when premium profit reaches 60%. Stop-loss a body leg when its
@@ -116,12 +157,15 @@ The strategy does not retry, because retrying is an execution decision.
 ## Open questions
 
 - After a one-sided stop, whether a re-entry rebuilds that side only (as written) or closes the whole
-  condor and re-enters fresh. The counters are the same either way. Ask the senior.
+  condor and re-enters fresh. The counters are the same either way. Ask Bilal.
 - Whether "premium profit" should be marked at mid, or at the price the position could actually be
   closed at (the ask for buys, the bid for sells). Mid is written; the second is more honest and more
   volatile on thin wings.
 - What a strategy should do when the chain has no strike near 0.25 delta, which happens late in a 0dte
   day. Written: no entry, and an event saying so.
+- The recovery fallback when the strategy tag is not enough to say which legs are a strategy's own.
+  Written: on restart the checkpoint's `intended_legs` is compared with Book 3, and any mismatch means
+  an alert and no action. **For Bilal**, together with his Book 3 section ([books.md](books.md)).
 
 ## Where to go next
 
