@@ -17,7 +17,7 @@ event of every type, including the market-data events that exist today (where th
 |---|---|---|
 | `decision_id` | The identifier of the **decision that started this chain** | Set once, when a strategy decides to act. Copied unchanged onto every event that follows from that decision: the target, each intent, each risk verdict, each order, each ack, each fill. |
 | `parent_event_id` | The `event_id` of the **one event that directly caused this one** | Set fresh at every hop. A fill's parent is the order; the order's is the intent; the intent's is the target. |
-| `actor` | **Who emitted it** | `strategy:<id>`, `oms`, `rms`, `execution`, `broker:delta`, `broker:paper`, or `operator:<name>` for a command a person sent. |
+| `actor` | **Who emitted it** | `strategy:<id>`, `oms:<client>`, `rms:<client>`, `execution:<client>`, `broker:delta`, `broker:paper`, or `operator:<name>` for a command a person sent. |
 
 Together they answer two questions: *what caused this?* (follow
 `parent_event_id` backwards, one hop at a time) and *who started this?* (read `actor` on the event
@@ -45,16 +45,18 @@ asked.
 
 ## The new events
 
-All follow the existing envelope rules: one type per stream, `{type}:{VENUE}[:{UNDERLYING}]`, flat
-envelope fields, one JSON payload. Venue is `DELTA` or `PAPER`.
+All follow the existing envelope rules: one type per stream, flat envelope fields, one JSON payload.
+Stream names follow who the event belongs to ([message-bus.md](message-bus.md)): a strategy's events
+carry its market, `strategy.target:{MARKET}`; everything a client's OMS or its adapter emits carries
+the client, `{type}:{CLIENT}`, and a `client_id` field.
 
 | Event | Emitted by | When | Payload, in short |
 |---|---|---|---|
-| `strategy.target` | a strategy | its desired position changes | strategy id, the whole Book 1, the chain snapshot it used |
+| `strategy.target` | a strategy | its desired position changes | strategy id, the whole target in units, the chain snapshot it used |
 | `strategy.transition` | a strategy | its state machine moves | strategy id, from, to, the counters |
 | `strategy.checkpoint` | a strategy | its state changes | strategy id, `seq`, the state as JSON ([strategy-worker.md](strategy-worker.md)) |
 | `strategy.signal_card` | a strategy | with every target | one entry per leg: quote, our Greeks and IV, underlying price, the chain snapshot |
-| `strategy.restore_request`, `oms.restore_request` | a strategy, or the oms | on start | who is asking ([message-bus.md](message-bus.md)) |
+| `strategy.restore_request`, `oms.restore_request` | a strategy, or a client's oms | on start | who is asking, and for which client ([message-bus.md](message-bus.md)) |
 | `strategy.restore`, `oms.restore` | persistence service | in reply | the latest checkpoint, or the latest books and today's orders |
 | `order.intent` | oms | a non-zero gap row is found | strategy id, contract, signed lots, the target's ids |
 | `risk.verdict` | rms | every intent | pass or reject, the check, the number and the limit |
@@ -62,7 +64,7 @@ envelope fields, one JSON payload. Venue is `DELTA` or `PAPER`.
 | `order.fill` | the adapter | a fill arrives, engine or manual | client order id if any, `origin` engine or manual, strategy id if engine, price, lots, fee |
 | `book.snapshot` | oms | any book changes, and every minute | which book, the rows |
 | `book.reallocation` | oms | Book 3 moves with no fill behind it | the strategies, the contract, the lots moved ([books.md](books.md)) |
-| `pnl.snapshot` | oms | every second | scope (strategy or engine), realised, unrealised, day total |
+| `pnl.snapshot` | oms | every second | scope (strategy or client), realised, unrealised, day total |
 | `recon.result` | oms | every reconciliation | both records of Book 4, the identity check, repairs made, frozen contracts |
 | `alert` | any | as today, plus: frozen contract, legging timeout, loss limit breached, restore not answered, persistence lag, calendar mismatch, lot size or multiplier changed | existing shape |
 | `control.command` | a person, via the API | as today, with new targets | see [operations.md](operations.md) |
@@ -92,12 +94,12 @@ ever justifies a server, VictoriaLogs is the named choice.
 
 ## One day, traced
 
-The sample strategy on 17 September, sandbox, one lot.
+The sample strategy on 17 September, one paper client holding one unit.
 
 ```mermaid
 sequenceDiagram
   participant S as strategy icbtc1
-  participant O as oms (rms, execution)
+  participant O as oms:paper1 (rms, execution)
   participant P as paper broker
   Note over S: 08:00 IST — decides. decision_id = D1, actor strategy:icbtc1
   S->>O: strategy.target (four legs) [D1, caused by: the decision]
@@ -107,7 +109,7 @@ sequenceDiagram
   P-->>O: order.fill × 2, origin engine [D1, caused by: each order]
   O->>P: order.sent × 2 sell bodies [D1]
   P-->>O: order.fill × 2 [D1]
-  O-->>S: book.snapshot (Book 3: four legs) [D1]
+  O->>O: book.snapshot:paper1 (Book 3: four legs) [D1]
   Note over S: 11:42 IST — put body delta reaches 0.45. New decision, decision_id D2
   S->>O: strategy.target (call side only) [D2]
   O->>P: order.sent × 2 closes, buys first [D2]

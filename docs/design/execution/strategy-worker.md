@@ -1,18 +1,21 @@
 # The strategy worker
 
 **What this page contains.** What a strategy program is allowed to know and to say, how one is started,
-what it keeps across a restart and how it gets it back, the signal card it records at every decision,
+the model position it follows, what it keeps across a restart and how it gets it back, the signal card
+it records at every decision,
 and the sample strategy (a daily iron condor) drawn as a state machine so that every rule in its
 description has one place to live.
 
-**How to read it.** The first five sections are the contract every strategy obeys. The sample strategy
+**How to read it.** The first six sections are the contract every strategy obeys. The sample strategy
 after them is a worked example of that contract, and the place to check that the contract is enough.
 
 ## What a strategy is
 
 A **strategy** is one running program that holds an opinion about what position to have, and publishes
-that opinion as a whole every time it changes. The opinion is Book 1 in [books.md](books.md): signed
-lots per contract. That is the entire output.
+that opinion as a whole every time it changes. The opinion is a **target**: signed **units** per
+contract, where one unit is the strategy's own leg ratio. That is the entire output. One strategy
+serves every client subscribed to it; each client's OMS multiplies the target by that client's units
+to make the client's Book 1 ([clients.md](clients.md)). A strategy never names a client.
 
 **Logic only.** A strategy never says *how* to get from what is held to what it wants. It never names
 an order, a limit price, a market order, a leg sequence, or a retry. When a strategy wants out of a
@@ -24,9 +27,9 @@ possible by accident: there is no event a strategy can publish that carries an o
 | Input | Where it comes from | Why |
 |---|---|---|
 | The option chain with our Greeks | the `computed.chain` events for its underlying | Strike selection by delta uses **our** delta. The venue's Greeks are reference columns and never inputs, a rule the whole repository already keeps. |
-| Its own actual position | Book 3 for its strategy identifier, published by the OMS | So it knows whether it is in, and with what, without ever talking to a broker. Book 3 can move without a fill of its own: orders are pooled, so lots the engine already held may be reallocated between strategies ([books.md](books.md)). A strategy reads its book and never assumes it changes only when it acted. |
+| Its own position | its **model position**: its last published target, and its checkpoint | Below. A strategy reads no client's books and no fills |
 | The time | a small `Clock` object it asks | Live, the clock is the wall clock. The same object can later be fed the timestamps of replayed events, so a strategy could run against the Parquet store without a change. That replay is not built; the object costs one interface now. |
-| Its parameters | environment variables set in the compose file | Lots, times, delta targets, limits. Read once at start. |
+| Its parameters | environment variables set in the compose file | Times, delta targets, thresholds. Read once at start. Size is not a parameter: it belongs to each client. |
 
 A strategy evaluates its rules every time a new chain arrives for its expiry (about once a second) and
 once a second on the clock, so a time rule fires even when the market is silent.
@@ -34,7 +37,7 @@ once a second on the clock, so a time rule fires even when the market is silent.
 ## How a strategy becomes a process
 
 **One compose service per running strategy, all from one image.** The service's environment says
-which strategy logic to run, what to call this instance, which venue's books it targets, and its
+which strategy logic to run, what to call this instance, which market it trades, and its
 parameters. Adding a strategy is adding a service; nothing running is touched. Compose and ECS restart,
 log and health-check each one on its own, so a new strategy cannot disturb a running one.
 
@@ -42,9 +45,24 @@ log and health-check each one on its own, so a new strategy cannot disturb a run
 |---|---|---|
 | `STRATEGY` | `iron_condor_0dte` | Which strategy code to run |
 | `STRATEGY_ID` | `icbtc1` | This instance's name. Short, because it travels inside every client order id, which Delta caps at 32 characters |
-| `VENUE` | `PAPER` or `DELTA` | Whose books this strategy's target goes to. The sandbox OMS reads `PAPER`; the live OMS reads `DELTA` |
+| `MARKET` | `DELTA`, `NSE`, `CBOE` | The exchange whose contracts it trades. Its target goes to `strategy.target:{MARKET}`, read by every client OMS on that market, paper or real |
 | `UNDERLYING` | `BTC` | One underlying per instance |
 | `PARAMS` | JSON | The strategy's own parameters, below |
+
+## The model position
+
+Many clients follow one strategy, and each gets its own fills at its own prices; some may miss a leg.
+A strategy cannot follow all of them, so it follows none. Its **model position** is the target it last
+published, **assumed held from the moment it is published**, and priced from its own signal card at
+the touch: the ask for a leg it buys, the bid for a leg it sells. Its entry credit, its take-profit and
+its state machine all run on that model. Each client's OMS then works to make the client's real
+position match it ([oms.md](oms.md)), and handles a failure alone.
+
+> **To review: the model position and a client's real position can differ.** The strategy believes it
+> holds the full target. A client whose OMS failed some legs may hold something else — only the wings
+> of a condor, which is a long strangle. The strategy's exits still reach that client, because an empty
+> target closes whatever the client holds, but its entries, stops and take-profit are decided on a
+> position the client may not have. To review before the first real client trades.
 
 ## What survives a restart
 
@@ -70,8 +88,8 @@ The `state` of the sample strategy holds:
 | `schema_version` | The shape of this JSONB, so newer strategy code can recognise an older checkpoint and convert it or refuse it |
 | `state` | Which box of the state machine below it is in |
 | `entries_today`, `reentries_after_stop`, `reentries_after_profit` | The counters the re-entry rules read |
-| `entry_credit` | The net premium received when the current position was opened |
-| `intended_legs` | The four contracts it chose, so a restart can tell a fill from a stranger |
+| `entry_credit` | The net premium of the current position at entry, priced at the touch from the signal card |
+| `intended_legs` | The four contracts it chose: the model position |
 | `day` | The trading day the counters belong to; a new day resets them |
 
 A strategy changes state a few dozen times a day, so keeping every checkpoint costs little, and a
@@ -83,10 +101,8 @@ persistence service reads the row with the highest `seq` for that strategy and p
 asks again every 10 seconds. A strategy with no checkpoint at all (its first run) receives an empty
 reply and starts in `Idle`.
 
-Its *position* is never stored by the strategy. Book 3 is the truth for that, and a restarted strategy
-reads its checkpoint first and Book 3 second. If Book 3 holds legs the checkpoint does not know, the
-strategy alerts and does nothing until a person looks. That is the one behaviour on this page chosen
-for safety over convenience.
+The checkpoint holds the model position, so a restarted strategy needs nothing else: it loads the
+checkpoint and republishes its target. It reads no client's books on the way.
 
 ## The signal card
 
@@ -124,14 +140,10 @@ closes every open position at settlement. The 17:00 IST exit is thirty minutes b
 stateDiagram-v2
   [*] --> Idle
   Idle --> Selecting : 08:00 IST, and entries allowed
-  Selecting --> Entering : four strikes chosen, target published
-  Entering --> InPosition : Book 3 shows all four legs
-  InPosition --> Exiting_Profit : premium profit ≥ 60%
-  InPosition --> Exiting_Stop : any body leg |delta| ≥ 0.45
-  InPosition --> Exiting_Time : 17:00 IST
-  Exiting_Profit --> Flat : Book 3 empty
-  Exiting_Stop --> Flat : Book 3 empty
-  Exiting_Time --> Done : Book 3 empty
+  Selecting --> InPosition : four strikes chosen, target published
+  InPosition --> Flat : premium profit ≥ 60%, empty target published
+  InPosition --> Flat : any body leg |delta| ≥ 0.45, that side dropped from the target
+  InPosition --> Done : 17:00 IST, empty target published
   Flat --> Selecting : re-entry allowed by the counters
   Flat --> Done : re-entries used up, or past 17:00
   Done --> Idle : next day
@@ -142,17 +154,17 @@ stateDiagram-v2
 | 08:00 IST entry | `Idle → Selecting` | The clock, in IST. Engine time is UTC; the parameter is converted once |
 | Body legs at \|delta\| 0.25 | `Selecting` | The strike whose **our** delta is nearest 0.25 on each side, from today's expiry |
 | Wings two strikes out | `Selecting` | Two rows further along the chain's strike ladder, on each side |
-| Take profit at 60% | `InPosition → Exiting_Profit` | (credit at entry − cost to close all four at mid) ÷ credit at entry ≥ 0.60 |
-| Stop-loss at \|delta\| 0.45 | `InPosition → Exiting_Stop` | Publishes a target without **that side**, body and wing together. The other side stays. A wing left alone is a lottery ticket; the other side keeps its credit |
-| Exit at 17:00 IST | `InPosition → Exiting_Time` | Empty target |
+| Take profit at 60% | `InPosition → Flat` | (credit at entry − cost to close all four at mid) ÷ credit at entry ≥ 0.60 |
+| Stop-loss at \|delta\| 0.45 | `InPosition → Flat` | Publishes a target without **that side**, body and wing together. The other side stays. A wing left alone is a lottery ticket; the other side keeps its credit |
+| Exit at 17:00 IST | `InPosition → Done` | Empty target |
 | Two re-entries after a stop | `Flat → Selecting` | Counts stop events; a re-entry rebuilds the stopped side at fresh 0.25-delta strikes |
 | One re-entry after a profit | `Flat → Selecting` | A fresh full condor |
-| Lots | parameter `lots` | Sizing is logic and belongs here. Execution is not and does not |
+| Size | each client's units | One unit is +1, −1, −1, +1 across the four strikes. How many units a client holds is the client's choice ([clients.md](clients.md)) |
 
-**What "entering" means without orders.** The strategy publishes the target and moves to `Entering`.
-It learns it is in when Book 3 shows the legs. If the OMS could not get there (a risk reject, a
-timeout), Book 3 never shows them; the strategy stays in `Entering` and the OMS's own events say why.
-The strategy does not retry, because retrying is an execution decision.
+**What "in position" means without orders.** The strategy publishes the target and is in position at
+once, on its model. Whether each client got there is that client's OMS's business: a risk reject, a
+timeout or a missed leg shows in the client's own events and alerts. The strategy does not retry,
+because retrying is an execution decision.
 
 ## Open questions
 
@@ -163,9 +175,6 @@ The strategy does not retry, because retrying is an execution decision.
   volatile on thin wings.
 - What a strategy should do when the chain has no strike near 0.25 delta, which happens late in a 0dte
   day. Written: no entry, and an event saying so.
-- The recovery fallback when the strategy tag is not enough to say which legs are a strategy's own.
-  Written: on restart the checkpoint's `intended_legs` is compared with Book 3, and any mismatch means
-  an alert and no action. **For Bilal**, together with his Book 3 section ([books.md](books.md)).
 
 ## Where to go next
 

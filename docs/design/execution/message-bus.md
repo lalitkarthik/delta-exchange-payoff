@@ -10,8 +10,17 @@ numbers. The restore section is what a strategy and the OMS do on every start.
 ## What the bus is
 
 The **message bus** is Redis Streams. Every program publishes events onto it and reads the events it
-needs from it. No program calls another directly. A **stream** holds one type of event for one venue,
-named `{type}:{VENUE}[:{UNDERLYING}]`.
+needs from it. No program calls another directly. A **stream** holds one type of event, and its name
+says whom the events belong to:
+
+| Events of | Stream name | Example |
+|---|---|---|
+| the feed | `{type}:{VENUE}[:{UNDERLYING}]` | `computed.chain:DELTA:BTC` |
+| a strategy | `{type}:{MARKET}` | `strategy.target:DELTA` |
+| a client's OMS and its adapter | `{type}:{CLIENT}` | `order.fill:acme` |
+
+A strategy's target is published once and read by every client OMS on that market; nothing a client's
+OMS publishes is read by another client's.
 
 Two programs turn bus traffic into lasting records, and they split the data between them:
 
@@ -58,6 +67,8 @@ records and writes them.
 | `strategy.signal_card` | `signal_cards` |
 
 The tables themselves are described in [oms.md](oms.md) and [strategy-worker.md](strategy-worker.md).
+Every table except `strategy_checkpoints` and `signal_cards` carries the `client_id` of the event it
+came from. All clients share one database; [clients.md](clients.md) flags that for review.
 
 **A record is published before the action it records.** The OMS publishes `order.sent` and only then
 hands the order to the broker adapter. If the OMS stops between the two, the record is already on the
@@ -92,8 +103,8 @@ sequenceDiagram
 | Who asks | What comes back |
 |---|---|
 | a strategy | its latest row in `strategy_checkpoints` ([strategy-worker.md](strategy-worker.md)) |
-| the OMS | the latest `book_snapshots` for every book, and today's `orders` with their client order ids ([oms.md](oms.md)) |
-| the sandbox OMS, for the paper broker | every paper fill, so the paper broker's positions are rebuilt ([paper-broker.md](paper-broker.md)) |
+| a client's OMS | that client's latest `book_snapshots` for every book, and its `orders` for today with their client order ids ([oms.md](oms.md)) |
+| a paper client's OMS, for its paper broker | that client's paper fills, so its paper broker's positions are rebuilt ([paper-broker.md](paper-broker.md)) |
 
 **No reply, no work.** A program that has asked and not heard back within **10 seconds** does not start
 work. It raises an alert and asks again every 10 seconds. A strategy that does not know its counters

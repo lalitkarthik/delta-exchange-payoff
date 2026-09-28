@@ -15,12 +15,17 @@ shrink the quantity, move the price, or drop a leg. A scaled order silently chan
 meant, and a value that quietly stops meaning what it says is the defect this repository has learned to
 fear most.
 
-Two families of check exist:
+Every client's OMS runs its own checks, with its own numbers ([clients.md](clients.md)). Two families
+of check exist:
 
-- **Strategy-wise** checks compare the intent against limits set for that strategy.
-- **Engine-wise** checks compare it against limits set for the whole strategy set.
+- **Strategy-wise** checks compare the intent against limits set for that strategy. They are written in
+  **units**, so one set of numbers fits every client whatever its size; the OMS converts units to lots
+  with the strategy's leg ratio, and money limits per unit are multiplied by the client's units.
+- **Client-wise** checks compare it against limits set for this client's whole account.
 
-A limit that is not configured is not checked, and the startup log says which checks are active.
+Each strategy has **default** limits. A client's file can override any of them, or switch a check off,
+for that client alone. A limit that is not configured is not checked, and each client OMS's startup log
+says which checks are active and at what values.
 
 **Orders are pooled, so one order can belong to two strategies.** When it does, it must pass the
 strategy-wise checks of **every** strategy whose desire contributed to it, not only the one named in
@@ -36,7 +41,7 @@ Each is written here as one sentence of arithmetic.
 
 | Compares | Against | From |
 |---|---|---|
-| The intent's quantity | The strategy's maximum lots per order | configuration |
+| The intent's quantity, in units | The strategy's maximum units per order | configuration |
 | The limit price the execution module would use | A band of ± X % around the **mid** of the contract's current quote | the latest quote on the bus; X from configuration |
 
 Mid is the reference rather than the last traded price, because on a wing the last trade can be hours
@@ -47,7 +52,7 @@ it. An intent whose contract has no two-sided quote fails this check.
 
 | Compares | Against | From |
 |---|---|---|
-| The estimated margin of the **resulting position** — Book 4 plus working plus this intent | The engine's margin ceiling | a margin model in the adapter; the ceiling from configuration; the wallet's blocked margin as the check on the model |
+| The estimated margin of the **resulting position** — Book 4 plus working plus this intent | The client's **allocation cap** | a margin model in the adapter; the cap from the client file; the wallet's blocked margin as the check on the model |
 
 **Margin is not additive per order.** A short option
 is far cheaper to hold once the long option that caps its loss is already held — that is the whole
@@ -68,10 +73,10 @@ number with no measurements behind it is how a system stops trading for a reason
 
 | Compares | Against | Scope |
 |---|---|---|
-| Lots held plus working plus this intent | A maximum, per **contract** | strategy-wise |
+| Units held plus working plus this intent | A maximum, per **contract** | strategy-wise |
 | The same, summed over an **underlying** | A maximum per underlying | strategy-wise |
 | The same, summed over the **strategy** | A maximum per strategy | strategy-wise |
-| The same, summed over the **whole engine** (Book 4 plus all working) | A maximum for the engine | engine-wise |
+| Lots summed over the **client's whole account** (Book 4 plus all working) | A maximum for the client | client-wise |
 
 Each is one number in configuration. Any not set is not checked.
 
@@ -87,7 +92,7 @@ only automatic one in this phase; open-interest and spread-width rules are later
 
 ### 5. Profit and loss tracking
 
-Not a check that rejects, but the input the sixth check reads. Per strategy and for the engine:
+Not a check that rejects, but the input the sixth check reads. Per strategy and for the client:
 
 | Figure | How it is computed |
 |---|---|
@@ -101,8 +106,8 @@ Published on the bus every second and stored every minute. Discord does not rece
 
 | Compares | Against | Scope |
 |---|---|---|
-| The strategy's day's total | The strategy's daily loss limit | strategy-wise |
-| The engine's day's total | The engine's daily loss limit | engine-wise |
+| The strategy's day's total, in this client's account | The strategy's daily loss limit per unit × the client's units | strategy-wise |
+| The client's day's total | The client's daily loss limit | client-wise |
 
 **On breach: new opening orders are rejected, closing orders still pass, and an alert is raised.**
 Nothing is flattened automatically. An automatic flatten is a burst of orders at the worst moment of
@@ -111,30 +116,42 @@ the day, and it is the kind of behaviour to add only after a person has watched 
 ## What a rejection looks like
 
 A rejected intent produces one event: which check, the strategy, the contract, the number compared and
-the limit it broke, and the identifiers linking it to the target that caused it. The strategy sees no
-fill arrive and stays where it was. The alert forwarder posts every rejection to Discord.
+the limit it broke, the client, and the identifiers linking it to the target that caused it. The
+strategy is not told: a rejection belongs to this client alone. The alert forwarder posts every
+rejection to Discord.
 
-## The configuration file
+## The configuration files
 
-One file, mounted into the OMS, read at start and on a `reload` command. Its shape:
+Two files, read at start and on a `reload` command. The strategy defaults, one file mounted into every
+client's OMS:
 
 ```yaml
-engine:
-  max_lots_total: 40
-  max_margin_usd: 5000
-  daily_loss_limit_usd: 800
-  ban: ["ETH"]
 strategies:
   icbtc1:
-    max_lots_per_order: 4
+    max_units_per_order: 1
     price_band_pct: 3
-    max_lots_per_contract: 4
-    max_lots_per_underlying: 16
-    max_lots_total: 16
-    daily_loss_limit_usd: 300
+    max_units_per_contract: 1
+    max_units_per_underlying: 4
+    max_units_total: 4
+    daily_loss_limit_usd_per_unit: 150
 ```
 
-A key that is absent switches that check off for that scope. The startup log lists what is on.
+And the `limits` section of each client's file ([clients.md](clients.md)), holding the client-wise
+limits and any overrides of the defaults:
+
+```yaml
+limits:
+  allocation_cap_usd: 20000
+  max_lots_total: 40
+  daily_loss_limit_usd: 800
+  ban: ["ETH"]
+  strategies:
+    icbtc1:
+      max_units_per_order: 2     # this client only
+```
+
+A key that is absent switches that check off for that scope. A key set to `null` in a client file
+switches a default off for that client. The startup log lists what is on.
 
 ## Open questions
 
@@ -144,6 +161,8 @@ A key that is absent switches that check off for that scope. The startup log lis
   and the evidence that turns check 2 from an alert into a rejection.
 - Whether a net-delta or net-gamma limit belongs in this phase. Written: not until positions exist to
   measure it on.
+- Whether the firm needs a hard limit **across clients**. Written: none; each client's OMS checks its
+  own account only, and the total across clients is a read-only sum.
 
 ## Where to go next
 

@@ -20,9 +20,12 @@ order; a bus hop between them would add latency and two more places for a silent
 change-safety. The risk module has one entry point, so it can be lifted into its own process later
 without changing what it checks.
 
-**Two instances, one image.** The live OMS is configured with the Delta adapter and reads targets for
-venue `DELTA`. The sandbox OMS is the same image with the paper adapter and reads venue `PAPER`. Stream
-names already carry the venue, so the two never see each other's traffic.
+**One instance per client, one image.** Each client's OMS is configured by that client's file
+([clients.md](clients.md)): its market, its broker adapter, its subscriptions and its limits. It reads
+`strategy.target:{MARKET}` for its market, keeps only the strategies the client subscribes to, and
+multiplies each target by the client's units to make the client's Book 1. Everything it publishes goes
+to streams named by the client, `{type}:{CLIENT}`, so no client sees another's traffic. A paper
+client's OMS is the same image with the paper broker behind it.
 
 **No database connection.** The OMS publishes its records as events, and the persistence service
 writes them to Postgres ([message-bus.md](message-bus.md)). It never reads Postgres directly either:
@@ -32,7 +35,7 @@ after a restart it asks for its records over the bus.
 
 ```mermaid
 flowchart LR
-  T["strategy.target<br/>(Book 1)"] --> P["Book 2 = Σ Book 1<br/>after the settling window"]
+  T["strategy.target × client units<br/>(Book 1)"] --> P["Book 2 = Σ Book 1<br/>after the settling window"]
   P --> G["gap = Book 2 − Book 4 − working<br/>per contract"]
   G -->|"one intent per non-zero row"| I["order intent"]
   I --> R["risk checks<br/>(six, in order)"]
@@ -78,7 +81,7 @@ stateDiagram-v2
 |---|---|
 | **Intent** | The OMS has decided an order is needed. It has a contract, a signed quantity, the strategy whose target change caused it, and the identifiers of that target. |
 | **Working** | Sent, acked, or partially filled: on its way, and subtracted from the gap. Held in the execution module's memory, never in a table, and rebuilt on restart from the broker's open orders ([books.md](books.md)). |
-| **Client order id** | The string the OMS chooses for each order and the broker echoes back. Delta caps it at 32 characters and requires it to be unique among the account's open orders. Format: `E.<strategy id>.<sequence>`, so a fill's origin and strategy can be read straight off it. Orders are pooled, so the strategy named is the one whose change caused the order; [books.md](books.md) says when that is not the whole truth. |
+| **Client order id** | The string the OMS chooses for each order and the broker echoes back. Delta caps it at 32 characters and requires it to be unique among the account's open orders. Format: `E.<strategy id>.<sequence>`, so a fill's origin and strategy can be read straight off it. No client is needed in it: each OMS talks to one client's account only. Orders are pooled, so the strategy named is the one whose change caused the order; [books.md](books.md) says when that is not the whole truth. |
 | **Cancel and replace** | The one execution method in this phase: place a limit at the current best price on our side (the **touch**), wait N seconds, and if unfilled cancel it and place a new one at the new touch. Give up after M attempts and raise an alert. N and M are OMS parameters. |
 
 **The record goes first.** The execution module publishes `order.sent` and only then hands the order to
@@ -112,7 +115,8 @@ alert is raised. A person unfreezes it.
 ## Which brokers it sends to
 
 The OMS talks to a broker only through a **broker adapter**, which has one interface: place, cancel,
-list open orders, list fills since a time, list positions, read the wallet.
+list open orders, list fills since a time, list positions, read the wallet. Each client's file names
+the one adapter its OMS uses.
 
 | Adapter | Status in this phase |
 |---|---|
@@ -126,6 +130,8 @@ A new broker is a new adapter. Nothing else in the OMS changes.
 ## What the OMS's records hold
 
 Postgres, one schema, the tables below, all written by the persistence service from events on the bus.
+Every table carries a `client_id`, except `strategy_checkpoints` and `signal_cards`, which belong to
+strategies and are shared by every client ([clients.md](clients.md) flags this for review).
 Local development and production differ by one connection string, held by the persistence service
 alone; the deployment page names a managed PostgreSQL for production.
 
@@ -136,7 +142,7 @@ alone; the deployment page names a managed PostgreSQL for production.
 | `book_snapshots` | book, per minute and on every change | So any book can be read back for any moment |
 | `strategy_checkpoints` | strategy checkpoint | Each strategy's state as JSONB, never overwritten ([strategy-worker.md](strategy-worker.md)) |
 | `signal_cards` | leg of a decision | What a strategy saw when it decided, for slippage research; never read by the order path ([strategy-worker.md](strategy-worker.md)) |
-| `pnl_snapshots` | strategy or engine, per minute | Realised and unrealised profit and loss ([rms.md](rms.md)) |
+| `pnl_snapshots` | strategy or client, per minute | Realised and unrealised profit and loss ([rms.md](rms.md)) |
 | `recon_results` | reconciliation run | Both records of Book 4, the identity check, and any frozen contract |
 | `reallocations` | Book 3 transfer with no fill behind it | The pooled-neutral case in [books.md](books.md): which strategy gave up which lots, and why |
 
@@ -149,8 +155,8 @@ rather than copied into a table nobody has needed yet ([events-and-tracing.md](e
 
 ## What happens on a restart
 
-1. The OMS publishes a restore request. The persistence service replies with the latest snapshot of
-   every book and today's `orders` rows ([message-bus.md](message-bus.md)). Until the reply arrives,
+1. The OMS publishes a restore request naming its client. The persistence service replies with that
+   client's latest snapshot of every book and its `orders` rows for today ([message-bus.md](message-bus.md)). Until the reply arrives,
    the OMS sends nothing and raises an alert every 10 seconds.
 2. The execution module asks the broker for its open orders and rebuilds the working orders from them,
    matched to the `orders` rows by client order id. An open order with no matching row freezes its
@@ -159,7 +165,7 @@ rather than copied into a table nobody has needed yet ([events-and-tracing.md](e
 
 ## What the API exposes
 
-Read-only routes, JSON, so a person can look without opening SQL: the books, working orders (read from
+Read-only routes, JSON, each taking the client as a filter, so a person can look without opening SQL: the books, working orders (read from
 the execution module, the only place they exist), today's orders and fills, the profit and loss
 snapshots, and the frozen contracts. A page on top of them is a
 later ticket.

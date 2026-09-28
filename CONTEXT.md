@@ -189,24 +189,24 @@ applies the day they land; until then the design pages are the authority.
 | Term | What it is | Where it lives |
 |---|---|---|
 | book | A table of signed lots per contract. Positive long, negative short. A snapshot of a position, never of prices or orders. | [books.md](docs/design/execution/books.md) |
-| desired book | What someone wants to hold. Book 1 (`desired:<strategy>`) and Book 2 (`desired:pooled`). | the same |
+| desired book | What someone wants to hold. Book 1 (`desired:<strategy>`, a strategy's target × the client's units) and Book 2 (`desired:pooled`). Every client's OMS keeps its own six books. | the same |
 | actual book | What is held. Book 3 (`actual:<strategy>`), Book 4 (`actual:engine`), Book 5 (`actual:broker`, the truth), Book 6 (`actual:discretionary`, derived as 5 − 4). | the same |
 | working orders | Orders sent and not yet filled, cancelled or rejected. **Not a book and not stored**: an in-memory structure in the execution module, rebuilt on restart from the broker's open orders. | the same |
 | gap | `Book 2 − Book 4 − working`, per contract. Pooled, so two strategies wanting opposite things produce no order. What the OMS turns into intents. | [oms.md](docs/design/execution/oms.md) |
 | settling window | The few hundred milliseconds a Book 2 change waits before becoming intents, so that targets arriving together net instead of firing twice. | [books.md](docs/design/execution/books.md) |
 | reallocation | A Book 3 change with no order and no fill behind it, when Book 1 moves and Book 2 does not. `Σ Book 3 = Book 4` still holds. | the same |
-| strategy | One running program that publishes a desired position and nothing else. | [strategy-worker.md](docs/design/execution/strategy-worker.md) |
+| strategy | One running program that publishes a desired position, in units, and nothing else. Shared by every client subscribed to it; it follows its own **model position** and reads no client's books. | [strategy-worker.md](docs/design/execution/strategy-worker.md) |
 | strategy set | Every strategy currently running. **Not "portfolio"**, which the terminal uses for a set of backtest runs. | [00-overview.md](docs/design/execution/00-overview.md) |
-| target | A `strategy.target` event: one strategy's whole Book 1, republished on every change. | [events-and-tracing.md](docs/design/execution/events-and-tracing.md) |
-| `oms` | The one process that keeps the books, computes the gap, runs the risk checks and sends orders. Risk checks and execution are modules inside it. | [oms.md](docs/design/execution/oms.md) |
+| target | A `strategy.target:{MARKET}` event: one strategy's whole desired position in units, republished on every change, read by every client OMS on that market. | [events-and-tracing.md](docs/design/execution/events-and-tracing.md) |
+| `oms` | The process that keeps one client's books, computes the gap, runs the risk checks and sends orders. **One instance per client**, `oms-<client>`. Risk checks and execution are modules inside it. | [oms.md](docs/design/execution/oms.md) |
 | intent | The OMS's decision that one order is needed. It precedes the risk verdict. | the same |
 | risk verdict | Pass or reject, from one of six checks. **A check never changes an order.** | [rms.md](docs/design/execution/rms.md) |
 | client order id | The string the OMS chooses per order and the broker echoes on orders and fills. `E.<strategy id>.<sequence>`, ≤ 32 characters. The engine's mark, and the **strategy tag** Book 3 is derived from — a broker that echoes no such id would leave Book 3 with no external confirmation. | [oms.md](docs/design/execution/oms.md) |
 | engine fill, manual fill | A fill with our client order id, and one without. The adapter decides, per broker. | [books.md](docs/design/execution/books.md) |
 | reconciliation | Every ten seconds and on every fill: rebuild Book 4 from the broker's marked fills and check `Book 4 + Book 6 = Book 5` and `Σ Book 3 = Book 4`. The broker wins: a mismatch is **repaired** with new orders, up to 3 re-fires per contract per decision and 2 Book 4 repairs per contract per day; past that, the contract is frozen. | the same |
-| freeze, kill | A contract-level stop and the engine-wide stop. Neither closes a position. | [operations.md](docs/design/execution/operations.md) |
+| freeze, kill | A contract-level stop and one client's stop; `oms:* kill` is the **firm-wide kill**. None closes a position. | [operations.md](docs/design/execution/operations.md) |
 | broker adapter | The one module that speaks a broker's API. Delta, and the paper broker. | [paper-broker.md](docs/design/execution/paper-broker.md) |
-| paper broker | An adapter with no external API: fills at the touch against live quotes, keeps its own Book 5, venue `PAPER`. | the same |
+| paper broker | An adapter with no external API: fills at the touch against live quotes, keeps its own Book 5. Behind every paper client's OMS. | the same |
 | manual door | A direct call on the paper broker producing a fill with no client order id, so Book 6 can be tested locally. **A test hook, not a command**: real manual trades happen on the broker's own app. | the same |
 | legging | Buy legs first, wait for their fills, then sell legs. An execution rule, never a strategy's. | [oms.md](docs/design/execution/oms.md) |
 | `decision_id`, `parent_event_id`, `actor` | The three fields added to every envelope: the decision that started a chain, the `event_id` of the one event that directly caused this one, and who emitted it. The literature calls the first two `correlation_id` and `causation_id`; they are spelled out here. There is **no** table copying events into Postgres — the trace is read from the log files. | [events-and-tracing.md](docs/design/execution/events-and-tracing.md) |
@@ -220,3 +220,9 @@ applies the day they land; until then the design pages are the authority.
 | lot size, multiplier | Units of the underlying per lot, and money per point. Per instrument, read daily from the source's instrument list; never one value for the engine. | the same |
 | subscription list | Per data adapter: root symbols and an expiry window, such as SPXW within two days. | the same |
 | venue file | One file per venue in `venues/`, outside the code: calendar, adapters, subscriptions, retention, and the names of credential variables. | the same |
+| client | A person or entity whose capital is traded. For now one broker account and one OMS. Nothing crosses clients. | [clients.md](docs/design/execution/clients.md) |
+| client file | `clients/<id>.yaml`: market, broker, credential variable names, subscriptions, limits and overrides. | the same |
+| subscription, unit | A client's choice to follow a strategy, with how many **units**; a unit is the strategy's leg ratio. Joining waits for the next entry from flat; leaving is immediate. | the same |
+| paper client | A client whose broker is the paper broker. The sandbox is paper clients. | the same |
+| model position | A strategy's last published target, assumed held and priced at the touch from its signal card. **To review**: it can differ from a client's real position. | [strategy-worker.md](docs/design/execution/strategy-worker.md) |
+| allocation cap | A client's ceiling on margin in use: the number check 2 compares against. | [rms.md](docs/design/execution/rms.md) |

@@ -10,9 +10,9 @@ once they land there. Everything here is a **decision, not a description**: none
 [Architecture](../../final-design/architecture.md) describes what is built.
 
 **One rule shaped every decision here: build the broad machine first.** Every part below is the
-simplest version that lets one strategy trade end to end in a sandbox, with every step traceable to
-what caused it. The intricate behaviours (partial fills, pooling orders across strategies, many
-clients) are named in each page's *Open questions* and left for later, on purpose.
+simplest version that lets one strategy trade end to end for several clients in a sandbox, with every
+step traceable to what caused it. The intricate behaviours (partial fills, pooling orders across
+strategies, copy trading) are named in each page's *Open questions* and left for later, on purpose.
 
 ## The whole machine, in one picture
 
@@ -30,8 +30,10 @@ flowchart LR
   API["api"]
   S1["strategy ic-btc-1"]
   S2["strategy ..."]
-  OMS["oms<br/>books · risk checks · execution"]
-  BA["broker adapter"]
+  OA["oms-acme<br/>books · risk checks · execution"]
+  OB["oms-paper1<br/>books · risk checks · execution"]
+  BA["Delta adapter<br/>(acme's account)"]
+  PB["paper broker"]
   PS["persistence service"]
   PG[("Postgres<br/>orders, fills, books,<br/>checkpoints, signal cards")]
   DC["alert forwarder<br/>(Discord)"]
@@ -39,16 +41,16 @@ flowchart LR
   BUS --> ST --> S3
   BUS --> API
   BUS --> S1 & S2
-  S1 & S2 -- "desired position,<br/>checkpoints, signal cards" --> BUS
-  BUS -- "desired positions" --> OMS
-  OMS --> BA --> V
-  BA -- "fills, positions" --> OMS
-  OMS -- "orders, fills, books, PnL" --> BUS
+  S1 & S2 -- "target in units,<br/>checkpoints, signal cards" --> BUS
+  BUS -- "targets" --> OA & OB
+  OA --> BA --> V
+  OB --> PB
+  OA & OB -- "orders, fills, books, PnL<br/>per client" --> BUS
   BUS --> PS --> PG
   PS -- "restore replies" --> BUS
   BUS --> DC
   classDef new fill:#e6f5e6,stroke:#2e7d32,stroke-width:2px
-  class S1,S2,OMS,BA,PS,PG new
+  class S1,S2,OA,OB,BA,PB,PS,PG new
 ```
 
 Green boxes are new. The feed, the bus, the store, the API and the alert forwarder change only where
@@ -58,8 +60,9 @@ Green boxes are new. The feed, the bus, the store, the API and the alert forward
 
 | Part | What it does | What it deliberately does not do |
 |---|---|---|
-| **Strategy** | Decides what position it wants to hold, and publishes that whole position every time its mind changes. One running program per strategy. | Never names an order, a price, an order type, or the sequence legs are sent in. |
-| **OMS** (order management system) | Keeps the books, works out the difference between what the strategies want **as a whole** and what is held, checks each order against the risk rules, and sends it. | Never decides *whether* to trade. That is the strategy's job. |
+| **Strategy** | Decides what position it wants to hold, in **units**, and publishes that whole position every time its mind changes. One running program per strategy, shared by every client. | Never names an order, a price, an order type, the sequence legs are sent in, or a client. |
+| **Client** | A person or entity whose capital is traded: one broker account, a list of **subscriptions** (strategy → units), and its own limits, in one client file ([clients.md](clients.md)). | Never shares an OMS, a book or a risk limit with another client. |
+| **OMS** (order management system) | **One instance per client.** Keeps that client's books, works out the difference between what its subscribed strategies want **as a whole** and what is held, checks each order against the client's risk rules, and sends it to the client's broker. | Never decides *whether* to trade. That is the strategy's job. |
 | **Risk checks** (RMS, risk management system) | A module inside the OMS. Every order passes through six checks before it is sent. A failed check rejects the order outright. | Never shrinks or reshapes an order. It says yes or no. |
 | **Broker adapter** | The one part that sends orders to a broker and reads back fills, positions and the wallet. Two are built: the **paper broker**, which fills orders against the live prices without touching the venue, and the Delta adapter. | Never brings in market data. That is a **data adapter**'s job, in the feed ([data-feed.md](data-feed.md)). |
 | **Persistence service** | The only program that connects to Postgres. It reads records off the bus and writes them, and it answers restore requests from programs that restart. | Never decides anything. It writes what it is sent and reads back what it is asked for. |
@@ -74,28 +77,39 @@ Three words are overloaded elsewhere and are pinned here.
 | **Book** | A table of *signed lots per contract*: how many of each contract someone wants, or holds. Negative is short. There are six, explained in [books.md](books.md). | Nowhere else in this repository. |
 | **Strategy** | One running program that decides on a position. | On Convex Hedge's terminal a strategy is a backtestable rule; in `payoff-project` it is a set of option legs. |
 | **Strategy set** | Every strategy program currently running. | *Portfolio* means a set of backtest runs on the terminal, so it is not used here. |
+| **Unit** | One copy of a strategy's leg ratio: a straddle's unit is one call and one put. Clients hold strategies in units. | A lot is one contract's trading size; a unit is several lots across legs. |
 
 ## The rules every page follows
 
-1. **A strategy publishes a position, never an order.** Everything about *how* to trade lives in the OMS, and a strategy's position reaches the order path only through the **pooled** desired book, so two strategies that want opposite things trade nothing. [books.md](books.md).
-2. **The broker is the truth about what is held.** The engine keeps its own record and checks it against the broker's, contract by contract, every ten seconds. When they disagree, the engine adopts the broker's record and repairs the gap with new orders, up to a fixed number of times; past that, the contract is frozen and a person is told.
-3. **Every event says who caused it.** Three identifiers on every message — `decision_id`, `parent_event_id`, `actor` — make any fill traceable back to the decision that started it. [events-and-tracing.md](events-and-tracing.md).
-4. **A risk check says no, or nothing.** It never changes an order.
-5. **The sandbox is the same software.** A second OMS instance with the paper broker behind it, reading the same live prices. Stream names carry the venue, so `PAPER` and `DELTA` never mix.
-6. **Postgres is reached only through the bus.** No program but the persistence service holds a database connection. A program that needs its records back after a restart asks for them over the bus. [message-bus.md](message-bus.md).
-7. **No real money in this phase.** The paper broker runs the sample strategy first; the venue's testnet is next; live trading is a decision taken later, by a person.
+1. **A strategy publishes a position in units, never an order.** Everything about *how* to trade lives in the OMS, and a strategy's position reaches the order path only through each client's **pooled** desired book, so two strategies that want opposite things trade nothing. [books.md](books.md).
+2. **One OMS per client, and nothing crosses clients.** Each client's books, limits and orders are its own; a strategy's target reaches a client only through the client's subscriptions. [clients.md](clients.md).
+3. **The broker is the truth about what is held.** The engine keeps its own record and checks it against the broker's, contract by contract, every ten seconds. When they disagree, the engine adopts the broker's record and repairs the gap with new orders, up to a fixed number of times; past that, the contract is frozen and a person is told.
+4. **Every event says who caused it.** Three identifiers on every message — `decision_id`, `parent_event_id`, `actor` — make any fill traceable back to the decision that started it. [events-and-tracing.md](events-and-tracing.md).
+5. **A risk check says no, or nothing.** It never changes an order.
+6. **The sandbox is the same software.** A sandbox is one or more **paper clients**: clients whose broker is the paper broker, reading the same live prices and the same targets as real clients.
+7. **Postgres is reached only through the bus.** No program but the persistence service holds a database connection. A program that needs its records back after a restart asks for them over the bus. [message-bus.md](message-bus.md).
+8. **No real money in this phase.** The paper broker runs the sample strategy first; the venue's testnet is next; live trading is a decision taken later, by a person.
 
 ## Reading order
 
 1. [books.md](books.md) — the six books, working orders, how an order is derived, and the check that catches and repairs a double fire
-2. [strategy-worker.md](strategy-worker.md) — what a strategy is, its checkpoints and signal cards, and the sample iron condor as a state machine
-3. [oms.md](oms.md) — from desired position to sent order: the order lifecycle, legging, and the tables
-4. [rms.md](rms.md) — the six risk checks and what happens when one fails
-5. [paper-broker.md](paper-broker.md) — how a fill is made up, and the door for manual trades
-6. [events-and-tracing.md](events-and-tracing.md) — the new events, the three identifiers, one traced day
-7. [message-bus.md](message-bus.md) — retention, the store's flush, and the persistence service
-8. [data-feed.md](data-feed.md) — market hours, instrument lists, subscriptions, and the two kinds of adapter
-9. [operations.md](operations.md) — commands, the kill switch, what a restart loses, and the build order
+2. [strategy-worker.md](strategy-worker.md) — what a strategy is, its model position, checkpoints and signal cards, and the sample iron condor as a state machine
+3. [clients.md](clients.md) — clients, the client file, subscriptions and units, joining and leaving, paper clients
+4. [oms.md](oms.md) — from desired position to sent order: the order lifecycle, legging, and the tables
+5. [rms.md](rms.md) — the six risk checks and what happens when one fails
+6. [paper-broker.md](paper-broker.md) — how a fill is made up, and the door for manual trades
+7. [events-and-tracing.md](events-and-tracing.md) — the new events, the three identifiers, one traced day
+8. [message-bus.md](message-bus.md) — retention, the store's flush, and the persistence service
+9. [data-feed.md](data-feed.md) — market hours, instrument lists, subscriptions, and the two kinds of adapter
+10. [operations.md](operations.md) — commands, the kill switch, what a restart loses, and the build order
+
+## To review
+
+Three decisions are taken for now and flagged to be looked at again before a real client trades:
+
+- A strategy's model position and a client's real position can differ ([strategy-worker.md](strategy-worker.md)).
+- Every client's records share one database, told apart by `client_id` ([clients.md](clients.md)).
+- Copy trading is not designed; manual trades stay in the account they were placed in ([clients.md](clients.md)).
 
 ## What is out of scope, on purpose
 
@@ -104,3 +118,4 @@ Three words are overloaded elsewhere and are pinned here.
 - A dashboard page. The API gains read-only routes; a page is a later ticket.
 - Any real broker beyond Delta. The adapter interface allows one to be added; which broker serves Indian indices and SPX is an open decision in [operations.md](operations.md).
 - Automatic flattening on a loss limit. A breach blocks new opening orders and tells a person.
+- A risk limit across clients. Each client's OMS checks only its own account.
