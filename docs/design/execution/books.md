@@ -6,8 +6,7 @@ changes its mind and there is still nothing to trade, and the check that keeps t
 twice or firing when a person already traded by hand, and repairs what it finds.
 
 **How to read it.** Start with the definition and the picture; the table after it is the reference.
-The three sections after that — how orders are derived, how the books move when no order is needed,
-and how Book 3 is filled in — are the reason this page exists.
+The sections on deriving orders, on books moving with no order, and on Book 3 are why this page exists.
 
 ## What a book is
 
@@ -20,7 +19,8 @@ Two kinds of book exist, and the whole design turns on the difference:
 - A **desired** book says what someone *wants* to hold.
 - An **actual** book says what *is* held.
 
-Orders exist only to make the actual books look like the desired ones.
+Orders exist only to make the actual books look like the desired ones. **Every client's OMS keeps its
+own six books**, and nothing on this page crosses clients ([clients.md](clients.md)).
 
 ## The picture
 
@@ -52,7 +52,7 @@ flowchart TB
 
 | Book | Name in code | Kind | Who writes it | How it is made |
 |---|---|---|---|---|
-| **1** | `desired:<strategy>` | desired | the strategy | Published whole by the strategy every time its target changes. One per running strategy. |
+| **1** | `desired:<strategy>` | desired | the OMS | The strategy's target, in units, times this client's units for it. One per subscribed strategy. |
 | **2** | `desired:pooled` | desired | the OMS | The sum of every Book 1, contract by contract. Two strategies opposite in one contract net to zero here. **This is the book orders are worked out from.** |
 | **3** | `actual:<strategy>` | actual | the OMS | Book 4 split by strategy, using the strategy tag the broker echoes on every engine fill. Also written directly, with no fill behind it, in the case below. |
 | **4** | `actual:engine` | actual | the OMS | Built only from fills the broker adapter marked as the engine's. Equals the sum of every Book 3. |
@@ -124,8 +124,8 @@ is published as its own event, `book.reallocation`, and kept in the `reallocatio
 Book 3 row which changed without a fill can be told from one that changed because of one.
 
 With one strategy running this never happens. It is the same code path regardless — Book 3 is
-recomputed after every Book 1 or Book 4 change — and a Book 3 that failed to move would leave a
-strategy trading against a position it does not know it has.
+recomputed after every Book 1 or Book 4 change — and a Book 3 that failed to move would misreport
+what each strategy holds for this client.
 
 ## How Book 3 is filled in, and the problem with it
 
@@ -174,11 +174,11 @@ A worked case. A strategy is short 2 lots of the 60000 put; at 10:00 a person se
 At the next check Book 5 is −4, Book 4 is −2 (only two fills carry our id), Book 6 is −2. Book 2 says
 −2 and working is 0, so the gap is zero and nothing fires. The manual trade sits in Book 6, untouched.
 
-## The sandbox has the same books
+## A paper client has the same books
 
-The paper broker is a broker like any other, so a sandbox OMS keeps Books 1 to 6 for venue `PAPER`.
-Its manual door ([paper-broker.md](paper-broker.md)) makes Book 6 non-zero, so the reconciliation
-above can be tested on a laptop with no keys.
+The paper broker is a broker like any other, so a paper client's OMS keeps Books 1 to 6 like any other.
+Its manual door ([paper-broker.md](paper-broker.md)) makes Book 6 non-zero, so the reconciliation can
+be tested on a laptop with no keys.
 
 ## Open questions
 
@@ -191,7 +191,7 @@ above can be tested on a laptop with no keys.
 - What the reconciliation should do when the broker's fill history and its position disagree, briefly,
   after a settlement. There is no single broker record to adopt. Written: freeze and alert.
 - How Book 3 links to Book 4 through working orders, fills, open orders, positions, strategy tags and
-  combinations of contracts. **For Bilal**; the attribution rule above stands meanwhile.
+  combinations of contracts, and the recovery fallback beyond the strategy tag. **For Bilal**.
 
 ## Where to go next
 

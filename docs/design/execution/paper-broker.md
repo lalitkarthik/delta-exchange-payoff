@@ -12,7 +12,9 @@ door is what makes the reconciliation in [books.md](books.md) testable without a
 The **broker adapter** is the one part of the OMS that speaks a broker's own API: place, cancel, list
 orders, list fills, list positions, read the wallet. The **paper broker** is an adapter that speaks no
 external API at all. It reads the live prices already on the bus and answers as a broker would, in
-memory, inside the sandbox OMS process. Its venue name is `PAPER`.
+memory, inside the OMS process of a **paper client**: a client whose file names the paper broker
+([clients.md](clients.md)). Each paper client has its own paper broker, with its own wallet and
+positions, so two paper clients never share a fill.
 
 **Why first.** It needs no account and no keys. Its fills are deterministic, so a test can say what
 should have happened. It runs on a laptop with the rest of the stack. And it is the research basis for
@@ -61,13 +63,13 @@ shape already allows them.
 
 The paper broker keeps its own Book 5, net signed lots per contract, updated by every fill it makes.
 The OMS reads it through the same adapter calls it would use on Delta: list positions, list fills since
-a time, read the wallet. The sandbox OMS therefore runs the same reconciliation, on the same schedule,
-as the live one. The paper wallet holds a configured starting balance and blocks margin using the same
+a time, read the wallet. A paper client's OMS therefore runs the same reconciliation, on the same
+schedule, as a real client's. The paper wallet holds a configured starting balance and blocks margin using the same
 margin model the risk checks use.
 
 Its positions live in memory, and every fill it makes is published and kept in the `fills` table. When
-the sandbox OMS restarts, the paper broker rebuilds its positions from every paper fill, which the OMS
-receives in its restore reply ([message-bus.md](message-bus.md)). A sandbox restart loses nothing.
+a paper client's OMS restarts, the paper broker rebuilds its positions from that client's paper fills,
+which the OMS receives in its restore reply ([message-bus.md](message-bus.md)). A sandbox restart loses nothing.
 
 ## The manual door
 
@@ -88,7 +90,7 @@ check idea, runnable on a laptop before any account exists.
 ```mermaid
 sequenceDiagram
   participant P as a test
-  participant OMS as sandbox oms
+  participant OMS as a paper client's oms
   participant PB as paper broker (inside oms)
   participant BUS as bus
   P->>PB: manual order {contract, side, lots}
